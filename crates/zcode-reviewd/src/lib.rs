@@ -1,5 +1,10 @@
+use review_store::{
+    Job, JobClaim, JobState, LifecycleWrite, NewJob, Store, StoreError, StoredProcessIdentity,
+    TerminalUpdate,
+};
 use std::{
-    io,
+    collections::HashMap,
+    fmt, io,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -327,9 +332,520 @@ pub fn classify_restart(identity: &ProcessIdentity) -> RuntimeTerminal {
     }
 }
 
+pub trait ManagedRuntime: Send + Sync + 'static {
+    fn identity(&self) -> Option<ProcessIdentity>;
+    fn stop(&self, grace: Duration) -> RuntimeTerminal;
+    fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal>;
+}
+
+impl ManagedRuntime for RuntimeOwner {
+    fn identity(&self) -> Option<ProcessIdentity> {
+        Some(self.identity())
+    }
+
+    fn stop(&self, grace: Duration) -> RuntimeTerminal {
+        self.stop(grace)
+    }
+
+    fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+        self.wait_terminal(timeout)
+    }
+}
+
+pub trait RuntimeFactory: Send + Sync + 'static {
+    fn spawn(&self, job: &Job, sink: Arc<dyn LifecycleSink>)
+        -> io::Result<Arc<dyn ManagedRuntime>>;
+}
+
+pub struct CommandRuntimeFactory<F> {
+    command: F,
+}
+
+impl<F> CommandRuntimeFactory<F> {
+    pub fn new(command: F) -> Self {
+        Self { command }
+    }
+}
+
+impl<F> RuntimeFactory for CommandRuntimeFactory<F>
+where
+    F: Fn(&Job) -> io::Result<Command> + Send + Sync + 'static,
+{
+    fn spawn(
+        &self,
+        job: &Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        let command = (self.command)(job)?;
+        Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerConfig {
+    pub global_max_agents: usize,
+    pub per_workspace_max_agents: usize,
+    pub stop_grace: Duration,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            global_max_agents: 2,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_secs(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SchedulerError {
+    Store(StoreError),
+    InvalidConfig(String),
+    RuntimeSpawn { agent_id: String, message: String },
+    LifecycleSink { agent_id: String, message: String },
+}
+
+impl fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "{error}"),
+            Self::InvalidConfig(message) => write!(f, "invalid scheduler config: {message}"),
+            Self::RuntimeSpawn { agent_id, message } => {
+                write!(f, "runtime spawn failed for {agent_id}: {message}")
+            }
+            Self::LifecycleSink { agent_id, message } => {
+                write!(f, "lifecycle sink failed for {agent_id}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchedulerError {}
+
+impl From<StoreError> for SchedulerError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct Scheduler {
+    inner: Arc<SchedulerInner>,
+}
+
+struct SchedulerInner {
+    owner_id: String,
+    store: Arc<Store>,
+    factory: Arc<dyn RuntimeFactory>,
+    config: SchedulerConfig,
+    state: Mutex<SchedulerState>,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    active: HashMap<String, ActiveRuntime>,
+    failures: HashMap<String, String>,
+}
+
+struct ActiveRuntime {
+    owner_epoch: u64,
+    runtime: Arc<dyn ManagedRuntime>,
+    sink: Arc<StoreLifecycleSink>,
+}
+
+struct StoreLifecycleSink {
+    store: Arc<Store>,
+    agent_id: String,
+    runtime_agent_id: String,
+    owner_epoch: u64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl StoreLifecycleSink {
+    fn new(
+        store: Arc<Store>,
+        agent_id: String,
+        runtime_agent_id: String,
+        owner_epoch: u64,
+    ) -> Self {
+        Self {
+            store,
+            agent_id,
+            runtime_agent_id,
+            owner_epoch,
+            last_error: Mutex::new(None),
+        }
+    }
+
+    fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
+        self.store
+            .transition_terminal(&self.agent_id, self.owner_epoch, &terminal_update(terminal))
+    }
+
+    fn error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
+
+    fn record_error(&self, error: &StoreError) {
+        let mut last = self.last_error.lock().unwrap();
+        if last.is_none() {
+            *last = Some(error.to_string());
+        }
+    }
+}
+
+impl LifecycleSink for StoreLifecycleSink {
+    fn emit(&self, record: LifecycleRecord) {
+        let event_type = match &record.event {
+            RuntimeEvent::Driver(Inbound::Message(_)) => "driver.message",
+            RuntimeEvent::Driver(Inbound::Lifecycle { .. }) => "driver.lifecycle",
+            RuntimeEvent::Driver(Inbound::Malformed(_)) => "driver.malformed",
+            RuntimeEvent::Driver(Inbound::OversizedLine { .. }) => "driver.oversized_line",
+            RuntimeEvent::Driver(Inbound::ChildExited(_)) => "driver.child_exited",
+            RuntimeEvent::Terminal(RuntimeTerminal::Stopped(_)) => "runtime.stopped",
+            RuntimeEvent::Terminal(RuntimeTerminal::Exited(_)) => "runtime.exited",
+            RuntimeEvent::Terminal(RuntimeTerminal::FailedRuntimeLost(_)) => {
+                "runtime.failed_runtime_lost"
+            }
+            RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(_)) => "runtime.orphaned",
+        };
+        let terminal = match &record.event {
+            RuntimeEvent::Terminal(terminal) => Some(terminal_update(terminal)),
+            _ => None,
+        };
+        let write = LifecycleWrite {
+            agent_id: self.agent_id.clone(),
+            runtime_agent_id: self.runtime_agent_id.clone(),
+            owner_epoch: self.owner_epoch,
+            source_sequence: record.sequence,
+            event_type: event_type.into(),
+            turn_id: None,
+            payload_json: serde_json::json!({"debug": format!("{:?}", record.event)}).to_string(),
+            redaction_level: "safe".into(),
+            terminal,
+        };
+        if let Err(error) = self.store.append_lifecycle(&write) {
+            self.record_error(&error);
+        }
+    }
+}
+
+fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
+    match terminal {
+        RuntimeTerminal::Stopped(_) => TerminalUpdate {
+            state: JobState::Completed,
+            failure_code: None,
+            failure_message: None,
+        },
+        RuntimeTerminal::Exited(ChildExit::Exited(Some(0))) => TerminalUpdate {
+            state: JobState::Completed,
+            failure_code: None,
+            failure_message: None,
+        },
+        RuntimeTerminal::Exited(exit) => TerminalUpdate {
+            state: JobState::FailedRuntimeLost,
+            failure_code: Some("RUNTIME_EXITED".into()),
+            failure_message: Some(format!("{exit:?}")),
+        },
+        RuntimeTerminal::FailedRuntimeLost(loss) => TerminalUpdate {
+            state: JobState::FailedRuntimeLost,
+            failure_code: Some("FAILED_RUNTIME_LOST".into()),
+            failure_message: Some(format!("{loss:?}")),
+        },
+        RuntimeTerminal::Orphaned(loss) => TerminalUpdate {
+            state: JobState::Orphaned,
+            failure_code: Some("ORPHANED".into()),
+            failure_message: Some(format!("{loss:?}")),
+        },
+    }
+}
+
+impl Scheduler {
+    pub fn new(
+        owner_id: impl Into<String>,
+        store: Arc<Store>,
+        factory: Arc<dyn RuntimeFactory>,
+        config: SchedulerConfig,
+    ) -> Result<Self, SchedulerError> {
+        if config.global_max_agents == 0 || config.per_workspace_max_agents == 0 {
+            return Err(SchedulerError::InvalidConfig(
+                "global and per-workspace limits must be positive".into(),
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(SchedulerInner {
+                owner_id: owner_id.into(),
+                store,
+                factory,
+                config,
+                state: Mutex::new(SchedulerState::default()),
+            }),
+        })
+    }
+
+    pub fn enqueue(&self, job: &NewJob) -> Result<Job, SchedulerError> {
+        Ok(self.inner.store.enqueue_job(job)?)
+    }
+
+    pub fn reconcile_startup(&self) -> Result<Vec<(String, JobState)>, SchedulerError> {
+        // Startup reconciliation is valid only before this scheduler owns a runtime.
+        // Persisted process identity is never used to signal or reconnect here.
+        let active = self.inner.state.lock().unwrap().active.is_empty();
+        if !active {
+            return Err(SchedulerError::InvalidConfig(
+                "startup reconciliation requires an empty active set".into(),
+            ));
+        }
+        Ok(self.inner.store.reconcile_startup()?)
+    }
+
+    pub fn start_ready(&self) -> Result<Vec<String>, SchedulerError> {
+        let mut started = Vec::new();
+        loop {
+            let claim = self.inner.store.claim_next(
+                &self.inner.owner_id,
+                self.inner.config.global_max_agents,
+                self.inner.config.per_workspace_max_agents,
+            )?;
+            let Some(claim) = claim else {
+                return Ok(started);
+            };
+            let agent_id = claim.job.agent_id.clone();
+            match self.start_claim(claim) {
+                Ok(true) => started.push(agent_id),
+                Ok(false) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn start_claim(&self, claim: JobClaim) -> Result<bool, SchedulerError> {
+        let runtime_agent_id = format!("{}:{}", claim.job.agent_id, claim.owner_epoch);
+        let sink = Arc::new(StoreLifecycleSink::new(
+            Arc::clone(&self.inner.store),
+            claim.job.agent_id.clone(),
+            runtime_agent_id.clone(),
+            claim.owner_epoch,
+        ));
+        let lifecycle_sink: Arc<dyn LifecycleSink> = sink.clone();
+        let runtime = match self.inner.factory.spawn(&claim.job, lifecycle_sink) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let message = error.to_string();
+                if let Err(store_error) = self.inner.store.fail_claim(
+                    &claim.job.agent_id,
+                    claim.owner_epoch,
+                    "RUNTIME_SPAWN_FAILED",
+                    &message,
+                ) {
+                    self.record_failure(&claim.job.agent_id, store_error.to_string());
+                }
+                return Err(SchedulerError::RuntimeSpawn {
+                    agent_id: claim.job.agent_id,
+                    message,
+                });
+            }
+        };
+        let identity = runtime.identity().map(|identity| StoredProcessIdentity {
+            pid: identity.pid,
+            process_group_id: identity.pgid,
+            uid: identity.uid,
+            start_token: identity.start_token,
+        });
+        let marked = match self.inner.store.mark_running(
+            &claim.job.agent_id,
+            claim.owner_epoch,
+            &runtime_agent_id,
+            identity.as_ref(),
+        ) {
+            Ok(marked) => marked,
+            Err(error) => {
+                let _ = runtime.stop(self.inner.config.stop_grace);
+                if let Err(failure_error) = self.inner.store.fail_claim(
+                    &claim.job.agent_id,
+                    claim.owner_epoch,
+                    "STORE_START_FAILED",
+                    &error.to_string(),
+                ) {
+                    self.record_failure(&claim.job.agent_id, failure_error.to_string());
+                }
+                return Err(SchedulerError::Store(error));
+            }
+        };
+        if !marked {
+            let current = self.inner.store.get_job(&claim.job.agent_id)?;
+            if current
+                .as_ref()
+                .is_some_and(|job| job.close_requested || job.state.is_terminal())
+            {
+                let terminal = runtime.stop(self.inner.config.stop_grace);
+                if let Err(error) = sink.finish(&terminal) {
+                    self.record_failure(&claim.job.agent_id, error.to_string());
+                }
+                return Ok(false);
+            }
+            let terminal = runtime.stop(self.inner.config.stop_grace);
+            let message = format!("running transition was not applied: {terminal:?}");
+            self.inner.store.fail_claim(
+                &claim.job.agent_id,
+                claim.owner_epoch,
+                "RUNTIME_START_RACE",
+                &message,
+            )?;
+            return Ok(false);
+        }
+
+        {
+            // Lock order: scheduler state is never held during SQLite, factory,
+            // spawn, wait, stop, or LifecycleSink calls.
+            let mut state = self.inner.state.lock().unwrap();
+            state.active.insert(
+                claim.job.agent_id.clone(),
+                ActiveRuntime {
+                    owner_epoch: claim.owner_epoch,
+                    runtime: Arc::clone(&runtime),
+                    sink: Arc::clone(&sink),
+                },
+            );
+        }
+        self.spawn_monitor(claim.job.agent_id, claim.owner_epoch, runtime, sink);
+        Ok(true)
+    }
+
+    fn spawn_monitor(
+        &self,
+        agent_id: String,
+        owner_epoch: u64,
+        runtime: Arc<dyn ManagedRuntime>,
+        sink: Arc<StoreLifecycleSink>,
+    ) {
+        let scheduler = self.clone();
+        thread::spawn(move || loop {
+            if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
+                if let Some(error) = sink.error() {
+                    if let Err(store_error) = scheduler.inner.store.fail_claim(
+                        &agent_id,
+                        owner_epoch,
+                        "LIFECYCLE_SINK_FAILED",
+                        &error,
+                    ) {
+                        scheduler.record_failure(&agent_id, store_error.to_string());
+                    }
+                    scheduler.record_failure(&agent_id, error);
+                } else if let Err(error) = sink.finish(&terminal) {
+                    scheduler.record_failure(&agent_id, error.to_string());
+                }
+                scheduler.release_active(&agent_id, owner_epoch);
+                if let Err(error) = scheduler.start_ready() {
+                    scheduler.record_failure(&agent_id, error.to_string());
+                }
+                return;
+            }
+            if let Some(error) = sink.error() {
+                let _ = runtime.stop(scheduler.inner.config.stop_grace);
+                if let Err(store_error) = scheduler.inner.store.fail_claim(
+                    &agent_id,
+                    owner_epoch,
+                    "LIFECYCLE_SINK_FAILED",
+                    &error,
+                ) {
+                    scheduler.record_failure(&agent_id, store_error.to_string());
+                }
+                scheduler.record_failure(&agent_id, error);
+                scheduler.release_active(&agent_id, owner_epoch);
+                return;
+            }
+        });
+    }
+
+    pub fn close_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
+        let decision = self.inner.store.request_close(agent_id)?;
+        if !decision.needs_runtime_stop {
+            return Ok(decision.state);
+        }
+        let active = {
+            let state = self.inner.state.lock().unwrap();
+            state
+                .active
+                .get(agent_id)
+                .filter(|active| active.owner_epoch == decision.owner_epoch)
+                .map(|active| (Arc::clone(&active.runtime), Arc::clone(&active.sink)))
+        };
+        let Some((runtime, sink)) = active else {
+            return Ok(decision.state);
+        };
+        let terminal = runtime.stop(self.inner.config.stop_grace);
+        if let Some(message) = sink.error() {
+            if let Err(error) = self.inner.store.fail_claim(
+                agent_id,
+                decision.owner_epoch,
+                "LIFECYCLE_SINK_FAILED",
+                &message,
+            ) {
+                self.record_failure(agent_id, error.to_string());
+                return Err(SchedulerError::Store(error));
+            }
+            self.record_failure(agent_id, message.clone());
+            self.release_active(agent_id, decision.owner_epoch);
+            return Err(SchedulerError::LifecycleSink {
+                agent_id: agent_id.into(),
+                message,
+            });
+        }
+        let state = sink.finish(&terminal)?;
+        self.release_active(agent_id, decision.owner_epoch);
+        Ok(state)
+    }
+
+    pub fn reap_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
+        let state = self.close_job(agent_id)?;
+        if !state.is_terminal() {
+            return Ok(state);
+        }
+        Ok(self.inner.store.reap_job(agent_id)?)
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.inner.state.lock().unwrap().active.len()
+    }
+
+    pub fn last_error(&self, agent_id: &str) -> Option<String> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .failures
+            .get(agent_id)
+            .cloned()
+    }
+
+    fn release_active(&self, agent_id: &str, owner_epoch: u64) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state
+            .active
+            .get(agent_id)
+            .is_some_and(|active| active.owner_epoch == owner_epoch)
+        {
+            state.active.remove(agent_id);
+        }
+    }
+
+    fn record_failure(&self, agent_id: &str, message: String) {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .failures
+            .entry(agent_id.into())
+            .or_insert(message);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use review_store::NewArtifact;
     use std::sync::Barrier;
 
     #[derive(Default)]
@@ -706,6 +1222,396 @@ mod tests {
         assert_eq!(
             classify_restart(&identity),
             RuntimeTerminal::Orphaned(RuntimeLoss::MissingLeader)
+        );
+    }
+
+    struct FakeRuntime {
+        sink: Arc<dyn LifecycleSink>,
+        next_sequence: std::sync::atomic::AtomicU64,
+        terminal: Mutex<Option<RuntimeTerminal>>,
+        changed: Condvar,
+        stop_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRuntime {
+        fn new(sink: Arc<dyn LifecycleSink>) -> Self {
+            Self {
+                sink,
+                next_sequence: std::sync::atomic::AtomicU64::new(1),
+                terminal: Mutex::new(None),
+                changed: Condvar::new(),
+                stop_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn emit_partial(&self, value: &str) {
+            let sequence = self
+                .next_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.sink.emit(LifecycleRecord {
+                sequence,
+                event: RuntimeEvent::Driver(Inbound::Malformed(value.into())),
+            });
+        }
+
+        fn finish(&self, requested: RuntimeTerminal) -> RuntimeTerminal {
+            let mut terminal = self.terminal.lock().unwrap();
+            if let Some(existing) = &*terminal {
+                return existing.clone();
+            }
+            let sequence = self
+                .next_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.sink.emit(LifecycleRecord {
+                sequence,
+                event: RuntimeEvent::Terminal(requested.clone()),
+            });
+            *terminal = Some(requested.clone());
+            self.changed.notify_all();
+            requested
+        }
+
+        fn stop_calls(&self) -> usize {
+            self.stop_calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl ManagedRuntime for FakeRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+
+        fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+            self.stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )))
+        }
+
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            let terminal = self.terminal.lock().unwrap();
+            if terminal.is_some() {
+                return terminal.clone();
+            }
+            self.changed
+                .wait_timeout(terminal, timeout)
+                .unwrap()
+                .0
+                .clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeFactory {
+        runtimes: Mutex<HashMap<String, Arc<FakeRuntime>>>,
+        fail_for: Mutex<Vec<String>>,
+    }
+
+    impl FakeFactory {
+        fn fail(&self, agent_id: &str) {
+            self.fail_for.lock().unwrap().push(agent_id.into());
+        }
+
+        fn runtime(&self, agent_id: &str) -> Arc<FakeRuntime> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(runtime) = self.runtimes.lock().unwrap().get(agent_id).cloned() {
+                    return runtime;
+                }
+                assert!(Instant::now() < deadline, "runtime was not spawned");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl RuntimeFactory for FakeFactory {
+        fn spawn(
+            &self,
+            job: &Job,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            if self
+                .fail_for
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|agent_id| agent_id == &job.agent_id)
+            {
+                return Err(io::Error::other("scripted spawn failure"));
+            }
+            let runtime = Arc::new(FakeRuntime::new(sink));
+            self.runtimes
+                .lock()
+                .unwrap()
+                .insert(job.agent_id.clone(), Arc::clone(&runtime));
+            Ok(runtime)
+        }
+    }
+
+    fn scheduler_fixture(
+        global: usize,
+        per_workspace: usize,
+    ) -> (tempfile::TempDir, Arc<Store>, Arc<FakeFactory>, Scheduler) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "daemon-test",
+            Arc::clone(&store),
+            factory.clone(),
+            SchedulerConfig {
+                global_max_agents: global,
+                per_workspace_max_agents: per_workspace,
+                stop_grace: Duration::from_millis(25),
+            },
+        )
+        .unwrap();
+        (directory, store, factory, scheduler)
+    }
+
+    fn wait_for_job_state(store: &Store, agent_id: &str, expected: JobState) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if store.get_job(agent_id).unwrap().unwrap().state == expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "job did not reach {expected:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn scheduler_persists_partial_events_and_releases_slots_fifo() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture(2, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-1", "workspace-a"))
+            .unwrap();
+        scheduler
+            .enqueue(&NewJob::new("job-2", "workspace-a"))
+            .unwrap();
+        scheduler
+            .enqueue(&NewJob::new("job-3", "workspace-b"))
+            .unwrap();
+        assert_eq!(scheduler.start_ready().unwrap(), vec!["job-1", "job-3"]);
+        assert_eq!(scheduler.active_count(), 2);
+
+        let first = factory.runtime("job-1");
+        first.emit_partial("partial-review");
+        first.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        wait_for_job_state(&store, "job-1", JobState::Completed);
+        let second = factory.runtime("job-2");
+        assert_eq!(
+            store.events_after("job-1", "job-1:1", 0, 10).unwrap().len(),
+            2
+        );
+        assert_eq!(store.cursor("job-1", "job-1:1").unwrap(), 2);
+        assert_eq!(scheduler.active_count(), 2);
+
+        second.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        factory
+            .runtime("job-3")
+            .finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        wait_for_job_state(&store, "job-2", JobState::Completed);
+        wait_for_job_state(&store, "job-3", JobState::Completed);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while scheduler.active_count() != 0 {
+            assert!(Instant::now() < deadline, "active slots were not released");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn spawn_failure_is_typed_durable_and_does_not_leak_a_slot() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        factory.fail("job-fail");
+        scheduler
+            .enqueue(&NewJob::new("job-fail", "workspace"))
+            .unwrap();
+        assert!(matches!(
+            scheduler.start_ready(),
+            Err(SchedulerError::RuntimeSpawn { .. })
+        ));
+        let job = store.get_job("job-fail").unwrap().unwrap();
+        assert_eq!(job.state, JobState::FailedRuntimeLost);
+        assert_eq!(job.failure_code.as_deref(), Some("RUNTIME_SPAWN_FAILED"));
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(store.active_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn lifecycle_sink_failure_stops_runtime_and_records_durable_failure() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-sink-fail", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("job-sink-fail");
+        let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER fail_lifecycle_events BEFORE INSERT ON events
+             BEGIN SELECT RAISE(FAIL, 'scripted event write failure'); END;",
+        )
+        .unwrap();
+
+        runtime.emit_partial("cannot-persist");
+        wait_for_job_state(&store, "job-sink-fail", JobState::FailedRuntimeLost);
+        let job = store.get_job("job-sink-fail").unwrap().unwrap();
+        assert_eq!(job.failure_code.as_deref(), Some("LIFECYCLE_SINK_FAILED"));
+        assert!(runtime.stop_calls() >= 1);
+        assert!(scheduler.last_error("job-sink-fail").is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while scheduler.active_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "failed sink leaked an active slot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn concurrent_close_and_reap_converge_and_retain_durable_rows() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-close", "workspace"))
+            .unwrap();
+        store
+            .insert_artifact(&NewArtifact {
+                artifact_id: "artifact".into(),
+                agent_id: "job-close".into(),
+                artifact_type: "report".into(),
+                path: "/report".into(),
+                sha256: "sha".into(),
+                bytes: 10,
+                checkpoint_number: None,
+            })
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("job-close");
+        runtime.emit_partial("partial");
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let scheduler = scheduler.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                scheduler.close_job("job-close")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), JobState::Closed);
+        }
+        assert!(runtime.stop_calls() >= 1);
+        assert_eq!(scheduler.reap_job("job-close").unwrap(), JobState::Closed);
+        assert_eq!(scheduler.reap_job("job-close").unwrap(), JobState::Closed);
+        assert_eq!(store.artifact_count("job-close").unwrap(), 1);
+        assert_eq!(
+            store
+                .events_after("job-close", "job-close:1", 0, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store.get_job("job-close").unwrap().unwrap().state,
+            JobState::Closed
+        );
+        assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_enqueue_start_and_close_has_no_slot_or_terminal_leak() {
+        let (_directory, store, _factory, scheduler) = scheduler_fixture(3, 1);
+        let enqueue_barrier = Arc::new(Barrier::new(13));
+        let mut enqueuers = Vec::new();
+        for index in 0..12 {
+            let scheduler = scheduler.clone();
+            let barrier = Arc::clone(&enqueue_barrier);
+            enqueuers.push(thread::spawn(move || {
+                barrier.wait();
+                scheduler.enqueue(&NewJob::new(
+                    format!("concurrent-{index}"),
+                    format!("workspace-{}", index % 4),
+                ))
+            }));
+        }
+        enqueue_barrier.wait();
+        for worker in enqueuers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let start_barrier = Arc::new(Barrier::new(5));
+        let mut starters = Vec::new();
+        for _ in 0..4 {
+            let scheduler = scheduler.clone();
+            let barrier = Arc::clone(&start_barrier);
+            starters.push(thread::spawn(move || {
+                barrier.wait();
+                scheduler.start_ready()
+            }));
+        }
+        start_barrier.wait();
+        for worker in starters {
+            worker.join().unwrap().unwrap();
+        }
+        assert_eq!(scheduler.active_count(), 3);
+        assert_eq!(store.active_count().unwrap(), 3);
+
+        let close_barrier = Arc::new(Barrier::new(13));
+        let mut closers = Vec::new();
+        for index in 0..12 {
+            let scheduler = scheduler.clone();
+            let barrier = Arc::clone(&close_barrier);
+            closers.push(thread::spawn(move || {
+                barrier.wait();
+                scheduler.close_job(&format!("concurrent-{index}"))
+            }));
+        }
+        close_barrier.wait();
+        for worker in closers {
+            worker.join().unwrap().unwrap();
+        }
+        for index in 0..12 {
+            wait_for_job_state(&store, &format!("concurrent-{index}"), JobState::Closed);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while scheduler.active_count() != 0 || store.active_count().unwrap() != 0 {
+            assert!(Instant::now() < deadline, "concurrent close leaked a slot");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn scheduler_restart_reconciliation_never_spawns_or_signals() {
+        let (directory, store, _factory, scheduler) = scheduler_fixture(2, 2);
+        scheduler.enqueue(&NewJob::new("queued", "a")).unwrap();
+        scheduler.enqueue(&NewJob::new("starting", "b")).unwrap();
+        store.claim_next("dead-daemon", 1, 1).unwrap().unwrap();
+        drop(scheduler);
+        drop(store);
+
+        let reopened = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "new-daemon",
+            Arc::clone(&reopened),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(scheduler.reconcile_startup().unwrap().len(), 2);
+        assert_eq!(factory.runtimes.lock().unwrap().len(), 0);
+        assert_eq!(
+            reopened.get_job("queued").unwrap().unwrap().state,
+            JobState::FailedRuntimeLost
+        );
+        assert_eq!(
+            reopened.get_job("starting").unwrap().unwrap().state,
+            JobState::Orphaned
         );
     }
 }

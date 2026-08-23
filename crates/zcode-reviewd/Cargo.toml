@@ -5,4 +5,9 @@ edition = "2021"
 
 [dependencies]
 zcode-driver = { path = "../zcode-driver" }
+review-store = { path = "../review-store" }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite = "0.32"
