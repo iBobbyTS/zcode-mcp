@@ -3,12 +3,12 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::Duration,
@@ -45,6 +45,7 @@ pub struct Driver {
     stdin: Arc<Mutex<ChildStdin>>,
     incoming: Mutex<Receiver<Inbound>>,
     child: Arc<Mutex<Option<Child>>>,
+    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     next_id: AtomicU64,
     stopped: AtomicBool,
 }
@@ -75,11 +76,14 @@ impl Driver {
         thread::spawn(move || read_loop(stdout, read_tx));
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let monitor_ref = Arc::clone(&child_ref);
-        thread::spawn(move || monitor_child(monitor_ref, tx));
+        let termination = Arc::new((Mutex::new(None), Condvar::new()));
+        let monitor_termination = Arc::clone(&termination);
+        thread::spawn(move || monitor_child(monitor_ref, tx, monitor_termination));
         Ok(Self {
             stdin,
             incoming: Mutex::new(rx),
             child: child_ref,
+            termination,
             next_id: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
         })
@@ -122,10 +126,15 @@ impl Driver {
         Ok(())
     }
     pub fn wait(&self) -> std::io::Result<Option<i32>> {
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            return Ok(child.wait()?.code());
+        let (lock, cvar) = &*self.termination;
+        let mut status = lock.lock().unwrap();
+        while status.is_none() {
+            status = cvar.wait(status).unwrap();
         }
-        Ok(None)
+        Ok(match status.as_ref().unwrap() {
+            ChildExit::Exited(code) => *code,
+            _ => None,
+        })
     }
 }
 impl Drop for Driver {
@@ -136,22 +145,13 @@ impl Drop for Driver {
 
 fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
     let mut reader = BufReader::new(stdout);
-    let mut buf = Vec::new();
     let mut sequence = 0;
     let mut turn_active = false;
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) if buf.len() > MAX_NDJSON_LINE_BYTES => {
-                let _ = tx.send(Inbound::OversizedLine { bytes: buf.len() });
-                continue;
-            }
-            Ok(_) => {
+        match read_bounded_line(&mut reader) {
+            Ok(Some((line, bytes))) if bytes <= MAX_NDJSON_LINE_BYTES => {
                 sequence += 1;
-                let line = String::from_utf8_lossy(&buf)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
+                let line = String::from_utf8_lossy(&line).to_string();
                 match parse_line(&line) {
                     Ok(msg) => {
                         if let WireMessage::Event(event) = &msg {
@@ -188,12 +188,60 @@ fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
                     }
                 }
             }
+            Ok(Some((_, bytes))) => {
+                let _ = tx.send(Inbound::OversizedLine { bytes });
+            }
+            Ok(None) => break,
             Err(_) => break,
         }
     }
 }
 
-fn monitor_child(child_ref: Arc<Mutex<Option<Child>>>, tx: Sender<Inbound>) {
+fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>, usize)>> {
+    let mut line = Vec::with_capacity(MAX_NDJSON_LINE_BYTES.min(8192));
+    let mut byte = [0u8; 1];
+    let mut total = 0usize;
+    let mut oversized = false;
+    loop {
+        match reader.read(&mut byte)? {
+            0 => {
+                return if total == 0 {
+                    Ok(None)
+                } else if oversized {
+                    Ok(Some((Vec::new(), total)))
+                } else {
+                    Ok(Some((line, total)))
+                }
+            }
+            _ => {
+                total += 1;
+                if byte[0] == b'\n' {
+                    if oversized {
+                        return Ok(Some((Vec::new(), total)));
+                    }
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    return Ok(Some((line, total)));
+                }
+                if !oversized {
+                    if line.len() < MAX_NDJSON_LINE_BYTES {
+                        line.push(byte[0]);
+                    } else {
+                        oversized = true;
+                        line.clear();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn monitor_child(
+    child_ref: Arc<Mutex<Option<Child>>>,
+    tx: Sender<Inbound>,
+    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
+) {
     loop {
         let status = {
             let mut guard = child_ref.lock().unwrap();
@@ -204,7 +252,11 @@ fn monitor_child(child_ref: Arc<Mutex<Option<Child>>>, tx: Sender<Inbound>) {
             })
         };
         if let Some(status) = status {
-            let _ = tx.send(Inbound::ChildExited(exit_class(status)));
+            let exit = exit_class(status);
+            let (lock, cvar) = &*termination;
+            *lock.lock().unwrap() = Some(exit.clone());
+            cvar.notify_all();
+            let _ = tx.send(Inbound::ChildExited(exit));
             return;
         }
         thread::sleep(Duration::from_millis(10));
