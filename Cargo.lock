@@ -436,6 +436,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "zcode-driver",
+ "zcode-protocol",
 ]
 
 [[package]]

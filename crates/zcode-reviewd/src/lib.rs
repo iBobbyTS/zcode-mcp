@@ -17,6 +17,7 @@ use zcode_driver::{
     observe_process, observe_process_group, ChildExit, Driver, Inbound, ProcessIdentity,
     StopOutcome,
 };
+use zcode_protocol::{LifecycleOrder, WireMessage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLoss {
@@ -459,7 +460,18 @@ struct StoreLifecycleSink {
     agent_id: String,
     runtime_agent_id: String,
     owner_epoch: u64,
-    last_error: Mutex<Option<String>>,
+    write_state: Mutex<SinkWriteState>,
+}
+
+#[derive(Default)]
+struct SinkWriteState {
+    first_error: Option<String>,
+}
+
+struct LifecycleProjection {
+    event_type: &'static str,
+    payload_json: String,
+    redaction_level: &'static str,
 }
 
 impl StoreLifecycleSink {
@@ -474,42 +486,40 @@ impl StoreLifecycleSink {
             agent_id,
             runtime_agent_id,
             owner_epoch,
-            last_error: Mutex::new(None),
+            write_state: Mutex::new(SinkWriteState::default()),
         }
     }
 
     fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
-        self.store
-            .transition_terminal(&self.agent_id, self.owner_epoch, &terminal_update(terminal))
+        let state = self.write_state.lock().unwrap();
+        if let Some(error) = &state.first_error {
+            self.store.fail_claim(
+                &self.agent_id,
+                self.owner_epoch,
+                "LIFECYCLE_SINK_FAILED",
+                error,
+            )
+        } else {
+            self.store.transition_terminal(
+                &self.agent_id,
+                self.owner_epoch,
+                &terminal_update(terminal),
+            )
+        }
     }
 
     fn error(&self) -> Option<String> {
-        self.last_error.lock().unwrap().clone()
-    }
-
-    fn record_error(&self, error: &StoreError) {
-        let mut last = self.last_error.lock().unwrap();
-        if last.is_none() {
-            *last = Some(error.to_string());
-        }
+        self.write_state.lock().unwrap().first_error.clone()
     }
 }
 
 impl LifecycleSink for StoreLifecycleSink {
     fn emit(&self, record: LifecycleRecord) {
-        let event_type = match &record.event {
-            RuntimeEvent::Driver(Inbound::Message(_)) => "driver.message",
-            RuntimeEvent::Driver(Inbound::Lifecycle { .. }) => "driver.lifecycle",
-            RuntimeEvent::Driver(Inbound::Malformed(_)) => "driver.malformed",
-            RuntimeEvent::Driver(Inbound::OversizedLine { .. }) => "driver.oversized_line",
-            RuntimeEvent::Driver(Inbound::ChildExited(_)) => "driver.child_exited",
-            RuntimeEvent::Terminal(RuntimeTerminal::Stopped(_)) => "runtime.stopped",
-            RuntimeEvent::Terminal(RuntimeTerminal::Exited(_)) => "runtime.exited",
-            RuntimeEvent::Terminal(RuntimeTerminal::FailedRuntimeLost(_)) => {
-                "runtime.failed_runtime_lost"
-            }
-            RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(_)) => "runtime.orphaned",
-        };
+        let mut state = self.write_state.lock().unwrap();
+        if state.first_error.is_some() {
+            return;
+        }
+        let projection = lifecycle_projection(&record.event);
         let terminal = match &record.event {
             RuntimeEvent::Terminal(terminal) => Some(terminal_update(terminal)),
             _ => None,
@@ -519,15 +529,143 @@ impl LifecycleSink for StoreLifecycleSink {
             runtime_agent_id: self.runtime_agent_id.clone(),
             owner_epoch: self.owner_epoch,
             source_sequence: record.sequence,
-            event_type: event_type.into(),
+            event_type: projection.event_type.into(),
             turn_id: None,
-            payload_json: serde_json::json!({"debug": format!("{:?}", record.event)}).to_string(),
-            redaction_level: "safe".into(),
+            payload_json: projection.payload_json,
+            redaction_level: projection.redaction_level.into(),
             terminal,
         };
         if let Err(error) = self.store.append_lifecycle(&write) {
-            self.record_error(&error);
+            state.first_error = Some(error.to_string());
         }
+    }
+}
+
+fn lifecycle_projection(event: &RuntimeEvent) -> LifecycleProjection {
+    let (event_type, payload, redaction_level) = match event {
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))) => (
+            "driver.message",
+            serde_json::json!({"kind": "request", "method": request.method}),
+            "redacted",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Response(response))) => (
+            "driver.message",
+            serde_json::json!({
+                "kind": "response",
+                "outcome": if response.error.is_some() { "error" } else { "result" },
+            }),
+            "redacted",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(message))) => (
+            "driver.message",
+            serde_json::json!({"kind": "event", "method": message.method}),
+            "redacted",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { .. })) => (
+            "raw.unknown",
+            serde_json::json!({"kind": "unknown_event", "raw": "[REDACTED]"}),
+            "redacted",
+        ),
+        RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence,
+            method,
+            order,
+        }) => (
+            "driver.lifecycle",
+            serde_json::json!({
+                "kind": "lifecycle",
+                "sequence": sequence,
+                "method": method,
+                "order": lifecycle_order_name(order),
+            }),
+            "allowlisted",
+        ),
+        RuntimeEvent::Driver(Inbound::Malformed(_)) => (
+            "driver.malformed",
+            serde_json::json!({"kind": "malformed", "detail": "[REDACTED]"}),
+            "redacted",
+        ),
+        RuntimeEvent::Driver(Inbound::OversizedLine { bytes }) => (
+            "driver.oversized_line",
+            serde_json::json!({"kind": "oversized_line", "bytes": bytes}),
+            "allowlisted",
+        ),
+        RuntimeEvent::Driver(Inbound::ChildExited(exit)) => (
+            "driver.child_exited",
+            serde_json::json!({"kind": "child_exited", "outcome": child_exit_name(exit)}),
+            "allowlisted",
+        ),
+        RuntimeEvent::Terminal(RuntimeTerminal::Stopped(outcome)) => (
+            "runtime.stopped",
+            serde_json::json!({"kind": "stopped", "outcome": stop_outcome_name(outcome)}),
+            "allowlisted",
+        ),
+        RuntimeEvent::Terminal(RuntimeTerminal::Exited(exit)) => (
+            "runtime.exited",
+            serde_json::json!({"kind": "exited", "outcome": child_exit_name(exit)}),
+            "allowlisted",
+        ),
+        RuntimeEvent::Terminal(RuntimeTerminal::FailedRuntimeLost(loss)) => (
+            "runtime.failed_runtime_lost",
+            serde_json::json!({"kind": "failed_runtime_lost", "reason": runtime_loss_name(loss)}),
+            runtime_loss_redaction(loss),
+        ),
+        RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(loss)) => (
+            "runtime.orphaned",
+            serde_json::json!({"kind": "orphaned", "reason": runtime_loss_name(loss)}),
+            runtime_loss_redaction(loss),
+        ),
+    };
+    LifecycleProjection {
+        event_type,
+        payload_json: payload.to_string(),
+        redaction_level,
+    }
+}
+
+fn lifecycle_order_name(order: &LifecycleOrder) -> &'static str {
+    match order {
+        LifecycleOrder::NotLifecycle => "not_lifecycle",
+        LifecycleOrder::InOrder => "in_order",
+        LifecycleOrder::OutOfOrder { .. } => "out_of_order",
+    }
+}
+
+fn child_exit_name(exit: &ChildExit) -> &'static str {
+    match exit {
+        ChildExit::Exited(Some(0)) => "exited_success",
+        ChildExit::Exited(Some(_)) => "exited_failure",
+        ChildExit::Exited(None) => "exited_unknown",
+        ChildExit::Signaled(_) => "signaled",
+        ChildExit::Unknown => "unknown",
+    }
+}
+
+fn stop_outcome_name(outcome: &StopOutcome) -> &'static str {
+    match outcome {
+        StopOutcome::AlreadyExited(_) => "already_exited",
+        StopOutcome::Terminated(_) => "terminated",
+    }
+}
+
+fn runtime_loss_name(loss: &RuntimeLoss) -> &'static str {
+    match loss {
+        RuntimeLoss::InvalidIdentity => "invalid_identity",
+        RuntimeLoss::UnsupportedIdentity => "unsupported_identity",
+        RuntimeLoss::MissingLeader => "missing_leader",
+        RuntimeLoss::IdentityMismatch => "identity_mismatch",
+        RuntimeLoss::UnknownMembership => "unknown_membership",
+        RuntimeLoss::SessionLost => "session_lost",
+        RuntimeLoss::StopFailed(_) => "stop_failed",
+        RuntimeLoss::EventStreamLost => "event_stream_lost",
+    }
+}
+
+fn runtime_loss_redaction(loss: &RuntimeLoss) -> &'static str {
+    if matches!(loss, RuntimeLoss::StopFailed(_)) {
+        "redacted"
+    } else {
+        "allowlisted"
     }
 }
 
@@ -546,17 +684,17 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
         RuntimeTerminal::Exited(exit) => TerminalUpdate {
             state: JobState::FailedRuntimeLost,
             failure_code: Some("RUNTIME_EXITED".into()),
-            failure_message: Some(format!("{exit:?}")),
+            failure_message: Some(child_exit_name(exit).into()),
         },
         RuntimeTerminal::FailedRuntimeLost(loss) => TerminalUpdate {
             state: JobState::FailedRuntimeLost,
             failure_code: Some("FAILED_RUNTIME_LOST".into()),
-            failure_message: Some(format!("{loss:?}")),
+            failure_message: Some(runtime_loss_name(loss).into()),
         },
         RuntimeTerminal::Orphaned(loss) => TerminalUpdate {
             state: JobState::Orphaned,
             failure_code: Some("ORPHANED".into()),
-            failure_message: Some(format!("{loss:?}")),
+            failure_message: Some(runtime_loss_name(loss).into()),
         },
     }
 }
@@ -847,6 +985,7 @@ mod tests {
     use super::*;
     use review_store::NewArtifact;
     use std::sync::Barrier;
+    use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope};
 
     #[derive(Default)]
     struct MemorySink {
@@ -1245,13 +1384,14 @@ mod tests {
         }
 
         fn emit_partial(&self, value: &str) {
+            self.emit_event(RuntimeEvent::Driver(Inbound::Malformed(value.into())));
+        }
+
+        fn emit_event(&self, event: RuntimeEvent) {
             let sequence = self
                 .next_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.sink.emit(LifecycleRecord {
-                sequence,
-                event: RuntimeEvent::Driver(Inbound::Malformed(value.into())),
-            });
+            self.sink.emit(LifecycleRecord { sequence, event });
         }
 
         fn finish(&self, requested: RuntimeTerminal) -> RuntimeTerminal {
@@ -1468,6 +1608,137 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn transient_lifecycle_failure_cannot_be_overwritten_by_success_terminal() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-transient-sink-fail", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("job-transient-sink-fail");
+        let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER fail_one_event_type BEFORE INSERT ON events
+             WHEN NEW.event_type = 'driver.malformed'
+             BEGIN SELECT RAISE(FAIL, 'scripted transient event failure'); END;",
+        )
+        .unwrap();
+
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::OversizedLine { bytes: 17 }));
+        runtime.emit_partial("this record is rejected");
+        runtime.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+
+        wait_for_job_state(
+            &store,
+            "job-transient-sink-fail",
+            JobState::FailedRuntimeLost,
+        );
+        let job = store.get_job("job-transient-sink-fail").unwrap().unwrap();
+        assert_eq!(job.failure_code.as_deref(), Some("LIFECYCLE_SINK_FAILED"));
+        assert_ne!(job.state, JobState::Completed);
+        let events = store
+            .events_after(
+                "job-transient-sink-fail",
+                "job-transient-sink-fail:1",
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "the committed partial event is retained");
+        assert_eq!(events[0].event_type, "driver.oversized_line");
+        assert_eq!(
+            store
+                .cursor("job-transient-sink-fail", "job-transient-sink-fail:1")
+                .unwrap(),
+            1
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while scheduler.active_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "failed sink leaked an active slot"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(store.active_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn store_sink_persists_only_allowlisted_or_redacted_lifecycle_fields() {
+        const REASONING: &str = "SENTINEL_PRIVATE_REASONING";
+        const TOKEN: &str = "SENTINEL_SECRET_TOKEN";
+        const PATH: &str = "/private/SENTINEL_PATH";
+        const TOOL_ARGS: &str = "SENTINEL_TOOL_ARGUMENTS";
+
+        let (_directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-redaction", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("job-redaction");
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Request(RequestEnvelope {
+                id: serde_json::json!({"token": TOKEN}),
+                method: "tool/call".into(),
+                params: serde_json::json!({"path": PATH, "arguments": TOOL_ARGS}),
+            }),
+        )));
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Response(ResponseEnvelope {
+                id: serde_json::json!({"token": TOKEN}),
+                result: Some(serde_json::json!({"reasoning": REASONING, "path": PATH})),
+                error: None,
+            }),
+        )));
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            EventEnvelope {
+                method: "turn/completed".into(),
+                params: serde_json::json!({"reasoning": REASONING, "token": TOKEN}),
+            },
+        ))));
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::UnknownEvent {
+                method: "future/event".into(),
+                raw: serde_json::json!({
+                    "method": "future/event",
+                    "reasoning": REASONING,
+                    "token": TOKEN,
+                    "path": PATH,
+                    "tool_args": TOOL_ARGS,
+                }),
+            },
+        )));
+        runtime.finish(RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed(
+            format!("runtime failed at {PATH} with {TOKEN}"),
+        )));
+
+        wait_for_job_state(&store, "job-redaction", JobState::FailedRuntimeLost);
+        let events = store
+            .events_after("job-redaction", "job-redaction:1", 0, 10)
+            .unwrap();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[3].event_type, "raw.unknown");
+        assert_eq!(events[3].redaction_level, "redacted");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[3].payload_json).unwrap(),
+            serde_json::json!({"kind": "unknown_event", "raw": "[REDACTED]"})
+        );
+        assert_eq!(events[4].redaction_level, "redacted");
+        for event in &events {
+            assert!(["redacted", "allowlisted"].contains(&event.redaction_level.as_str()));
+            for sentinel in [REASONING, TOKEN, PATH, TOOL_ARGS] {
+                assert!(
+                    !event.payload_json.contains(sentinel),
+                    "durable payload leaked {sentinel}: {}",
+                    event.payload_json
+                );
+            }
+        }
+        let job = store.get_job("job-redaction").unwrap().unwrap();
+        assert_eq!(job.failure_message.as_deref(), Some("stop_failed"));
+        assert!(!job.failure_message.unwrap().contains(TOKEN));
     }
 
     #[test]

@@ -299,6 +299,7 @@ pub struct StoredEvent {
     pub source_sequence: u64,
     pub event_type: String,
     pub payload_json: String,
+    pub redaction_level: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,7 +881,7 @@ impl Store {
     ) -> StoreResult<Vec<StoredEvent>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json
+            "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level
              FROM events WHERE agent_id = ?1 AND runtime_agent_id = ?2 AND seq > ?3
              ORDER BY seq LIMIT ?4",
         )?;
@@ -899,6 +900,7 @@ impl Store {
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )?
@@ -906,13 +908,21 @@ impl Store {
         events
             .into_iter()
             .map(
-                |(runtime_agent_id, sequence, source_sequence, event_type, payload_json)| {
+                |(
+                    runtime_agent_id,
+                    sequence,
+                    source_sequence,
+                    event_type,
+                    payload_json,
+                    redaction_level,
+                )| {
                     Ok(StoredEvent {
                         runtime_agent_id,
                         sequence: i64_to_u64(sequence)?,
                         source_sequence: i64_to_u64(source_sequence)?,
                         event_type,
                         payload_json,
+                        redaction_level,
                     })
                 },
             )
