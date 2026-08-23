@@ -1,7 +1,5 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 use std::{
     io::{BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
@@ -45,7 +43,7 @@ pub struct Driver {
     stdin: Arc<Mutex<ChildStdin>>,
     incoming: Mutex<Receiver<Inbound>>,
     child: Arc<Mutex<Option<Child>>>,
-    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
+    termination: Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
     next_id: AtomicU64,
     stopped: AtomicBool,
 }
@@ -73,12 +71,13 @@ impl Driver {
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = mpsc::channel();
         let read_tx = tx.clone();
-        thread::spawn(move || read_loop(stdout, read_tx));
+        let (read_done_tx, read_done_rx) = mpsc::channel();
+        thread::spawn(move || read_loop(stdout, read_tx, read_done_tx));
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let monitor_ref = Arc::clone(&child_ref);
-        let termination = Arc::new((Mutex::new(None), Condvar::new()));
+        let termination = Arc::new((std::sync::OnceLock::new(), Mutex::new(()), Condvar::new()));
         let monitor_termination = Arc::clone(&termination);
-        thread::spawn(move || monitor_child(monitor_ref, tx, monitor_termination));
+        thread::spawn(move || monitor_child(monitor_ref, tx, monitor_termination, read_done_rx));
         Ok(Self {
             stdin,
             incoming: Mutex::new(rx),
@@ -126,15 +125,17 @@ impl Driver {
         Ok(())
     }
     pub fn wait(&self) -> std::io::Result<Option<i32>> {
-        let (lock, cvar) = &*self.termination;
-        let mut status = lock.lock().unwrap();
-        while status.is_none() {
-            status = cvar.wait(status).unwrap();
+        let (result, wait_lock, cvar) = &*self.termination;
+        let mut guard = wait_lock.lock().unwrap();
+        while result.get().is_none() {
+            guard = cvar.wait(guard).unwrap();
         }
-        Ok(match status.as_ref().unwrap() {
-            ChildExit::Exited(code) => *code,
-            _ => None,
-        })
+        Ok(
+            match result.get().expect("child monitor publishes before wake") {
+                ChildExit::Exited(code) => *code,
+                _ => None,
+            },
+        )
     }
 }
 impl Drop for Driver {
@@ -143,7 +144,8 @@ impl Drop for Driver {
     }
 }
 
-fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
+fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>, done: Sender<()>) {
+    let _done = ReadDone(done);
     let mut reader = BufReader::new(stdout);
     let mut sequence = 0;
     let mut turn_active = false;
@@ -190,6 +192,7 @@ fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
             }
             Ok(Some((_, bytes))) => {
                 let _ = tx.send(Inbound::OversizedLine { bytes });
+                return;
             }
             Ok(None) => break,
             Err(_) => break,
@@ -197,18 +200,22 @@ fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
     }
 }
 
+struct ReadDone(Sender<()>);
+impl Drop for ReadDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>, usize)>> {
     let mut line = Vec::with_capacity(MAX_NDJSON_LINE_BYTES.min(8192));
     let mut byte = [0u8; 1];
     let mut total = 0usize;
-    let mut oversized = false;
     loop {
         match reader.read(&mut byte)? {
             0 => {
                 return if total == 0 {
                     Ok(None)
-                } else if oversized {
-                    Ok(Some((Vec::new(), total)))
                 } else {
                     Ok(Some((line, total)))
                 }
@@ -216,21 +223,15 @@ fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>,
             _ => {
                 total += 1;
                 if byte[0] == b'\n' {
-                    if oversized {
-                        return Ok(Some((Vec::new(), total)));
-                    }
                     if line.last() == Some(&b'\r') {
                         line.pop();
                     }
                     return Ok(Some((line, total)));
                 }
-                if !oversized {
-                    if line.len() < MAX_NDJSON_LINE_BYTES {
-                        line.push(byte[0]);
-                    } else {
-                        oversized = true;
-                        line.clear();
-                    }
+                if line.len() < MAX_NDJSON_LINE_BYTES {
+                    line.push(byte[0]);
+                } else {
+                    return Ok(Some((Vec::new(), MAX_NDJSON_LINE_BYTES + 1)));
                 }
             }
         }
@@ -240,27 +241,46 @@ fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>,
 fn monitor_child(
     child_ref: Arc<Mutex<Option<Child>>>,
     tx: Sender<Inbound>,
-    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
+    termination: Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
+    read_done: Receiver<()>,
 ) {
     loop {
         let status = {
             let mut guard = child_ref.lock().unwrap();
-            guard.as_mut().and_then(|child| match child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                Ok(None) => None,
-                Err(_) => Some(ExitStatus::from_raw(1)),
-            })
+            match guard.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = read_done.recv_timeout(Duration::from_secs(1));
+                        publish_child_exit(ChildExit::Unknown, &tx, &termination);
+                        return;
+                    }
+                },
+                None => None,
+            }
         };
         if let Some(status) = status {
+            let _ = read_done.recv_timeout(Duration::from_secs(1));
             let exit = exit_class(status);
-            let (lock, cvar) = &*termination;
-            *lock.lock().unwrap() = Some(exit.clone());
+            let (result, _wait_lock, cvar) = &*termination;
+            let _ = result.set(exit.clone());
             cvar.notify_all();
             let _ = tx.send(Inbound::ChildExited(exit));
             return;
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn publish_child_exit(
+    exit: ChildExit,
+    tx: &Sender<Inbound>,
+    termination: &Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
+) {
+    let (result, _wait_lock, cvar) = &**termination;
+    let _ = result.set(exit.clone());
+    cvar.notify_all();
+    let _ = tx.send(Inbound::ChildExited(exit));
 }
 
 #[cfg(unix)]
@@ -340,6 +360,17 @@ mod tests {
             Ok(Inbound::OversizedLine { bytes }) if bytes > MAX_NDJSON_LINE_BYTES
         ));
         d.stop().unwrap();
+    }
+
+    #[test]
+    fn unterminated_oversized_line_is_bounded_and_closes_reader() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "head -c 1048577 /dev/zero"]);
+        let d = Driver::spawn(c).unwrap();
+        assert!(matches!(
+            d.recv_timeout(Duration::from_secs(2)),
+            Ok(Inbound::OversizedLine { bytes }) if bytes == MAX_NDJSON_LINE_BYTES + 1
+        ));
     }
 
     #[test]
