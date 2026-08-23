@@ -6,7 +6,6 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -91,25 +90,21 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
     };
     let request = r#"{"jsonrpc":"2.0","id":"preflight-1","method":"workspace/readState","params":{}}
 "#;
-    if child
+    let write_result = child
         .stdin
         .as_mut()
-        .and_then(|stdin| stdin.write_all(request.as_bytes()).ok())
-        .is_none()
-    {
+        .ok_or(())
+        .and_then(|stdin| stdin.write_all(request.as_bytes()).map_err(|_| ()));
+    if write_result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
         return failed("unable to write probe");
     }
     drop(child.stdin.take());
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let (tx, rx) = mpsc::channel();
-    let tx_out = tx.clone();
-    thread::spawn(move || {
-        let _ = tx_out.send(("stdout", read_bounded(stdout, 64 * 1024)));
-    });
-    thread::spawn(move || {
-        let _ = tx.send(("stderr", read_bounded(stderr, 64 * 1024)));
-    });
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, 64 * 1024));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, 64 * 1024));
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     while Instant::now() < deadline {
@@ -123,14 +118,8 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         let _ = child.kill();
     }
     let status = child.wait().ok();
-    let mut out = Vec::new();
-    for _ in 0..2 {
-        if let Ok((stream, bytes)) = rx.recv_timeout(Duration::from_millis(250)) {
-            if stream == "stdout" {
-                out = bytes;
-            }
-        }
-    }
+    let out = stdout_reader.join().unwrap_or_default();
+    let _stderr = stderr_reader.join().unwrap_or_default();
     if timed_out {
         return failed("probe timed out");
     }
@@ -340,6 +329,22 @@ mod tests {
             identity(Some(&paths.1)).unwrap().runtime_path.as_deref(),
             Some("<redacted>")
         );
+        cleanup(paths);
+    }
+
+    #[test]
+    fn probe_reports_write_failure_without_leaking_child() {
+        let paths = fixture("#!/bin/sh\nexit 0");
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&paths.0)
+            .status()
+            .unwrap();
+        let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1));
+        assert!(matches!(
+            result.compatibility_status.as_str(),
+            "failed" | "incompatible"
+        ));
         cleanup(paths);
     }
 }
