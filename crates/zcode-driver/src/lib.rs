@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
-    io::{BufReader, Read, Write},
+    io::{self, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -69,10 +69,16 @@ impl Driver {
         let mut child = command.spawn()?;
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
         let (tx, rx) = mpsc::channel();
         let read_tx = tx.clone();
         let (read_done_tx, read_done_rx) = mpsc::channel();
         thread::spawn(move || read_loop(stdout, read_tx, read_done_tx));
+        // Always drain diagnostics independently of the protocol stream. A
+        // noisy runtime must not block on its stderr pipe and prevent a
+        // response from reaching stdout. Diagnostics are intentionally
+        // discarded so they can never contaminate stdout or leak secrets.
+        thread::spawn(move || drain_stderr(stderr));
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let monitor_ref = Arc::clone(&child_ref);
         let termination = Arc::new((Mutex::new(None), Condvar::new()));
@@ -137,6 +143,10 @@ impl Driver {
             },
         )
     }
+}
+
+fn drain_stderr(mut stderr: impl Read + Send + 'static) {
+    let _ = io::copy(&mut stderr, &mut io::sink());
 }
 impl Drop for Driver {
     fn drop(&mut self) {
@@ -434,5 +444,22 @@ mod tests {
             }
         ));
         assert!(matches!(second, Inbound::Message(WireMessage::Event(_))));
+    }
+
+    #[test]
+    fn noisy_stderr_does_not_block_stdout_response() {
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "read line; head -c 262144 /dev/zero >&2; printf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}'",
+        ]);
+        let d = Driver::spawn(c).unwrap();
+        d.send_request("probe", serde_json::json!({})).unwrap();
+        assert!(matches!(
+            d.recv_timeout(Duration::from_secs(3)),
+            Ok(Inbound::Message(WireMessage::Response(response)))
+                if response.id == serde_json::json!(1)
+        ));
+        d.stop().unwrap();
     }
 }
