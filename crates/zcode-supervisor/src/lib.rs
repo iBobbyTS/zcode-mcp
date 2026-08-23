@@ -542,7 +542,13 @@ pub fn replay_journal(p: &Path) -> io::Result<Vec<JournalRecord>> {
     let mut s = String::new();
     file.read_to_string(&mut s)?;
     let mut records = Vec::new();
-    for (i, line) in s.lines().filter(|line| !line.trim().is_empty()).enumerate() {
+    for (i, line) in s.lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal contains empty record",
+            ));
+        }
         let record: JournalRecord = serde_json::from_str(line).map_err(io::Error::other)?;
         if record.sequence != i as u64 + 1 {
             return Err(io::Error::new(
@@ -839,6 +845,7 @@ pub mod shim {
         let mut line = String::new();
         BufReader::new(stream.try_clone()?).read_line(&mut line)?;
         let request: Request = serde_json::from_str(&line).map_err(io::Error::other)?;
+        let _guard = lock.lock().unwrap();
         if request.capability != capability
             || request.pid != proof.pid
             || request.pgid != proof.pgid
@@ -853,7 +860,6 @@ pub mod shim {
             writeln!(stream, "{{\"ok\":false,\"error\":\"unauthorized\"}}")?;
             return Ok(());
         }
-        let _guard = lock.lock().unwrap();
         let result = match request.op.as_str() {
             "attest" => match observe_group(proof) {
                 Ok(observed) => transition_observed(
