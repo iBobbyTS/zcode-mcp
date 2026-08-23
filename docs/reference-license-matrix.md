@@ -10,7 +10,7 @@ vendor, extract, decompile, patch, or redistribute the official ZCode runtime
 | zcode-acp | `42fe149d` | `LICENSE` (repository path; not fetched) | Yes | No | None |
 | zcode-cli | `e6e110cb` | `LICENSE` (repository path; not fetched) | Yes | No | None |
 | zcode-tui | `8ba8f688` | `LICENSE` (repository path; not fetched) | Yes | No | None |
-| omg.dev | `0e574c42` | `LICENSE` (repository path; not fetched) | Yes | No | None |
+| omg.dev | `c75b3181` | `LICENSE` (repository path; not fetched) | Yes | No | None |
 | pi-subagents | `3f9d35cd` | `LICENSE` (repository path; not fetched) | Yes | No | None |
 | sailing | `b1ec38ec` | `LICENSE` (repository path; not fetched) | Yes | No | None |
 | mcp-supersubagents | `c30fd7c1` | `LICENSE` (repository path; not fetched) | Yes | No | None |
