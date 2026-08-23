@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS agents (
     report_path TEXT,
     runtime_hash TEXT,
     zcode_session_id TEXT,
+    initial_prompt TEXT NOT NULL DEFAULT 'Begin review.',
+    turn_state TEXT NOT NULL DEFAULT 'IDLE',
     pid INTEGER,
     process_group_id INTEGER,
     process_uid INTEGER,
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS agents (
     owner_epoch INTEGER NOT NULL DEFAULT 0,
     lease_expires_at INTEGER,
     close_requested INTEGER NOT NULL DEFAULT 0,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     started_at INTEGER,
     completed_at INTEGER,
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS agents (
     last_event_seq INTEGER NOT NULL DEFAULT 0,
     failure_code TEXT,
     failure_message TEXT,
+    closed_at INTEGER,
     reaped_at INTEGER
 );
 
@@ -78,7 +82,9 @@ CREATE TABLE IF NOT EXISTS messages (
     state TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,
-    target_turn_id TEXT
+    target_turn_id TEXT,
+    failure_code TEXT,
+    failure_message TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pending_requests (
@@ -90,6 +96,8 @@ CREATE TABLE IF NOT EXISTS pending_requests (
     state TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     responded_at INTEGER,
+    response_decision TEXT,
+    response_content TEXT,
     UNIQUE (agent_id, correlation_id)
 );
 
@@ -133,8 +141,9 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     created_at INTEGER NOT NULL
 );
 
-PRAGMA user_version = 1;
 "#;
+
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -170,6 +179,8 @@ pub enum JobState {
     Running,
     Stopping,
     Completed,
+    Cancelled,
+    Failed,
     FailedRuntimeLost,
     Orphaned,
     Closed,
@@ -179,7 +190,12 @@ impl JobState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::FailedRuntimeLost | Self::Orphaned | Self::Closed
+            Self::Completed
+                | Self::Cancelled
+                | Self::Failed
+                | Self::FailedRuntimeLost
+                | Self::Orphaned
+                | Self::Closed
         )
     }
 
@@ -190,6 +206,8 @@ impl JobState {
             Self::Running => "RUNNING",
             Self::Stopping => "STOPPING",
             Self::Completed => "COMPLETED",
+            Self::Cancelled => "CANCELLED",
+            Self::Failed => "FAILED",
             Self::FailedRuntimeLost => "FAILED_RUNTIME_LOST",
             Self::Orphaned => "ORPHANED",
             Self::Closed => "CLOSED",
@@ -203,6 +221,8 @@ impl JobState {
             "RUNNING" => Ok(Self::Running),
             "STOPPING" => Ok(Self::Stopping),
             "COMPLETED" => Ok(Self::Completed),
+            "CANCELLED" => Ok(Self::Cancelled),
+            "FAILED" => Ok(Self::Failed),
             "FAILED_RUNTIME_LOST" => Ok(Self::FailedRuntimeLost),
             "ORPHANED" => Ok(Self::Orphaned),
             "CLOSED" => Ok(Self::Closed),
@@ -225,6 +245,7 @@ pub struct NewJob {
     pub workspace_path: String,
     pub report_path: Option<String>,
     pub runtime_hash: Option<String>,
+    pub initial_prompt: String,
 }
 
 impl NewJob {
@@ -240,6 +261,7 @@ impl NewJob {
             workspace_path: workspace_path.into(),
             report_path: None,
             runtime_hash: None,
+            initial_prompt: "Begin review.".into(),
         }
     }
 }
@@ -250,15 +272,49 @@ pub struct Job {
     pub idempotency_key: Option<String>,
     pub state: JobState,
     pub workspace_path: String,
+    pub initial_prompt: String,
     pub owner_id: Option<String>,
     pub owner_epoch: u64,
     pub close_requested: bool,
+    pub stop_requested: bool,
     pub last_event_seq: u64,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
     pub runtime_agent_id: Option<String>,
+    pub zcode_session_id: Option<String>,
+    pub turn_state: TurnState,
     pub process_identity: Option<StoredProcessIdentity>,
+    pub closed_at: Option<i64>,
+    pub reaped_at: Option<i64>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    Idle,
+    Active,
+    Failed,
+}
+
+impl TurnState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Active => "ACTIVE",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "IDLE" => Ok(Self::Idle),
+            "ACTIVE" => Ok(Self::Active),
+            "FAILED" => Ok(Self::Failed),
+            other => Err(StoreError::InvalidState(format!(
+                "unknown turn state {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +342,7 @@ pub struct LifecycleWrite {
     pub payload_json: String,
     pub redaction_level: String,
     pub terminal: Option<TerminalUpdate>,
+    pub turn_state: Option<TurnState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,16 +404,62 @@ pub struct CloseDecision {
     pub needs_runtime_stop: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageState {
+    Queued,
+    Sending,
+    Delivered,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMessage {
+    pub message_id: String,
+    pub agent_id: String,
+    pub mode: String,
+    pub content: String,
+    pub state: MessageState,
+    pub target_turn_id: Option<String>,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingRequestState {
+    Pending,
+    Sending,
+    Responded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPendingRequest {
+    pub request_id: String,
+    pub agent_id: String,
+    pub correlation_id: String,
+    pub request_type: String,
+    pub payload_json: String,
+    pub state: PendingRequestState,
+    pub response_decision: Option<String>,
+    pub response_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryClaim {
+    Claimed,
+    AlreadyDelivered,
+    InFlight,
+}
+
 pub struct Store {
     connection: Mutex<Connection>,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
+        migrate_to_v2(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -387,8 +490,8 @@ impl Store {
             "INSERT INTO agents (
                 agent_id, idempotency_key, parent_agent_id, review_kind,
                 feature_id, section_id, round_kind, state, workspace_path,
-                report_path, runtime_hash, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'QUEUED', ?8, ?9, ?10, ?11)",
+                report_path, runtime_hash, initial_prompt, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'QUEUED', ?8, ?9, ?10, ?11, ?12)",
             params![
                 job.agent_id,
                 job.idempotency_key,
@@ -400,6 +503,7 @@ impl Store {
                 job.workspace_path,
                 job.report_path,
                 job.runtime_hash,
+                job.initial_prompt,
                 created_at,
             ],
         )?;
@@ -471,10 +575,11 @@ impl Store {
     pub fn list_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT agent_id, idempotency_key, state, workspace_path, owner_id,
-                    owner_epoch, close_requested, last_event_seq, failure_code,
-                    failure_message, runtime_agent_id, pid, process_group_id,
-                    process_uid, process_start_token, created_at
+            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
+                    owner_epoch, close_requested, stop_requested, last_event_seq,
+                    failure_code, failure_message, runtime_agent_id,
+                    zcode_session_id, turn_state, pid, process_group_id,
+                    process_uid, process_start_token, closed_at, reaped_at, created_at
              FROM agents ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         let rows = statement
@@ -549,20 +654,42 @@ impl Store {
         }))
     }
 
-    pub fn mark_running(
+    #[cfg(test)]
+    fn mark_running(
         &self,
         agent_id: &str,
         owner_epoch: u64,
         runtime_agent_id: &str,
         identity: Option<&StoredProcessIdentity>,
     ) -> StoreResult<bool> {
+        self.mark_session_running(
+            agent_id,
+            owner_epoch,
+            runtime_agent_id,
+            identity,
+            None,
+            None,
+        )
+    }
+
+    pub fn mark_session_running(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime_agent_id: &str,
+        identity: Option<&StoredProcessIdentity>,
+        zcode_session_id: Option<&str>,
+        turn_state: Option<TurnState>,
+    ) -> StoreResult<bool> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
             "UPDATE agents SET state = 'RUNNING', runtime_agent_id = ?1,
                  pid = ?2, process_group_id = ?3, process_uid = ?4,
-                 process_start_token = ?5, last_heartbeat_at = ?6
-             WHERE agent_id = ?7 AND owner_epoch = ?8 AND state = 'STARTING'",
+                 process_start_token = ?5, last_heartbeat_at = ?6,
+                 zcode_session_id = COALESCE(?7, zcode_session_id),
+                 turn_state = COALESCE(?8, turn_state)
+             WHERE agent_id = ?9 AND owner_epoch = ?10 AND state = 'STARTING'",
             params![
                 runtime_agent_id,
                 identity.map(|value| value.pid),
@@ -570,6 +697,8 @@ impl Store {
                 identity.map(|value| value.uid),
                 identity.map(|value| value.start_token.as_str()),
                 now_millis(),
+                zcode_session_id,
+                turn_state.map(TurnState::as_str),
                 agent_id,
                 u64_to_i64(owner_epoch)?,
             ],
@@ -607,7 +736,8 @@ impl Store {
             transaction.commit()?;
             return i64_to_u64(existing);
         }
-        let (state, epoch, close_requested) = query_guard(&transaction, &write.agent_id)?;
+        let (state, epoch, close_requested, stop_requested) =
+            query_guard(&transaction, &write.agent_id)?;
         if state.is_terminal() || epoch != write.owner_epoch {
             return Err(StoreError::Conflict(format!(
                 "late lifecycle record rejected for {} epoch {}",
@@ -652,8 +782,15 @@ impl Store {
         )?;
         transaction.execute(
             "UPDATE agents SET last_event_seq = MAX(last_event_seq, ?1),
-                 last_heartbeat_at = ?2 WHERE agent_id = ?3",
-            params![sequence, now_millis(), write.agent_id],
+                 last_heartbeat_at = ?2,
+                 turn_state = COALESCE(?3, turn_state)
+             WHERE agent_id = ?4",
+            params![
+                sequence,
+                now_millis(),
+                write.turn_state.map(TurnState::as_str),
+                write.agent_id
+            ],
         )?;
         if let Some(terminal) = &write.terminal {
             apply_terminal(
@@ -662,6 +799,7 @@ impl Store {
                 write.owner_epoch,
                 state,
                 close_requested,
+                stop_requested,
                 terminal,
             )?;
         }
@@ -677,7 +815,7 @@ impl Store {
     ) -> StoreResult<JobState> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, epoch, close_requested) = query_guard(&transaction, agent_id)?;
+        let (state, epoch, close_requested, stop_requested) = query_guard(&transaction, agent_id)?;
         if state.is_terminal() {
             transaction.commit()?;
             return Ok(state);
@@ -693,6 +831,7 @@ impl Store {
             owner_epoch,
             state,
             close_requested,
+            stop_requested,
             terminal,
         )?;
         transaction.commit()?;
@@ -720,16 +859,18 @@ impl Store {
     pub fn request_close(&self, agent_id: &str) -> StoreResult<CloseDecision> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, epoch, _) = query_guard(&transaction, agent_id)?;
+        let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
         let (next, needs_runtime_stop) = match state {
-            JobState::Queued => (JobState::Closed, false),
+            JobState::Queued => (JobState::Cancelled, false),
             JobState::Starting | JobState::Running => (JobState::Stopping, true),
             JobState::Stopping => (JobState::Stopping, true),
             terminal => (terminal, false),
         };
         if state != next || !state.is_terminal() {
             transaction.execute(
-                "UPDATE agents SET state = ?1, close_requested = 1,
+                "UPDATE agents SET state = ?1, close_requested = 1, stop_requested = 1,
+                     closed_at = CASE WHEN ?2 = 1 THEN COALESCE(closed_at, ?3)
+                                      ELSE closed_at END,
                      completed_at = CASE WHEN ?2 = 1 THEN COALESCE(completed_at, ?3)
                                          ELSE completed_at END
                  WHERE agent_id = ?4",
@@ -745,6 +886,49 @@ impl Store {
                     Some("CLOSE_REQUESTED"),
                 )?;
             }
+        } else {
+            transaction.execute(
+                "UPDATE agents SET close_requested = 1,
+                     closed_at = COALESCE(closed_at, ?1) WHERE agent_id = ?2",
+                params![now_millis(), agent_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(CloseDecision {
+            state: next,
+            owner_epoch: epoch,
+            needs_runtime_stop,
+        })
+    }
+
+    pub fn request_stop(&self, agent_id: &str) -> StoreResult<CloseDecision> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
+        let (next, needs_runtime_stop) = match state {
+            JobState::Queued => (JobState::Cancelled, false),
+            JobState::Starting | JobState::Running => (JobState::Stopping, true),
+            JobState::Stopping => (JobState::Stopping, true),
+            terminal => (terminal, false),
+        };
+        if !state.is_terminal() {
+            transaction.execute(
+                "UPDATE agents SET state = ?1, stop_requested = 1,
+                     completed_at = CASE WHEN ?2 = 1 THEN COALESCE(completed_at, ?3)
+                                         ELSE completed_at END
+                 WHERE agent_id = ?4",
+                params![next.as_str(), next.is_terminal(), now_millis(), agent_id],
+            )?;
+            if state != next {
+                insert_ledger(
+                    &transaction,
+                    agent_id,
+                    epoch,
+                    Some(state),
+                    next,
+                    Some("STOP_REQUESTED"),
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(CloseDecision {
@@ -757,7 +941,7 @@ impl Store {
     pub fn reap_job(&self, agent_id: &str) -> StoreResult<JobState> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, _, _) = query_guard(&transaction, agent_id)?;
+        let (state, _, _, _) = query_guard(&transaction, agent_id)?;
         if !state.is_terminal() {
             return Err(StoreError::InvalidState(format!(
                 "cannot reap nonterminal job {agent_id}"
@@ -778,7 +962,7 @@ impl Store {
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT agent_id, state, owner_epoch FROM agents
-                 WHERE state IN ('QUEUED', 'STARTING', 'RUNNING', 'STOPPING')
+                 WHERE state IN ('STARTING', 'RUNNING', 'STOPPING')
                  ORDER BY created_at, rowid",
             )?;
             let rows = statement
@@ -795,13 +979,7 @@ impl Store {
         let mut reconciled = Vec::with_capacity(rows.len());
         for (agent_id, state, epoch) in rows {
             let old = JobState::parse(&state)?;
-            let (next, code) = match old {
-                JobState::Queued => (JobState::Orphaned, "DAEMON_RESTART_BEFORE_START"),
-                JobState::Starting | JobState::Running | JobState::Stopping => {
-                    (JobState::FailedRuntimeLost, "DAEMON_RESTART_RUNTIME_LOST")
-                }
-                _ => continue,
-            };
+            let (next, code) = (JobState::FailedRuntimeLost, "DAEMON_RESTART_RUNTIME_LOST");
             transaction.execute(
                 "UPDATE agents SET state = ?1, completed_at = COALESCE(completed_at, ?2),
                      failure_code = ?3, failure_message = ?4
@@ -836,13 +1014,32 @@ impl Store {
         mode: &str,
         content: &str,
     ) -> StoreResult<bool> {
-        let connection = self.connection.lock().unwrap();
-        let changed = connection.execute(
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = query_message(&transaction, message_id)? {
+            if existing.agent_id != agent_id || existing.mode != mode || existing.content != content
+            {
+                return Err(StoreError::Conflict(format!(
+                    "message id {message_id} was reused with different content"
+                )));
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let job = query_job(&transaction, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState(format!("unknown job {agent_id}")))?;
+        if job.state.is_terminal() {
+            return Err(StoreError::InvalidState(format!(
+                "cannot message terminal job {agent_id}"
+            )));
+        }
+        let changed = transaction.execute(
             "INSERT OR IGNORE INTO messages
              (message_id, agent_id, mode, content, state, created_at)
              VALUES (?1, ?2, ?3, ?4, 'QUEUED', ?5)",
             params![message_id, agent_id, mode, content, now_millis()],
         )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -854,8 +1051,22 @@ impl Store {
         request_type: &str,
         payload_json: &str,
     ) -> StoreResult<bool> {
-        let connection = self.connection.lock().unwrap();
-        let changed = connection.execute(
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = query_pending_request(&transaction, request_id)? {
+            if existing.agent_id != agent_id
+                || existing.correlation_id != correlation_id
+                || existing.request_type != request_type
+                || existing.payload_json != payload_json
+            {
+                return Err(StoreError::Conflict(format!(
+                    "pending request id {request_id} was reused"
+                )));
+            }
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
             "INSERT OR IGNORE INTO pending_requests
              (request_id, agent_id, correlation_id, request_type, payload_json, state, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 'PENDING', ?6)",
@@ -868,10 +1079,73 @@ impl Store {
                 now_millis()
             ],
         )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
-    pub fn deliver_message(&self, message_id: &str) -> StoreResult<bool> {
+    pub fn message(&self, message_id: &str) -> StoreResult<Option<StoredMessage>> {
+        let connection = self.connection.lock().unwrap();
+        query_message(&connection, message_id)
+    }
+
+    pub fn claim_next_message(&self, agent_id: &str) -> StoreResult<Option<StoredMessage>> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let message_id = transaction
+            .query_row(
+                "SELECT message_id FROM messages
+                 WHERE agent_id = ?1 AND state = 'QUEUED'
+                 ORDER BY created_at, rowid LIMIT 1",
+                [agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(message_id) = message_id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE messages SET state = 'SENDING'
+             WHERE message_id = ?1 AND state = 'QUEUED'",
+            [&message_id],
+        )?;
+        let message = query_message(&transaction, &message_id)?;
+        transaction.commit()?;
+        Ok(message)
+    }
+
+    pub fn complete_message(
+        &self,
+        message_id: &str,
+        target_turn_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE messages SET state = 'DELIVERED', delivered_at = ?1,
+                 target_turn_id = ?2, failure_code = NULL, failure_message = NULL
+             WHERE message_id = ?3 AND state = 'SENDING'",
+            params![now_millis(), target_turn_id, message_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn fail_message(
+        &self,
+        message_id: &str,
+        failure_code: &str,
+        failure_message: &str,
+    ) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE messages SET state = 'FAILED', failure_code = ?1,
+                 failure_message = ?2 WHERE message_id = ?3 AND state = 'SENDING'",
+            params![failure_code, failure_message, message_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[cfg(test)]
+    fn deliver_message(&self, message_id: &str) -> StoreResult<bool> {
         let connection = self.connection.lock().unwrap();
         let changed = connection.execute(
             "UPDATE messages SET state = 'DELIVERED', delivered_at = ?1
@@ -881,11 +1155,94 @@ impl Store {
         Ok(changed == 1)
     }
 
-    pub fn respond_pending_request(
+    pub fn pending_request(
         &self,
         agent_id: &str,
-        correlation_id: &str,
-    ) -> StoreResult<bool> {
+        request_id: &str,
+    ) -> StoreResult<Option<StoredPendingRequest>> {
+        let connection = self.connection.lock().unwrap();
+        let request = query_pending_request(&connection, request_id)?;
+        Ok(request.filter(|request| request.agent_id == agent_id))
+    }
+
+    pub fn pending_requests(&self, agent_id: &str) -> StoreResult<Vec<StoredPendingRequest>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT request_id FROM pending_requests
+             WHERE agent_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let ids = statement
+            .query_map([agent_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|request_id| {
+                query_pending_request(&connection, &request_id)?.ok_or_else(|| {
+                    StoreError::InvalidState(format!("pending request {request_id} disappeared"))
+                })
+            })
+            .collect()
+    }
+
+    pub fn claim_pending_response(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+        decision: &str,
+        content: Option<&str>,
+    ) -> StoreResult<DeliveryClaim> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let request = query_pending_request(&transaction, request_id)?
+            .filter(|request| request.agent_id == agent_id)
+            .ok_or_else(|| StoreError::InvalidState(format!("unknown request {request_id}")))?;
+        if request.state != PendingRequestState::Pending
+            && (request.response_decision.as_deref() != Some(decision)
+                || request.response_content.as_deref() != content)
+        {
+            return Err(StoreError::Conflict(format!(
+                "request {request_id} response was changed"
+            )));
+        }
+        let claim = match request.state {
+            PendingRequestState::Pending => {
+                transaction.execute(
+                    "UPDATE pending_requests SET state = 'SENDING',
+                         response_decision = ?1, response_content = ?2
+                     WHERE request_id = ?3 AND agent_id = ?4 AND state = 'PENDING'",
+                    params![decision, content, request_id, agent_id],
+                )?;
+                DeliveryClaim::Claimed
+            }
+            PendingRequestState::Sending => DeliveryClaim::InFlight,
+            PendingRequestState::Responded => DeliveryClaim::AlreadyDelivered,
+        };
+        transaction.commit()?;
+        Ok(claim)
+    }
+
+    pub fn complete_pending_response(&self, agent_id: &str, request_id: &str) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE pending_requests SET state = 'RESPONDED', responded_at = ?1
+             WHERE agent_id = ?2 AND request_id = ?3 AND state = 'SENDING'",
+            params![now_millis(), agent_id, request_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_pending_response(&self, agent_id: &str, request_id: &str) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE pending_requests SET state = 'PENDING',
+                 response_decision = NULL, response_content = NULL
+             WHERE agent_id = ?1 AND request_id = ?2 AND state = 'SENDING'",
+            params![agent_id, request_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    #[cfg(test)]
+    fn respond_pending_request(&self, agent_id: &str, correlation_id: &str) -> StoreResult<bool> {
         let connection = self.connection.lock().unwrap();
         let changed = connection.execute(
             "UPDATE pending_requests SET state = 'RESPONDED', responded_at = ?1
@@ -895,11 +1252,8 @@ impl Store {
         Ok(changed == 1)
     }
 
-    pub fn respond_pending_request_by_id(
-        &self,
-        agent_id: &str,
-        request_id: &str,
-    ) -> StoreResult<bool> {
+    #[cfg(test)]
+    fn respond_pending_request_by_id(&self, agent_id: &str, request_id: &str) -> StoreResult<bool> {
         let connection = self.connection.lock().unwrap();
         let changed = connection.execute(
             "UPDATE pending_requests SET state = 'RESPONDED', responded_at = ?1
@@ -1105,6 +1459,167 @@ impl Store {
     }
 }
 
+fn migrate_to_v2(connection: &mut Connection) -> StoreResult<()> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(StoreError::InvalidState(format!(
+            "store schema version {version} is newer than supported {SCHEMA_VERSION}"
+        )));
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (table, column, definition) in [
+        (
+            "agents",
+            "initial_prompt",
+            "initial_prompt TEXT NOT NULL DEFAULT 'Begin review.'",
+        ),
+        (
+            "agents",
+            "turn_state",
+            "turn_state TEXT NOT NULL DEFAULT 'IDLE'",
+        ),
+        (
+            "agents",
+            "stop_requested",
+            "stop_requested INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("agents", "closed_at", "closed_at INTEGER"),
+        ("messages", "failure_code", "failure_code TEXT"),
+        ("messages", "failure_message", "failure_message TEXT"),
+        (
+            "pending_requests",
+            "response_decision",
+            "response_decision TEXT",
+        ),
+        (
+            "pending_requests",
+            "response_content",
+            "response_content TEXT",
+        ),
+    ] {
+        if !table_has_column(&transaction, table, column)? {
+            transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
+        }
+    }
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn table_has_column(connection: &Connection, table: &str, expected: &str) -> StoreResult<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|column| column == expected))
+}
+
+fn query_message(connection: &Connection, message_id: &str) -> StoreResult<Option<StoredMessage>> {
+    let row = connection
+        .query_row(
+            "SELECT message_id, agent_id, mode, content, state, target_turn_id,
+                    failure_code FROM messages WHERE message_id = ?1",
+            [message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(message_id, agent_id, mode, content, state, target_turn_id, failure_code)| {
+            let state = match state.as_str() {
+                "QUEUED" => MessageState::Queued,
+                "SENDING" => MessageState::Sending,
+                "DELIVERED" => MessageState::Delivered,
+                "FAILED" => MessageState::Failed,
+                other => {
+                    return Err(StoreError::InvalidState(format!(
+                        "unknown message state {other}"
+                    )))
+                }
+            };
+            Ok(StoredMessage {
+                message_id,
+                agent_id,
+                mode,
+                content,
+                state,
+                target_turn_id,
+                failure_code,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn query_pending_request(
+    connection: &Connection,
+    request_id: &str,
+) -> StoreResult<Option<StoredPendingRequest>> {
+    let row = connection
+        .query_row(
+            "SELECT request_id, agent_id, correlation_id, request_type,
+                    payload_json, state, response_decision, response_content
+             FROM pending_requests WHERE request_id = ?1",
+            [request_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            request_id,
+            agent_id,
+            correlation_id,
+            request_type,
+            payload_json,
+            state,
+            response_decision,
+            response_content,
+        )| {
+            let state = match state.as_str() {
+                "PENDING" => PendingRequestState::Pending,
+                "SENDING" => PendingRequestState::Sending,
+                "RESPONDED" => PendingRequestState::Responded,
+                other => {
+                    return Err(StoreError::InvalidState(format!(
+                        "unknown pending request state {other}"
+                    )))
+                }
+            };
+            Ok(StoredPendingRequest {
+                request_id,
+                agent_id,
+                correlation_id,
+                request_type,
+                payload_json,
+                state,
+                response_decision,
+                response_content,
+            })
+        },
+    )
+    .transpose()
+}
+
 fn query_events_after(
     connection: &Connection,
     agent_id: &str,
@@ -1156,10 +1671,11 @@ fn query_events_after(
 fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>> {
     let row = connection
         .query_row(
-            "SELECT agent_id, idempotency_key, state, workspace_path, owner_id,
-                    owner_epoch, close_requested, last_event_seq, failure_code,
-                    failure_message, runtime_agent_id, pid, process_group_id,
-                    process_uid, process_start_token, created_at
+            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
+                    owner_epoch, close_requested, stop_requested, last_event_seq,
+                    failure_code, failure_message, runtime_agent_id,
+                    zcode_session_id, turn_state, pid, process_group_id,
+                    process_uid, process_start_token, closed_at, reaped_at, created_at
              FROM agents WHERE agent_id = ?1",
             [agent_id],
             map_job_row,
@@ -1171,10 +1687,11 @@ fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>
 fn query_job_by_idempotency(connection: &Connection, key: &str) -> StoreResult<Option<Job>> {
     let row = connection
         .query_row(
-            "SELECT agent_id, idempotency_key, state, workspace_path, owner_id,
-                    owner_epoch, close_requested, last_event_seq, failure_code,
-                    failure_message, runtime_agent_id, pid, process_group_id,
-                    process_uid, process_start_token, created_at
+            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
+                    owner_epoch, close_requested, stop_requested, last_event_seq,
+                    failure_code, failure_message, runtime_agent_id,
+                    zcode_session_id, turn_state, pid, process_group_id,
+                    process_uid, process_start_token, closed_at, reaped_at, created_at
              FROM agents WHERE idempotency_key = ?1",
             [key],
             map_job_row,
@@ -1188,17 +1705,23 @@ type JobRow = (
     Option<String>,
     String,
     String,
+    String,
     Option<String>,
     i64,
     i64,
     i64,
+    i64,
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    String,
     Option<i64>,
     Option<i64>,
     Option<i64>,
     Option<String>,
+    Option<i64>,
+    Option<i64>,
     i64,
 );
 
@@ -1220,11 +1743,17 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         row.get(13)?,
         row.get(14)?,
         row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
+        row.get(21)?,
     ))
 }
 
 fn convert_job_row(row: JobRow) -> StoreResult<Job> {
-    let identity = match (row.11, row.12, row.13, row.14) {
+    let identity = match (row.15, row.16, row.17, row.18) {
         (Some(pid), Some(process_group_id), Some(uid), Some(start_token)) => {
             Some(StoredProcessIdentity {
                 pid: u32::try_from(pid)
@@ -1249,31 +1778,39 @@ fn convert_job_row(row: JobRow) -> StoreResult<Job> {
         idempotency_key: row.1,
         state: JobState::parse(&row.2)?,
         workspace_path: row.3,
-        owner_id: row.4,
-        owner_epoch: i64_to_u64(row.5)?,
-        close_requested: row.6 != 0,
-        last_event_seq: i64_to_u64(row.7)?,
-        failure_code: row.8,
-        failure_message: row.9,
-        runtime_agent_id: row.10,
+        initial_prompt: row.4,
+        owner_id: row.5,
+        owner_epoch: i64_to_u64(row.6)?,
+        close_requested: row.7 != 0,
+        stop_requested: row.8 != 0,
+        last_event_seq: i64_to_u64(row.9)?,
+        failure_code: row.10,
+        failure_message: row.11,
+        runtime_agent_id: row.12,
+        zcode_session_id: row.13,
+        turn_state: TurnState::parse(&row.14)?,
         process_identity: identity,
-        created_at: row.15,
+        closed_at: row.19,
+        reaped_at: row.20,
+        created_at: row.21,
     })
 }
 
 fn query_guard(
     transaction: &Transaction<'_>,
     agent_id: &str,
-) -> StoreResult<(JobState, u64, bool)> {
+) -> StoreResult<(JobState, u64, bool, bool)> {
     let value = transaction
         .query_row(
-            "SELECT state, owner_epoch, close_requested FROM agents WHERE agent_id = ?1",
+            "SELECT state, owner_epoch, close_requested, stop_requested
+             FROM agents WHERE agent_id = ?1",
             [agent_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
@@ -1283,6 +1820,7 @@ fn query_guard(
         JobState::parse(&value.0)?,
         i64_to_u64(value.1)?,
         value.2 != 0,
+        value.3 != 0,
     ))
 }
 
@@ -1292,6 +1830,7 @@ fn apply_terminal(
     owner_epoch: u64,
     from_state: JobState,
     close_requested: bool,
+    stop_requested: bool,
     terminal: &TerminalUpdate,
 ) -> StoreResult<JobState> {
     if !terminal.state.is_terminal() {
@@ -1299,14 +1838,17 @@ fn apply_terminal(
             "terminal update must select a terminal state".into(),
         ));
     }
-    let final_state = if close_requested {
-        JobState::Closed
-    } else {
-        terminal.state
-    };
+    let final_state =
+        if (stop_requested || close_requested) && terminal.state == JobState::Completed {
+            JobState::Cancelled
+        } else {
+            terminal.state
+        };
     let changed = transaction.execute(
         "UPDATE agents SET state = ?1, completed_at = COALESCE(completed_at, ?2),
-             failure_code = ?3, failure_message = ?4
+             failure_code = ?3, failure_message = ?4,
+             closed_at = CASE WHEN close_requested = 1
+                              THEN COALESCE(closed_at, ?2) ELSE closed_at END
          WHERE agent_id = ?5 AND owner_epoch = ?6
            AND state IN ('STARTING', 'RUNNING', 'STOPPING')",
         params![
@@ -1415,6 +1957,7 @@ mod tests {
             payload_json: "{}".into(),
             redaction_level: "safe".into(),
             terminal: None,
+            turn_state: None,
         }
     }
 
@@ -1435,6 +1978,7 @@ mod tests {
                 workspace_path: "/different".into(),
                 report_path: None,
                 runtime_hash: None,
+                initial_prompt: "Begin review.".into(),
             })
             .unwrap();
         assert_eq!(duplicate.agent_id, "job-1");
@@ -1663,14 +2207,14 @@ mod tests {
 
         let reopened = Store::open(path).unwrap();
         let changed = reopened.reconcile_startup().unwrap();
-        assert_eq!(changed.len(), 2);
+        assert_eq!(changed.len(), 1);
         assert_eq!(
             reopened.get_job("queued").unwrap().unwrap().state,
             JobState::FailedRuntimeLost
         );
         assert_eq!(
             reopened.get_job("running").unwrap().unwrap().state,
-            JobState::Orphaned
+            JobState::Queued
         );
         assert_eq!(
             reopened
@@ -1727,5 +2271,170 @@ mod tests {
             store.get_job("job-1").unwrap().unwrap().state,
             JobState::Starting
         );
+    }
+
+    #[test]
+    fn accepted_v1_rows_events_and_artifacts_migrate_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v1.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA user_version = 1;
+                PRAGMA foreign_keys = ON;
+                CREATE TABLE agents (
+                    agent_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE,
+                    parent_agent_id TEXT, review_kind TEXT, feature_id TEXT,
+                    section_id TEXT, round_kind TEXT, state TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL, report_path TEXT, runtime_hash TEXT,
+                    zcode_session_id TEXT, pid INTEGER, process_group_id INTEGER,
+                    process_uid INTEGER, process_start_token TEXT, runtime_agent_id TEXT,
+                    owner_id TEXT, owner_epoch INTEGER NOT NULL DEFAULT 0,
+                    lease_expires_at INTEGER, close_requested INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
+                    last_heartbeat_at INTEGER, last_event_seq INTEGER NOT NULL DEFAULT 0,
+                    failure_code TEXT, failure_message TEXT, reaped_at INTEGER
+                );
+                CREATE TABLE events (
+                    agent_id TEXT NOT NULL, runtime_agent_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, source_seq INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL, event_type TEXT NOT NULL,
+                    turn_id TEXT, payload_json TEXT NOT NULL, redaction_level TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, runtime_agent_id, seq),
+                    UNIQUE (agent_id, runtime_agent_id, source_seq)
+                );
+                CREATE TABLE artifacts (
+                    artifact_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                    artifact_type TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    bytes INTEGER NOT NULL, checkpoint_number INTEGER, created_at INTEGER NOT NULL
+                );
+                CREATE TABLE messages (
+                    message_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
+                    content TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    delivered_at INTEGER, target_turn_id TEXT
+                );
+                CREATE TABLE pending_requests (
+                    request_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+                    correlation_id TEXT NOT NULL, request_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, state TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, responded_at INTEGER,
+                    UNIQUE (agent_id, correlation_id)
+                );
+                INSERT INTO agents (
+                    agent_id, idempotency_key, state, workspace_path, runtime_agent_id,
+                    owner_epoch, created_at, completed_at, last_event_seq
+                ) VALUES ('v1-job', 'v1-key', 'COMPLETED', '/v1', 'v1-runtime', 3, 1, 2, 1);
+                INSERT INTO events VALUES (
+                    'v1-job', 'v1-runtime', 1, 1, 1, 'driver.event', NULL,
+                    '{"preserved":true}', 'allowlisted'
+                );
+                INSERT INTO artifacts VALUES (
+                    'v1-artifact', 'v1-job', 'report', '/v1/report.md', 'abc', 7, 1, 2
+                );
+                INSERT INTO messages VALUES (
+                    'v1-message', 'v1-job', 'queue', 'preserved message',
+                    'DELIVERED', 1, 2, 'v1-turn'
+                );
+                INSERT INTO pending_requests VALUES (
+                    'v1-request', 'v1-job', '"wire-1"', 'permission', '{}',
+                    'RESPONDED', 1, 2
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path).unwrap();
+        let job = store.get_job("v1-job").unwrap().unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.initial_prompt, "Begin review.");
+        assert_eq!(job.turn_state, TurnState::Idle);
+        assert_eq!(job.zcode_session_id, None);
+        assert_eq!(
+            store.events_after("v1-job", "v1-runtime", 0, 10).unwrap()[0].payload_json,
+            "{\"preserved\":true}"
+        );
+        assert_eq!(store.artifacts("v1-job", 10).unwrap()[0].bytes, 7);
+        assert_eq!(
+            store.message("v1-message").unwrap().unwrap().state,
+            MessageState::Delivered
+        );
+        assert_eq!(
+            store
+                .pending_request("v1-job", "v1-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Responded
+        );
+        let version: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn delivery_claims_are_fifo_and_idempotent_without_false_completion() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "delivery-job", "/workspace");
+        store
+            .insert_message("message-1", "delivery-job", "queue", "first")
+            .unwrap();
+        store
+            .insert_message("message-2", "delivery-job", "queue", "second")
+            .unwrap();
+        let first = store.claim_next_message("delivery-job").unwrap().unwrap();
+        assert_eq!(first.message_id, "message-1");
+        assert_eq!(first.state, MessageState::Sending);
+        assert!(store.complete_message("message-1", Some("turn-1")).unwrap());
+        assert_eq!(
+            store
+                .claim_next_message("delivery-job")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            "message-2"
+        );
+
+        store
+            .insert_pending_request(
+                "request-1",
+                "delivery-job",
+                "\"wire-1\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_pending_response("delivery-job", "request-1", "allow", None)
+                .unwrap(),
+            DeliveryClaim::Claimed
+        );
+        assert_eq!(
+            store
+                .pending_request("delivery-job", "request-1")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Sending
+        );
+        assert!(store
+            .complete_pending_response("delivery-job", "request-1")
+            .unwrap());
+        assert_eq!(
+            store
+                .claim_pending_response("delivery-job", "request-1", "allow", None)
+                .unwrap(),
+            DeliveryClaim::AlreadyDelivered
+        );
+        assert!(matches!(
+            store.claim_pending_response("delivery-job", "request-1", "deny", None),
+            Err(StoreError::Conflict(_))
+        ));
     }
 }

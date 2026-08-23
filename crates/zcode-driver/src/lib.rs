@@ -3,6 +3,8 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
+    collections::HashMap,
+    fmt,
     io::{self, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
@@ -14,7 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 use zcode_protocol::{
-    classify_lifecycle, encode, parse_line, LifecycleOrder, RequestEnvelope, WireMessage,
+    classify_lifecycle, encode, parse_line, LifecycleOrder, RequestEnvelope, ResponseEnvelope,
+    WireMessage,
 };
 
 pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
@@ -47,6 +50,76 @@ pub enum Inbound {
         bytes: usize,
     },
     ChildExited(ChildExit),
+    UnmatchedResponse {
+        id: serde_json::Value,
+        outcome: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    Timeout,
+    Cancelled,
+    ChildExited(ChildExit),
+    StreamClosed,
+    WriteFailed(String),
+    Remote(serde_json::Value),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "request deadline elapsed"),
+            Self::Cancelled => write!(f, "request was cancelled"),
+            Self::ChildExited(exit) => {
+                write!(f, "runtime exited while request was pending: {exit:?}")
+            }
+            Self::StreamClosed => write!(f, "runtime response stream closed"),
+            Self::WriteFailed(_) => write!(f, "runtime request write failed"),
+            Self::Remote(_) => write!(f, "runtime returned an application error"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+type PendingSender = Sender<Result<ResponseEnvelope, RequestError>>;
+type PendingMap = HashMap<String, PendingSender>;
+
+pub struct PendingRequest {
+    key: String,
+    receiver: Receiver<Result<ResponseEnvelope, RequestError>>,
+    pending: Arc<Mutex<PendingMap>>,
+    finished: bool,
+}
+
+impl PendingRequest {
+    pub fn wait(mut self, timeout: Duration) -> Result<ResponseEnvelope, RequestError> {
+        let result = match self.receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(RequestError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(RequestError::StreamClosed),
+        };
+        self.pending.lock().unwrap().remove(&self.key);
+        self.finished = true;
+        result.and_then(|response| match response.error.clone() {
+            Some(error) => Err(RequestError::Remote(error)),
+            None => Ok(response),
+        })
+    }
+
+    pub fn cancel(mut self) {
+        self.pending.lock().unwrap().remove(&self.key);
+        self.finished = true;
+    }
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.pending.lock().unwrap().remove(&self.key);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +177,8 @@ pub struct Driver {
     next_id: AtomicU64,
     stop_state: Arc<(Mutex<StopState>, Condvar)>,
     identity: ProcessIdentity,
+    pending: Arc<Mutex<PendingMap>>,
+    subscribers: Arc<Mutex<Vec<Sender<Inbound>>>>,
 }
 
 impl Driver {
@@ -141,8 +216,8 @@ impl Driver {
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let (tx, rx) = mpsc::channel();
-        let read_tx = tx.clone();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let read_tx = raw_tx.clone();
         let (read_done_tx, read_done_rx) = mpsc::channel();
         thread::spawn(move || read_loop(stdout, read_tx, read_done_tx));
         // Always drain diagnostics independently of the protocol stream. A
@@ -154,7 +229,14 @@ impl Driver {
         let monitor_ref = Arc::clone(&child_ref);
         let termination = Arc::new((Mutex::new(None), Condvar::new()));
         let monitor_termination = Arc::clone(&termination);
-        thread::spawn(move || monitor_child(monitor_ref, tx, monitor_termination, read_done_rx));
+        thread::spawn(move || {
+            monitor_child(monitor_ref, raw_tx, monitor_termination, read_done_rx)
+        });
+        let pending = Arc::new(Mutex::new(PendingMap::new()));
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, rx) = mpsc::channel();
+        subscribers.lock().unwrap().push(event_tx);
+        spawn_dispatcher(raw_rx, Arc::clone(&pending), Arc::clone(&subscribers));
         Ok(Self {
             stdin,
             incoming: Mutex::new(rx),
@@ -166,20 +248,62 @@ impl Driver {
                 Condvar::new(),
             )),
             identity,
+            pending,
+            subscribers,
         })
     }
-    pub fn send_request(
+    #[cfg(test)]
+    fn send_request(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> std::io::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.send(&RequestEnvelope {
-            id: id.into(),
-            method: method.into(),
-            params,
-        })?;
+        self.send(&RequestEnvelope::new(id.into(), method, params))?;
         Ok(id.into())
+    }
+
+    pub fn begin_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<PendingRequest, RequestError> {
+        let id = serde_json::Value::from(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let key = response_key(&id).ok_or(RequestError::StreamClosed)?;
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.insert(key.clone(), sender).is_some() {
+                return Err(RequestError::StreamClosed);
+            }
+        }
+        if let Err(error) = self.send(&RequestEnvelope::new(id, method, params)) {
+            self.pending.lock().unwrap().remove(&key);
+            return Err(RequestError::WriteFailed(error.to_string()));
+        }
+        Ok(PendingRequest {
+            key,
+            receiver,
+            pending: Arc::clone(&self.pending),
+            finished: false,
+        })
+    }
+
+    pub fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<ResponseEnvelope, RequestError> {
+        self.begin_request(method, params)?.wait(timeout)
+    }
+
+    pub fn respond(&self, id: serde_json::Value, result: serde_json::Value) -> io::Result<()> {
+        self.send(&ResponseEnvelope::success(id, result))
+    }
+
+    pub fn respond_error(&self, id: serde_json::Value, error: serde_json::Value) -> io::Result<()> {
+        self.send(&ResponseEnvelope::failure(id, error))
     }
     pub fn send<T: serde::Serialize>(&self, value: &T) -> std::io::Result<()> {
         let mut input = self.stdin.lock().unwrap();
@@ -188,6 +312,11 @@ impl Driver {
     }
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Inbound, RecvTimeoutError> {
         self.incoming.lock().unwrap().recv_timeout(timeout)
+    }
+    pub fn subscribe(&self) -> Receiver<Inbound> {
+        let (sender, receiver) = mpsc::channel();
+        self.subscribers.lock().unwrap().push(sender);
+        receiver
     }
     pub fn stop(&self) -> std::io::Result<()> {
         self.stop_and_reap(Duration::from_secs(1)).map(|_| ())
@@ -696,6 +825,80 @@ impl Drop for Driver {
     }
 }
 
+fn response_key(id: &serde_json::Value) -> Option<String> {
+    match id {
+        serde_json::Value::String(_) | serde_json::Value::Number(_) => {
+            serde_json::to_string(id).ok()
+        }
+        _ => None,
+    }
+}
+
+fn spawn_dispatcher(
+    incoming: Receiver<Inbound>,
+    pending: Arc<Mutex<PendingMap>>,
+    subscribers: Arc<Mutex<Vec<Sender<Inbound>>>>,
+) {
+    thread::spawn(move || {
+        while let Ok(inbound) = incoming.recv() {
+            match inbound {
+                Inbound::Message(WireMessage::Response(response)) => {
+                    let matched = response_key(&response.id)
+                        .and_then(|key| pending.lock().unwrap().remove(&key));
+                    if let Some(waiter) = matched {
+                        let _ = waiter.send(Ok(response));
+                    } else {
+                        broadcast(
+                            &subscribers,
+                            Inbound::UnmatchedResponse {
+                                id: response.id,
+                                outcome: if response.error.is_some() {
+                                    "error"
+                                } else {
+                                    "result"
+                                }
+                                .into(),
+                            },
+                        );
+                    }
+                }
+                Inbound::ChildExited(exit) => {
+                    let waiters = {
+                        let mut pending = pending.lock().unwrap();
+                        pending
+                            .drain()
+                            .map(|(_, sender)| sender)
+                            .collect::<Vec<_>>()
+                    };
+                    for waiter in waiters {
+                        let _ = waiter.send(Err(RequestError::ChildExited(exit.clone())));
+                    }
+                    broadcast(&subscribers, Inbound::ChildExited(exit));
+                }
+                inbound => broadcast(&subscribers, inbound),
+            }
+        }
+        let waiters = {
+            let mut pending = pending.lock().unwrap();
+            pending
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            let _ = waiter.send(Err(RequestError::StreamClosed));
+        }
+        subscribers.lock().unwrap().clear();
+    });
+}
+
+fn broadcast(subscribers: &Mutex<Vec<Sender<Inbound>>>, inbound: Inbound) {
+    subscribers
+        .lock()
+        .unwrap()
+        .retain(|subscriber| subscriber.send(inbound.clone()).is_ok());
+}
+
 fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>, done: Sender<()>) {
     let _done = ReadDone(done);
     let mut reader = BufReader::new(stdout);
@@ -1003,13 +1206,106 @@ mod tests {
             "read line; head -c 262144 /dev/zero >&2; printf '%s\\n' '{\"id\":1,\"result\":{\"ok\":true}}'",
         ]);
         let d = Driver::spawn(c).unwrap();
-        d.send_request("probe", serde_json::json!({})).unwrap();
-        assert!(matches!(
-            d.recv_timeout(Duration::from_secs(3)),
-            Ok(Inbound::Message(WireMessage::Response(response)))
-                if response.id == serde_json::json!(1)
-        ));
+        let response = d
+            .request("probe", serde_json::json!({}), Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(response.id, serde_json::json!(1));
         d.stop().unwrap();
+    }
+
+    #[test]
+    fn concurrent_waiters_are_correlated_while_events_are_broadcast() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "read first; read second; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{}}' '{\"id\":2,\"result\":{\"value\":\"second\"}}' '{\"method\":\"permission/request\",\"params\":{\"request_id\":\"p1\"}}' '{\"id\":1,\"result\":{\"value\":\"first\"}}' '{\"method\":\"turn/completed\",\"params\":{}}'; sleep 1",
+        ]);
+        let driver = Arc::new(Driver::spawn(command).unwrap());
+        let events = driver.subscribe();
+        let first = driver
+            .begin_request("first", serde_json::json!({}))
+            .unwrap();
+        let second = driver
+            .begin_request("second", serde_json::json!({}))
+            .unwrap();
+        assert_eq!(
+            second.wait(Duration::from_secs(2)).unwrap().result.unwrap()["value"],
+            "second"
+        );
+        assert_eq!(
+            first.wait(Duration::from_secs(2)).unwrap().result.unwrap()["value"],
+            "first"
+        );
+        let mut methods = Vec::new();
+        for _ in 0..8 {
+            if let Ok(Inbound::Message(WireMessage::Event(event))) =
+                events.recv_timeout(Duration::from_millis(250))
+            {
+                methods.push(event.method);
+                if methods.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            methods,
+            vec!["turn/started", "permission/request", "turn/completed"]
+        );
+        driver.stop().unwrap();
+    }
+
+    #[test]
+    fn timeout_cancel_duplicate_and_unknown_ids_cannot_complete_another_waiter() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "read first; read second; read third; printf '%s\n' '{\"id\":99,\"result\":{}}' '{\"id\":2,\"result\":{\"cancelled\":true}}' '{\"id\":3,\"result\":{\"ok\":true}}' '{\"id\":3,\"result\":{\"duplicate\":true}}'; sleep 1",
+        ]);
+        let driver = Driver::spawn(command).unwrap();
+        let events = driver.subscribe();
+        let timed_out = driver.begin_request("slow", serde_json::json!({})).unwrap();
+        assert_eq!(
+            timed_out.wait(Duration::from_millis(20)).unwrap_err(),
+            RequestError::Timeout
+        );
+        let cancelled = driver
+            .begin_request("cancel", serde_json::json!({}))
+            .unwrap();
+        cancelled.cancel();
+        let live = driver.begin_request("live", serde_json::json!({})).unwrap();
+        assert_eq!(
+            live.wait(Duration::from_secs(2)).unwrap().result.unwrap()["ok"],
+            true
+        );
+        let mut unmatched = Vec::new();
+        for _ in 0..4 {
+            if let Ok(Inbound::UnmatchedResponse { id, .. }) =
+                events.recv_timeout(Duration::from_millis(250))
+            {
+                unmatched.push(id);
+            }
+        }
+        assert!(unmatched.contains(&serde_json::json!(99)));
+        assert!(unmatched.contains(&serde_json::json!(2)));
+        assert!(unmatched.contains(&serde_json::json!(3)));
+        driver.stop().unwrap();
+    }
+
+    #[test]
+    fn child_exit_fails_all_pending_waiters() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "read first; read second; exit 7"]);
+        let driver = Driver::spawn(command).unwrap();
+        let first = driver.begin_request("one", serde_json::json!({})).unwrap();
+        let second = driver.begin_request("two", serde_json::json!({})).unwrap();
+        assert!(matches!(
+            first.wait(Duration::from_secs(2)),
+            Err(RequestError::ChildExited(ChildExit::Exited(Some(7))))
+        ));
+        assert!(matches!(
+            second.wait(Duration::from_secs(2)),
+            Err(RequestError::ChildExited(ChildExit::Exited(Some(7))))
+        ));
     }
 
     #[test]

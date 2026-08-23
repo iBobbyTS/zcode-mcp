@@ -1,6 +1,6 @@
-use crate::{Scheduler, SchedulerError};
+use crate::{MessageDisposition, ResponseDisposition, Scheduler, SchedulerError};
 use review_store::{
-    DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent,
+    DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent, TurnState,
     WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 1;
+pub const RPC_VERSION: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -93,6 +93,12 @@ pub struct NewJobInput {
     pub report_path: Option<String>,
     #[serde(default)]
     pub runtime_hash: Option<String>,
+    #[serde(default = "default_initial_prompt")]
+    pub initial_prompt: String,
+}
+
+fn default_initial_prompt() -> String {
+    "Begin review.".into()
 }
 
 impl From<NewJobInput> for NewJob {
@@ -108,6 +114,7 @@ impl From<NewJobInput> for NewJob {
             workspace_path: value.workspace_path,
             report_path: value.report_path,
             runtime_hash: value.runtime_hash,
+            initial_prompt: value.initial_prompt,
         }
     }
 }
@@ -144,6 +151,27 @@ pub struct MessageInput {
 pub struct RespondInput {
     pub agent_id: String,
     pub request_id: String,
+    pub decision: ResponseDecision,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDecision {
+    Allow,
+    Deny,
+    Answer,
+}
+
+impl ResponseDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Answer => "answer",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,12 +236,10 @@ pub enum RpcSuccess {
         page: EventPage,
     },
     Message {
-        accepted: bool,
-        created: bool,
+        disposition: MessageDispositionView,
     },
     Respond {
-        accepted: bool,
-        changed: bool,
+        disposition: ResponseDispositionView,
     },
     Stopped {
         state: JobStateView,
@@ -272,6 +298,8 @@ pub enum JobStateView {
     Running,
     Stopping,
     Completed,
+    Cancelled,
+    Failed,
     FailedRuntimeLost,
     Orphaned,
     Closed,
@@ -285,9 +313,69 @@ impl From<JobState> for JobStateView {
             JobState::Running => Self::Running,
             JobState::Stopping => Self::Stopping,
             JobState::Completed => Self::Completed,
+            JobState::Cancelled => Self::Cancelled,
+            JobState::Failed => Self::Failed,
             JobState::FailedRuntimeLost => Self::FailedRuntimeLost,
             JobState::Orphaned => Self::Orphaned,
             JobState::Closed => Self::Closed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDispositionView {
+    Queued,
+    Delivered,
+    InterruptedThenDelivered,
+    AlreadyDelivered,
+    Failed,
+}
+
+impl From<MessageDisposition> for MessageDispositionView {
+    fn from(value: MessageDisposition) -> Self {
+        match value {
+            MessageDisposition::Queued => Self::Queued,
+            MessageDisposition::Delivered => Self::Delivered,
+            MessageDisposition::InterruptedThenDelivered => Self::InterruptedThenDelivered,
+            MessageDisposition::AlreadyDelivered => Self::AlreadyDelivered,
+            MessageDisposition::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDispositionView {
+    Responded,
+    AlreadyResponded,
+    InFlight,
+}
+
+impl From<ResponseDisposition> for ResponseDispositionView {
+    fn from(value: ResponseDisposition) -> Self {
+        match value {
+            ResponseDisposition::Responded => Self::Responded,
+            ResponseDisposition::AlreadyResponded => Self::AlreadyResponded,
+            ResponseDisposition::InFlight => Self::InFlight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TurnStateView {
+    Idle,
+    Active,
+    Failed,
+}
+
+impl From<TurnState> for TurnStateView {
+    fn from(value: TurnState) -> Self {
+        match value {
+            TurnState::Idle => Self::Idle,
+            TurnState::Active => Self::Active,
+            TurnState::Failed => Self::Failed,
         }
     }
 }
@@ -300,10 +388,16 @@ pub struct JobView {
     pub workspace_path: String,
     pub owner_epoch: u64,
     pub close_requested: bool,
+    pub stop_requested: bool,
     pub last_event_seq: u64,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
     pub runtime_agent_id: Option<String>,
+    pub zcode_session_id: Option<String>,
+    pub turn_state: TurnStateView,
+    pub closed: bool,
+    pub reaped: bool,
+    pub live_steer: bool,
     pub created_at: i64,
 }
 
@@ -316,10 +410,16 @@ impl From<Job> for JobView {
             workspace_path: value.workspace_path,
             owner_epoch: value.owner_epoch,
             close_requested: value.close_requested,
+            stop_requested: value.stop_requested,
             last_event_seq: value.last_event_seq,
             failure_code: value.failure_code,
             failure_message: value.failure_message.map(|_| "[REDACTED]".into()),
             runtime_agent_id: value.runtime_agent_id,
+            zcode_session_id: value.zcode_session_id,
+            turn_state: value.turn_state.into(),
+            closed: value.closed_at.is_some(),
+            reaped: value.reaped_at.is_some(),
+            live_steer: false,
             created_at: value.created_at,
         }
     }
@@ -456,6 +556,7 @@ impl RpcService {
             RpcMethod::Enqueue { job } => {
                 validate_id(&job.agent_id, "agent_id")?;
                 validate_text(&job.workspace_path, "workspace_path", 4096)?;
+                validate_text(&job.initial_prompt, "initial_prompt", 64 * 1024)?;
                 if let Some(key) = &job.idempotency_key {
                     validate_text(key, "idempotency_key", 512)?;
                 }
@@ -482,35 +583,41 @@ impl RpcService {
                     ));
                 }
                 validate_text(&input.content, "content", 16 * 1024)?;
-                let created = self
-                    .store
-                    .insert_message(
-                        &input.message_id,
+                let disposition = self
+                    .scheduler
+                    .message_job(
                         &input.agent_id,
+                        &input.message_id,
                         &input.mode,
                         &input.content,
                     )
-                    .map_err(map_store)?;
+                    .map_err(map_scheduler)?;
                 Ok(RpcSuccess::Message {
-                    accepted: true,
-                    created,
+                    disposition: disposition.into(),
                 })
             }
             RpcMethod::Respond(input) => {
                 self.require_job(&input.agent_id)?;
                 validate_id(&input.request_id, "request_id")?;
-                let changed = self
-                    .store
-                    .respond_pending_request_by_id(&input.agent_id, &input.request_id)
-                    .map_err(map_store)?;
+                if let Some(content) = input.content.as_deref() {
+                    validate_text(content, "response content", 16 * 1024)?;
+                }
+                let disposition = self
+                    .scheduler
+                    .respond_job(
+                        &input.agent_id,
+                        &input.request_id,
+                        input.decision.as_str(),
+                        input.content.as_deref(),
+                    )
+                    .map_err(map_scheduler)?;
                 Ok(RpcSuccess::Respond {
-                    accepted: true,
-                    changed,
+                    disposition: disposition.into(),
                 })
             }
             RpcMethod::Stop { agent_id } => {
                 self.require_job(&agent_id)?;
-                let state = self.scheduler.close_job(&agent_id).map_err(map_scheduler)?;
+                let state = self.scheduler.stop_job(&agent_id).map_err(map_scheduler)?;
                 Ok(RpcSuccess::Stopped {
                     state: state.into(),
                 })
@@ -767,6 +874,9 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
         }
         SchedulerError::RuntimeSpawn { .. } | SchedulerError::LifecycleSink { .. } => {
             RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed")
+        }
+        SchedulerError::RuntimeCommand { .. } => {
+            RpcError::new(RpcErrorCode::Unavailable, "runtime command failed")
         }
     }
 }

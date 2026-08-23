@@ -1,8 +1,22 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const JSON_RPC_VERSION: &str = "2.0";
+pub const WORKSPACE_READ_STATE: &str = "workspace/readState";
+pub const SESSION_CREATE: &str = "session/create";
+pub const SESSION_SUBSCRIBE: &str = "session/subscribe";
+pub const SESSION_SEND: &str = "session/send";
+pub const SESSION_STOP: &str = "session/stop";
+pub const SESSION_CLOSE: &str = "session/close";
+
+fn default_jsonrpc() -> String {
+    JSON_RPC_VERSION.into()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestEnvelope {
+    #[serde(default = "default_jsonrpc")]
+    pub jsonrpc: String,
     pub id: Value,
     pub method: String,
     #[serde(default)]
@@ -11,6 +25,8 @@ pub struct RequestEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
+    #[serde(default = "default_jsonrpc")]
+    pub jsonrpc: String,
     pub id: Value,
     #[serde(default)]
     pub result: Option<Value>,
@@ -20,6 +36,8 @@ pub struct ResponseEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
+    #[serde(default = "default_jsonrpc")]
+    pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -31,6 +49,63 @@ pub enum WireMessage {
     Response(ResponseEnvelope),
     Event(EventEnvelope),
     UnknownEvent { method: String, raw: Value },
+}
+
+impl RequestEnvelope {
+    pub fn new(id: Value, method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: JSON_RPC_VERSION.into(),
+            id,
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+impl ResponseEnvelope {
+    pub fn success(id: Value, result: Value) -> Self {
+        Self {
+            jsonrpc: JSON_RPC_VERSION.into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn failure(id: Value, error: Value) -> Self {
+        Self {
+            jsonrpc: JSON_RPC_VERSION.into(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+pub fn session_id_from_result(result: &Value) -> Option<&str> {
+    result
+        .get("session_id")
+        .or_else(|| result.get("sessionId"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("session")
+                .and_then(|session| session.get("id"))
+                .and_then(Value::as_str)
+        })
+}
+
+pub fn turn_id_from_result(result: &Value) -> Option<&str> {
+    result
+        .get("turn_id")
+        .or_else(|| result.get("turnId"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +190,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let req = RequestEnvelope {
+            jsonrpc: JSON_RPC_VERSION.into(),
             id: Value::from(1),
             method: "initialize".into(),
             params: serde_json::json!({"x":1}),
@@ -147,6 +223,17 @@ mod tests {
             LifecycleOrder::OutOfOrder {
                 expected: "turn/started"
             }
+        );
+    }
+
+    #[test]
+    fn session_and_turn_ids_accept_observed_result_shapes() {
+        let nested = serde_json::json!({"session": {"id": "s1"}, "turn": {"id": "t1"}});
+        assert_eq!(session_id_from_result(&nested), Some("s1"));
+        assert_eq!(turn_id_from_result(&nested), Some("t1"));
+        assert_eq!(
+            session_id_from_result(&serde_json::json!({"sessionId": "s2"})),
+            Some("s2")
         );
     }
 }

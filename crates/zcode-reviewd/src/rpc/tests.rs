@@ -1,9 +1,10 @@
 use super::*;
 use crate::{
-    CommandRuntimeFactory, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeEvent,
-    RuntimeFactory, RuntimeTerminal, SchedulerConfig,
+    CommandRuntimeFactory, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeCommandError,
+    RuntimeEvent, RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady,
+    TurnBoundary, TurnSnapshot,
 };
-use review_store::{Job, LifecycleWrite, NewArtifact};
+use review_store::{Job, LifecycleWrite, MessageState, NewArtifact, PendingRequestState};
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
@@ -25,6 +26,7 @@ struct FakeRuntime {
     next_sequence: AtomicU64,
     terminal: Mutex<Option<RuntimeTerminal>>,
     changed: Condvar,
+    turn: Mutex<TurnSnapshot>,
 }
 
 impl FakeRuntime {
@@ -34,6 +36,11 @@ impl FakeRuntime {
             next_sequence: AtomicU64::new(1),
             terminal: Mutex::new(None),
             changed: Condvar::new(),
+            turn: Mutex::new(TurnSnapshot {
+                generation: 0,
+                active: false,
+                boundary: None,
+            }),
         }
     }
 
@@ -75,6 +82,59 @@ impl ManagedRuntime for FakeRuntime {
             .unwrap()
             .0
             .clone()
+    }
+
+    fn bootstrap_session(
+        &self,
+        job: &Job,
+        _timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        *self.turn.lock().unwrap() = TurnSnapshot {
+            generation: 1,
+            active: true,
+            boundary: None,
+        };
+        Ok(SessionReady {
+            session_id: format!("session-{}", job.agent_id),
+            initial_turn_id: Some("turn-1".into()),
+        })
+    }
+
+    fn send_turn(
+        &self,
+        _session_id: &str,
+        _content: &str,
+        _timeout: Duration,
+    ) -> Result<Option<String>, RuntimeCommandError> {
+        let mut turn = self.turn.lock().unwrap();
+        turn.generation = turn.generation.saturating_add(1);
+        turn.active = true;
+        turn.boundary = None;
+        Ok(Some(format!("turn-{}", turn.generation)))
+    }
+
+    fn stop_turn(
+        &self,
+        _session_id: &str,
+        _timeout: Duration,
+    ) -> Result<TurnSnapshot, RuntimeCommandError> {
+        let mut turn = self.turn.lock().unwrap();
+        turn.active = false;
+        turn.boundary = Some(TurnBoundary::Completed);
+        Ok(turn.clone())
+    }
+
+    fn respond_request(
+        &self,
+        _correlation_id: &str,
+        _decision: &str,
+        _content: Option<&str>,
+    ) -> Result<(), RuntimeCommandError> {
+        Ok(())
+    }
+
+    fn turn_snapshot(&self) -> TurnSnapshot {
+        self.turn.lock().unwrap().clone()
     }
 }
 
@@ -153,6 +213,7 @@ fn fixture() -> Fixture {
             global_max_agents: 4,
             per_workspace_max_agents: 4,
             stop_grace: Duration::from_millis(100),
+            command_timeout: Duration::from_secs(1),
         },
     )
     .unwrap();
@@ -208,6 +269,7 @@ fn enqueue_request(agent_id: &str, key: &str) -> RpcMethod {
             round_kind: Some("INITIAL_BOUNDED".into()),
             report_path: None,
             runtime_hash: Some("runtime-hash".into()),
+            initial_prompt: "Begin review.".into(),
         },
     }
 }
@@ -257,6 +319,8 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcMethod::Respond(RespondInput {
             agent_id: "job-1".into(),
             request_id: "permission-1".into(),
+            decision: ResponseDecision::Allow,
+            content: None,
         }),
         RpcMethod::Stop {
             agent_id: "job-1".into(),
@@ -314,14 +378,14 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     );
     let unsupported = raw_call(
         &fixture.socket,
-        b"{\"version\":2,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
+        b"{\"version\":3,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
     );
     assert_eq!(unsupported.request_id.as_deref(), Some("v"));
     assert_eq!(error(unsupported).code, RpcErrorCode::UnsupportedVersion);
     assert_eq!(
         error(raw_call(
             &fixture.socket,
-            b"{\"version\":1,\"request_id\":\"m\",\"method\":\"missing\"}\n"
+            b"{\"version\":2,\"request_id\":\"m\",\"method\":\"missing\"}\n"
         ))
         .code,
         RpcErrorCode::UnknownMethod
@@ -447,6 +511,7 @@ fn transport_maps_conflict_runtime_loss_and_payload_caps() {
             payload_json: "x".repeat(MAX_EVENT_PAYLOAD_BYTES + 1),
             redaction_level: "redacted".into(),
             terminal: None,
+            turn_state: None,
         })
         .unwrap();
     assert_eq!(
@@ -562,15 +627,13 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
     assert!(matches!(
         success(rpc.call(&request("message-1", message.clone())).unwrap()),
         RpcSuccess::Message {
-            accepted: true,
-            created: true
+            disposition: MessageDispositionView::Queued
         }
     ));
     assert!(matches!(
         success(rpc.call(&request("message-2", message)).unwrap()),
         RpcSuccess::Message {
-            accepted: true,
-            created: false
+            disposition: MessageDispositionView::Queued
         }
     ));
     fixture
@@ -580,19 +643,19 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
     let respond = RpcMethod::Respond(RespondInput {
         agent_id: "job-1".into(),
         request_id: "req-1".into(),
+        decision: ResponseDecision::Allow,
+        content: None,
     });
     assert!(matches!(
         success(rpc.call(&request("respond-1", respond.clone())).unwrap()),
         RpcSuccess::Respond {
-            accepted: true,
-            changed: true
+            disposition: ResponseDispositionView::Responded
         }
     ));
     assert!(matches!(
         success(rpc.call(&request("respond-2", respond)).unwrap()),
         RpcSuccess::Respond {
-            accepted: true,
-            changed: false
+            disposition: ResponseDispositionView::AlreadyResponded
         }
     ));
 
@@ -856,7 +919,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
+            "read one; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; read two; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"session_id\":\"real-fake-session\"}}'; read three; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}'; read four; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"turn_id\":\"turn-1\"}}' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"turn_id\":\"turn-1\"}}'; trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
         ]);
         Ok(command)
     }));
@@ -869,6 +932,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
             global_max_agents: 1,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_millis(100),
+            command_timeout: Duration::from_secs(1),
         },
     )
     .unwrap();
@@ -937,7 +1001,9 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
         ));
     }
     let job = store.get_job("job-1").unwrap().unwrap();
-    assert_eq!(job.state, JobState::Closed);
+    assert_eq!(job.state, JobState::Cancelled);
+    assert!(job.closed_at.is_some());
+    assert!(job.reaped_at.is_some());
     assert!(observe_process_group(identity.process_group_id)
         .unwrap()
         .is_empty());
@@ -950,5 +1016,255 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
             .count(),
         1
     );
+    server.shutdown();
+}
+
+fn workspace_fake_runtime() -> PathBuf {
+    let executable = std::env::current_exe().unwrap();
+    let debug = executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("test executable must be under target/debug/deps");
+    let path = debug.join(format!(
+        "zcode-fake-runtime{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        path.is_file(),
+        "build zcode-fake-runtime before running this targeted fixture"
+    );
+    path
+}
+
+#[derive(Default)]
+struct NullSink;
+
+impl LifecycleSink for NullSink {
+    fn emit(&self, _record: LifecycleRecord) {}
+}
+
+#[test]
+fn prompt_already_running_is_returned_as_a_remote_error() {
+    let owner =
+        RuntimeOwner::spawn(Command::new(workspace_fake_runtime()), Arc::new(NullSink)).unwrap();
+    let session = owner
+        .bootstrap_session("/workspace", "keep active", Duration::from_secs(2))
+        .unwrap();
+    let error = owner
+        .send_turn(
+            &session.session_id,
+            "must not live steer",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeCommandError::Remote(ref value)
+            if value.get("code").and_then(serde_json::Value::as_str)
+                == Some("PROMPT_ALREADY_RUNNING")
+    ));
+    owner.stop(Duration::from_millis(100));
+}
+
+#[test]
+fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("session.sqlite3")).unwrap());
+    let runtime_path = workspace_fake_runtime();
+    let factory = Arc::new(CommandRuntimeFactory::new(move |_job: &Job| {
+        Ok(Command::new(&runtime_path))
+    }));
+    let scheduler = Scheduler::new(
+        "fake-session-owner",
+        Arc::clone(&store),
+        factory,
+        SchedulerConfig {
+            global_max_agents: 1,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_millis(100),
+            command_timeout: Duration::from_secs(2),
+        },
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc").join("review.sock");
+    let server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let rpc = client(&socket);
+    let mut enqueue = enqueue_request("session-job", "session-key");
+    let RpcMethod::Enqueue { job } = &mut enqueue else {
+        unreachable!()
+    };
+    job.initial_prompt = "permission input unknown_event".into();
+    success(rpc.call(&request("enqueue", enqueue)).unwrap());
+    assert!(matches!(
+        success(rpc.call(&request("start", RpcMethod::Start)).unwrap()),
+        RpcSuccess::Started { ref agent_ids } if agent_ids == &["session-job"]
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (identity, pending) = loop {
+        let job = store.get_job("session-job").unwrap().unwrap();
+        let pending = store.pending_requests("session-job").unwrap();
+        if job.state == JobState::Running && pending.len() == 2 {
+            assert_eq!(job.zcode_session_id.as_deref(), Some("fake-session-7f3a"));
+            assert_eq!(job.turn_state, review_store::TurnState::Active);
+            break (job.process_identity.unwrap(), pending);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session bootstrap did not settle"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    let permission = pending
+        .iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    let input = pending
+        .iter()
+        .find(|request| request.request_type == "input")
+        .unwrap();
+    assert!(matches!(
+        success(
+            rpc.call(&request(
+                "permission",
+                RpcMethod::Respond(RespondInput {
+                    agent_id: "session-job".into(),
+                    request_id: permission.request_id.clone(),
+                    decision: ResponseDecision::Allow,
+                    content: None,
+                }),
+            ))
+            .unwrap()
+        ),
+        RpcSuccess::Respond {
+            disposition: ResponseDispositionView::Responded
+        }
+    ));
+    assert!(matches!(
+        success(
+            rpc.call(&request(
+                "input",
+                RpcMethod::Respond(RespondInput {
+                    agent_id: "session-job".into(),
+                    request_id: input.request_id.clone(),
+                    decision: ResponseDecision::Answer,
+                    content: Some("fixture answer".into()),
+                }),
+            ))
+            .unwrap()
+        ),
+        RpcSuccess::Respond {
+            disposition: ResponseDispositionView::Responded
+        }
+    ));
+    assert!(store
+        .pending_requests("session-job")
+        .unwrap()
+        .iter()
+        .all(|request| request.state == PendingRequestState::Responded));
+
+    assert!(matches!(
+        success(
+            rpc.call(&request(
+                "queue",
+                RpcMethod::Message(MessageInput {
+                    agent_id: "session-job".into(),
+                    message_id: "message-queue".into(),
+                    mode: "queue".into(),
+                    content: "auto_complete queued turn".into(),
+                }),
+            ))
+            .unwrap()
+        ),
+        RpcSuccess::Message {
+            disposition: MessageDispositionView::Queued
+        }
+    ));
+    success(
+        rpc.call(&request(
+            "interrupt",
+            RpcMethod::Message(MessageInput {
+                agent_id: "session-job".into(),
+                message_id: "message-interrupt".into(),
+                mode: "interrupt_and_continue".into(),
+                content: "auto_complete interrupt turn".into(),
+            }),
+        ))
+        .unwrap(),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let first = store.message("message-queue").unwrap().unwrap();
+        let second = store.message("message-interrupt").unwrap().unwrap();
+        let job = store.get_job("session-job").unwrap().unwrap();
+        if first.state == MessageState::Delivered
+            && second.state == MessageState::Delivered
+            && job.state == JobState::Completed
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "queued turns did not complete");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        success(
+            rpc.call(&request(
+                "duplicate-message",
+                RpcMethod::Message(MessageInput {
+                    agent_id: "session-job".into(),
+                    message_id: "message-interrupt".into(),
+                    mode: "interrupt_and_continue".into(),
+                    content: "auto_complete interrupt turn".into(),
+                }),
+            ))
+            .unwrap()
+        ),
+        RpcSuccess::Message {
+            disposition: MessageDispositionView::AlreadyDelivered
+        }
+    ));
+    assert!(observe_process_group(identity.process_group_id)
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        success(
+            rpc.call(&request(
+                "close",
+                RpcMethod::Close {
+                    agent_id: "session-job".into(),
+                },
+            ))
+            .unwrap()
+        ),
+        RpcSuccess::Closed {
+            state: JobStateView::Completed
+        }
+    ));
+    success(
+        rpc.call(&request(
+            "reap",
+            RpcMethod::Reap {
+                agent_id: "session-job".into(),
+            },
+        ))
+        .unwrap(),
+    );
+    let job = store.get_job("session-job").unwrap().unwrap();
+    assert!(job.closed_at.is_some());
+    assert!(job.reaped_at.is_some());
+    let events = store
+        .events_after(
+            "session-job",
+            job.runtime_agent_id.as_deref().unwrap(),
+            0,
+            100,
+        )
+        .unwrap();
+    assert!(events.iter().any(|event| event.event_type == "raw.unknown"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "driver.message" && event.payload_json.contains("session/updated")
+    }));
     server.shutdown();
 }
