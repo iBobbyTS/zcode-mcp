@@ -60,6 +60,7 @@ enum OwnerState {
 struct PublisherState {
     next_sequence: u64,
     owner: OwnerState,
+    exit_boundary_delivered: bool,
 }
 
 struct Publisher {
@@ -75,6 +76,7 @@ impl Publisher {
             state: Mutex::new(PublisherState {
                 next_sequence: 1,
                 owner: OwnerState::Running,
+                exit_boundary_delivered: false,
             }),
             changed: Condvar::new(),
         }
@@ -85,7 +87,12 @@ impl Publisher {
         if matches!(state.owner, OwnerState::Terminal(_)) {
             return;
         }
+        let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
         self.emit_locked(&mut state, RuntimeEvent::Driver(event));
+        if is_exit_boundary {
+            state.exit_boundary_delivered = true;
+            self.changed.notify_all();
+        }
         if let Some(terminal) = exit_terminal {
             if matches!(state.owner, OwnerState::Running) {
                 self.publish_terminal_locked(&mut state, terminal);
@@ -112,6 +119,19 @@ impl Publisher {
         }
         self.publish_terminal_locked(&mut state, terminal.clone());
         terminal
+    }
+
+    fn wait_for_exit_boundary(&self) -> Option<RuntimeTerminal> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.exit_boundary_delivered {
+                return None;
+            }
+            if let OwnerState::Terminal(terminal) = &state.owner {
+                return Some(terminal.clone());
+            }
+            state = self.changed.wait(state).unwrap();
+        }
     }
 
     fn publish_terminal_locked(&self, state: &mut PublisherState, terminal: RuntimeTerminal) {
@@ -189,7 +209,10 @@ impl RuntimeOwner {
             return terminal;
         }
         let terminal = match self.driver.stop_and_reap(grace) {
-            Ok(outcome) => RuntimeTerminal::Stopped(outcome),
+            Ok(outcome) => match self.publisher.wait_for_exit_boundary() {
+                Some(terminal) => terminal,
+                None => RuntimeTerminal::Stopped(outcome),
+            },
             Err(error) => {
                 RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed(error.to_string()))
             }
@@ -220,6 +243,7 @@ fn spawn_event_pump(driver: Arc<Driver>, publisher: Arc<Publisher>, shutdown: Ar
         }
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
+                let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
                 let terminal = match &event {
                     Inbound::ChildExited(exit) => {
                         match observe_process_group(driver.identity().pgid) {
@@ -234,6 +258,9 @@ fn spawn_event_pump(driver: Arc<Driver>, publisher: Arc<Publisher>, shutdown: Ar
                     _ => None,
                 };
                 publisher.emit_driver(event, terminal);
+                if is_exit_boundary {
+                    return;
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -344,6 +371,100 @@ mod tests {
         fn snapshot(&self) -> Vec<LifecycleRecord> {
             self.records.lock().unwrap().clone()
         }
+    }
+
+    #[derive(Default)]
+    struct GatedSink {
+        records: Mutex<Vec<LifecycleRecord>>,
+        changed: Condvar,
+        released_through: Mutex<u64>,
+        released: Condvar,
+    }
+
+    impl LifecycleSink for GatedSink {
+        fn emit(&self, record: LifecycleRecord) {
+            let sequence = record.sequence;
+            self.records.lock().unwrap().push(record);
+            self.changed.notify_all();
+
+            let mut released = self.released_through.lock().unwrap();
+            while *released < sequence {
+                released = self.released.wait(released).unwrap();
+            }
+        }
+    }
+
+    impl GatedSink {
+        fn wait_for_len(&self, expected: usize) {
+            let mut records = self.records.lock().unwrap();
+            while records.len() < expected {
+                records = self.changed.wait(records).unwrap();
+            }
+        }
+
+        fn release_through(&self, sequence: u64) {
+            *self.released_through.lock().unwrap() = sequence;
+            self.released.notify_all();
+        }
+
+        fn snapshot(&self) -> Vec<LifecycleRecord> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn queued_driver_events_are_delivered_before_explicit_stop_terminal() {
+        let sink = Arc::new(GatedSink::default());
+        let publisher = Arc::new(Publisher::new(sink.clone()));
+        assert_eq!(publisher.begin_stopping(), None);
+
+        let pump_publisher = Arc::clone(&publisher);
+        let pump = thread::spawn(move || {
+            pump_publisher.emit_driver(Inbound::Malformed("queued-1".into()), None);
+            pump_publisher.emit_driver(Inbound::Malformed("queued-2".into()), None);
+            pump_publisher.emit_driver(
+                Inbound::ChildExited(ChildExit::Exited(Some(0))),
+                Some(RuntimeTerminal::Exited(ChildExit::Exited(Some(0)))),
+            );
+        });
+
+        let terminal_publisher = Arc::clone(&publisher);
+        let terminal = thread::spawn(move || {
+            assert_eq!(terminal_publisher.wait_for_exit_boundary(), None);
+            terminal_publisher.publish_terminal(RuntimeTerminal::Stopped(
+                StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))),
+            ))
+        });
+
+        for sequence in 1..=3 {
+            sink.wait_for_len(sequence as usize);
+            assert!(sink
+                .snapshot()
+                .iter()
+                .all(|record| matches!(record.event, RuntimeEvent::Driver(_))));
+            sink.release_through(sequence);
+        }
+
+        sink.wait_for_len(4);
+        let records = sink.snapshot();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(RuntimeEvent::Terminal(RuntimeTerminal::Stopped(_)))
+        ));
+        sink.release_through(4);
+
+        pump.join().unwrap();
+        assert!(matches!(
+            terminal.join().unwrap(),
+            RuntimeTerminal::Stopped(_)
+        ));
     }
 
     #[test]

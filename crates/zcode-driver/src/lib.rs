@@ -812,7 +812,10 @@ fn monitor_child(
             }
         };
         if let Some(status) = status {
-            let _ = read_done.recv_timeout(Duration::from_secs(1));
+            // A normal child exit closes the Driver-owned stdout pipe. Wait for
+            // the reader to enqueue every preceding item before publishing the
+            // exit boundary consumed by RuntimeOwner.
+            let _ = read_done.recv();
             let exit = exit_class(status);
             let (result, cvar) = &*termination;
             let mut guard = result.lock().unwrap();
