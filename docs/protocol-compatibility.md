@@ -14,7 +14,7 @@ cargo run -p runtime-preflight
 ```
 
 The command reads `ZCODE_RUNTIME_PATH` only. It emits JSON with a redacted
-absolute path, byte size, SHA-256, Node version, and an app-server probe result.
+redacted path token, byte size, SHA-256, Node version, and an app-server probe result.
 Authentication tokens and provider secrets are not read or emitted.
 
 When the variable is absent, or the path is not a regular file, the result is
