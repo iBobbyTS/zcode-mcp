@@ -19,6 +19,8 @@ use zcode_driver::{
 };
 use zcode_protocol::{LifecycleOrder, WireMessage};
 
+pub mod rpc;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLoss {
     InvalidIdentity,

@@ -314,6 +314,17 @@ pub struct NewArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredArtifact {
+    pub artifact_id: String,
+    pub artifact_type: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub checkpoint_number: Option<u64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseDecision {
     pub state: JobState,
     pub owner_epoch: u64,
@@ -386,6 +397,21 @@ impl Store {
     pub fn get_job(&self, agent_id: &str) -> StoreResult<Option<Job>> {
         let connection = self.connection.lock().unwrap();
         query_job(&connection, agent_id)
+    }
+
+    pub fn list_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT agent_id, idempotency_key, state, workspace_path, owner_id,
+                    owner_epoch, close_requested, last_event_seq, failure_code,
+                    failure_message, runtime_agent_id, pid, process_group_id,
+                    process_uid, process_start_token, created_at
+             FROM agents ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([usize_to_i64(limit)?], map_job_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(convert_job_row).collect()
     }
 
     pub fn claim_next(
@@ -800,6 +826,20 @@ impl Store {
         Ok(changed == 1)
     }
 
+    pub fn respond_pending_request_by_id(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+    ) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let changed = connection.execute(
+            "UPDATE pending_requests SET state = 'RESPONDED', responded_at = ?1
+             WHERE agent_id = ?2 AND request_id = ?3 AND state = 'PENDING'",
+            params![now_millis(), agent_id, request_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn insert_artifact(&self, artifact: &NewArtifact) -> StoreResult<bool> {
         let connection = self.connection.lock().unwrap();
         let changed = connection.execute(
@@ -948,6 +988,53 @@ impl Store {
             "SELECT COUNT(*) FROM artifacts WHERE agent_id = ?1",
             agent_id,
         )
+    }
+
+    pub fn artifacts(&self, agent_id: &str, limit: usize) -> StoreResult<Vec<StoredArtifact>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT artifact_id, artifact_type, path, sha256, bytes,
+                    checkpoint_number, created_at
+             FROM artifacts WHERE agent_id = ?1
+             ORDER BY checkpoint_number DESC, created_at DESC, artifact_id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![agent_id, usize_to_i64(limit)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    artifact_id,
+                    artifact_type,
+                    path,
+                    sha256,
+                    bytes,
+                    checkpoint_number,
+                    created_at,
+                )| {
+                    Ok(StoredArtifact {
+                        artifact_id,
+                        artifact_type,
+                        path,
+                        sha256,
+                        bytes: i64_to_u64(bytes)?,
+                        checkpoint_number: checkpoint_number.map(i64_to_u64).transpose()?,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
     }
 
     pub fn ledger_entry_count(&self, agent_id: &str) -> StoreResult<u64> {
@@ -1291,6 +1378,15 @@ mod tests {
         assert!(store.respond_pending_request("job-1", "corr-1").unwrap());
         assert!(!store.respond_pending_request("job-1", "corr-1").unwrap());
         assert!(store
+            .insert_pending_request("req-3", "job-1", "corr-3", "input", "{}")
+            .unwrap());
+        assert!(store
+            .respond_pending_request_by_id("job-1", "req-3")
+            .unwrap());
+        assert!(!store
+            .respond_pending_request_by_id("job-1", "req-3")
+            .unwrap());
+        assert!(store
             .insert_artifact(&NewArtifact {
                 artifact_id: "artifact-1".into(),
                 agent_id: "job-1".into(),
@@ -1329,6 +1425,8 @@ mod tests {
         );
         assert_eq!(reopened.cursor("job-1", "runtime-1").unwrap(), 1);
         assert_eq!(reopened.artifact_count("job-1").unwrap(), 1);
+        assert_eq!(reopened.artifacts("job-1", 1).unwrap()[0].sha256, "abc");
+        assert_eq!(reopened.list_jobs(10).unwrap()[0].agent_id, "job-1");
         assert_eq!(reopened.ledger_entry_count("job-1").unwrap(), 1);
         assert_eq!(reopened.compatibility_count().unwrap(), 1);
     }
