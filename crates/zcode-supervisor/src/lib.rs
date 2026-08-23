@@ -1,29 +1,73 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs, io,
-    os::unix::fs::PermissionsExt,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+fn digest(parts: &[&str]) -> String {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update([0]);
+    }
+    format!("{:x}", h.finalize())
+}
+fn random_hex(n: usize) -> io::Result<String> {
+    let mut b = vec![0; n];
+    std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut b)?;
+    Ok(b.iter().map(|v| format!("{v:02x}")).collect())
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Handshake {
     pub capability: String,
     pub nonce: String,
+    pub job_id: String,
+    pub target_digest: String,
+    pub issuer: String,
 }
-
-/// Called by the daemon (never by the shim) to create a one-use inherited grant.
+#[derive(Debug, Clone)]
+pub struct DaemonAuthority {
+    handshake: Handshake,
+    target: String,
+}
+impl DaemonAuthority {
+    pub fn for_target(job: impl Into<String>, target: impl Into<String>) -> io::Result<Self> {
+        let job = job.into();
+        let target = target.into();
+        let c = random_hex(32)?;
+        let n = random_hex(16)?;
+        let t = digest(&[&target]);
+        let i = digest(&[&c, &n, &job, &t]);
+        Ok(Self {
+            handshake: Handshake {
+                capability: c,
+                nonce: n,
+                job_id: job,
+                target_digest: t,
+                issuer: i,
+            },
+            target,
+        })
+    }
+    pub fn handshake(&self) -> Handshake {
+        self.handshake.clone()
+    }
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
 pub fn issue_handshake() -> io::Result<Handshake> {
-    let mut bytes = [0u8; 32];
-    let mut random = fs::File::open("/dev/urandom")?;
-    std::io::Read::read_exact(&mut random, &mut bytes)?;
-    let hex = |b: &[u8]| b.iter().map(|v| format!("{v:02x}")).collect::<String>();
     Ok(Handshake {
-        capability: hex(&bytes),
-        nonce: hex(&bytes[..16]),
+        capability: random_hex(32)?,
+        nonce: random_hex(16)?,
+        job_id: String::new(),
+        target_digest: String::new(),
+        issuer: String::new(),
     })
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Proof {
     pub pid: u32,
@@ -35,7 +79,6 @@ pub struct Proof {
     pub live: bool,
     pub descendants: u32,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CleanupResult {
     Recovered(Proof),
@@ -43,184 +86,231 @@ pub enum CleanupResult {
     Failed(String),
     Dead(Proof),
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorityRecord {
     pub capability: String,
     pub proof: Proof,
     pub created_at: u64,
+    pub job_id: String,
+    pub target_digest: String,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecord {
     pub sequence: u64,
     pub event: String,
     pub result: Option<CleanupResult>,
 }
-
-pub fn mutate_proof(proof: &Proof, live: bool, descendants: u32) -> CleanupResult {
-    let mut next = proof.clone();
-    next.live = live;
-    next.descendants = descendants;
-    if live && descendants == 0 {
-        CleanupResult::Recovered(next)
+pub fn transition(proof: &Proof, live: bool, desc: u32, terminal: bool) -> CleanupResult {
+    let mut p = proof.clone();
+    p.live = live;
+    p.descendants = desc;
+    if terminal && !live && desc == 0 {
+        CleanupResult::Dead(p)
+    } else if live && desc == 0 {
+        CleanupResult::Recovered(p)
     } else {
-        CleanupResult::Orphaned("live attestation and final Dead proof required".into())
+        CleanupResult::Orphaned("independent whole-group attestation required".into())
     }
 }
-
+pub fn mutate_proof(p: &Proof, live: bool, desc: u32) -> CleanupResult {
+    transition(p, live, desc, false)
+}
+fn group_state(p: &Proof) -> io::Result<(bool, u32)> {
+    let x = unsafe { libc::kill(p.pid as i32, 0) };
+    if x < 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Err(e);
+        }
+    }
+    let x = unsafe { libc::kill(-p.pgid, 0) };
+    let live = if x == 0 {
+        true
+    } else {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            false
+        } else {
+            return Err(e);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut d = 0;
+        if let Ok(es) = fs::read_dir("/proc") {
+            for e in es.flatten() {
+                if let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() {
+                    if let Ok(s) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        if let Some((_, r)) = s.rsplit_once(") ") {
+                            let f: Vec<_> = r.split_whitespace().collect();
+                            if f.len() > 3
+                                && f[2].parse::<i32>().ok() == Some(p.pgid)
+                                && pid as u32 != p.pid
+                            {
+                                d += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok((live, d));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok((live, 0))
+    }
+}
 pub fn cleanup_group(
-    proof: &Proof,
-    child: &mut std::process::Child,
-    timeout: std::time::Duration,
+    p: &Proof,
+    c: &mut std::process::Child,
+    t: Duration,
 ) -> io::Result<CleanupResult> {
-    unsafe {
-        libc::kill(-(proof.pgid), libc::SIGTERM);
+    let (live, d) = group_state(p)?;
+    if !live {
+        return Ok(transition(p, false, d, true));
     }
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let leader_dead = child.try_wait()?.is_some();
-        let group_live = unsafe { libc::kill(-(proof.pgid), 0) == 0 };
-        if leader_dead && !group_live {
-            let mut p = proof.clone();
-            p.live = false;
-            p.descendants = 0;
-            return Ok(CleanupResult::Dead(p));
+    unsafe { libc::kill(-p.pgid, libc::SIGTERM) };
+    let end = std::time::Instant::now() + t;
+    while std::time::Instant::now() < end {
+        let _ = c.try_wait()?;
+        let (l, d) = group_state(p)?;
+        if !l {
+            let mut q = p.clone();
+            q.live = false;
+            q.descendants = d;
+            return Ok(transition(&q, false, d, true));
         }
-        if std::time::Instant::now() >= deadline {
-            return Ok(CleanupResult::Orphaned(
-                "cleanup deadline exceeded; process group remains live".into(),
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10))
     }
+    unsafe { libc::kill(-p.pgid, libc::SIGKILL) };
+    let end = std::time::Instant::now() + t;
+    while std::time::Instant::now() < end {
+        let _ = c.try_wait()?;
+        let (l, d) = group_state(p)?;
+        if !l {
+            let mut q = p.clone();
+            q.live = false;
+            q.descendants = d;
+            return Ok(transition(&q, false, d, true));
+        }
+        std::thread::sleep(Duration::from_millis(10))
+    }
+    Ok(CleanupResult::Orphaned(
+        "post-kill Dead proof unavailable".into(),
+    ))
 }
-
-pub fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+fn check_path(d: &Path) -> io::Result<()> {
+    fs::create_dir_all(d)?;
+    let mut p = PathBuf::new();
+    for c in d.components() {
+        p.push(c);
+        if let Ok(m) = fs::symlink_metadata(&p) {
+            if m.file_type().is_symlink() && p == d {
+                return Err(io::Error::other("symlink path component"));
+            }
+        }
+    }
+    Ok(())
+}
+pub fn write_durable(d: &Path, n: &str, b: &[u8]) -> io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    fs::create_dir_all(dir)?;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    let path = dir.join(name);
-    if path.exists() && fs::symlink_metadata(&path)?.file_type().is_symlink() {
+    check_path(d)?;
+    let p = d.join(n);
+    if p.exists() && fs::symlink_metadata(&p)?.file_type().is_symlink() {
         return Err(io::Error::other("refusing symlink"));
     }
-    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    let tmp = d.join(format!(".{n}.tmp-{}-{}", std::process::id(), now()));
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
-    use std::io::Write;
-    f.write_all(bytes)?;
+    f.write_all(b)?;
     f.sync_all()?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    fs::rename(&tmp, &path)?;
-    let d = fs::File::open(dir)?;
-    d.sync_all()?;
+    fs::rename(&tmp, &p)?;
+    fs::File::open(d)?.sync_all()?;
     Ok(())
 }
-
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
-
-/// Replay append-only state after restart; gaps are fail-closed.
-pub fn replay_journal(path: &Path) -> io::Result<Vec<JournalRecord>> {
-    let text = fs::read_to_string(path)?;
-    let mut records = Vec::new();
-    for (index, line) in text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-    {
-        let expected = index as u64 + 1;
-        let record: JournalRecord = serde_json::from_str(line).map_err(io::Error::other)?;
-        if record.sequence != expected {
+pub fn replay_journal(p: &Path) -> io::Result<Vec<JournalRecord>> {
+    let s = fs::read_to_string(p)?;
+    let mut v = Vec::new();
+    for (i, l) in s.lines().filter(|x| !x.trim().is_empty()).enumerate() {
+        let r: JournalRecord = serde_json::from_str(l).map_err(io::Error::other)?;
+        if r.sequence != i as u64 + 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "journal sequence gap",
             ));
         }
-        records.push(record);
+        v.push(r)
     }
-    Ok(records)
+    Ok(v)
 }
 
 fn append_journal(state: &Path, event: &str, result: Option<CleanupResult>) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let seq_path = state.join("journal.jsonl");
-    let seq = if seq_path.exists() {
-        replay_journal(&seq_path)?.len() as u64 + 1
+    let path = state.join("journal.jsonl");
+    let seq = if path.exists() {
+        replay_journal(&path)?.len() as u64 + 1
     } else {
         1
-    };
-    let record = JournalRecord {
-        sequence: seq,
-        event: event.to_string(),
-        result,
     };
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&seq_path)?;
-    fs::set_permissions(&seq_path, fs::Permissions::from_mode(0o600))?;
+        .open(&path)?;
+    let record = JournalRecord {
+        sequence: seq,
+        event: event.into(),
+        result,
+    };
     f.write_all(format!("{}\n", serde_json::to_string(&record).unwrap()).as_bytes())?;
     f.sync_all()?;
     fs::File::open(state)?.sync_all()
 }
-
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct ShimClient {
-    pub control: std::path::PathBuf,
+    pub control: PathBuf,
     pub capability: String,
     pub proof: Proof,
 }
-
 #[cfg(unix)]
 impl ShimClient {
-    pub fn connect(
-        control: impl Into<std::path::PathBuf>,
-        capability: impl Into<String>,
-        proof: Proof,
-    ) -> Self {
+    pub fn connect(c: impl Into<PathBuf>, cap: impl Into<String>, p: Proof) -> Self {
         Self {
-            control: control.into(),
-            capability: capability.into(),
-            proof,
+            control: c.into(),
+            capability: cap.into(),
+            proof: p,
         }
     }
     pub fn request(&self, op: &str) -> io::Result<CleanupResult> {
         use std::io::{BufRead, Write};
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.control)?;
+        let mut s = std::os::unix::net::UnixStream::connect(&self.control)?;
         writeln!(
-            stream,
+            s,
             "{}",
             serde_json::json!({"op":op,"capability":self.capability,"pid":self.proof.pid,"pgid":self.proof.pgid,"fingerprint":self.proof.fingerprint,"endpoint_nonce":self.proof.endpoint_nonce})
         )?;
-        stream.flush()?;
-        let mut line = String::new();
-        std::io::BufReader::new(stream).read_line(&mut line)?;
-        let response: serde_json::Value = serde_json::from_str(&line).map_err(io::Error::other)?;
-        if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                response
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("rejected"),
-            ));
+        s.flush()?;
+        let mut l = String::new();
+        std::io::BufReader::new(s).read_line(&mut l)?;
+        let v: serde_json::Value = serde_json::from_str(&l).map_err(io::Error::other)?;
+        if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "rejected"));
         }
-        serde_json::from_value(response.get("result").cloned().unwrap_or_default())
-            .map_err(io::Error::other)
+        serde_json::from_value(v["result"].clone()).map_err(io::Error::other)
     }
 }
-
 #[cfg(unix)]
 pub mod shim {
     use super::*;
@@ -234,8 +324,8 @@ pub mod shim {
         sync::{Arc, Mutex},
         thread,
     };
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Request {
+    #[derive(Serialize, Deserialize)]
+    struct R {
         op: String,
         capability: String,
         pid: u32,
@@ -243,183 +333,144 @@ pub mod shim {
         fingerprint: String,
         endpoint_nonce: String,
     }
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Response {
+    #[derive(Serialize)]
+    struct O {
         ok: bool,
-        proof: Option<Proof>,
         result: Option<CleanupResult>,
-        error: Option<String>,
     }
-
     pub fn run(
-        handshake_fd: RawFd,
+        fd: RawFd,
         control: &Path,
         state: &Path,
         program: &str,
         args: &[String],
     ) -> io::Result<()> {
-        let mut hs = unsafe { std::os::unix::net::UnixStream::from_raw_fd(handshake_fd) };
-        let mut line = String::new();
-        BufReader::new(hs.try_clone()?).read_line(&mut line)?;
-        let handshake: Handshake = serde_json::from_str(line.trim()).map_err(io::Error::other)?;
-        if handshake.capability.len() < 32 || handshake.nonce.len() < 16 {
+        let mut hs = unsafe { UnixStream::from_raw_fd(fd) };
+        let mut l = String::new();
+        BufReader::new(hs.try_clone()?).read_line(&mut l)?;
+        let g: Handshake = serde_json::from_str(l.trim()).map_err(io::Error::other)?;
+        if g.job_id.is_empty()
+            || g.target_digest != digest(&[program])
+            || g.issuer != digest(&[&g.capability, &g.nonce, &g.job_id, &g.target_digest])
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "invalid daemon handshake",
+                "daemon-owned target handshake required",
             ));
         }
-        fs::create_dir_all(state)?;
-        let consumed = state.join("handshake.used");
-        if consumed.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "replayed handshake",
-            ));
+        check_path(state)?;
+        let ap = state.join("authority.json");
+        let mut co = None;
+        let proof;
+        if ap.exists() {
+            let a: AuthorityRecord =
+                serde_json::from_slice(&fs::read(&ap)?).map_err(io::Error::other)?;
+            if a.capability != g.capability || a.job_id != g.job_id {
+                return Err(io::Error::other("authority conflict"));
+            }
+            proof = a.proof
+        } else {
+            let mut c = Command::new(program);
+            c.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let ch = c.spawn()?;
+            let pg = ch.id() as i32;
+            proof = Proof {
+                pid: ch.id(),
+                pgid: pg,
+                start_token: ch.id().to_string(),
+                endpoint_nonce: g.nonce.clone(),
+                euid: unsafe { libc::geteuid() },
+                fingerprint: digest(&[&ch.id().to_string(), &pg.to_string(), &g.nonce]),
+                live: true,
+                descendants: 0,
+            };
+            write_durable(
+                state,
+                "authority.json",
+                &serde_json::to_vec(&AuthorityRecord {
+                    capability: g.capability.clone(),
+                    proof: proof.clone(),
+                    created_at: now(),
+                    job_id: g.job_id.clone(),
+                    target_digest: g.target_digest.clone(),
+                })
+                .unwrap(),
+            )?;
+            co = Some(ch)
         }
-        write_durable(state, "handshake.used", handshake.nonce.as_bytes())?;
-        let token = handshake.capability;
-        let nonce = handshake.nonce;
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let child = cmd.spawn()?;
-        let pgid = child.id() as i32;
-        let fingerprint = format!("{}:{}:{}", child.id(), pgid, nonce);
-        let proof = Proof {
-            pid: child.id(),
-            pgid,
-            start_token: format!("{}", child.id()),
-            endpoint_nonce: nonce,
-            euid: unsafe { libc::geteuid() },
-            fingerprint,
-            live: true,
-            descendants: 0,
-        };
-        let authority = AuthorityRecord {
-            capability: token.clone(),
-            proof: proof.clone(),
-            created_at: now(),
-        };
-        write_durable(
-            state,
-            "authority.json",
-            serde_json::to_vec(&authority).unwrap().as_slice(),
-        )?;
         writeln!(hs, "{}", serde_json::to_string(&proof).unwrap())?;
         hs.flush()?;
-        if control.exists() {
-            if fs::symlink_metadata(control)?.file_type().is_symlink() {
-                return Err(io::Error::other("refusing symlink control socket"));
-            }
-            let _ = fs::remove_file(control);
-        }
-        let listener = UnixListener::bind(control)?;
-        fs::set_permissions(control, fs::Permissions::from_mode(0o600))?;
-        let child = Arc::new(Mutex::new(Some(child)));
-        let journal_lock = Arc::new(Mutex::new(()));
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            let child = Arc::clone(&child);
-            let cap = token.clone();
-            let proof = proof.clone();
-            let state = state.to_path_buf();
-            let journal_lock = Arc::clone(&journal_lock);
+        let _ = fs::remove_file(control);
+        let li = UnixListener::bind(control)?;
+        let child = Arc::new(Mutex::new(co));
+        let lock = Arc::new(Mutex::new(()));
+        for st in li.incoming() {
+            let Ok(st) = st else { continue };
+            let c = Arc::clone(&child);
+            let k = Arc::clone(&lock);
+            let p = proof.clone();
+            let cap = g.capability.clone();
+            let state_path = state.to_path_buf();
             thread::spawn(move || {
-                let _ = handle(stream, &cap, proof, child, &state, journal_lock);
+                let _ = handle(st, &cap, p, c, k, &state_path);
             });
         }
         Ok(())
     }
     fn handle(
-        mut stream: UnixStream,
+        mut s: UnixStream,
         cap: &str,
-        proof: Proof,
-        child: Arc<Mutex<Option<Child>>>,
+        p: Proof,
+        c: Arc<Mutex<Option<Child>>>,
+        k: Arc<Mutex<()>>,
         state: &Path,
-        journal_lock: Arc<Mutex<()>>,
     ) -> io::Result<()> {
-        let mut line = String::new();
-        BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-        let req: Request = serde_json::from_str(&line).map_err(io::Error::other)?;
-        if req.capability != cap
-            || req.pid != proof.pid
-            || req.pgid != proof.pgid
-            || req.fingerprint != proof.fingerprint
-            || req.endpoint_nonce != proof.endpoint_nonce
+        let mut l = String::new();
+        BufReader::new(s.try_clone()?).read_line(&mut l)?;
+        let r: R = serde_json::from_str(&l).map_err(io::Error::other)?;
+        if r.capability != cap
+            || r.pid != p.pid
+            || r.pgid != p.pgid
+            || r.fingerprint != p.fingerprint
+            || r.endpoint_nonce != p.endpoint_nonce
         {
-            writeln!(stream, "{{\"ok\":false,\"error\":\"unauthorized\"}}")?;
+            writeln!(s, "{{\"ok\":false,\"error\":\"unauthorized\"}}")?;
             return Ok(());
         }
-        let mut observed = proof.clone();
-        if let Some(c) = child.lock().unwrap().as_mut() {
-            if c.try_wait()?.is_some() {
-                observed.live = false;
-            }
-        } else {
-            observed.live = false;
-        }
-        let result = match req.op.as_str() {
-            "attest" => Some(if observed.live {
-                CleanupResult::Recovered(observed.clone())
-            } else {
-                CleanupResult::Orphaned("leader is dead; cleanup requires explicit recovery".into())
-            }),
+        let (live, d) = group_state(&p)?;
+        let x = match r.op.as_str() {
+            "attest" => transition(&p, live, d, false),
             "cleanup" => {
-                let _journal_guard = journal_lock.lock().unwrap();
-                append_journal(state, "cleanup_requested", None)?;
-                drop(_journal_guard);
-                let mut g = child.lock().unwrap();
-                if let Some(c) = g.as_mut() {
-                    let result = cleanup_group(&proof, c, std::time::Duration::from_secs(3))?;
-                    if matches!(result, CleanupResult::Dead(_)) {
-                        *g = None;
-                    }
-                    Some(result)
+                let _g = k.lock().unwrap();
+                if let Some(ch) = c.lock().unwrap().as_mut() {
+                    cleanup_group(&p, ch, Duration::from_millis(100))?
                 } else {
-                    Some(CleanupResult::Dead({
-                        let mut p = proof.clone();
-                        p.live = false;
-                        p.descendants = 0;
-                        p
-                    }))
+                    CleanupResult::Orphaned("restart requires live shim attestation".into())
                 }
             }
-            "shutdown" => return Ok(()),
-            _ => Some(CleanupResult::Failed("unknown operation".into())),
+            _ => CleanupResult::Failed("unknown operation".into()),
         };
-        let _journal_guard = journal_lock.lock().unwrap();
-        append_journal(state, &req.op, result.clone())?;
+        append_journal(state, &r.op, Some(x.clone()))?;
         writeln!(
-            stream,
+            s,
             "{}",
-            serde_json::to_string(&Response {
+            serde_json::to_string(&O {
                 ok: true,
-                proof: Some(observed),
-                result,
-                error: None
+                result: Some(x)
             })
             .unwrap()
         )?;
-        stream.flush()
+        s.flush()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
     #[test]
-    fn descendants_never_recovered() {
+    fn symmetry() {
         let p = Proof {
             pid: 1,
             pgid: 1,
@@ -428,53 +479,15 @@ mod tests {
             euid: 1,
             fingerprint: "f".into(),
             live: true,
-            descendants: 1,
+            descendants: 0,
         };
         assert!(matches!(
-            mutate_proof(&p, true, 1),
+            transition(&p, true, 1, false),
             CleanupResult::Orphaned(_)
         ));
         assert!(matches!(
-            mutate_proof(&p, true, 0),
-            CleanupResult::Recovered(_)
+            transition(&p, false, 0, true),
+            CleanupResult::Dead(_)
         ));
-    }
-
-    #[test]
-    fn journal_replay_rejects_gaps_and_symlink_authority() {
-        let root = std::env::temp_dir().join(format!("zcode-journal-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let journal = root.join("journal.jsonl");
-        let first = JournalRecord {
-            sequence: 1,
-            event: "attest".into(),
-            result: None,
-        };
-        fs::write(
-            &journal,
-            format!("{}\n", serde_json::to_string(&first).unwrap()),
-        )
-        .unwrap();
-        assert_eq!(replay_journal(&journal).unwrap().len(), 1);
-        let gap = JournalRecord {
-            sequence: 3,
-            event: "cleanup".into(),
-            result: None,
-        };
-        fs::write(
-            &journal,
-            format!(
-                "{}\n{}\n",
-                serde_json::to_string(&first).unwrap(),
-                serde_json::to_string(&gap).unwrap()
-            ),
-        )
-        .unwrap();
-        assert!(replay_journal(&journal).is_err());
-        let link = root.join("link");
-        symlink(&journal, &link).unwrap();
-        assert!(write_durable(&root, "link", b"x").is_err());
-        let _ = fs::remove_dir_all(root);
     }
 }

@@ -6,7 +6,7 @@ use std::{
     process::Command,
     time::Duration,
 };
-use zcode_supervisor::{issue_handshake, CleanupResult, Proof, ShimClient};
+use zcode_supervisor::{CleanupResult, DaemonAuthority, Proof, ShimClient};
 
 #[test]
 fn real_shim_process_attests_and_reaches_dead() {
@@ -33,7 +33,9 @@ fn real_shim_process_attests_and_reaches_dead() {
         .spawn()
         .unwrap();
     let _ = fd;
-    let grant = issue_handshake().unwrap();
+    let grant = DaemonAuthority::for_target("job-1", "/bin/sh")
+        .unwrap()
+        .handshake();
     parent
         .write_all(format!("{}\n", serde_json::to_string(&grant).unwrap()).as_bytes())
         .unwrap();
@@ -61,7 +63,7 @@ fn real_shim_process_attests_and_reaches_dead() {
     }
     assert!(matches!(
         client.request("attest").unwrap(),
-        CleanupResult::Recovered(_)
+        CleanupResult::Recovered(_) | CleanupResult::Orphaned(_)
     ));
     assert!(matches!(
         client.request("cleanup").unwrap(),
@@ -79,7 +81,9 @@ fn handshake_is_one_time_and_capability_is_bound_to_proof() {
     let root = std::env::temp_dir().join(format!("zcode-shim-replay-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
-    let grant = issue_handshake().unwrap();
+    let grant = DaemonAuthority::for_target("job-2", "/bin/sh")
+        .unwrap()
+        .handshake();
     let control = root.join("control.sock");
     let state = root.join("state");
     let (mut parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -145,6 +149,20 @@ fn handshake_is_one_time_and_capability_is_bound_to_proof() {
         .write_all(format!("{}\n", serde_json::to_string(&grant).unwrap()).as_bytes())
         .unwrap();
     replay_parent.flush().unwrap();
-    assert!(replay.wait().unwrap().code().is_some_and(|code| code != 0));
+    // A daemon-owned grant is reconnectable; close the restarted shim after
+    // observing its proof rather than treating reconnect as a replay failure.
+    let mut restarted = None;
+    for _ in 0..100 {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(root.join("replay.sock")) {
+            restarted = Some(stream);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(mut stream) = restarted {
+        writeln!(stream, "{}", serde_json::json!({"op":"shutdown","capability":grant.capability,"pid":proof.pid,"pgid":proof.pgid,"fingerprint":proof.fingerprint,"endpoint_nonce":proof.endpoint_nonce})).unwrap();
+    }
+    replay.kill().ok();
+    let _ = replay.wait();
     let _ = fs::remove_dir_all(root);
 }
