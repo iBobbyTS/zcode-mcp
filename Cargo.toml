@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/runtime-preflight"]
+members = ["crates/runtime-preflight", "crates/zcode-protocol", "crates/zcode-driver", "crates/zcode-fake-runtime"]
 resolver = "2"
