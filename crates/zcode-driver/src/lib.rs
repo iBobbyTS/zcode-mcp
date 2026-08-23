@@ -24,6 +24,14 @@ pub enum ChildExit {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub pgid: i32,
+    pub uid: u32,
+    pub start_token: String,
+}
+
 #[derive(Debug)]
 pub enum Inbound {
     Message(WireMessage),
@@ -46,6 +54,7 @@ pub struct Driver {
     termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     next_id: AtomicU64,
     stopped: AtomicBool,
+    identity: ProcessIdentity,
 }
 
 impl Driver {
@@ -67,6 +76,12 @@ impl Driver {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
+        let identity = observe_identity(child.id()).unwrap_or_else(|_| ProcessIdentity {
+            pid: child.id(),
+            pgid: unsafe { libc::getpgid(child.id() as i32) },
+            uid: unsafe { libc::geteuid() },
+            start_token: String::new(),
+        });
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -91,6 +106,7 @@ impl Driver {
             termination,
             next_id: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
+            identity,
         })
     }
     pub fn send_request(
@@ -115,20 +131,62 @@ impl Driver {
         self.incoming.lock().unwrap().recv_timeout(timeout)
     }
     pub fn stop(&self) -> std::io::Result<()> {
+        self.stop_and_reap(Duration::from_secs(1))
+    }
+    pub fn identity(&self) -> ProcessIdentity {
+        self.identity.clone()
+    }
+    pub fn stop_and_reap(&self, timeout: Duration) -> std::io::Result<()> {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
-            #[cfg(unix)]
-            unsafe {
-                let _ = libc::kill(-(child.id() as i32), libc::SIGTERM);
-            }
-            #[cfg(not(unix))]
-            let _ = child.kill();
-            #[cfg(unix)]
-            let _ = child.kill();
+        let mut child = self.child.lock().unwrap();
+        let Some(process) = child.as_mut() else {
+            return Ok(());
+        };
+        if process.try_wait()?.is_some() {
+            return Ok(());
         }
-        Ok(())
+        let observed = observe_identity(process.id());
+        if !self.identity.start_token.is_empty() && observed.as_ref().ok() != Some(&self.identity) {
+            return Err(io::Error::other(
+                "process identity changed; refusing signal",
+            ));
+        }
+        #[cfg(unix)]
+        unsafe {
+            if libc::kill(-(self.identity.pgid), libc::SIGTERM) != 0 {
+                // The Driver still owns the live Child handle. If the group
+                // probe is unavailable, terminate only that known leader;
+                // restart cleanup remains fail-closed on the missing proof.
+                process.kill()?;
+            }
+        }
+        #[cfg(unix)]
+        if self.identity.pgid <= 1 {
+            process.kill()?;
+        }
+        #[cfg(not(unix))]
+        process.kill()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if process.try_wait()?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        #[cfg(unix)]
+        unsafe {
+            if libc::kill(-(self.identity.pgid), libc::SIGKILL) != 0
+                && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        process.wait().map(|_| ())
     }
     pub fn wait(&self) -> std::io::Result<Option<i32>> {
         let (result, cvar) = &*self.termination;
@@ -142,6 +200,42 @@ impl Driver {
                 _ => None,
             },
         )
+    }
+}
+
+fn observe_identity(pid: u32) -> io::Result<ProcessIdentity> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "pid=,pgid=,uid=,lstart=", "-p"])
+            .arg(pid.to_string())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("unable to observe process identity"));
+        }
+        let line = String::from_utf8_lossy(&output.stdout);
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            return Err(io::Error::other("incomplete process identity"));
+        }
+        let parsed_pid = fields[0].parse().map_err(io::Error::other)?;
+        let pgid = fields[1].parse().map_err(io::Error::other)?;
+        let uid = fields[2].parse().map_err(io::Error::other)?;
+        Ok(ProcessIdentity {
+            pid: parsed_pid,
+            pgid,
+            uid,
+            start_token: fields[3..].join(" "),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ProcessIdentity {
+            pid,
+            pgid: pid as i32,
+            uid: 0,
+            start_token: pid.to_string(),
+        })
     }
 }
 
