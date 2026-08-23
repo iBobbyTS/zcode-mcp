@@ -919,7 +919,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "read one; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; read two; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"session_id\":\"real-fake-session\"}}'; read three; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}'; read four; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"turn_id\":\"turn-1\"}}' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"turn_id\":\"turn-1\"}}'; trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
+            "read one; printf '%s\\n' '{\"id\":1,\"result\":{}}'; read two; printf '%s\\n' '{\"id\":2,\"result\":{\"session\":{\"sessionId\":\"real-fake-session\"}}}'; read three; printf '%s\\n' '{\"id\":3,\"result\":{}}'; read four; printf '%s\\n' '{\"id\":4,\"result\":{\"accepted\":true}}' '{\"method\":\"session/event\",\"params\":{\"sessionId\":\"real-fake-session\",\"type\":\"turn.started\",\"turnId\":\"turn-1\"}}'; trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
         ]);
         Ok(command)
     }));
@@ -1060,8 +1060,7 @@ fn prompt_already_running_is_returned_as_a_remote_error() {
     assert!(matches!(
         error,
         RuntimeCommandError::Remote(ref value)
-            if value.get("code").and_then(serde_json::Value::as_str)
-                == Some("PROMPT_ALREADY_RUNNING")
+            if value.get("code").and_then(serde_json::Value::as_i64) == Some(-32010)
     ));
     owner.stop(Duration::from_millis(100));
 }
@@ -1122,7 +1121,7 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
         .unwrap();
     let input = pending
         .iter()
-        .find(|request| request.request_type == "input")
+        .find(|request| request.request_type == "unsupported_input")
         .unwrap();
     assert!(matches!(
         success(
@@ -1141,28 +1140,43 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
             disposition: ResponseDispositionView::Responded
         }
     ));
+    let unsupported = rpc
+        .call(&request(
+            "input",
+            RpcMethod::Respond(RespondInput {
+                agent_id: "session-job".into(),
+                request_id: input.request_id.clone(),
+                decision: ResponseDecision::Answer,
+                content: Some("fixture answer".into()),
+            }),
+        ))
+        .unwrap();
     assert!(matches!(
-        success(
-            rpc.call(&request(
-                "input",
-                RpcMethod::Respond(RespondInput {
-                    agent_id: "session-job".into(),
-                    request_id: input.request_id.clone(),
-                    decision: ResponseDecision::Answer,
-                    content: Some("fixture answer".into()),
-                }),
-            ))
-            .unwrap()
-        ),
-        RpcSuccess::Respond {
-            disposition: ResponseDispositionView::Responded
+        unsupported.outcome,
+        RpcOutcome::Error {
+            error: RpcError {
+                code: RpcErrorCode::Validation,
+                ..
+            }
         }
     ));
-    assert!(store
-        .pending_requests("session-job")
-        .unwrap()
-        .iter()
-        .all(|request| request.state == PendingRequestState::Responded));
+    let pending = store.pending_requests("session-job").unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .find(|request| request.request_type == "permission")
+            .unwrap()
+            .state,
+        PendingRequestState::Responded
+    );
+    assert_eq!(
+        pending
+            .iter()
+            .find(|request| request.request_type == "unsupported_input")
+            .unwrap()
+            .state,
+        PendingRequestState::Pending
+    );
 
     assert!(matches!(
         success(
@@ -1264,7 +1278,7 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
         .unwrap();
     assert!(events.iter().any(|event| event.event_type == "raw.unknown"));
     assert!(events.iter().any(|event| {
-        event.event_type == "driver.message" && event.payload_json.contains("session/updated")
+        event.event_type == "driver.message" && event.payload_json.contains("permission.responded")
     }));
     server.shutdown();
 }

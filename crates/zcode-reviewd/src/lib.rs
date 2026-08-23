@@ -18,8 +18,10 @@ use zcode_driver::{
     RequestError, StopOutcome,
 };
 use zcode_protocol::{
-    session_id_from_result, turn_id_from_result, LifecycleOrder, WireMessage, SESSION_CREATE,
-    SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE, WORKSPACE_READ_STATE,
+    event_type, session_id_from_result, turn_id_from_result, CreateSessionParams, LifecycleOrder,
+    SendParams, SessionParams, SubscribeParams, WireMessage, WorkspaceRef,
+    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_SEND,
+    SESSION_STOP, SESSION_SUBSCRIBE, WORKSPACE_READ_STATE,
 };
 
 pub mod rpc;
@@ -126,18 +128,21 @@ impl TurnTracker {
         let Inbound::Message(WireMessage::Event(event)) = inbound else {
             return;
         };
+        let Some(kind) = event_type(event) else {
+            return;
+        };
         let mut state = self.state.lock().unwrap();
-        match event.method.as_str() {
-            "turn/started" => {
+        match kind {
+            "turn.started" => {
                 state.generation = state.generation.saturating_add(1);
                 state.active = true;
                 state.boundary = None;
             }
-            "turn/completed" if state.active => {
+            "turn.completed" if state.active => {
                 state.active = false;
                 state.boundary = Some(TurnBoundary::Completed);
             }
-            "turn/failed" if state.active => {
+            "turn.failed" if state.active => {
                 state.active = false;
                 state.boundary = Some(TurnBoundary::Failed);
             }
@@ -372,16 +377,18 @@ impl RuntimeOwner {
         initial_prompt: &str,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.driver.request(
-            WORKSPACE_READ_STATE,
-            serde_json::json!({"workspace": workspace_path}),
-            timeout,
-        )?;
-        let created = self.driver.request(
-            SESSION_CREATE,
-            serde_json::json!({"workspace": workspace_path}),
-            timeout,
-        )?;
+        self.driver
+            .request(WORKSPACE_READ_STATE, serde_json::json!({}), timeout)?;
+        let create_params = serde_json::to_value(CreateSessionParams {
+            workspace: WorkspaceRef {
+                workspace_key: workspace_path,
+                workspace_path,
+            },
+        })
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        let created = self
+            .driver
+            .request(SESSION_CREATE, create_params, timeout)?;
         let result = created.result.as_ref().ok_or_else(|| {
             RuntimeCommandError::InvalidSession("session/create result is missing".into())
         })?;
@@ -391,11 +398,14 @@ impl RuntimeOwner {
                 RuntimeCommandError::InvalidSession("session/create returned no session id".into())
             })?
             .to_owned();
-        self.driver.request(
-            SESSION_SUBSCRIBE,
-            serde_json::json!({"session_id": session_id}),
-            timeout,
-        )?;
+        let subscribe_params = serde_json::to_value(SubscribeParams {
+            session_id: &session_id,
+            delivery_kind: "desktop-continuous",
+            include_snapshot: false,
+        })
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.driver
+            .request(SESSION_SUBSCRIBE, subscribe_params, timeout)?;
         *self.session_id.lock().unwrap() = Some(session_id.clone());
         let initial_turn_id = self.send_turn(&session_id, initial_prompt, timeout)?;
         Ok(SessionReady {
@@ -412,11 +422,12 @@ impl RuntimeOwner {
     ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
         let previous = self.turn_tracker.snapshot().generation;
-        let response = self.driver.request(
-            SESSION_SEND,
-            serde_json::json!({"session_id": session_id, "message": content}),
-            timeout,
-        )?;
+        let params = serde_json::to_value(SendParams {
+            session_id,
+            content,
+        })
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        let response = self.driver.request(SESSION_SEND, params, timeout)?;
         let turn_id = response
             .result
             .as_ref()
@@ -436,11 +447,9 @@ impl RuntimeOwner {
         if !current.active {
             return Ok(current);
         }
-        self.driver.request(
-            SESSION_STOP,
-            serde_json::json!({"session_id": session_id}),
-            timeout,
-        )?;
+        let params = serde_json::to_value(SessionParams { session_id })
+            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.driver.request(SESSION_STOP, params, timeout)?;
         self.turn_tracker
             .wait_boundary_after(current.generation, timeout)
     }
@@ -454,11 +463,18 @@ impl RuntimeOwner {
         let id = serde_json::from_str(correlation_id).map_err(|_| {
             RuntimeCommandError::InvalidSession("stored request correlation is invalid".into())
         })?;
+        if !matches!(decision, "allow" | "deny") {
+            return Err(RuntimeCommandError::Unsupported);
+        }
+        let mut result = serde_json::json!({"decision": decision});
+        if let Some(reason) = content {
+            result
+                .as_object_mut()
+                .expect("permission result is an object")
+                .insert("reason".into(), reason.into());
+        }
         self.driver
-            .respond(
-                id,
-                serde_json::json!({"decision": decision, "content": content}),
-            )
+            .respond(id, result)
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))
     }
 
@@ -468,11 +484,10 @@ impl RuntimeOwner {
         timeout: Duration,
     ) -> Result<(), RuntimeCommandError> {
         self.validate_session(session_id)?;
-        self.driver.request(
-            zcode_protocol::SESSION_CLOSE,
-            serde_json::json!({"session_id": session_id}),
-            timeout,
-        )?;
+        let params = serde_json::to_value(SessionParams { session_id })
+            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.driver
+            .request(zcode_protocol::SESSION_CLOSE, params, timeout)?;
         Ok(())
     }
 
@@ -555,9 +570,23 @@ fn spawn_event_pump(
                 let terminal = match &event {
                     Inbound::ChildExited(exit) => {
                         match observe_process_group(driver.identity().pgid) {
-                            Ok(members) if members.is_empty() => {
-                                Some(RuntimeTerminal::Exited(exit.clone()))
-                            }
+                            Ok(members) if members.is_empty() => match exit {
+                                ChildExit::Exited(Some(0)) => {
+                                    let turn = turn_tracker.snapshot();
+                                    if !turn.active
+                                        && turn.boundary == Some(TurnBoundary::Completed)
+                                    {
+                                        Some(RuntimeTerminal::Completed(
+                                            StopOutcome::AlreadyExited(exit.clone()),
+                                        ))
+                                    } else {
+                                        Some(RuntimeTerminal::FailedRuntimeLost(
+                                            RuntimeLoss::EventStreamLost,
+                                        ))
+                                    }
+                                }
+                                _ => Some(RuntimeTerminal::Exited(exit.clone())),
+                            },
                             Ok(_) | Err(_) => {
                                 Some(RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership))
                             }
@@ -949,7 +978,7 @@ impl LifecycleSink for StoreLifecycleSink {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
                 if matches!(
                     request.method.as_str(),
-                    "permission/request" | "input/request"
+                    INTERACTION_REQUEST_PERMISSION | INTERACTION_REQUEST_USER_INPUT
                 ) =>
             {
                 let request_id = format!("{}:request:{}", self.agent_id, record.sequence);
@@ -960,10 +989,10 @@ impl LifecycleSink for StoreLifecycleSink {
                         return;
                     }
                 };
-                let request_type = if request.method == "permission/request" {
+                let request_type = if request.method == INTERACTION_REQUEST_PERMISSION {
                     "permission"
                 } else {
-                    "input"
+                    "unsupported_input"
                 };
                 if let Err(error) = self.store.insert_pending_request(
                     &request_id,
@@ -996,9 +1025,9 @@ impl LifecycleSink for StoreLifecycleSink {
             terminal,
             turn_state: match &record.event {
                 RuntimeEvent::Driver(Inbound::Lifecycle { method, .. }) => match method.as_str() {
-                    "turn/started" => Some(TurnState::Active),
-                    "turn/completed" => Some(TurnState::Idle),
-                    "turn/failed" => Some(TurnState::Failed),
+                    "turn.started" => Some(TurnState::Active),
+                    "turn.completed" => Some(TurnState::Idle),
+                    "turn.failed" => Some(TurnState::Failed),
                     _ => None,
                 },
                 _ => None,
@@ -1034,7 +1063,11 @@ fn lifecycle_projection(
         ),
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(message))) => (
             "driver.message",
-            serde_json::json!({"kind": "event", "method": message.method}),
+            serde_json::json!({
+                "kind": "event",
+                "method": message.method,
+                "type": event_type(message),
+            }),
             "redacted",
         ),
         RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { .. })) => (
@@ -1176,11 +1209,6 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
             state: JobState::Failed,
             failure_code: Some("TURN_FAILED".into()),
             failure_message: Some("turn_failed".into()),
-        },
-        RuntimeTerminal::Exited(ChildExit::Exited(Some(0))) => TerminalUpdate {
-            state: JobState::Completed,
-            failure_code: None,
-            failure_message: None,
         },
         RuntimeTerminal::Exited(exit) => TerminalUpdate {
             state: JobState::FailedRuntimeLost,
@@ -1351,52 +1379,78 @@ impl Scheduler {
         ) {
             Ok(marked) => marked,
             Err(error) => {
-                if let Err(failure_error) = self.inner.store.fail_claim(
+                let _ = self.cleanup_registered_runtime(
                     &claim.job.agent_id,
                     claim.owner_epoch,
-                    "STORE_START_FAILED",
-                    &error.to_string(),
-                ) {
-                    self.record_failure(&claim.job.agent_id, failure_error.to_string());
-                }
-                let _ = runtime.stop(self.inner.config.stop_grace);
-                self.release_active(&claim.job.agent_id, claim.owner_epoch);
+                    &runtime,
+                    &sink,
+                    Some(("STORE_START_FAILED", error.to_string())),
+                );
                 return Err(SchedulerError::Store(error));
             }
         };
         if !marked {
-            let current = self.inner.store.get_job(&claim.job.agent_id)?;
+            let current = match self.inner.store.get_job(&claim.job.agent_id) {
+                Ok(current) => current,
+                Err(error) => {
+                    let _ = self.cleanup_registered_runtime(
+                        &claim.job.agent_id,
+                        claim.owner_epoch,
+                        &runtime,
+                        &sink,
+                        Some(("POST_REGISTRATION_READ_FAILED", error.to_string())),
+                    );
+                    return Err(SchedulerError::Store(error));
+                }
+            };
             if current.as_ref().is_some_and(|job| {
                 job.stop_requested
                     || job.close_requested
                     || job.state == JobState::Stopping
                     || job.state.is_terminal()
             }) {
-                let terminal = runtime.stop(self.inner.config.stop_grace);
-                if let Err(error) = sink.finish(&terminal) {
-                    self.record_failure(&claim.job.agent_id, error.to_string());
-                }
-                self.release_active(&claim.job.agent_id, claim.owner_epoch);
+                self.cleanup_registered_runtime(
+                    &claim.job.agent_id,
+                    claim.owner_epoch,
+                    &runtime,
+                    &sink,
+                    None,
+                )?;
                 return Ok(false);
             }
             let message = "running transition was not applied";
-            self.inner.store.fail_claim(
+            self.cleanup_registered_runtime(
                 &claim.job.agent_id,
                 claim.owner_epoch,
-                "RUNTIME_START_RACE",
-                message,
+                &runtime,
+                &sink,
+                Some(("RUNTIME_START_RACE", message.into())),
             )?;
-            let _ = runtime.stop(self.inner.config.stop_grace);
-            self.release_active(&claim.job.agent_id, claim.owner_epoch);
             return Ok(false);
         }
-        let current = self.inner.store.get_job(&claim.job.agent_id)?;
+        let current = match self.inner.store.get_job(&claim.job.agent_id) {
+            Ok(current) => current,
+            Err(error) => {
+                let _ = self.cleanup_registered_runtime(
+                    &claim.job.agent_id,
+                    claim.owner_epoch,
+                    &runtime,
+                    &sink,
+                    Some(("POST_REGISTRATION_READ_FAILED", error.to_string())),
+                );
+                return Err(SchedulerError::Store(error));
+            }
+        };
         if current.as_ref().is_some_and(|job| {
             job.stop_requested || job.close_requested || job.state != JobState::Running
         }) {
-            let terminal = runtime.stop(self.inner.config.stop_grace);
-            let state = sink.finish(&terminal)?;
-            self.release_active(&claim.job.agent_id, claim.owner_epoch);
+            let state = self.cleanup_registered_runtime(
+                &claim.job.agent_id,
+                claim.owner_epoch,
+                &runtime,
+                &sink,
+                None,
+            )?;
             debug_assert!(state.is_terminal());
             return Ok(false);
         }
@@ -1409,6 +1463,52 @@ impl Scheduler {
             operation,
         );
         Ok(true)
+    }
+
+    fn cleanup_registered_runtime(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &Arc<StoreLifecycleSink>,
+        failure: Option<(&str, String)>,
+    ) -> Result<JobState, SchedulerError> {
+        let preclassified = failure.map(|(code, message)| {
+            self.inner
+                .store
+                .fail_claim(agent_id, owner_epoch, code, &message)
+        });
+        let terminal = runtime.stop(self.inner.config.stop_grace);
+        let finished = sink.finish(&terminal);
+        self.release_active(agent_id, owner_epoch);
+
+        if let Some(result) = preclassified {
+            match result {
+                Ok(state) => return Ok(state),
+                Err(error) => {
+                    self.record_failure(agent_id, error.to_string());
+                    return Err(SchedulerError::Store(error));
+                }
+            }
+        }
+        match finished {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                self.record_failure(agent_id, error.to_string());
+                match self.inner.store.fail_claim(
+                    agent_id,
+                    owner_epoch,
+                    "TERMINAL_WRITE_FAILED",
+                    &error.to_string(),
+                ) {
+                    Ok(state) => Ok(state),
+                    Err(fallback) => {
+                        self.record_failure(agent_id, fallback.to_string());
+                        Err(SchedulerError::Store(fallback))
+                    }
+                }
+            }
+        }
     }
 
     fn spawn_monitor(
@@ -1617,21 +1717,17 @@ impl Scheduler {
             })?;
         let valid = match request.request_type.as_str() {
             "permission" => matches!(decision, "allow" | "deny"),
-            "input" => decision == "answer" && content.is_some_and(|value| !value.is_empty()),
             _ => false,
         };
         if !valid {
             return Err(SchedulerError::InvalidConfig(
-                "response decision does not match the pending request type".into(),
+                if request.request_type == "unsupported_input" {
+                    "user-input response is unsupported by the pinned app-server seam".into()
+                } else {
+                    "response decision does not match the pending request type".into()
+                },
             ));
         }
-        let Some((_epoch, runtime, _session_id, operation)) = self.active_session(agent_id) else {
-            return Err(SchedulerError::RuntimeCommand {
-                agent_id: agent_id.into(),
-                message: "runtime is not active".into(),
-            });
-        };
-        let _guard = operation.lock().unwrap();
         match self
             .inner
             .store
@@ -1640,6 +1736,28 @@ impl Scheduler {
             DeliveryClaim::AlreadyDelivered => return Ok(ResponseDisposition::AlreadyResponded),
             DeliveryClaim::InFlight => return Ok(ResponseDisposition::InFlight),
             DeliveryClaim::Claimed => {}
+        }
+        let Some((_epoch, runtime, _session_id, operation)) = self.active_session(agent_id) else {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "runtime is not active".into(),
+            });
+        };
+        let _guard = operation.lock().unwrap();
+        let current = self.inner.store.get_job(agent_id)?;
+        if current.as_ref().is_none_or(|job| {
+            job.state != JobState::Running || job.stop_requested || job.close_requested
+        }) {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "runtime is stopping or no longer active".into(),
+            });
         }
         if let Err(error) = runtime.respond_request(&request.correlation_id, decision, content) {
             self.inner
@@ -1663,25 +1781,33 @@ impl Scheduler {
     }
 
     pub fn stop_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
-        let decision = self.inner.store.request_stop(agent_id)?;
-        self.stop_active(agent_id, decision, false)
+        self.request_stop_or_close(agent_id, false)
     }
 
     pub fn close_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
-        let decision = self.inner.store.request_close(agent_id)?;
-        self.stop_active(agent_id, decision, true)
+        self.request_stop_or_close(agent_id, true)
     }
 
-    fn stop_active(
+    fn request_stop_or_close(
         &self,
         agent_id: &str,
-        decision: review_store::CloseDecision,
         close_session: bool,
     ) -> Result<JobState, SchedulerError> {
+        let active = self.active_session(agent_id);
+        let operation = active
+            .as_ref()
+            .map(|(_, _, _, operation)| Arc::clone(operation));
+        let _guard = operation
+            .as_ref()
+            .map(|operation| operation.lock().unwrap());
+        let decision = if close_session {
+            self.inner.store.request_close(agent_id)?
+        } else {
+            self.inner.store.request_stop(agent_id)?
+        };
         if !decision.needs_runtime_stop {
             return Ok(decision.state);
         }
-        let active = self.active_session(agent_id);
         let Some((owner_epoch, runtime, session_id, operation)) = active else {
             return Ok(decision.state);
         };
@@ -1699,7 +1825,7 @@ impl Scheduler {
             agent_id: agent_id.into(),
             message: "active runtime disappeared".into(),
         })?;
-        let _guard = operation.lock().unwrap();
+        let _ = operation;
         if runtime.turn_snapshot().active {
             let _ = runtime.stop_turn(&session_id, self.inner.config.command_timeout);
         }
@@ -1711,29 +1837,49 @@ impl Scheduler {
             None
         };
         let terminal = runtime.stop(self.inner.config.stop_grace);
-        if let Some(message) = sink.error() {
-            if let Err(error) = self.inner.store.fail_claim(
+        let result = if let Some(message) = sink.error() {
+            let fallback = self.inner.store.fail_claim(
                 agent_id,
                 decision.owner_epoch,
                 "LIFECYCLE_SINK_FAILED",
                 &message,
-            ) {
-                self.record_failure(agent_id, error.to_string());
-                return Err(SchedulerError::Store(error));
-            }
+            );
             self.record_failure(agent_id, message.clone());
-            self.release_active(agent_id, decision.owner_epoch);
-            return Err(SchedulerError::LifecycleSink {
-                agent_id: agent_id.into(),
-                message,
-            });
-        }
-        let state = sink.finish(&terminal)?;
+            match fallback {
+                Ok(_) => Err(SchedulerError::LifecycleSink {
+                    agent_id: agent_id.into(),
+                    message,
+                }),
+                Err(error) => {
+                    self.record_failure(agent_id, error.to_string());
+                    Err(SchedulerError::Store(error))
+                }
+            }
+        } else {
+            match sink.finish(&terminal) {
+                Ok(state) => Ok(state),
+                Err(error) => {
+                    self.record_failure(agent_id, error.to_string());
+                    match self.inner.store.fail_claim(
+                        agent_id,
+                        decision.owner_epoch,
+                        "TERMINAL_WRITE_FAILED",
+                        &error.to_string(),
+                    ) {
+                        Ok(state) => Ok(state),
+                        Err(fallback) => {
+                            self.record_failure(agent_id, fallback.to_string());
+                            Err(SchedulerError::Store(fallback))
+                        }
+                    }
+                }
+            }
+        };
         self.release_active(agent_id, decision.owner_epoch);
         if let Some(error) = close_error {
             self.record_failure(agent_id, error.to_string());
         }
-        Ok(state)
+        result
     }
 
     fn active_session(&self, agent_id: &str) -> Option<ActiveSession> {
@@ -1815,6 +1961,44 @@ pub struct Daemon {
     shutdown: Arc<AtomicBool>,
     claim_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     server: Mutex<Option<rpc::RpcServer>>,
+    _singleton_lock: SingletonLock,
+}
+
+#[cfg(unix)]
+struct SingletonLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl SingletonLock {
+    fn acquire(database: &std::path::Path) -> io::Result<Self> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+        let mut lock_name = database.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(std::path::PathBuf::from(lock_name))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "review database already has a lifecycle owner",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 #[cfg(unix)]
@@ -1825,20 +2009,35 @@ impl Daemon {
         server_options: rpc::ServerOptions,
         claim_interval: Duration,
     ) -> io::Result<Self> {
+        Self::start_inner(socket, scheduler, server_options, claim_interval, || {})
+    }
+
+    fn start_inner<F>(
+        socket: impl AsRef<std::path::Path>,
+        scheduler: Scheduler,
+        server_options: rpc::ServerOptions,
+        claim_interval: Duration,
+        before_reconcile: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(),
+    {
         if claim_interval.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "claim interval must be positive",
             ));
         }
+        let singleton_lock = SingletonLock::acquire(scheduler.store().database_path())?;
+        before_reconcile();
+        scheduler
+            .reconcile_startup()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let service = Arc::new(
             rpc::RpcService::new(scheduler.clone(), scheduler.store())
                 .map_err(|_| io::Error::other("scheduler store ownership mismatch"))?,
         );
         let server = rpc::RpcServer::bind(socket, service, server_options)?;
-        scheduler
-            .reconcile_startup()
-            .map_err(|error| io::Error::other(error.to_string()))?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let loop_shutdown = Arc::clone(&shutdown);
         let loop_scheduler = scheduler.clone();
@@ -1855,6 +2054,7 @@ impl Daemon {
             shutdown,
             claim_thread: Mutex::new(Some(claim_thread)),
             server: Mutex::new(Some(server)),
+            _singleton_lock: singleton_lock,
         })
     }
 
@@ -2084,7 +2284,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{}}'; trap '' TERM; exec tail -f /dev/null",
+            "printf '%s\\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}'; trap '' TERM; exec tail -f /dev/null",
         ]);
         let owner = Arc::new(RuntimeOwner::spawn(command, sink.clone()).unwrap());
         assert!(sink.wait_for(Duration::from_secs(2), |records| {
@@ -2146,6 +2346,40 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn exit_zero_during_active_turn_is_runtime_loss_without_completion_boundary() {
+        let sink = Arc::new(MemorySink::default());
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}'",
+        ]);
+        let owner = RuntimeOwner::spawn(command, sink).unwrap();
+        assert_eq!(
+            owner.wait_terminal(Duration::from_secs(2)),
+            Some(RuntimeTerminal::FailedRuntimeLost(
+                RuntimeLoss::EventStreamLost
+            ))
+        );
+    }
+
+    #[test]
+    fn exit_zero_after_observed_completion_boundary_is_successful() {
+        let sink = Arc::new(MemorySink::default());
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.completed\"}}'",
+        ]);
+        let owner = RuntimeOwner::spawn(command, sink).unwrap();
+        assert!(matches!(
+            owner.wait_terminal(Duration::from_secs(2)),
+            Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0))
+            )))
+        ));
     }
 
     #[test]
@@ -2469,10 +2703,14 @@ mod tests {
     fn wait_for_job_state(store: &Store, agent_id: &str, expected: JobState) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if store.get_job(agent_id).unwrap().unwrap().state == expected {
+            let state = store.get_job(agent_id).unwrap().unwrap().state;
+            if state == expected {
                 return;
             }
-            assert!(Instant::now() < deadline, "job did not reach {expected:?}");
+            assert!(
+                Instant::now() < deadline,
+                "job {agent_id} remained {state:?} instead of {expected:?}"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2494,7 +2732,9 @@ mod tests {
 
         let first = factory.runtime("job-1");
         first.emit_partial("partial-review");
-        first.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        first.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
         wait_for_job_state(&store, "job-1", JobState::Completed);
         let second = factory.runtime("job-2");
         assert_eq!(
@@ -2504,10 +2744,14 @@ mod tests {
         assert_eq!(store.cursor("job-1", "job-1:1").unwrap(), 2);
         assert_eq!(scheduler.active_count(), 2);
 
-        second.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        second.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
         factory
             .runtime("job-3")
-            .finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
         wait_for_job_state(&store, "job-2", JobState::Completed);
         wait_for_job_state(&store, "job-3", JobState::Completed);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2564,6 +2808,124 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn post_registration_read_failure_stops_runtime_terminalizes_and_releases_slot() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-read-fault", "workspace"))
+            .unwrap();
+        let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER corrupt_running_turn_state AFTER UPDATE OF state ON agents
+             WHEN NEW.agent_id = 'job-read-fault' AND NEW.state = 'RUNNING'
+             BEGIN
+                 UPDATE agents SET turn_state = 'BROKEN' WHERE agent_id = NEW.agent_id;
+             END;",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            scheduler.start_ready(),
+            Err(SchedulerError::Store(_))
+        ));
+        let runtime = factory.runtime("job-read-fault");
+        assert!(runtime.stop_calls() >= 1);
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(store.active_count().unwrap(), 0);
+        let job = store.get_job("job-read-fault").unwrap().unwrap();
+        assert_eq!(job.state, JobState::FailedRuntimeLost);
+        assert_eq!(
+            job.failure_code.as_deref(),
+            Some("POST_REGISTRATION_READ_FAILED")
+        );
+    }
+
+    #[test]
+    fn terminal_write_failure_falls_back_and_releases_exact_active_epoch() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("job-terminal-fault", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("job-terminal-fault");
+        let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER reject_success_terminal_ledger BEFORE INSERT ON lifecycle_ledger
+             WHEN NEW.agent_id = 'job-terminal-fault' AND NEW.reason_code IS NULL
+             BEGIN SELECT RAISE(FAIL, 'scripted terminal write failure'); END;",
+        )
+        .unwrap();
+
+        assert!(scheduler.stop_job("job-terminal-fault").is_err());
+        assert!(runtime.stop_calls() >= 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while scheduler.active_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "terminal fault leaked active epoch"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let job = store.get_job("job-terminal-fault").unwrap().unwrap();
+        assert_eq!(job.state, JobState::FailedRuntimeLost);
+        assert_eq!(job.failure_code.as_deref(), Some("LIFECYCLE_SINK_FAILED"));
+    }
+
+    #[test]
+    fn responded_request_replay_remains_idempotent_after_job_terminal() {
+        let (_directory, store, _factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("responded-job", "workspace"))
+            .unwrap();
+        let claim = store.claim_next("manual-owner", 1, 1).unwrap().unwrap();
+        store
+            .mark_session_running(
+                "responded-job",
+                claim.owner_epoch,
+                "runtime",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .insert_pending_request(
+                "request-1",
+                "responded-job",
+                "\"server-1\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_pending_response("responded-job", "request-1", "allow", None)
+                .unwrap(),
+            DeliveryClaim::Claimed
+        );
+        assert!(store
+            .complete_pending_response("responded-job", "request-1")
+            .unwrap());
+        store
+            .transition_terminal(
+                "responded-job",
+                claim.owner_epoch,
+                &TerminalUpdate {
+                    state: JobState::Completed,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            scheduler
+                .respond_job("responded-job", "request-1", "allow", None)
+                .unwrap(),
+            ResponseDisposition::AlreadyResponded
+        );
     }
 
     #[test]
@@ -2636,7 +2998,6 @@ mod tests {
         let runtime = factory.runtime("job-redaction");
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
             WireMessage::Request(RequestEnvelope {
-                jsonrpc: "2.0".into(),
                 id: serde_json::json!({"token": TOKEN}),
                 method: "tool/call".into(),
                 params: serde_json::json!({"path": PATH, "arguments": TOOL_ARGS}),
@@ -2644,7 +3005,6 @@ mod tests {
         )));
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
             WireMessage::Response(ResponseEnvelope {
-                jsonrpc: "2.0".into(),
                 id: serde_json::json!({"token": TOKEN}),
                 result: Some(serde_json::json!({"reasoning": REASONING, "path": PATH})),
                 error: None,
@@ -2652,9 +3012,12 @@ mod tests {
         )));
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
             EventEnvelope {
-                jsonrpc: "2.0".into(),
-                method: "turn/completed".into(),
-                params: serde_json::json!({"reasoning": REASONING, "token": TOKEN}),
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type": "turn.completed",
+                    "reasoning": REASONING,
+                    "token": TOKEN
+                }),
             },
         ))));
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
@@ -2916,6 +3279,62 @@ mod tests {
             reopened.get_job("starting").unwrap().unwrap().state,
             JobState::Queued
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_does_not_publish_socket_or_start_runtime_before_reconciliation() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("recovering-job", "workspace"))
+            .unwrap();
+        let claim = store.claim_next("old-owner", 1, 1).unwrap().unwrap();
+        store
+            .mark_session_running(
+                "recovering-job",
+                claim.owner_epoch,
+                "old-runtime",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let socket = directory.path().join("gated").join("review.sock");
+        let thread_socket = socket.clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let thread_entered = Arc::clone(&entered);
+        let thread_release = Arc::clone(&release);
+        let start_scheduler = scheduler.clone();
+        let starter = thread::spawn(move || {
+            Daemon::start_inner(
+                thread_socket,
+                start_scheduler,
+                rpc::ServerOptions::default(),
+                Duration::from_millis(20),
+                || {
+                    thread_entered.wait();
+                    thread_release.wait();
+                },
+            )
+        });
+
+        entered.wait();
+        assert!(
+            !socket.exists(),
+            "socket became ready before reconciliation"
+        );
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
+        assert!(factory.runtimes.lock().unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+        release.wait();
+
+        let daemon = starter.join().unwrap().unwrap();
+        assert_eq!(
+            store.get_job("recovering-job").unwrap().unwrap().state,
+            JobState::FailedRuntimeLost
+        );
+        daemon.shutdown();
     }
 
     #[test]

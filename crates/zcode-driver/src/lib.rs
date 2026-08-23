@@ -16,8 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 use zcode_protocol::{
-    classify_lifecycle, encode, parse_line, LifecycleOrder, RequestEnvelope, ResponseEnvelope,
-    WireMessage,
+    classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
+    ResponseEnvelope, WireMessage,
 };
 
 pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
@@ -912,26 +912,28 @@ fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>, d
                 match parse_line(&line) {
                     Ok(msg) => {
                         if let WireMessage::Event(event) = &msg {
-                            let order = classify_lifecycle(&event.method, turn_active);
-                            if event.method == "turn/started"
-                                && matches!(order, LifecycleOrder::InOrder)
-                            {
-                                turn_active = true;
-                            }
-                            if matches!(event.method.as_str(), "turn/completed" | "turn/failed")
-                                && matches!(order, LifecycleOrder::InOrder)
-                            {
-                                turn_active = false;
-                            }
-                            if tx
-                                .send(Inbound::Lifecycle {
-                                    sequence,
-                                    method: event.method.clone(),
-                                    order,
-                                })
-                                .is_err()
-                            {
-                                return;
+                            if let Some(kind) = event_type(event) {
+                                let order = classify_lifecycle(kind, turn_active);
+                                if kind == "turn.started"
+                                    && matches!(order, LifecycleOrder::InOrder)
+                                {
+                                    turn_active = true;
+                                }
+                                if matches!(kind, "turn.completed" | "turn.failed")
+                                    && matches!(order, LifecycleOrder::InOrder)
+                                {
+                                    turn_active = false;
+                                }
+                                if tx
+                                    .send(Inbound::Lifecycle {
+                                        sequence,
+                                        method: kind.into(),
+                                        order,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
                             }
                         }
                         if tx.send(Inbound::Message(msg)).is_err() {
@@ -1072,7 +1074,7 @@ mod tests {
     #[test]
     fn dispatch_interleaved() {
         let mut c = Command::new("sh");
-        c.args(["-c", "read line; printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{}}' '{\"method\":\"permission/request\",\"params\":{}}' '{\"id\":1,\"result\":{\"ok\":true}}' '{\"method\":\"turn/completed\",\"params\":{}}'"]);
+        c.args(["-c", "read line; printf '%s\\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}' '{\"id\":\"server-1\",\"method\":\"interaction/requestPermission\",\"params\":{}}' '{\"id\":1,\"result\":{\"ok\":true}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.completed\"}}'"]);
         let d = Driver::spawn(c).unwrap();
         let _ = d.send_request("turn/start", serde_json::json!({})).unwrap();
         let mut seen = 0;
@@ -1182,7 +1184,7 @@ mod tests {
         let mut c = Command::new("sh");
         c.args([
             "-c",
-            "printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{}}' '{\"method\":\"turn/started\",\"params\":{}}'",
+            "printf '%s\\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.completed\"}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}'",
         ]);
         let d = Driver::spawn(c).unwrap();
         let first = d.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1218,7 +1220,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "read first; read second; printf '%s\n' '{\"method\":\"turn/started\",\"params\":{}}' '{\"id\":2,\"result\":{\"value\":\"second\"}}' '{\"method\":\"permission/request\",\"params\":{\"request_id\":\"p1\"}}' '{\"id\":1,\"result\":{\"value\":\"first\"}}' '{\"method\":\"turn/completed\",\"params\":{}}'; sleep 1",
+            "read first; read second; printf '%s\n' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}' '{\"id\":2,\"result\":{\"value\":\"second\"}}' '{\"id\":\"server-1\",\"method\":\"interaction/requestPermission\",\"params\":{}}' '{\"id\":1,\"result\":{\"value\":\"first\"}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.completed\"}}'; sleep 1",
         ]);
         let driver = Arc::new(Driver::spawn(command).unwrap());
         let events = driver.subscribe();
@@ -1238,10 +1240,12 @@ mod tests {
         );
         let mut methods = Vec::new();
         for _ in 0..8 {
-            if let Ok(Inbound::Message(WireMessage::Event(event))) =
-                events.recv_timeout(Duration::from_millis(250))
-            {
-                methods.push(event.method);
+            if let Ok(Inbound::Message(message)) = events.recv_timeout(Duration::from_millis(250)) {
+                match message {
+                    WireMessage::Event(event) => methods.push(event.method),
+                    WireMessage::Request(request) => methods.push(request.method),
+                    _ => {}
+                }
                 if methods.len() == 3 {
                     break;
                 }
@@ -1249,7 +1253,11 @@ mod tests {
         }
         assert_eq!(
             methods,
-            vec!["turn/started", "permission/request", "turn/completed"]
+            vec![
+                "session/event",
+                "interaction/requestPermission",
+                "session/event"
+            ]
         );
         driver.stop().unwrap();
     }

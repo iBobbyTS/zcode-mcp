@@ -115,14 +115,37 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         thread::sleep(Duration::from_millis(10));
     }
 
-    let second = Command::new(daemon_executable)
+    let second_socket = directory.path().join("private").join("second.sock");
+    let mut second = Command::new(daemon_executable)
         .env("ZCODE_REVIEWD_DATABASE", &database)
-        .env("ZCODE_REVIEWD_SOCKET", &socket)
+        .env("ZCODE_REVIEWD_SOCKET", &second_socket)
         .env("ZCODE_RUNTIME_PATH", &runtime)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(!second.status.success());
-    assert!(second.stdout.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let second_status = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!("same database with a different socket acquired a second owner");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!second_status.success());
+    let mut second_stdout = Vec::new();
+    second
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut second_stdout)
+        .unwrap();
+    assert!(second_stdout.is_empty());
+    assert!(!second_socket.exists());
 
     let reconnected = RpcClient::new(&socket, Duration::from_secs(2));
     assert!(matches!(

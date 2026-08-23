@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::{
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, TryLockError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -451,18 +451,27 @@ pub enum DeliveryClaim {
 
 pub struct Store {
     connection: Mutex<Connection>,
+    database_path: PathBuf,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
-        let mut connection = Connection::open(path)?;
+        let mut connection = Connection::open(path.as_ref())?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
         migrate_to_v2(&mut connection)?;
+        let database_path = std::fs::canonicalize(path.as_ref()).map_err(|error| {
+            StoreError::InvalidState(format!("database path cannot be canonicalized: {error}"))
+        })?;
         Ok(Self {
             connection: Mutex::new(connection),
+            database_path,
         })
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     pub fn journal_mode(&self) -> StoreResult<String> {
@@ -615,7 +624,7 @@ impl Store {
                    AND (SELECT COUNT(*) FROM agents active
                         WHERE active.workspace_path = queued.workspace_path
                           AND active.state IN ('STARTING', 'RUNNING', 'STOPPING')) < ?1
-                 ORDER BY created_at, rowid LIMIT 1",
+                 ORDER BY queued.created_at, queued.rowid LIMIT 1",
                 [usize_to_i64(per_workspace_limit)?],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -876,6 +885,7 @@ impl Store {
                  WHERE agent_id = ?4",
                 params![next.as_str(), next.is_terminal(), now_millis(), agent_id],
             )?;
+            settle_terminal_commands(&transaction, agent_id, "CLOSE_REQUESTED")?;
             if state != next {
                 insert_ledger(
                     &transaction,
@@ -919,6 +929,7 @@ impl Store {
                  WHERE agent_id = ?4",
                 params![next.as_str(), next.is_terminal(), now_millis(), agent_id],
             )?;
+            settle_terminal_commands(&transaction, agent_id, "STOP_REQUESTED")?;
             if state != next {
                 insert_ledger(
                     &transaction,
@@ -993,6 +1004,7 @@ impl Store {
                     old.as_str(),
                 ],
             )?;
+            settle_terminal_commands(&transaction, &agent_id, "DAEMON_RESTART_RUNTIME_LOST")?;
             insert_ledger(
                 &transaction,
                 &agent_id,
@@ -1022,6 +1034,13 @@ impl Store {
                 return Err(StoreError::Conflict(format!(
                     "message id {message_id} was reused with different content"
                 )));
+            }
+            let job = query_job(&transaction, agent_id)?
+                .ok_or_else(|| StoreError::InvalidState(format!("unknown job {agent_id}")))?;
+            if job.state.is_terminal()
+                && matches!(existing.state, MessageState::Queued | MessageState::Sending)
+            {
+                settle_terminal_commands(&transaction, agent_id, "JOB_ALREADY_TERMINAL")?;
             }
             transaction.commit()?;
             return Ok(false);
@@ -1093,9 +1112,12 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let message_id = transaction
             .query_row(
-                "SELECT message_id FROM messages
-                 WHERE agent_id = ?1 AND state = 'QUEUED'
-                 ORDER BY created_at, rowid LIMIT 1",
+                "SELECT messages.message_id FROM messages
+                 JOIN agents ON agents.agent_id = messages.agent_id
+                 WHERE messages.agent_id = ?1 AND messages.state = 'QUEUED'
+                   AND agents.state = 'RUNNING'
+                   AND agents.stop_requested = 0 AND agents.close_requested = 0
+                 ORDER BY messages.created_at, messages.rowid LIMIT 1",
                 [agent_id],
                 |row| row.get::<_, String>(0),
             )
@@ -1847,6 +1869,8 @@ fn apply_terminal(
     let changed = transaction.execute(
         "UPDATE agents SET state = ?1, completed_at = COALESCE(completed_at, ?2),
              failure_code = ?3, failure_message = ?4,
+             turn_state = CASE WHEN ?1 IN ('FAILED', 'FAILED_RUNTIME_LOST', 'ORPHANED')
+                               THEN 'FAILED' ELSE 'IDLE' END,
              closed_at = CASE WHEN close_requested = 1
                               THEN COALESCE(closed_at, ?2) ELSE closed_at END
          WHERE agent_id = ?5 AND owner_epoch = ?6
@@ -1865,6 +1889,11 @@ fn apply_terminal(
             "terminal transition lost for {agent_id} epoch {owner_epoch}"
         )));
     }
+    settle_terminal_commands(
+        transaction,
+        agent_id,
+        terminal.failure_code.as_deref().unwrap_or("JOB_TERMINATED"),
+    )?;
     insert_ledger(
         transaction,
         agent_id,
@@ -1874,6 +1903,26 @@ fn apply_terminal(
         terminal.failure_code.as_deref(),
     )?;
     Ok(final_state)
+}
+
+fn settle_terminal_commands(
+    transaction: &Transaction<'_>,
+    agent_id: &str,
+    reason_code: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "UPDATE messages SET state = 'FAILED', failure_code = ?1,
+             failure_message = 'runtime is no longer available'
+         WHERE agent_id = ?2 AND state IN ('QUEUED', 'SENDING')",
+        params![reason_code, agent_id],
+    )?;
+    transaction.execute(
+        "UPDATE pending_requests SET state = 'PENDING',
+             response_decision = NULL, response_content = NULL
+         WHERE agent_id = ?1 AND state = 'SENDING'",
+        [agent_id],
+    )?;
+    Ok(())
 }
 
 fn insert_ledger(
@@ -2381,6 +2430,10 @@ mod tests {
     fn delivery_claims_are_fifo_and_idempotent_without_false_completion() {
         let (_directory, _path, store) = file_store();
         enqueue(&store, "delivery-job", "/workspace");
+        let claim = claim(&store, "delivery-job");
+        store
+            .mark_running("delivery-job", claim.owner_epoch, "runtime", None)
+            .unwrap();
         store
             .insert_message("message-1", "delivery-job", "queue", "first")
             .unwrap();
@@ -2436,5 +2489,69 @@ mod tests {
             store.claim_pending_response("delivery-job", "request-1", "deny", None),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn restart_terminalizes_queued_and_sending_messages_without_future_delivery_claim() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "restart-job", "/workspace");
+        let claim = claim(&store, "restart-job");
+        store
+            .mark_running("restart-job", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        store
+            .insert_message("sending-message", "restart-job", "queue", "first")
+            .unwrap();
+        store
+            .insert_message("queued-message", "restart-job", "queue", "second")
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_next_message("restart-job")
+                .unwrap()
+                .unwrap()
+                .state,
+            MessageState::Sending
+        );
+
+        assert_eq!(store.reconcile_startup().unwrap().len(), 1);
+        for message_id in ["sending-message", "queued-message"] {
+            let message = store.message(message_id).unwrap().unwrap();
+            assert_eq!(message.state, MessageState::Failed);
+            assert_eq!(
+                message.failure_code.as_deref(),
+                Some("DAEMON_RESTART_RUNTIME_LOST")
+            );
+        }
+        assert!(store.claim_next_message("restart-job").unwrap().is_none());
+        assert!(!store
+            .insert_message("queued-message", "restart-job", "queue", "second")
+            .unwrap());
+        assert_eq!(
+            store.message("queued-message").unwrap().unwrap().state,
+            MessageState::Failed
+        );
+    }
+
+    #[test]
+    fn stop_intent_prevents_a_queued_message_from_being_claimed() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "stopping-job", "/workspace");
+        let claim = claim(&store, "stopping-job");
+        store
+            .mark_running("stopping-job", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        store
+            .insert_message("never-send", "stopping-job", "queue", "content")
+            .unwrap();
+
+        assert_eq!(
+            store.request_stop("stopping-job").unwrap().state,
+            JobState::Stopping
+        );
+        assert!(store.claim_next_message("stopping-job").unwrap().is_none());
+        let message = store.message("never-send").unwrap().unwrap();
+        assert_eq!(message.state, MessageState::Failed);
+        assert_eq!(message.failure_code.as_deref(), Some("STOP_REQUESTED"));
     }
 }

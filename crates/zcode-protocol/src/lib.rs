@@ -1,22 +1,19 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const JSON_RPC_VERSION: &str = "2.0";
 pub const WORKSPACE_READ_STATE: &str = "workspace/readState";
 pub const SESSION_CREATE: &str = "session/create";
 pub const SESSION_SUBSCRIBE: &str = "session/subscribe";
 pub const SESSION_SEND: &str = "session/send";
 pub const SESSION_STOP: &str = "session/stop";
 pub const SESSION_CLOSE: &str = "session/close";
-
-fn default_jsonrpc() -> String {
-    JSON_RPC_VERSION.into()
-}
+pub const SESSION_EVENT: &str = "session/event";
+pub const INTERACTION_REQUEST_PERMISSION: &str = "interaction/requestPermission";
+pub const INTERACTION_REQUEST_USER_INPUT: &str = "interaction/requestUserInput";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
-    #[serde(default = "default_jsonrpc")]
-    pub jsonrpc: String,
     pub id: Value,
     pub method: String,
     #[serde(default)]
@@ -24,20 +21,18 @@ pub struct RequestEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseEnvelope {
-    #[serde(default = "default_jsonrpc")]
-    pub jsonrpc: String,
     pub id: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventEnvelope {
-    #[serde(default = "default_jsonrpc")]
-    pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -54,7 +49,6 @@ pub enum WireMessage {
 impl RequestEnvelope {
     pub fn new(id: Value, method: impl Into<String>, params: Value) -> Self {
         Self {
-            jsonrpc: JSON_RPC_VERSION.into(),
             id,
             method: method.into(),
             params,
@@ -65,7 +59,6 @@ impl RequestEnvelope {
 impl ResponseEnvelope {
     pub fn success(id: Value, result: Value) -> Self {
         Self {
-            jsonrpc: JSON_RPC_VERSION.into(),
             id,
             result: Some(result),
             error: None,
@@ -74,7 +67,6 @@ impl ResponseEnvelope {
 
     pub fn failure(id: Value, error: Value) -> Self {
         Self {
-            jsonrpc: JSON_RPC_VERSION.into(),
             id,
             result: None,
             error: Some(error),
@@ -83,29 +75,55 @@ impl ResponseEnvelope {
 }
 
 pub fn session_id_from_result(result: &Value) -> Option<&str> {
-    result
-        .get("session_id")
-        .or_else(|| result.get("sessionId"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("session")
-                .and_then(|session| session.get("id"))
-                .and_then(Value::as_str)
-        })
+    result.get("sessionId").and_then(Value::as_str).or_else(|| {
+        result
+            .get("session")
+            .and_then(|session| session.get("sessionId"))
+            .and_then(Value::as_str)
+    })
 }
 
 pub fn turn_id_from_result(result: &Value) -> Option<&str> {
-    result
-        .get("turn_id")
-        .or_else(|| result.get("turnId"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(Value::as_str)
-        })
+    result.get("turnId").and_then(Value::as_str)
+}
+
+pub fn event_type(event: &EventEnvelope) -> Option<&str> {
+    (event.method == SESSION_EVENT)
+        .then(|| event.params.get("type").and_then(Value::as_str))
+        .flatten()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRef<'a> {
+    pub workspace_key: &'a str,
+    pub workspace_path: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CreateSessionParams<'a> {
+    pub workspace: WorkspaceRef<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeParams<'a> {
+    pub session_id: &'a str,
+    pub delivery_kind: &'static str,
+    pub include_snapshot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendParams<'a> {
+    pub session_id: &'a str,
+    pub content: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionParams<'a> {
+    pub session_id: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +139,11 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
     let value: Value =
         serde_json::from_str(line).map_err(|e| ParseError::InvalidJson(e.to_string()))?;
     let obj = value.as_object().ok_or(ParseError::NotObject)?;
+    if obj.contains_key("jsonrpc") {
+        return Err(ParseError::InvalidEnvelope(
+            "jsonrpc is not part of the strict ZCode envelope".into(),
+        ));
+    }
     if obj.contains_key("id") && (obj.contains_key("result") || obj.contains_key("error")) {
         if obj.contains_key("result") && obj.contains_key("error") {
             return Err(ParseError::ContradictoryResponse);
@@ -135,15 +158,17 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
                 .map(WireMessage::Request)
                 .map_err(|e| ParseError::InvalidEnvelope(e.to_string()));
         }
-        let known = matches!(
-            method,
-            "turn/started"
-                | "turn/completed"
-                | "session/updated"
-                | "permission/request"
-                | "input/request"
-                | "turn/failed"
-        );
+        let known = method == SESSION_EVENT
+            && obj
+                .get("params")
+                .and_then(|params| params.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "turn.started" | "turn.completed" | "turn.failed" | "permission.responded"
+                    )
+                });
         return if known {
             serde_json::from_value(value)
                 .map(WireMessage::Event)
@@ -168,13 +193,13 @@ pub enum LifecycleOrder {
 /// Classify lifecycle events without reordering or dropping the wire stream.
 pub fn classify_lifecycle(method: &str, turn_active: bool) -> LifecycleOrder {
     match (method, turn_active) {
-        ("turn/started", false) => LifecycleOrder::InOrder,
-        ("turn/started", true) => LifecycleOrder::OutOfOrder {
-            expected: "turn/completed or turn/failed",
+        ("turn.started", false) => LifecycleOrder::InOrder,
+        ("turn.started", true) => LifecycleOrder::OutOfOrder {
+            expected: "turn.completed or turn.failed",
         },
-        ("turn/completed" | "turn/failed", true) => LifecycleOrder::InOrder,
-        ("turn/completed" | "turn/failed", false) => LifecycleOrder::OutOfOrder {
-            expected: "turn/started",
+        ("turn.completed" | "turn.failed", true) => LifecycleOrder::InOrder,
+        ("turn.completed" | "turn.failed", false) => LifecycleOrder::OutOfOrder {
+            expected: "turn.started",
         },
         _ => LifecycleOrder::NotLifecycle,
     }
@@ -190,13 +215,19 @@ mod tests {
     #[test]
     fn round_trip() {
         let req = RequestEnvelope {
-            jsonrpc: JSON_RPC_VERSION.into(),
             id: Value::from(1),
-            method: "initialize".into(),
+            method: SESSION_CREATE.into(),
             params: serde_json::json!({"x":1}),
         };
         let parsed = parse_line(&encode(&req).unwrap()).unwrap();
         assert_eq!(parsed, WireMessage::Request(req));
+        assert!(!encode(&RequestEnvelope::new(
+            Value::from(2),
+            SESSION_SEND,
+            serde_json::json!({"sessionId":"s1","content":"review"}),
+        ))
+        .unwrap()
+        .contains("jsonrpc"));
     }
     #[test]
     fn unknown_preserved() {
@@ -217,23 +248,47 @@ mod tests {
     }
 
     #[test]
+    fn legacy_jsonrpc_envelope_is_rejected() {
+        assert!(matches!(
+            parse_line(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            Err(ParseError::InvalidEnvelope(_))
+        ));
+    }
+
+    #[test]
     fn lifecycle_order_is_explicit() {
         assert_eq!(
-            classify_lifecycle("turn/completed", false),
+            classify_lifecycle("turn.completed", false),
             LifecycleOrder::OutOfOrder {
-                expected: "turn/started"
+                expected: "turn.started"
             }
         );
     }
 
     #[test]
     fn session_and_turn_ids_accept_observed_result_shapes() {
-        let nested = serde_json::json!({"session": {"id": "s1"}, "turn": {"id": "t1"}});
+        let nested = serde_json::json!({"session": {"sessionId": "s1"}, "turnId": "t1"});
         assert_eq!(session_id_from_result(&nested), Some("s1"));
         assert_eq!(turn_id_from_result(&nested), Some("t1"));
         assert_eq!(
             session_id_from_result(&serde_json::json!({"sessionId": "s2"})),
             Some("s2")
         );
+        assert_eq!(
+            session_id_from_result(&serde_json::json!({"session": {"id": "legacy"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn session_event_exposes_lifecycle_discriminator() {
+        let event = parse_line(
+            r#"{"method":"session/event","params":{"sessionId":"s1","type":"turn.started"}}"#,
+        )
+        .unwrap();
+        let WireMessage::Event(event) = event else {
+            panic!("session/event must remain on the event stream");
+        };
+        assert_eq!(event_type(&event), Some("turn.started"));
     }
 }
