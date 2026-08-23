@@ -395,11 +395,21 @@ mod tests {
     }
 
     impl GatedSink {
-        fn wait_for_len(&self, expected: usize) {
+        fn wait_for_len(&self, expected: usize, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
             let mut records = self.records.lock().unwrap();
             while records.len() < expected {
-                records = self.changed.wait(records).unwrap();
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (next, wait) = self.changed.wait_timeout(records, deadline - now).unwrap();
+                records = next;
+                if wait.timed_out() && records.len() < expected {
+                    return false;
+                }
             }
+            true
         }
 
         fn release_through(&self, sequence: u64) {
@@ -437,7 +447,7 @@ mod tests {
         });
 
         for sequence in 1..=3 {
-            sink.wait_for_len(sequence as usize);
+            assert!(sink.wait_for_len(sequence as usize, Duration::from_secs(2)));
             assert!(sink
                 .snapshot()
                 .iter()
@@ -445,7 +455,7 @@ mod tests {
             sink.release_through(sequence);
         }
 
-        sink.wait_for_len(4);
+        assert!(sink.wait_for_len(4, Duration::from_secs(2)));
         let records = sink.snapshot();
         assert_eq!(
             records
@@ -465,6 +475,53 @@ mod tests {
             terminal.join().unwrap(),
             RuntimeTerminal::Stopped(_)
         ));
+    }
+
+    #[test]
+    fn runtime_owner_drains_real_driver_backlog_before_stop_terminal() {
+        let sink = Arc::new(GatedSink::default());
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\n' '{\"id\":1,\"result\":{}}' '{\"id\":2,\"result\":{}}' '{\"id\":3,\"result\":{}}'; trap '' TERM; exec tail -f /dev/null",
+        ]);
+        let owner = Arc::new(RuntimeOwner::spawn(command, sink.clone()).unwrap());
+        assert!(sink.wait_for_len(1, Duration::from_secs(2)));
+
+        let stop_owner = Arc::clone(&owner);
+        let stop = thread::spawn(move || stop_owner.stop(Duration::from_millis(100)));
+
+        for sequence in 1..=4 {
+            assert!(sink.wait_for_len(sequence as usize, Duration::from_secs(2)));
+            assert!(sink
+                .snapshot()
+                .iter()
+                .all(|record| matches!(record.event, RuntimeEvent::Driver(_))));
+            sink.release_through(sequence);
+        }
+
+        assert!(sink.wait_for_len(5, Duration::from_secs(2)));
+        let records = sink.snapshot();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, RuntimeEvent::Terminal(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(RuntimeEvent::Terminal(RuntimeTerminal::Stopped(_)))
+        ));
+        sink.release_through(5);
+        assert!(matches!(stop.join().unwrap(), RuntimeTerminal::Stopped(_)));
     }
 
     #[test]
@@ -538,6 +595,73 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn spontaneous_leader_exit_with_stdout_descendant_is_bounded_and_fail_closed() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "zcode-reviewd-stdout-descendant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sink = Arc::new(MemorySink::default());
+        let mut command = Command::new("sh");
+        command.env("DESCENDANT_PID_FILE", &pid_path).args([
+            "-c",
+            "sleep 3 & child=$!; printf '%s' \"$child\" > \"$DESCENDANT_PID_FILE\"; sleep 0.1; exit 7",
+        ]);
+        let owner = RuntimeOwner::spawn(command, sink.clone()).unwrap();
+        let descendant = wait_for_pid_file(&pid_path);
+
+        assert_eq!(
+            owner.wait_terminal(Duration::from_secs(2)),
+            Some(RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership))
+        );
+        assert!(observe_process(descendant).is_ok());
+        let records = sink.snapshot();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, RuntimeEvent::Terminal(_)))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(
+                RuntimeLoss::UnknownMembership
+            )))
+        ));
+
+        wait_for_process_exit(descendant);
+        std::fs::remove_file(pid_path).unwrap();
+    }
+
+    fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(pid) = contents.parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_process_exit(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while observe_process(pid).is_ok() {
+            assert!(Instant::now() < deadline, "descendant did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

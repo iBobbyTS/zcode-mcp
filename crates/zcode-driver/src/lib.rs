@@ -796,6 +796,8 @@ fn monitor_child(
     termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     read_done: Receiver<()>,
 ) {
+    const READ_EXIT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(1);
+
     loop {
         let status = {
             let mut guard = child_ref.lock().unwrap();
@@ -803,7 +805,7 @@ fn monitor_child(
                 Some(child) => match child.try_wait() {
                     Ok(status) => status,
                     Err(_) => {
-                        let _ = read_done.recv_timeout(Duration::from_secs(1));
+                        let _ = read_done.recv_timeout(READ_EXIT_BOUNDARY_TIMEOUT);
                         publish_child_exit(ChildExit::Unknown, &tx, &termination);
                         return;
                     }
@@ -812,10 +814,11 @@ fn monitor_child(
             }
         };
         if let Some(status) = status {
-            // A normal child exit closes the Driver-owned stdout pipe. Wait for
-            // the reader to enqueue every preceding item before publishing the
-            // exit boundary consumed by RuntimeOwner.
-            let _ = read_done.recv();
+            // A descendant may retain the stdout descriptor after the leader
+            // exits. Preserve the reader ordering barrier when it completes,
+            // but publish a bounded boundary so RuntimeOwner can classify a
+            // still-live or ambiguous group without signalling it.
+            let _ = read_done.recv_timeout(READ_EXIT_BOUNDARY_TIMEOUT);
             let exit = exit_class(status);
             let (result, cvar) = &*termination;
             let mut guard = result.lock().unwrap();
