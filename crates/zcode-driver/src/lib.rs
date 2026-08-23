@@ -1,8 +1,10 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::{
     io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -11,19 +13,38 @@ use std::{
     thread,
     time::Duration,
 };
-use zcode_protocol::{encode, parse_line, RequestEnvelope, WireMessage};
+use zcode_protocol::{
+    classify_lifecycle, encode, parse_line, LifecycleOrder, RequestEnvelope, WireMessage,
+};
+
+pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildExit {
+    Exited(Option<i32>),
+    Signaled(i32),
+    Unknown,
+}
 
 #[derive(Debug)]
 pub enum Inbound {
     Message(WireMessage),
+    Lifecycle {
+        sequence: u64,
+        method: String,
+        order: LifecycleOrder,
+    },
     Malformed(String),
-    ChildExited(Option<i32>),
+    OversizedLine {
+        bytes: usize,
+    },
+    ChildExited(ChildExit),
 }
 
 pub struct Driver {
     stdin: Arc<Mutex<ChildStdin>>,
     incoming: Mutex<Receiver<Inbound>>,
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     next_id: AtomicU64,
     stopped: AtomicBool,
 }
@@ -50,11 +71,15 @@ impl Driver {
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || read_loop(stdout, tx));
+        let read_tx = tx.clone();
+        thread::spawn(move || read_loop(stdout, read_tx));
+        let child_ref = Arc::new(Mutex::new(Some(child)));
+        let monitor_ref = Arc::clone(&child_ref);
+        thread::spawn(move || monitor_child(monitor_ref, tx));
         Ok(Self {
             stdin,
             incoming: Mutex::new(rx),
-            child: Mutex::new(Some(child)),
+            child: child_ref,
             next_id: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
         })
@@ -93,7 +118,6 @@ impl Driver {
             let _ = child.kill();
             #[cfg(unix)]
             let _ = child.kill();
-            let _ = child.wait();
         }
         Ok(())
     }
@@ -111,24 +135,95 @@ impl Drop for Driver {
 }
 
 fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>) {
-    for line in BufReader::new(stdout).lines() {
-        match line {
-            Ok(line) => match parse_line(&line) {
-                Ok(msg) => {
-                    if tx.send(Inbound::Message(msg)).is_err() {
-                        return;
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
+    let mut sequence = 0;
+    let mut turn_active = false;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) if buf.len() > MAX_NDJSON_LINE_BYTES => {
+                let _ = tx.send(Inbound::OversizedLine { bytes: buf.len() });
+                continue;
+            }
+            Ok(_) => {
+                sequence += 1;
+                let line = String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+                match parse_line(&line) {
+                    Ok(msg) => {
+                        if let WireMessage::Event(event) = &msg {
+                            let order = classify_lifecycle(&event.method, turn_active);
+                            if event.method == "turn/started"
+                                && matches!(order, LifecycleOrder::InOrder)
+                            {
+                                turn_active = true;
+                            }
+                            if matches!(event.method.as_str(), "turn/completed" | "turn/failed")
+                                && matches!(order, LifecycleOrder::InOrder)
+                            {
+                                turn_active = false;
+                            }
+                            if tx
+                                .send(Inbound::Lifecycle {
+                                    sequence,
+                                    method: event.method.clone(),
+                                    order,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if tx.send(Inbound::Message(msg)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        if tx.send(Inbound::Malformed(format!("{e:?}"))).is_err() {
+                            return;
+                        }
                     }
                 }
-                Err(e) => {
-                    if tx.send(Inbound::Malformed(format!("{e:?}"))).is_err() {
-                        return;
-                    }
-                }
-            },
+            }
             Err(_) => break,
         }
     }
-    let _ = tx.send(Inbound::ChildExited(None));
+}
+
+fn monitor_child(child_ref: Arc<Mutex<Option<Child>>>, tx: Sender<Inbound>) {
+    loop {
+        let status = {
+            let mut guard = child_ref.lock().unwrap();
+            guard.as_mut().and_then(|child| match child.try_wait() {
+                Ok(Some(status)) => Some(status),
+                Ok(None) => None,
+                Err(_) => Some(ExitStatus::from_raw(1)),
+            })
+        };
+        if let Some(status) = status {
+            let _ = tx.send(Inbound::ChildExited(exit_class(status)));
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn exit_class(status: ExitStatus) -> ChildExit {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        ChildExit::Signaled(signal)
+    } else {
+        ChildExit::Exited(status.code())
+    }
+}
+
+#[cfg(not(unix))]
+fn exit_class(status: ExitStatus) -> ChildExit {
+    ChildExit::Exited(status.code())
 }
 
 #[cfg(test)]
@@ -141,7 +236,7 @@ mod tests {
         let d = Driver::spawn(c).unwrap();
         let _ = d.send_request("turn/start", serde_json::json!({})).unwrap();
         let mut seen = 0;
-        for _ in 0..4 {
+        for _ in 0..8 {
             if let Ok(Inbound::Message(_)) = d.recv_timeout(Duration::from_secs(2)) {
                 seen += 1;
             }
@@ -181,5 +276,53 @@ mod tests {
         let _ = d.send_request("turn/start", serde_json::json!({}));
         d.stop().unwrap();
         d.stop().unwrap();
+    }
+
+    #[test]
+    fn oversized_line_is_classified_and_discarded() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "printf '%1048577s\\n' x"]);
+        let d = Driver::spawn(c).unwrap();
+        assert!(matches!(
+            d.recv_timeout(Duration::from_secs(2)),
+            Ok(Inbound::OversizedLine { bytes }) if bytes > MAX_NDJSON_LINE_BYTES
+        ));
+        d.stop().unwrap();
+    }
+
+    #[test]
+    fn child_exit_status_is_published_once() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "exit 7"]);
+        let d = Driver::spawn(c).unwrap();
+        assert!(matches!(
+            d.recv_timeout(Duration::from_secs(2)),
+            Ok(Inbound::ChildExited(ChildExit::Exited(Some(7))))
+        ));
+        assert!(matches!(
+            d.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn out_of_order_lifecycle_keeps_transport_sequence() {
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            "printf '%s\\n' '{\"method\":\"turn/completed\",\"params\":{}}' '{\"method\":\"turn/started\",\"params\":{}}'",
+        ]);
+        let d = Driver::spawn(c).unwrap();
+        let first = d.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = d.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            first,
+            Inbound::Lifecycle {
+                sequence: 1,
+                order: LifecycleOrder::OutOfOrder { .. },
+                ..
+            }
+        ));
+        assert!(matches!(second, Inbound::Message(WireMessage::Event(_))));
     }
 }

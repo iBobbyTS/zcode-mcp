@@ -39,6 +39,7 @@ pub enum ParseError {
     NotObject,
     MissingKind,
     InvalidEnvelope(String),
+    ContradictoryResponse,
 }
 
 pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
@@ -46,6 +47,9 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
         serde_json::from_str(line).map_err(|e| ParseError::InvalidJson(e.to_string()))?;
     let obj = value.as_object().ok_or(ParseError::NotObject)?;
     if obj.contains_key("id") && (obj.contains_key("result") || obj.contains_key("error")) {
+        if obj.contains_key("result") && obj.contains_key("error") {
+            return Err(ParseError::ContradictoryResponse);
+        }
         return serde_json::from_value(value)
             .map(WireMessage::Response)
             .map_err(|e| ParseError::InvalidEnvelope(e.to_string()));
@@ -79,6 +83,28 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
     Err(ParseError::MissingKind)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleOrder {
+    NotLifecycle,
+    InOrder,
+    OutOfOrder { expected: &'static str },
+}
+
+/// Classify lifecycle events without reordering or dropping the wire stream.
+pub fn classify_lifecycle(method: &str, turn_active: bool) -> LifecycleOrder {
+    match (method, turn_active) {
+        ("turn/started", false) => LifecycleOrder::InOrder,
+        ("turn/started", true) => LifecycleOrder::OutOfOrder {
+            expected: "turn/completed or turn/failed",
+        },
+        ("turn/completed" | "turn/failed", true) => LifecycleOrder::InOrder,
+        ("turn/completed" | "turn/failed", false) => LifecycleOrder::OutOfOrder {
+            expected: "turn/started",
+        },
+        _ => LifecycleOrder::NotLifecycle,
+    }
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string(value)
 }
@@ -104,5 +130,23 @@ mod tests {
     #[test]
     fn malformed_classified() {
         assert!(matches!(parse_line("{"), Err(ParseError::InvalidJson(_))));
+    }
+
+    #[test]
+    fn contradictory_response_is_rejected() {
+        assert_eq!(
+            parse_line(r#"{"id":1,"result":{},"error":{}}"#),
+            Err(ParseError::ContradictoryResponse)
+        );
+    }
+
+    #[test]
+    fn lifecycle_order_is_explicit() {
+        assert_eq!(
+            classify_lifecycle("turn/completed", false),
+            LifecycleOrder::OutOfOrder {
+                expected: "turn/started"
+            }
+        );
     }
 }
