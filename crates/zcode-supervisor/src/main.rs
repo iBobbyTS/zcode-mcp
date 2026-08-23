@@ -13,5 +13,8 @@ fn main() {
         .unwrap()
         .parse()
         .unwrap();
-    zcode_supervisor::shim::run(fd, &control, &state, &program, &args).unwrap();
+    if let Err(error) = zcode_supervisor::shim::run(fd, &control, &state, &program, &args) {
+        eprintln!("zcode-supervisor-shim: {error}");
+        std::process::exit(1);
+    }
 }
