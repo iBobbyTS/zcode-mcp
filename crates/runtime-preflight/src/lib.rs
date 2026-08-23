@@ -6,9 +6,13 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Preflight {
@@ -77,14 +81,23 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
     if !path.is_file() {
         return untested("runtime unavailable");
     }
-    let mut child = match Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(path)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => return failed("unable to start node"),
     };
@@ -96,15 +109,21 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         .ok_or(())
         .and_then(|stdin| stdin.write_all(request.as_bytes()).map_err(|_| ()));
     if write_result.is_err() {
-        let _ = child.kill();
+        terminate_process_group(&mut child);
         let _ = child.wait();
         return failed("unable to write probe");
     }
     drop(child.stdin.take());
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, 64 * 1024));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, 64 * 1024));
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = stdout_tx.send(read_bounded(stdout, 64 * 1024));
+    });
+    thread::spawn(move || {
+        let _ = stderr_tx.send(read_bounded(stderr, 64 * 1024));
+    });
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     while Instant::now() < deadline {
@@ -115,11 +134,17 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
     }
     if child.try_wait().ok().flatten().is_none() {
         timed_out = true;
-        let _ = child.kill();
+        terminate_process_group(&mut child);
     }
     let status = child.wait().ok();
-    let out = stdout_reader.join().unwrap_or_default();
-    let _stderr = stderr_reader.join().unwrap_or_default();
+    // Descendants can inherit the pipes after the leader exits. Never join a
+    // reader indefinitely; process-group termination normally closes them.
+    let out = stdout_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap_or_default();
+    let _stderr = stderr_rx
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap_or_default();
     if timed_out {
         return failed("probe timed out");
     }
@@ -160,6 +185,20 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         reason: None,
         observed_methods: Some(methods),
     }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = killpg(child.id() as i32, 9);
+    }
+    let _ = child.kill();
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
@@ -316,15 +355,17 @@ mod tests {
 
     #[test]
     fn probe_times_out_and_redacts_identity() {
-        let paths = fixture("#!/bin/sh\nsleep 2");
+        let paths = fixture("#!/bin/sh\nsleep 2 & wait");
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
             .status()
             .unwrap();
+        let started = Instant::now();
         let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_millis(20));
         assert_eq!(result.compatibility_status, "failed");
         assert!(result.reason.unwrap().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             identity(Some(&paths.1)).unwrap().runtime_path.as_deref(),
             Some("<redacted>")
