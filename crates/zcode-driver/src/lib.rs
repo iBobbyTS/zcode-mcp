@@ -43,7 +43,7 @@ pub struct Driver {
     stdin: Arc<Mutex<ChildStdin>>,
     incoming: Mutex<Receiver<Inbound>>,
     child: Arc<Mutex<Option<Child>>>,
-    termination: Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
+    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     next_id: AtomicU64,
     stopped: AtomicBool,
 }
@@ -75,7 +75,7 @@ impl Driver {
         thread::spawn(move || read_loop(stdout, read_tx, read_done_tx));
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let monitor_ref = Arc::clone(&child_ref);
-        let termination = Arc::new((std::sync::OnceLock::new(), Mutex::new(()), Condvar::new()));
+        let termination = Arc::new((Mutex::new(None), Condvar::new()));
         let monitor_termination = Arc::clone(&termination);
         thread::spawn(move || monitor_child(monitor_ref, tx, monitor_termination, read_done_rx));
         Ok(Self {
@@ -125,13 +125,13 @@ impl Driver {
         Ok(())
     }
     pub fn wait(&self) -> std::io::Result<Option<i32>> {
-        let (result, wait_lock, cvar) = &*self.termination;
-        let mut guard = wait_lock.lock().unwrap();
-        while result.get().is_none() {
+        let (result, cvar) = &*self.termination;
+        let mut guard = result.lock().unwrap();
+        while guard.is_none() {
             guard = cvar.wait(guard).unwrap();
         }
         Ok(
-            match result.get().expect("child monitor publishes before wake") {
+            match guard.as_ref().expect("child monitor publishes before wake") {
                 ChildExit::Exited(code) => *code,
                 _ => None,
             },
@@ -241,7 +241,7 @@ fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>,
 fn monitor_child(
     child_ref: Arc<Mutex<Option<Child>>>,
     tx: Sender<Inbound>,
-    termination: Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
+    termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     read_done: Receiver<()>,
 ) {
     loop {
@@ -262,8 +262,11 @@ fn monitor_child(
         if let Some(status) = status {
             let _ = read_done.recv_timeout(Duration::from_secs(1));
             let exit = exit_class(status);
-            let (result, _wait_lock, cvar) = &*termination;
-            let _ = result.set(exit.clone());
+            let (result, cvar) = &*termination;
+            let mut guard = result.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(exit.clone());
+            }
             cvar.notify_all();
             let _ = tx.send(Inbound::ChildExited(exit));
             return;
@@ -275,10 +278,13 @@ fn monitor_child(
 fn publish_child_exit(
     exit: ChildExit,
     tx: &Sender<Inbound>,
-    termination: &Arc<(std::sync::OnceLock<ChildExit>, Mutex<()>, Condvar)>,
+    termination: &Arc<(Mutex<Option<ChildExit>>, Condvar)>,
 ) {
-    let (result, _wait_lock, cvar) = &**termination;
-    let _ = result.set(exit.clone());
+    let (result, cvar) = &**termination;
+    let mut guard = result.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(exit.clone());
+    }
     cvar.notify_all();
     let _ = tx.send(Inbound::ChildExited(exit));
 }
@@ -386,6 +392,27 @@ mod tests {
             d.recv_timeout(Duration::from_millis(50)),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn wait_race_does_not_lose_child_exit_wakeup() {
+        // Exercise the boundary where the monitor publishes just as a caller
+        // begins waiting. The timeout keeps a lost wakeup from hanging tests.
+        for _ in 0..64 {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 0"]);
+            let driver = Arc::new(Driver::spawn(c).unwrap());
+            let waiter = Arc::clone(&driver);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(waiter.wait());
+            });
+            let result = rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wait must not lose monitor notification")
+                .unwrap();
+            assert_eq!(result, Some(0));
+        }
     }
 
     #[test]
