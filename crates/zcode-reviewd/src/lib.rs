@@ -724,6 +724,10 @@ impl Scheduler {
         })
     }
 
+    pub fn store(&self) -> Arc<Store> {
+        Arc::clone(&self.inner.store)
+    }
+
     pub fn enqueue(&self, job: &NewJob) -> Result<Job, SchedulerError> {
         Ok(self.inner.store.enqueue_job(job)?)
     }

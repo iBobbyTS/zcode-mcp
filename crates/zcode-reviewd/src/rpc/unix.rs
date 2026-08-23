@@ -219,6 +219,13 @@ fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
 }
 
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    remove_stale_socket_with(path, |path| UnixStream::connect(path).map(drop))
+}
+
+fn remove_stale_socket_with<F>(path: &Path, connect: F) -> io::Result<()>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -230,10 +237,28 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
             "socket path exists and is not a socket",
         ));
     }
-    if UnixStream::connect(path).is_ok() {
+    let expected = SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    match connect(path) {
+        Ok(()) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "socket already has a listener",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(error) => return Err(error),
+    }
+    let current = fs::symlink_metadata(path)?;
+    if !current.file_type().is_socket()
+        || current.dev() != expected.device
+        || current.ino() != expected.inode
+    {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            "socket already has a listener",
+            "socket identity changed during stale cleanup",
         ));
     }
     fs::remove_file(path)
@@ -289,13 +314,21 @@ fn write_response(stream: &mut UnixStream, mut response: RpcResponse) -> io::Res
     if frame.len() > MAX_FRAME_BYTES {
         response = RpcResponse {
             version: RPC_VERSION,
-            request_id: response.request_id,
+            request_id: response
+                .request_id
+                .filter(|request_id| !request_id.is_empty() && request_id.len() <= 128),
             outcome: RpcOutcome::Error {
                 error: RpcError::new(RpcErrorCode::Oversized, "response frame exceeds cap"),
             },
         };
         frame = serde_json::to_vec(&response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized fallback response exceeds cap",
+            ));
+        }
     }
     frame.push(b'\n');
     stream.write_all(&frame)
@@ -326,5 +359,47 @@ fn read_limited_frame<R: BufRead>(reader: &mut R, cap: usize) -> io::Result<Vec<
         if newline.is_some() {
             return Ok(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_connect_error_preserves_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let error = remove_stale_socket_with(&path, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "scripted ambiguous failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(path.exists());
+        drop(listener);
+    }
+
+    #[test]
+    fn replaced_socket_is_not_unlinked_after_no_listener_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let mut replacement = None;
+        let error = remove_stale_socket_with(&path, |path| {
+            fs::remove_file(path).unwrap();
+            replacement = Some(UnixListener::bind(path).unwrap());
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "scripted no-listener result",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.exists());
+        drop(replacement);
     }
 }

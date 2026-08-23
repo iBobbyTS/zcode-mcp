@@ -156,7 +156,7 @@ fn fixture() -> Fixture {
         },
     )
     .unwrap();
-    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)));
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
     let server = RpcServer::bind(&socket, Arc::clone(&service), ServerOptions::default()).unwrap();
     Fixture {
         _directory: directory,
@@ -355,6 +355,37 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
         error(raw_call(&fixture.socket, &oversized)).code,
         RpcErrorCode::Oversized
     );
+
+    let near_cap_id = "r".repeat(MAX_FRAME_BYTES - 128);
+    let response = client(&fixture.socket)
+        .call(&RpcRequest {
+            version: RPC_VERSION,
+            request_id: near_cap_id,
+            method: RpcMethod::Start,
+        })
+        .unwrap();
+    assert_eq!(response.request_id, None);
+    assert_eq!(error(response).code, RpcErrorCode::Validation);
+}
+
+#[test]
+fn rpc_service_rejects_a_store_outside_the_scheduler_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let scheduler_store =
+        Arc::new(Store::open(directory.path().join("scheduler.sqlite3")).unwrap());
+    let other_store = Arc::new(Store::open(directory.path().join("other.sqlite3")).unwrap());
+    let factory: Arc<dyn RuntimeFactory> = Arc::new(FakeFactory::default());
+    let scheduler = Scheduler::new(
+        "rpc-owner",
+        scheduler_store,
+        factory,
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        RpcService::new(scheduler, other_store),
+        Err(RpcServiceConfigError::MismatchedStore)
+    ));
 }
 
 #[test]
@@ -707,10 +738,8 @@ fn file_backed_server_restart_reconciles_and_retains_partial_events() {
         restarted_scheduler.reconcile_startup().unwrap(),
         vec![("job-1".into(), JobState::FailedRuntimeLost)]
     );
-    let restarted_service = Arc::new(RpcService::new(
-        restarted_scheduler,
-        Arc::clone(&restarted_store),
-    ));
+    let restarted_service =
+        Arc::new(RpcService::new(restarted_scheduler, Arc::clone(&restarted_store)).unwrap());
     let restarted =
         RpcServer::bind(&fixture.socket, restarted_service, ServerOptions::default()).unwrap();
     let rpc = client(&fixture.socket);
@@ -843,7 +872,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
         },
     )
     .unwrap();
-    let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)));
+    let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
     let socket = directory.path().join("private").join("review.sock");
     let server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
     let rpc = client(&socket);

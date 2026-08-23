@@ -2,9 +2,12 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use std::{
     fmt,
     path::Path,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, TryLockError},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -303,6 +306,19 @@ pub struct StoredEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitSnapshot {
+    pub job: Option<Job>,
+    pub runtime_agent_id: Option<String>,
+    pub events: Vec<StoredEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeadlineRead<T> {
+    Ready(T),
+    TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewArtifact {
     pub artifact_id: String,
     pub agent_id: String,
@@ -338,7 +354,7 @@ pub struct Store {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let connection = Connection::open(path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
         Ok(Self {
@@ -397,6 +413,59 @@ impl Store {
     pub fn get_job(&self, agent_id: &str) -> StoreResult<Option<Job>> {
         let connection = self.connection.lock().unwrap();
         query_job(&connection, agent_id)
+    }
+
+    pub fn wait_snapshot_until(
+        &self,
+        agent_id: &str,
+        requested_runtime_agent_id: Option<&str>,
+        after: u64,
+        limit: usize,
+        deadline: Instant,
+    ) -> StoreResult<DeadlineRead<WaitSnapshot>> {
+        let after = u64_to_i64(after)?;
+        let limit = usize_to_i64(limit)?;
+        let connection = loop {
+            match self.connection.try_lock() {
+                Ok(connection) => break connection,
+                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(DeadlineRead::TimedOut);
+                    }
+                    thread::sleep((deadline - now).min(Duration::from_millis(1)));
+                }
+            }
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(DeadlineRead::TimedOut);
+        }
+        connection.busy_timeout(deadline - now)?;
+        let snapshot = (|| {
+            let job = query_job(&connection, agent_id)?;
+            let runtime_agent_id = requested_runtime_agent_id
+                .map(str::to_owned)
+                .or_else(|| job.as_ref().and_then(|job| job.runtime_agent_id.clone()));
+            let events = match runtime_agent_id.as_deref() {
+                Some(runtime_agent_id) => {
+                    query_events_after(&connection, agent_id, runtime_agent_id, after, limit)?
+                }
+                None => Vec::new(),
+            };
+            Ok(WaitSnapshot {
+                job,
+                runtime_agent_id,
+                events,
+            })
+        })();
+        let restore = connection.busy_timeout(STORE_BUSY_TIMEOUT);
+        restore?;
+        if Instant::now() >= deadline {
+            return Ok(DeadlineRead::TimedOut);
+        }
+        snapshot.map(DeadlineRead::Ready)
     }
 
     pub fn list_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
@@ -920,53 +989,13 @@ impl Store {
         limit: usize,
     ) -> StoreResult<Vec<StoredEvent>> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare(
-            "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level
-             FROM events WHERE agent_id = ?1 AND runtime_agent_id = ?2 AND seq > ?3
-             ORDER BY seq LIMIT ?4",
-        )?;
-        let events = statement
-            .query_map(
-                params![
-                    agent_id,
-                    runtime_agent_id,
-                    u64_to_i64(after)?,
-                    usize_to_i64(limit)?
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        events
-            .into_iter()
-            .map(
-                |(
-                    runtime_agent_id,
-                    sequence,
-                    source_sequence,
-                    event_type,
-                    payload_json,
-                    redaction_level,
-                )| {
-                    Ok(StoredEvent {
-                        runtime_agent_id,
-                        sequence: i64_to_u64(sequence)?,
-                        source_sequence: i64_to_u64(source_sequence)?,
-                        event_type,
-                        payload_json,
-                        redaction_level,
-                    })
-                },
-            )
-            .collect()
+        query_events_after(
+            &connection,
+            agent_id,
+            runtime_agent_id,
+            u64_to_i64(after)?,
+            usize_to_i64(limit)?,
+        )
     }
 
     pub fn cursor(&self, agent_id: &str, runtime_agent_id: &str) -> StoreResult<u64> {
@@ -1074,6 +1103,54 @@ impl Store {
         connection.pragma_update(None, "query_only", enabled)?;
         Ok(())
     }
+}
+
+fn query_events_after(
+    connection: &Connection,
+    agent_id: &str,
+    runtime_agent_id: &str,
+    after: i64,
+    limit: i64,
+) -> StoreResult<Vec<StoredEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level
+         FROM events WHERE agent_id = ?1 AND runtime_agent_id = ?2 AND seq > ?3
+         ORDER BY seq LIMIT ?4",
+    )?;
+    let events = statement
+        .query_map(params![agent_id, runtime_agent_id, after, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    events
+        .into_iter()
+        .map(
+            |(
+                runtime_agent_id,
+                sequence,
+                source_sequence,
+                event_type,
+                payload_json,
+                redaction_level,
+            )| {
+                Ok(StoredEvent {
+                    runtime_agent_id,
+                    sequence: i64_to_u64(sequence)?,
+                    source_sequence: i64_to_u64(source_sequence)?,
+                    event_type,
+                    payload_json,
+                    redaction_level,
+                })
+            },
+        )
+        .collect()
 }
 
 fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>> {
@@ -1498,6 +1575,26 @@ mod tests {
             ids[0]
         );
         assert!(store.claim_next("owner", 8, 8).unwrap().is_none());
+    }
+
+    #[test]
+    fn wait_snapshot_deadline_includes_store_mutex_contention() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "job-1", "a");
+        let connection = store.connection.lock().unwrap();
+        let started = Instant::now();
+        let result = store
+            .wait_snapshot_until(
+                "job-1",
+                None,
+                0,
+                10,
+                Instant::now() + Duration::from_millis(20),
+            )
+            .unwrap();
+        assert_eq!(result, DeadlineRead::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(connection);
     }
 
     #[test]

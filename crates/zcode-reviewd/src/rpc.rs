@@ -1,5 +1,8 @@
 use crate::{Scheduler, SchedulerError};
-use review_store::{Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent};
+use review_store::{
+    DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent,
+    WaitSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -379,9 +382,17 @@ pub struct RpcService {
     store: Arc<Store>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcServiceConfigError {
+    MismatchedStore,
+}
+
 impl RpcService {
-    pub fn new(scheduler: Scheduler, store: Arc<Store>) -> Self {
-        Self { scheduler, store }
+    pub fn new(scheduler: Scheduler, store: Arc<Store>) -> Result<Self, RpcServiceConfigError> {
+        if !Arc::ptr_eq(&scheduler.store(), &store) {
+            return Err(RpcServiceConfigError::MismatchedStore);
+        }
+        Ok(Self { scheduler, store })
     }
 
     pub fn handle_bytes(&self, frame: &[u8]) -> RpcResponse {
@@ -397,6 +408,7 @@ impl RpcService {
         let request_id = value
             .get("request_id")
             .and_then(Value::as_str)
+            .filter(|request_id| valid_request_id(request_id))
             .map(str::to_owned);
         let version = value.get("version").and_then(Value::as_u64);
         if version != Some(u64::from(RPC_VERSION)) {
@@ -426,9 +438,9 @@ impl RpcService {
                 )
             }
         };
-        if request.request_id.is_empty() || request.request_id.len() > 128 {
+        if !valid_request_id(&request.request_id) {
             return RpcResponse::error(
-                Some(request.request_id),
+                None,
                 RpcError::new(RpcErrorCode::Validation, "request_id is invalid"),
             );
         }
@@ -572,34 +584,7 @@ impl RpcService {
                 query.limit + 1,
             )
             .map_err(map_store)?;
-        let mut events = Vec::new();
-        let mut payload_bytes = 0usize;
-        let mut has_more = stored.len() > query.limit;
-        for event in stored.into_iter().take(query.limit) {
-            if event.payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
-                return Err(RpcError::new(
-                    RpcErrorCode::Oversized,
-                    "stored event payload exceeds the transport cap",
-                ));
-            }
-            let next_bytes = payload_bytes.saturating_add(event.payload_json.len());
-            if next_bytes > MAX_PAGE_PAYLOAD_BYTES {
-                has_more = true;
-                break;
-            }
-            payload_bytes = next_bytes;
-            events.push(event.into());
-        }
-        let next_sequence = events
-            .last()
-            .map(|event: &EventView| event.sequence)
-            .unwrap_or(query.after);
-        Ok(EventPage {
-            runtime_agent_id: Some(runtime_agent_id),
-            events,
-            next_sequence,
-            has_more,
-        })
+        page_from_events(Some(runtime_agent_id), query.after, query.limit, stored)
     }
 
     fn wait(&self, query: WaitQuery) -> Result<RpcSuccess, RpcError> {
@@ -609,31 +594,62 @@ impl RpcService {
                 "wait timeout is outside the allowed range",
             ));
         }
-        let initial = self.require_job(&query.agent_id)?;
         let deadline = Instant::now() + Duration::from_millis(query.timeout_ms);
+        validate_id(&query.agent_id, "agent_id")?;
+        if let Some(runtime_agent_id) = query.runtime_agent_id.as_deref() {
+            validate_id(runtime_agent_id, "runtime_agent_id")?;
+        }
+        let (initial, initial_page) = self.wait_snapshot(&query, deadline)?;
+        if !initial_page.events.is_empty() || initial.state.is_terminal() {
+            return Ok(RpcSuccess::Wait {
+                job: initial.into(),
+                page: initial_page,
+            });
+        }
+        let initial_state = initial.state;
         loop {
-            let job = self.require_job(&query.agent_id)?;
-            let page = self.event_page(EventQuery {
-                agent_id: query.agent_id.clone(),
-                runtime_agent_id: query.runtime_agent_id.clone(),
-                after: query.after,
-                limit: MAX_PAGE_EVENTS,
-            })?;
-            if !page.events.is_empty() || job.state.is_terminal() || job.state != initial.state {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(wait_timeout());
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+            let (job, page) = self.wait_snapshot(&query, deadline)?;
+            if !page.events.is_empty() || job.state.is_terminal() || job.state != initial_state {
                 return Ok(RpcSuccess::Wait {
                     job: job.into(),
                     page,
                 });
             }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RpcError::new(
-                    RpcErrorCode::Timeout,
-                    "wait deadline elapsed",
-                ));
-            }
-            thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
+    }
+
+    fn wait_snapshot(
+        &self,
+        query: &WaitQuery,
+        deadline: Instant,
+    ) -> Result<(Job, EventPage), RpcError> {
+        let snapshot = match self
+            .store
+            .wait_snapshot_until(
+                &query.agent_id,
+                query.runtime_agent_id.as_deref(),
+                query.after,
+                MAX_PAGE_EVENTS + 1,
+                deadline,
+            )
+            .map_err(map_store)?
+        {
+            DeadlineRead::Ready(snapshot) => snapshot,
+            DeadlineRead::TimedOut => return Err(wait_timeout()),
+        };
+        let WaitSnapshot {
+            job,
+            runtime_agent_id,
+            events,
+        } = snapshot;
+        let job = job.ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "job was not found"))?;
+        let page = page_from_events(runtime_agent_id, query.after, MAX_PAGE_EVENTS, events)?;
+        Ok((job, page))
     }
 
     fn result(&self, query: ResultQuery) -> Result<RpcSuccess, RpcError> {
@@ -687,6 +703,50 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
 
 fn validate_id(value: &str, field: &str) -> Result<(), RpcError> {
     validate_text(value, field, 256)
+}
+
+fn valid_request_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.contains('\0')
+}
+
+fn wait_timeout() -> RpcError {
+    RpcError::new(RpcErrorCode::Timeout, "wait deadline elapsed")
+}
+
+fn page_from_events(
+    runtime_agent_id: Option<String>,
+    after: u64,
+    limit: usize,
+    stored: Vec<StoredEvent>,
+) -> Result<EventPage, RpcError> {
+    let mut events = Vec::new();
+    let mut payload_bytes = 0usize;
+    let mut has_more = stored.len() > limit;
+    for event in stored.into_iter().take(limit) {
+        if event.payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
+            return Err(RpcError::new(
+                RpcErrorCode::Oversized,
+                "stored event payload exceeds the transport cap",
+            ));
+        }
+        let next_bytes = payload_bytes.saturating_add(event.payload_json.len());
+        if next_bytes > MAX_PAGE_PAYLOAD_BYTES {
+            has_more = true;
+            break;
+        }
+        payload_bytes = next_bytes;
+        events.push(event.into());
+    }
+    let next_sequence = events
+        .last()
+        .map(|event: &EventView| event.sequence)
+        .unwrap_or(after);
+    Ok(EventPage {
+        runtime_agent_id,
+        events,
+        next_sequence,
+        has_more,
+    })
 }
 
 fn validate_text(value: &str, field: &str, max: usize) -> Result<(), RpcError> {
