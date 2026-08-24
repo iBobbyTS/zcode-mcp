@@ -63,6 +63,21 @@ impl ReviewJobOrchestrator {
         &self,
         manifest: &ReviewManifest,
     ) -> Result<SpawnedReview, OrchestrationError> {
+        self.submit_review_mode(manifest, true)
+    }
+
+    pub fn submit_review(
+        &self,
+        manifest: &ReviewManifest,
+    ) -> Result<SpawnedReview, OrchestrationError> {
+        self.submit_review_mode(manifest, false)
+    }
+
+    fn submit_review_mode(
+        &self,
+        manifest: &ReviewManifest,
+        start: bool,
+    ) -> Result<SpawnedReview, OrchestrationError> {
         let prepared = ReviewPreparer
             .prepare(manifest)
             .map_err(|error| OrchestrationError::Preparation(error.to_string()))?;
@@ -80,7 +95,9 @@ impl ReviewJobOrchestrator {
             .map_err(OrchestrationError::Store)?
             .is_some()
         {
-            let _ = self.scheduler.start_ready();
+            if start {
+                let _ = self.scheduler.start_ready();
+            }
             let job = self
                 .scheduler
                 .store()
@@ -98,9 +115,10 @@ impl ReviewJobOrchestrator {
             .enqueue_prepared(agent_id, prompt.text, &prepared)
             .map_err(OrchestrationError::Scheduler)?;
 
-        // Starting is intentionally automatic. Runtime/session failures are durable
-        // job outcomes, so callers still receive the stable job identifier.
-        let _ = self.scheduler.start_ready();
+        if start {
+            let _ = self.scheduler.start_ready();
+        }
+
         let job = self
             .scheduler
             .store()

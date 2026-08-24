@@ -279,6 +279,13 @@ pub enum JobState {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobListScope {
+    Active,
+    Recent,
+    All,
+}
+
 impl JobState {
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -796,16 +803,25 @@ impl Store {
     }
 
     pub fn list_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
+        self.list_jobs_scoped(JobListScope::Recent, limit)
+    }
+
+    pub fn list_jobs_scoped(&self, scope: JobListScope, limit: usize) -> StoreResult<Vec<Job>> {
         let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare(
+        let where_clause = match scope {
+            JobListScope::Active => "WHERE state IN ('QUEUED', 'STARTING', 'RUNNING', 'STOPPING')",
+            JobListScope::Recent | JobListScope::All => "",
+        };
+        let sql = format!(
             "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
                     owner_epoch, close_requested, stop_requested, last_event_seq,
                     failure_code, failure_message, runtime_agent_id,
                     zcode_session_id, turn_state, pid, process_group_id,
                     process_uid, process_start_token, closed_at, reaped_at, created_at,
                     prepared_launch_json, prepared_launch_sha256
-             FROM agents ORDER BY created_at DESC, rowid DESC LIMIT ?1",
-        )?;
+             FROM agents {where_clause} ORDER BY created_at DESC, rowid DESC LIMIT ?1"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement
             .query_map([usize_to_i64(limit)?], map_job_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -3088,6 +3104,22 @@ mod tests {
         let mut job = NewJob::new(id, workspace);
         job.idempotency_key = Some(format!("key-{id}"));
         store.enqueue_job(&job).unwrap()
+    }
+
+    #[test]
+    fn active_list_filters_in_sql_before_limit() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "old-active", "/workspace/active");
+        let claim = store.claim_next("daemon", 200, 200).unwrap().unwrap();
+        assert_eq!(claim.job.agent_id, "old-active");
+        for index in 0..101 {
+            let id = format!("terminal-{index:03}");
+            enqueue(&store, &id, &format!("/workspace/{index}"));
+            assert_eq!(store.request_stop(&id).unwrap().state, JobState::Cancelled);
+        }
+        let active = store.list_jobs_scoped(JobListScope::Active, 100).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].agent_id, "old-active");
     }
 
     fn claim(store: &Store, id: &str) -> JobClaim {

@@ -393,7 +393,10 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
             agent_id: "job-1".into(),
             preview_bytes: 64,
         }),
-        RpcMethod::List { limit: 10 },
+        RpcMethod::List {
+            scope: JobListScopeView::Recent,
+            limit: 10,
+        },
         RpcMethod::Close {
             agent_id: "job-1".into(),
         },
@@ -454,7 +457,7 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     assert_eq!(
         error(raw_call(
             &fixture.socket,
-            b"{\"version\":4,\"request_id\":\"m\",\"method\":\"missing\"}\n"
+            b"{\"version\":5,\"request_id\":\"m\",\"method\":\"missing\"}\n"
         ))
         .code,
         RpcErrorCode::UnknownMethod
@@ -476,7 +479,13 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     assert_eq!(
         error(
             client(&fixture.socket)
-                .call(&request("invalid", RpcMethod::List { limit: 0 }))
+                .call(&request(
+                    "invalid",
+                    RpcMethod::List {
+                        scope: JobListScopeView::Recent,
+                        limit: 0
+                    }
+                ))
                 .unwrap()
         )
         .code,
@@ -718,13 +727,19 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
     assert!(matches!(
         success(rpc.call(&request("respond-1", respond.clone())).unwrap()),
         RpcSuccess::Respond {
-            disposition: ResponseDispositionView::Responded
+            outcome: ResponseOutcomeView {
+                disposition: ResponseDispositionView::Responded,
+                ..
+            }
         }
     ));
     assert!(matches!(
         success(rpc.call(&request("respond-2", respond)).unwrap()),
         RpcSuccess::Respond {
-            disposition: ResponseDispositionView::AlreadyResponded
+            outcome: ResponseOutcomeView {
+                disposition: ResponseDispositionView::AlreadyResponded,
+                ..
+            }
         }
     ));
 
@@ -774,8 +789,8 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
     let validator = jsonschema::draft202012::options().build(&schema).unwrap();
     assert!(validator.is_valid(&serde_json::to_value(artifact).unwrap()));
 
-    assert_eq!(
-        error(
+    assert!(matches!(
+        success(
             rpc.call(&request(
                 "wait-timeout",
                 RpcMethod::Wait(WaitQuery {
@@ -786,17 +801,15 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
                 }),
             ))
             .unwrap()
-        )
-        .code,
-        RpcErrorCode::Timeout
-    );
+        ),
+        RpcSuccess::Wait { timed_out: true, ref page, .. } if page.events.is_empty()
+    ));
     let emit_runtime = Arc::clone(&runtime);
     let emit = thread::spawn(move || {
         thread::sleep(Duration::from_millis(20));
         emit_runtime.emit(RuntimeEvent::Driver(Inbound::OversizedLine { bytes: 4096 }));
     });
-    assert!(matches!(
-        success(
+    assert!(matches!(success(
             rpc.call(&request(
                 "wait-event",
                 RpcMethod::Wait(WaitQuery {
@@ -827,7 +840,7 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
         RpcSuccess::Status { ref job } if job.state == JobStateView::Running
     ));
     assert!(matches!(
-        success(rpc.call(&request("list", RpcMethod::List { limit: 10 })).unwrap()),
+        success(rpc.call(&request("list", RpcMethod::List { scope: JobListScopeView::Recent, limit: 10 })).unwrap()),
         RpcSuccess::Listed { ref jobs } if jobs.len() == 1
     ));
 }
@@ -1216,7 +1229,10 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
             .unwrap()
         ),
         RpcSuccess::Respond {
-            disposition: ResponseDispositionView::Responded
+            outcome: ResponseOutcomeView {
+                disposition: ResponseDispositionView::Responded,
+                ..
+            }
         }
     ));
     let unsupported = rpc

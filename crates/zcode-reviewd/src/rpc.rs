@@ -5,8 +5,8 @@ use crate::{
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
 use review_preparation::ReviewManifest;
 use review_store::{
-    DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent, TurnState,
-    WaitSnapshot,
+    DeadlineRead, Job, JobListScope, JobState, NewJob, PendingRequestState, Store, StoreError,
+    StoredArtifact, StoredEvent, StoredPendingRequest, TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 4;
+pub const RPC_VERSION: u16 = 5;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -43,19 +43,40 @@ pub struct RpcRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RpcMethod {
-    SpawnReview { manifest: ReviewManifest },
-    Enqueue { job: NewJobInput },
+    SpawnReview {
+        manifest: ReviewManifest,
+    },
+    SubmitReview {
+        manifest: ReviewManifest,
+    },
+    Enqueue {
+        job: NewJobInput,
+    },
     Start,
-    Status { agent_id: String },
+    Status {
+        agent_id: String,
+    },
+    Pending {
+        agent_id: String,
+    },
     Events(EventQuery),
     Wait(WaitQuery),
     Message(MessageInput),
     Respond(RespondInput),
-    Stop { agent_id: String },
+    Stop {
+        agent_id: String,
+    },
     Result(ResultQuery),
-    List { limit: usize },
-    Close { agent_id: String },
-    Reap { agent_id: String },
+    List {
+        scope: JobListScopeView,
+        limit: usize,
+    },
+    Close {
+        agent_id: String,
+    },
+    Reap {
+        agent_id: String,
+    },
     ReviewTool(ReviewToolInput),
 }
 
@@ -64,9 +85,11 @@ impl RpcMethod {
         matches!(
             name,
             "spawn_review"
+                | "submit_review"
                 | "enqueue"
                 | "start"
                 | "status"
+                | "pending"
                 | "events"
                 | "wait"
                 | "message"
@@ -168,6 +191,24 @@ pub struct RespondInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum JobListScopeView {
+    Active,
+    Recent,
+    All,
+}
+
+impl From<JobListScopeView> for JobListScope {
+    fn from(value: JobListScopeView) -> Self {
+        match value {
+            JobListScopeView::Active => Self::Active,
+            JobListScopeView::Recent => Self::Recent,
+            JobListScopeView::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResponseDecision {
     Allow,
     Deny,
@@ -244,6 +285,12 @@ pub enum RpcSuccess {
         counts_as_independent: bool,
         capabilities: ReviewCapabilitiesView,
     },
+    ReviewSubmitted {
+        job: JobView,
+        prompt_sha256: String,
+        resumed_existing: bool,
+        capabilities: ReviewCapabilitiesView,
+    },
     Enqueued {
         job: JobView,
     },
@@ -253,18 +300,22 @@ pub enum RpcSuccess {
     Status {
         job: JobView,
     },
+    Pending {
+        requests: Vec<PendingRequestView>,
+    },
     Events {
         page: EventPage,
     },
     Wait {
         job: JobView,
         page: EventPage,
+        timed_out: bool,
     },
     Message {
         disposition: MessageDispositionView,
     },
     Respond {
-        disposition: ResponseDispositionView,
+        outcome: ResponseOutcomeView,
     },
     Stopped {
         state: JobStateView,
@@ -388,6 +439,48 @@ impl From<ResponseDisposition> for ResponseDispositionView {
             ResponseDisposition::InFlight => Self::InFlight,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseOutcomeView {
+    pub disposition: ResponseDispositionView,
+    pub requested_decision: String,
+    pub effective_decision: String,
+    pub policy_overrode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_reason_code: Option<String>,
+}
+
+impl From<crate::ResponseOutcome> for ResponseOutcomeView {
+    fn from(value: crate::ResponseOutcome) -> Self {
+        Self {
+            disposition: value.disposition.into(),
+            requested_decision: value.requested_decision,
+            effective_decision: value.effective_decision,
+            policy_overrode: value.policy_overrode,
+            policy_reason_code: value.policy_reason_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingRequestStateView {
+    Pending,
+    Sending,
+    Responded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRequestView {
+    pub request_id: String,
+    pub kind: String,
+    pub state: PendingRequestStateView,
+    pub respondable: bool,
+    pub tool_name: Option<String>,
+    pub operation: String,
+    pub summary: String,
+    pub policy_preview: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +685,7 @@ pub struct ArtifactView {
     pub observed_sha256: Option<String>,
     pub observed_bytes: Option<u64>,
     pub checkpoint_number: Option<u64>,
+    pub finalized: bool,
     pub integrity: ArtifactIntegrityView,
     pub preview_state: PreviewState,
     pub preview: Option<String>,
@@ -701,6 +795,24 @@ impl RpcService {
                     capabilities,
                 })
             }
+            RpcMethod::SubmitReview { manifest } => {
+                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        RpcErrorCode::Unavailable,
+                        "private review orchestration is unavailable",
+                    )
+                })?;
+                let submitted = orchestrator
+                    .submit_review(&manifest)
+                    .map_err(map_orchestration)?;
+                let capabilities = JobView::from(submitted.job.clone()).capabilities;
+                Ok(RpcSuccess::ReviewSubmitted {
+                    job: submitted.job.into(),
+                    prompt_sha256: submitted.prompt_sha256,
+                    resumed_existing: submitted.resumed_existing,
+                    capabilities,
+                })
+            }
             RpcMethod::Enqueue { job } => {
                 validate_id(&job.agent_id, "agent_id")?;
                 validate_text(&job.workspace_path, "workspace_path", 4096)?;
@@ -717,6 +829,17 @@ impl RpcService {
             RpcMethod::Status { agent_id } => Ok(RpcSuccess::Status {
                 job: self.require_job(&agent_id)?.into(),
             }),
+            RpcMethod::Pending { agent_id } => {
+                let job = self.require_job(&agent_id)?;
+                let requests = self
+                    .store
+                    .pending_requests(&agent_id)
+                    .map_err(map_store)?
+                    .into_iter()
+                    .map(|request| pending_request_view(&job, request))
+                    .collect();
+                Ok(RpcSuccess::Pending { requests })
+            }
             RpcMethod::Events(query) => Ok(RpcSuccess::Events {
                 page: self.event_page(query)?,
             }),
@@ -750,7 +873,7 @@ impl RpcService {
                 if let Some(content) = input.content.as_deref() {
                     validate_text(content, "response content", 16 * 1024)?;
                 }
-                let disposition = self
+                let outcome = self
                     .scheduler
                     .respond_job(
                         &input.agent_id,
@@ -760,7 +883,7 @@ impl RpcService {
                     )
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::Respond {
-                    disposition: disposition.into(),
+                    outcome: outcome.into(),
                 })
             }
             RpcMethod::Stop { agent_id } => {
@@ -771,7 +894,7 @@ impl RpcService {
                 })
             }
             RpcMethod::Result(query) => self.result(query),
-            RpcMethod::List { limit } => {
+            RpcMethod::List { scope, limit } => {
                 if limit == 0 || limit > MAX_LIST_JOBS {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
@@ -780,7 +903,7 @@ impl RpcService {
                 }
                 let jobs = self
                     .store
-                    .list_jobs(limit)
+                    .list_jobs_scoped(scope.into(), limit)
                     .map_err(map_store)?
                     .into_iter()
                     .map(JobView::from)
@@ -863,25 +986,50 @@ impl RpcService {
         if let Some(runtime_agent_id) = query.runtime_agent_id.as_deref() {
             validate_id(runtime_agent_id, "runtime_agent_id")?;
         }
-        let (initial, initial_page) = self.wait_snapshot(&query, deadline)?;
+        let (initial, initial_page) = match self.wait_snapshot(&query, deadline) {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.code == RpcErrorCode::Timeout => {
+                let job = self.require_job(&query.agent_id)?;
+                return Ok(wait_timed_out(job, query.after));
+            }
+            Err(error) => return Err(error),
+        };
         if !initial_page.events.is_empty() || initial.state.is_terminal() {
             return Ok(RpcSuccess::Wait {
                 job: initial.into(),
                 page: initial_page,
+                timed_out: false,
             });
         }
         let initial_state = initial.state;
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(wait_timeout());
+                return Ok(RpcSuccess::Wait {
+                    job: initial.into(),
+                    page: EventPage {
+                        runtime_agent_id: None,
+                        events: Vec::new(),
+                        next_sequence: query.after,
+                        has_more: false,
+                    },
+                    timed_out: true,
+                });
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
-            let (job, page) = self.wait_snapshot(&query, deadline)?;
+            let (job, page) = match self.wait_snapshot(&query, deadline) {
+                Ok(snapshot) => snapshot,
+                Err(error) if error.code == RpcErrorCode::Timeout => {
+                    let job = self.require_job(&query.agent_id)?;
+                    return Ok(wait_timed_out(job, query.after));
+                }
+                Err(error) => return Err(error),
+            };
             if !page.events.is_empty() || job.state.is_terminal() || job.state != initial_state {
                 return Ok(RpcSuccess::Wait {
                     job: job.into(),
                     page,
+                    timed_out: false,
                 });
             }
         }
@@ -963,6 +1111,7 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
         observed_sha256: None,
         observed_bytes: None,
         checkpoint_number: artifact.checkpoint_number,
+        finalized: false,
         integrity: ArtifactIntegrityView::LegacyUnverified,
         preview_state,
         preview: None,
@@ -986,10 +1135,118 @@ fn verified_artifact_view(artifact: VerifiedArtifact, requested: usize) -> Artif
         observed_sha256: artifact.actual_sha256,
         observed_bytes: artifact.actual_bytes,
         checkpoint_number: Some(artifact.checkpoint_number),
+        finalized: artifact.finalized,
         integrity: artifact.integrity.into(),
         preview_state,
         preview: artifact.preview,
     }
+}
+
+fn pending_request_view(job: &Job, request: StoredPendingRequest) -> PendingRequestView {
+    let state = match request.state {
+        PendingRequestState::Pending => PendingRequestStateView::Pending,
+        PendingRequestState::Sending => PendingRequestStateView::Sending,
+        PendingRequestState::Responded => PendingRequestStateView::Responded,
+    };
+    if request.request_type != "permission" {
+        return PendingRequestView {
+            request_id: request.request_id,
+            kind: "unsupported_input".into(),
+            state,
+            respondable: false,
+            tool_name: None,
+            operation: "user_input".into(),
+            summary: "unsupported user input request".into(),
+            policy_preview: "unknown".into(),
+        };
+    }
+    let params = serde_json::from_str::<Value>(&request.payload_json).ok();
+    let tool_name = params
+        .as_ref()
+        .and_then(|value| value.get("toolName"))
+        .and_then(Value::as_str)
+        .map(|value| value.chars().take(64).collect::<String>());
+    let operation = tool_name
+        .as_deref()
+        .map(operation_category)
+        .unwrap_or("unknown")
+        .to_owned();
+    let summary = params
+        .as_ref()
+        .map(sanitized_permission_summary)
+        .unwrap_or_else(|| "unrecognized permission request".into());
+    let policy_preview = params
+        .as_ref()
+        .and_then(|params| {
+            let prepared = serde_json::from_str::<review_preparation::PreparedLaunchSpec>(
+                job.prepared_launch_json.as_deref()?,
+            )
+            .ok()?;
+            let launcher = prepared.launcher().ok()?;
+            let decision = launcher
+                .decide_zcode_permission(params, review_preparation::ExternalDecision::Allow);
+            Some(if decision.allowed {
+                "externally_decidable"
+            } else {
+                "hard_deny"
+            })
+        })
+        .unwrap_or("unknown")
+        .to_owned();
+    PendingRequestView {
+        request_id: request.request_id,
+        kind: "permission".into(),
+        state,
+        respondable: true,
+        tool_name,
+        operation,
+        summary,
+        policy_preview,
+    }
+}
+
+fn operation_category(tool_name: &str) -> &'static str {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "read" | "grep" | "glob" => "read",
+        "write" | "edit" | "delete" | "move" => "write",
+        "execute" | "terminal" => "command",
+        "network" => "network",
+        "git_ref_mutation" => "git_ref_mutation",
+        _ => "unknown",
+    }
+}
+
+fn sanitized_permission_summary(params: &Value) -> String {
+    let input = params.get("input").unwrap_or(&Value::Null);
+    let leaf = |name: &str| {
+        input
+            .get(name)
+            .and_then(Value::as_str)
+            .and_then(|value| std::path::Path::new(value).file_name())
+            .map(|value| value.to_string_lossy().chars().take(96).collect::<String>())
+    };
+    if let Some(program) = leaf("program") {
+        let count = input
+            .get("args")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        return format!("command {program} with {count} arguments");
+    }
+    if let Some(path) = leaf("path")
+        .or_else(|| leaf("destination"))
+        .or_else(|| leaf("source"))
+    {
+        return format!("target {path}");
+    }
+    if params
+        .get("toolName")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("git_ref_mutation"))
+    {
+        return "Git reference mutation".into();
+    }
+    "permission request".into()
 }
 
 fn validate_id(value: &str, field: &str) -> Result<(), RpcError> {
@@ -1002,6 +1259,19 @@ fn valid_request_id(value: &str) -> bool {
 
 fn wait_timeout() -> RpcError {
     RpcError::new(RpcErrorCode::Timeout, "wait deadline elapsed")
+}
+
+fn wait_timed_out(job: Job, after: u64) -> RpcSuccess {
+    RpcSuccess::Wait {
+        job: job.into(),
+        page: EventPage {
+            runtime_agent_id: None,
+            events: Vec::new(),
+            next_sequence: after,
+            has_more: false,
+        },
+        timed_out: true,
+    }
 }
 
 fn page_from_events(
@@ -1067,6 +1337,12 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
 
 fn map_orchestration(error: OrchestrationError) -> RpcError {
     match error {
+        OrchestrationError::Preparation(message) if message.contains("idempotency conflict") => {
+            RpcError::new(
+                RpcErrorCode::Conflict,
+                "review submission conflicts with durable state",
+            )
+        }
         OrchestrationError::Preparation(message) | OrchestrationError::Prompt(message) => {
             RpcError::new(RpcErrorCode::Validation, message)
         }

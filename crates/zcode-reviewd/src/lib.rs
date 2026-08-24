@@ -1,7 +1,8 @@
 use review_ledger::{LedgerError, LedgerManager, ToolResult, VerifiedArtifact, REVIEW_FINALIZE};
 use review_store::{
-    DeliveryClaim, Job, JobClaim, JobState, LifecycleWrite, MessageState, NewJob, Store,
-    StoreError, StoredMessage, StoredProcessIdentity, TerminalUpdate, TurnState,
+    DeliveryClaim, Job, JobClaim, JobState, LifecycleWrite, MessageState, NewJob,
+    PendingRequestState, Store, StoreError, StoredMessage, StoredProcessIdentity, TerminalUpdate,
+    TurnState,
 };
 use std::{
     collections::HashMap,
@@ -1064,6 +1065,15 @@ pub enum ResponseDisposition {
     Responded,
     AlreadyResponded,
     InFlight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseOutcome {
+    pub disposition: ResponseDisposition,
+    pub requested_decision: String,
+    pub effective_decision: String,
+    pub policy_overrode: bool,
+    pub policy_reason_code: Option<String>,
 }
 
 struct StoreLifecycleSink {
@@ -2208,7 +2218,7 @@ impl Scheduler {
         request_id: &str,
         decision: &str,
         content: Option<&str>,
-    ) -> Result<ResponseDisposition, SchedulerError> {
+    ) -> Result<ResponseOutcome, SchedulerError> {
         let request = self
             .inner
             .store
@@ -2230,6 +2240,25 @@ impl Scheduler {
                     "response decision does not match the pending request type".into()
                 },
             ));
+        }
+        if request.state != PendingRequestState::Pending {
+            let effective_decision = request.response_decision.clone().ok_or_else(|| {
+                SchedulerError::InvalidConfig("persisted response outcome is incomplete".into())
+            })?;
+            let policy_overrode = effective_decision != decision;
+            return Ok(ResponseOutcome {
+                disposition: if request.state == PendingRequestState::Responded {
+                    ResponseDisposition::AlreadyResponded
+                } else {
+                    ResponseDisposition::InFlight
+                },
+                requested_decision: decision.to_owned(),
+                effective_decision,
+                policy_overrode,
+                policy_reason_code: policy_overrode
+                    .then_some(request.response_content)
+                    .flatten(),
+            });
         }
         let mut effective_decision = decision;
         let mut policy_reason = None;
@@ -2264,15 +2293,24 @@ impl Scheduler {
             }
         }
         let effective_content = policy_reason.as_deref().or(content);
-        match self.inner.store.claim_pending_response(
+        let existing_disposition = match self.inner.store.claim_pending_response(
             agent_id,
             request_id,
             effective_decision,
             effective_content,
         )? {
-            DeliveryClaim::AlreadyDelivered => return Ok(ResponseDisposition::AlreadyResponded),
-            DeliveryClaim::InFlight => return Ok(ResponseDisposition::InFlight),
-            DeliveryClaim::Claimed => {}
+            DeliveryClaim::AlreadyDelivered => Some(ResponseDisposition::AlreadyResponded),
+            DeliveryClaim::InFlight => Some(ResponseDisposition::InFlight),
+            DeliveryClaim::Claimed => None,
+        };
+        if let Some(disposition) = existing_disposition {
+            return Ok(ResponseOutcome {
+                disposition,
+                requested_decision: decision.to_owned(),
+                effective_decision: effective_decision.to_owned(),
+                policy_overrode: effective_decision != decision,
+                policy_reason_code: policy_reason,
+            });
         }
         let Some((_epoch, runtime, _session_id, operation)) = self.active_session(agent_id) else {
             self.inner
@@ -2318,7 +2356,13 @@ impl Scheduler {
                 "request {request_id} lost its response claim"
             ))));
         }
-        Ok(ResponseDisposition::Responded)
+        Ok(ResponseOutcome {
+            disposition: ResponseDisposition::Responded,
+            requested_decision: decision.to_owned(),
+            effective_decision: effective_decision.to_owned(),
+            policy_overrode: effective_decision != decision,
+            policy_reason_code: policy_reason,
+        })
     }
 
     pub fn stop_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
@@ -3516,7 +3560,13 @@ mod tests {
             scheduler
                 .respond_job("responded-job", "request-1", "allow", None)
                 .unwrap(),
-            ResponseDisposition::AlreadyResponded
+            ResponseOutcome {
+                disposition: ResponseDisposition::AlreadyResponded,
+                requested_decision: "allow".into(),
+                effective_decision: "allow".into(),
+                policy_overrode: false,
+                policy_reason_code: None,
+            }
         );
     }
 

@@ -13,6 +13,7 @@
     "observed_sha256",
     "observed_bytes",
     "checkpoint_number",
+    "finalized",
     "integrity",
     "preview_state",
     "preview"
@@ -42,6 +43,7 @@
       "minimum": 0,
       "maximum": 18446744073709551615
     },
+    "finalized": { "type": "boolean" },
     "integrity": {
       "enum": ["valid", "missing", "replaced", "binary", "invalid", "legacy_unverified"]
     },

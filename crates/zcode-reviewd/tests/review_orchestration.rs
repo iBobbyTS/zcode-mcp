@@ -332,6 +332,62 @@ impl Fixture {
 }
 
 #[test]
+fn submit_only_returns_stable_job_before_runtime_bootstrap() {
+    let fixture = Fixture::new();
+    let manifest = fixture.manifest("submit-only", "S07");
+    let first = fixture
+        .service
+        .dispatch(RpcMethod::SubmitReview {
+            manifest: manifest.clone(),
+        })
+        .unwrap();
+    let (agent_id, prompt_sha256) = match first {
+        RpcSuccess::ReviewSubmitted {
+            job,
+            prompt_sha256,
+            resumed_existing,
+            ..
+        } => {
+            assert!(!resumed_existing);
+            assert_eq!(job.state, zcode_reviewd::rpc::JobStateView::Queued);
+            assert!(job.zcode_session_id.is_none());
+            (job.agent_id, prompt_sha256)
+        }
+        other => panic!("unexpected submit response: {other:?}"),
+    };
+    assert_eq!(fixture.scheduler.active_count(), 0);
+    assert!(fixture
+        .store
+        .get_job(&agent_id)
+        .unwrap()
+        .unwrap()
+        .process_identity
+        .is_none());
+    match fixture
+        .service
+        .dispatch(RpcMethod::SubmitReview { manifest })
+        .unwrap()
+    {
+        RpcSuccess::ReviewSubmitted {
+            job,
+            prompt_sha256: replay_sha256,
+            resumed_existing,
+            ..
+        } => {
+            assert!(resumed_existing);
+            assert_eq!(job.agent_id, agent_id);
+            assert_eq!(replay_sha256, prompt_sha256);
+        }
+        other => panic!("unexpected replay response: {other:?}"),
+    }
+    assert_eq!(fixture.scheduler.active_count(), 0);
+    assert_eq!(
+        fixture.scheduler.stop_job(&agent_id).unwrap(),
+        JobState::Cancelled
+    );
+}
+
+#[test]
 fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions() {
     let fixture = Fixture::new();
     let source_before = git(&fixture.repository, &["status", "--porcelain=v1"]);
@@ -371,6 +427,27 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(pending
         .iter()
         .any(|request| request.request_type == "permission"));
+    let projected_pending = match fixture
+        .service
+        .dispatch(RpcMethod::Pending {
+            agent_id: first.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::Pending { requests } => requests,
+        other => panic!("unexpected pending response: {other:?}"),
+    };
+    assert!(projected_pending
+        .iter()
+        .any(|request| { request.kind == "unsupported_input" && !request.respondable }));
+    assert!(projected_pending.iter().any(|request| {
+        request.kind == "permission"
+            && request.respondable
+            && request.policy_preview == "hard_deny"
+            && !request
+                .summary
+                .contains(fixture.repository.to_string_lossy().as_ref())
+    }));
     assert!(matches!(
         fixture
             .service
@@ -510,6 +587,26 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
         .unwrap();
     assert_eq!(permission.state, PendingRequestState::Responded);
     assert_eq!(permission.response_decision.as_deref(), Some("deny"));
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(RpcMethod::Respond(RespondInput {
+                agent_id: first.clone(),
+                request_id: permission.request_id.clone(),
+                decision: ResponseDecision::Allow,
+                content: None,
+            }))
+            .unwrap(),
+        RpcSuccess::Respond {
+            outcome: zcode_reviewd::rpc::ResponseOutcomeView {
+                disposition: zcode_reviewd::rpc::ResponseDispositionView::AlreadyResponded,
+                requested_decision,
+                effective_decision,
+                policy_overrode: true,
+                policy_reason_code: Some(_),
+            }
+        } if requested_decision == "allow" && effective_decision == "deny"
+    ));
     assert_eq!(
         first_events
             .iter()
@@ -597,8 +694,8 @@ fn concurrent_first_spawn_is_one_independent_job_and_conflicts_stay_rejected() {
             manifest: conflicting,
         })
         .unwrap_err();
-    assert_eq!(conflict.code, RpcErrorCode::Validation);
-    assert!(conflict.message.contains("idempotency conflict"));
+    assert_eq!(conflict.code, RpcErrorCode::Conflict);
+    assert!(!conflict.message.contains("conflicting-model"));
     assert_eq!(
         fixture.scheduler.stop_job(&responses[0].0).unwrap(),
         JobState::Cancelled

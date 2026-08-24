@@ -1,0 +1,18 @@
+[package]
+name = "zcode-review-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmcp = { version = "=3.1.4", features = ["client", "server", "transport-io"] }
+rmcp-macros = "=3.1.4"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
+zcode-reviewd = { path = "../zcode-reviewd" }
+review-preparation = { path = "../review-preparation" }
+
+[dev-dependencies]
+review-store = { path = "../review-store" }
+tempfile = "3"
