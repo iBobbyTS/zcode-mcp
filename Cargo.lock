@@ -1188,6 +1188,7 @@ dependencies = [
  "jsonschema",
  "review-preparation",
  "rmcp",
+ "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
