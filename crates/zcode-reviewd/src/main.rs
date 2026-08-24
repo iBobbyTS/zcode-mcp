@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
-    let factory = Arc::new(CommandRuntimeFactory::new(
+    let factory = Arc::new(CommandRuntimeFactory::new_prepared(
         move |_job: &review_store::Job| runtime_command(runtime.as_deref()),
     ));
     let runtime_factory: Arc<dyn RuntimeFactory> = factory;

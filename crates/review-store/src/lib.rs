@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS agents (
     workspace_path TEXT NOT NULL,
     report_path TEXT,
     runtime_hash TEXT,
+    prepared_launch_json TEXT,
+    prepared_launch_sha256 TEXT,
     zcode_session_id TEXT,
     initial_prompt TEXT NOT NULL DEFAULT 'Begin review.',
     turn_state TEXT NOT NULL DEFAULT 'IDLE',
@@ -143,7 +145,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 
 "#;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -245,6 +247,8 @@ pub struct NewJob {
     pub workspace_path: String,
     pub report_path: Option<String>,
     pub runtime_hash: Option<String>,
+    pub prepared_launch_json: Option<String>,
+    pub prepared_launch_sha256: Option<String>,
     pub initial_prompt: String,
 }
 
@@ -261,6 +265,8 @@ impl NewJob {
             workspace_path: workspace_path.into(),
             report_path: None,
             runtime_hash: None,
+            prepared_launch_json: None,
+            prepared_launch_sha256: None,
             initial_prompt: "Begin review.".into(),
         }
     }
@@ -273,6 +279,8 @@ pub struct Job {
     pub state: JobState,
     pub workspace_path: String,
     pub initial_prompt: String,
+    pub prepared_launch_json: Option<String>,
+    pub prepared_launch_sha256: Option<String>,
     pub owner_id: Option<String>,
     pub owner_epoch: u64,
     pub close_requested: bool,
@@ -460,7 +468,7 @@ impl Store {
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
-        migrate_to_v2(&mut connection)?;
+        migrate_to_v3(&mut connection)?;
         let database_path = std::fs::canonicalize(path.as_ref()).map_err(|error| {
             StoreError::InvalidState(format!("database path cannot be canonicalized: {error}"))
         })?;
@@ -480,10 +488,35 @@ impl Store {
     }
 
     pub fn enqueue_job(&self, job: &NewJob) -> StoreResult<Job> {
+        match (
+            job.prepared_launch_json.as_deref(),
+            job.prepared_launch_sha256.as_deref(),
+        ) {
+            (Some(json), Some(hash)) if !json.is_empty() && !hash.is_empty() => {}
+            (None, None) => {}
+            _ => {
+                return Err(StoreError::InvalidState(
+                    "prepared launch JSON and SHA-256 must be supplied together".into(),
+                ))
+            }
+        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(key) = &job.idempotency_key {
             if let Some(existing) = query_job_by_idempotency(&transaction, key)? {
+                let compatible = match (
+                    job.prepared_launch_sha256.as_deref(),
+                    existing.prepared_launch_sha256.as_deref(),
+                ) {
+                    (None, None) => true,
+                    (Some(requested), Some(stored)) => requested == stored,
+                    _ => false,
+                };
+                if !compatible {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} names a different prepared launch"
+                    )));
+                }
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -499,8 +532,9 @@ impl Store {
             "INSERT INTO agents (
                 agent_id, idempotency_key, parent_agent_id, review_kind,
                 feature_id, section_id, round_kind, state, workspace_path,
-                report_path, runtime_hash, initial_prompt, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'QUEUED', ?8, ?9, ?10, ?11, ?12)",
+                report_path, runtime_hash, prepared_launch_json,
+                prepared_launch_sha256, initial_prompt, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'QUEUED', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 job.agent_id,
                 job.idempotency_key,
@@ -512,6 +546,8 @@ impl Store {
                 job.workspace_path,
                 job.report_path,
                 job.runtime_hash,
+                job.prepared_launch_json,
+                job.prepared_launch_sha256,
                 job.initial_prompt,
                 created_at,
             ],
@@ -588,7 +624,8 @@ impl Store {
                     owner_epoch, close_requested, stop_requested, last_event_seq,
                     failure_code, failure_message, runtime_agent_id,
                     zcode_session_id, turn_state, pid, process_group_id,
-                    process_uid, process_start_token, closed_at, reaped_at, created_at
+                    process_uid, process_start_token, closed_at, reaped_at, created_at,
+                    prepared_launch_json, prepared_launch_sha256
              FROM agents ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         let rows = statement
@@ -1481,7 +1518,7 @@ impl Store {
     }
 }
 
-fn migrate_to_v2(connection: &mut Connection) -> StoreResult<()> {
+fn migrate_to_v3(connection: &mut Connection) -> StoreResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(StoreError::InvalidState(format!(
@@ -1517,6 +1554,16 @@ fn migrate_to_v2(connection: &mut Connection) -> StoreResult<()> {
             "pending_requests",
             "response_content",
             "response_content TEXT",
+        ),
+        (
+            "agents",
+            "prepared_launch_json",
+            "prepared_launch_json TEXT",
+        ),
+        (
+            "agents",
+            "prepared_launch_sha256",
+            "prepared_launch_sha256 TEXT",
         ),
     ] {
         if !table_has_column(&transaction, table, column)? {
@@ -1697,7 +1744,8 @@ fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>
                     owner_epoch, close_requested, stop_requested, last_event_seq,
                     failure_code, failure_message, runtime_agent_id,
                     zcode_session_id, turn_state, pid, process_group_id,
-                    process_uid, process_start_token, closed_at, reaped_at, created_at
+                    process_uid, process_start_token, closed_at, reaped_at, created_at,
+                    prepared_launch_json, prepared_launch_sha256
              FROM agents WHERE agent_id = ?1",
             [agent_id],
             map_job_row,
@@ -1713,7 +1761,8 @@ fn query_job_by_idempotency(connection: &Connection, key: &str) -> StoreResult<O
                     owner_epoch, close_requested, stop_requested, last_event_seq,
                     failure_code, failure_message, runtime_agent_id,
                     zcode_session_id, turn_state, pid, process_group_id,
-                    process_uid, process_start_token, closed_at, reaped_at, created_at
+                    process_uid, process_start_token, closed_at, reaped_at, created_at,
+                    prepared_launch_json, prepared_launch_sha256
              FROM agents WHERE idempotency_key = ?1",
             [key],
             map_job_row,
@@ -1745,6 +1794,8 @@ type JobRow = (
     Option<i64>,
     Option<i64>,
     i64,
+    Option<String>,
+    Option<String>,
 );
 
 fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
@@ -1771,6 +1822,8 @@ fn map_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         row.get(19)?,
         row.get(20)?,
         row.get(21)?,
+        row.get(22)?,
+        row.get(23)?,
     ))
 }
 
@@ -1801,6 +1854,8 @@ fn convert_job_row(row: JobRow) -> StoreResult<Job> {
         state: JobState::parse(&row.2)?,
         workspace_path: row.3,
         initial_prompt: row.4,
+        prepared_launch_json: row.22,
+        prepared_launch_sha256: row.23,
         owner_id: row.5,
         owner_epoch: i64_to_u64(row.6)?,
         close_requested: row.7 != 0,
@@ -2027,6 +2082,8 @@ mod tests {
                 workspace_path: "/different".into(),
                 report_path: None,
                 runtime_hash: None,
+                prepared_launch_json: None,
+                prepared_launch_sha256: None,
                 initial_prompt: "Begin review.".into(),
             })
             .unwrap();
@@ -2099,6 +2156,42 @@ mod tests {
         assert_eq!(reopened.list_jobs(10).unwrap()[0].agent_id, "job-1");
         assert_eq!(reopened.ledger_entry_count("job-1").unwrap(), 1);
         assert_eq!(reopened.compatibility_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn prepared_launch_is_persisted_before_claim_and_conflicting_idempotency_fails() {
+        let (_directory, _path, store) = file_store();
+        let mut first = NewJob::new("prepared-1", "/prepared/worktree");
+        first.idempotency_key = Some("prepared-key".into());
+        first.prepared_launch_json = Some("{\"head_sha\":\"a\"}".into());
+        first.prepared_launch_sha256 = Some("digest-a".into());
+        let stored = store.enqueue_job(&first).unwrap();
+        assert_eq!(
+            stored.prepared_launch_json.as_deref(),
+            Some("{\"head_sha\":\"a\"}")
+        );
+        assert_eq!(stored.prepared_launch_sha256.as_deref(), Some("digest-a"));
+        assert_eq!(stored.state, JobState::Queued);
+
+        let mut same = first.clone();
+        same.agent_id = "prepared-same".into();
+        assert_eq!(store.enqueue_job(&same).unwrap().agent_id, "prepared-1");
+
+        let mut conflict = first.clone();
+        conflict.agent_id = "prepared-conflict".into();
+        conflict.prepared_launch_json = Some("{\"head_sha\":\"b\"}".into());
+        conflict.prepared_launch_sha256 = Some("digest-b".into());
+        assert!(matches!(
+            store.enqueue_job(&conflict),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut incomplete = NewJob::new("incomplete", "/prepared/worktree");
+        incomplete.prepared_launch_json = Some("{}".into());
+        assert!(matches!(
+            store.enqueue_job(&incomplete),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]

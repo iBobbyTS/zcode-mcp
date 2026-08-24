@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+use review_preparation::{
+    NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
+};
 use review_store::{JobState, NewJob, Store};
 use std::{
     io::{Read, Write},
@@ -11,8 +14,8 @@ use std::{
 };
 use zcode_driver::{observe_process, observe_process_group};
 use zcode_reviewd::rpc::{
-    JobStateView, NewJobInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
-    RPC_VERSION,
+    JobStateView, RespondInput, ResponseDecision, RpcClient, RpcMethod, RpcOutcome, RpcRequest,
+    RpcSuccess, RPC_VERSION,
 };
 
 fn fake_runtime() -> PathBuf {
@@ -53,6 +56,47 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         "workspace fake runtime binary is required"
     );
     let daemon_executable = env!("CARGO_BIN_EXE_zcode-reviewd");
+    let repository = create_repository(directory.path());
+    let head = git_text(&repository, &["rev-parse", "HEAD"]);
+    let prepared = ReviewPreparer
+        .prepare(&ReviewManifest {
+            schema: "sectioned-zcode-review/v1".into(),
+            review_kind: ReviewKind::Code,
+            feature_id: "feature".into(),
+            section_id: "S04".into(),
+            round_kind: RoundKind::InitialBounded,
+            repository,
+            base_ref: head.clone(),
+            head_ref: head,
+            plan_path: ".agent-work/PLAN.md".into(),
+            context_paths: Vec::new(),
+            scope_paths: vec!["src".into()],
+            forbidden_input_globs: Vec::new(),
+            validation_commands: Vec::new(),
+            report_target: ".agent-work/reviews/daemon/report.md".into(),
+            scratch_root: ".agent-work/scratch/jobs".into(),
+            model: None,
+            fresh_session: true,
+            network_policy: NetworkPolicy::Deny,
+            scratch_policy: ScratchPolicy::Isolated,
+            idempotency_key: "daemon-key".into(),
+        })
+        .unwrap();
+    let mut queued = NewJob::new("daemon-job", prepared.worktree.path.to_string_lossy());
+    queued.idempotency_key = Some(prepared.idempotency_key.clone());
+    queued.review_kind = Some("code".into());
+    queued.feature_id = Some("feature".into());
+    queued.section_id = Some("S04".into());
+    queued.round_kind = Some("INITIAL_BOUNDED".into());
+    queued.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+    queued.runtime_hash = Some("fake".into());
+    queued.initial_prompt = "permission input".into();
+    queued.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+    queued.prepared_launch_sha256 = Some(prepared.prepared_sha256);
+    Store::open(&database)
+        .unwrap()
+        .enqueue_job(&queued)
+        .unwrap();
     let mut daemon = Command::new(daemon_executable)
         .env("ZCODE_REVIEWD_DATABASE", &database)
         .env("ZCODE_REVIEWD_SOCKET", &socket)
@@ -67,28 +111,6 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         thread::sleep(Duration::from_millis(10));
     }
     let client = RpcClient::new(&socket, Duration::from_secs(2));
-    success(
-        client
-            .call(&request(
-                "enqueue",
-                RpcMethod::Enqueue {
-                    job: NewJobInput {
-                        agent_id: "daemon-job".into(),
-                        workspace_path: "/workspace".into(),
-                        idempotency_key: Some("daemon-key".into()),
-                        parent_agent_id: None,
-                        review_kind: Some("code".into()),
-                        feature_id: Some("feature".into()),
-                        section_id: Some("S03".into()),
-                        round_kind: Some("fixture".into()),
-                        report_path: None,
-                        runtime_hash: Some("fake".into()),
-                        initial_prompt: "permission input".into(),
-                    },
-                },
-            ))
-            .unwrap(),
-    );
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         let status = success(
@@ -115,6 +137,46 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+
+    let store = Store::open(&database).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let permission = loop {
+        if let Some(request) = store
+            .pending_requests("daemon-job")
+            .unwrap()
+            .into_iter()
+            .find(|request| request.request_type == "permission")
+        {
+            break request;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "permission request was not persisted"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    success(
+        client
+            .call(&request(
+                "respond-local-policy",
+                RpcMethod::Respond(RespondInput {
+                    agent_id: "daemon-job".into(),
+                    request_id: permission.request_id.clone(),
+                    decision: ResponseDecision::Allow,
+                    content: None,
+                }),
+            ))
+            .unwrap(),
+    );
+    let persisted = store
+        .pending_request("daemon-job", &permission.request_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.response_decision.as_deref(), Some("deny"));
+    assert_eq!(
+        persisted.response_content.as_deref(),
+        Some("read_path_unverifiable")
+    );
 
     let second_socket = directory.path().join("private").join("second.sock");
     let mut second = Command::new(daemon_executable)
@@ -207,6 +269,42 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .unwrap();
     assert_eq!(job.state, JobState::Cancelled);
     assert!(job.closed_at.is_some());
+}
+
+fn create_repository(root: &Path) -> PathBuf {
+    let repository = root.join("repository");
+    std::fs::create_dir_all(repository.join("src")).unwrap();
+    std::fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    git_text(&repository, &["init"]);
+    git_text(&repository, &["config", "user.name", "S04 Test"]);
+    git_text(
+        &repository,
+        &["config", "user.email", "s04@example.invalid"],
+    );
+    git_text(&repository, &["add", "src/lib.rs"]);
+    git_text(&repository, &["commit", "-m", "fixture"]);
+    std::fs::create_dir_all(repository.join(".agent-work")).unwrap();
+    std::fs::write(repository.join(".agent-work/PLAN.md"), "# plan\n").unwrap();
+    std::fs::canonicalize(repository).unwrap()
+}
+
+fn git_text(repository: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().into()
 }
 
 #[test]

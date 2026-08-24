@@ -789,11 +789,22 @@ pub trait RuntimeFactory: Send + Sync + 'static {
 
 pub struct CommandRuntimeFactory<F> {
     command: F,
+    require_prepared: bool,
 }
 
 impl<F> CommandRuntimeFactory<F> {
     pub fn new(command: F) -> Self {
-        Self { command }
+        Self {
+            command,
+            require_prepared: false,
+        }
+    }
+
+    pub fn new_prepared(command: F) -> Self {
+        Self {
+            command,
+            require_prepared: true,
+        }
     }
 }
 
@@ -806,6 +817,24 @@ where
         job: &Job,
         sink: Arc<dyn LifecycleSink>,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        if self.require_prepared {
+            let json = job.prepared_launch_json.as_deref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "prepared launch is required")
+            })?;
+            let prepared: review_preparation::PreparedLaunchSpec = serde_json::from_str(json)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            prepared
+                .validate_for_launch()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if job.prepared_launch_sha256.as_deref() != Some(prepared.prepared_sha256.as_str())
+                || job.workspace_path != prepared.worktree.path.to_string_lossy()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "stored job does not match its prepared launch",
+                ));
+            }
+        }
         let command = (self.command)(job)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
@@ -1260,6 +1289,48 @@ impl Scheduler {
 
     pub fn enqueue(&self, job: &NewJob) -> Result<Job, SchedulerError> {
         Ok(self.inner.store.enqueue_job(job)?)
+    }
+
+    pub fn enqueue_prepared(
+        &self,
+        agent_id: impl Into<String>,
+        initial_prompt: impl Into<String>,
+        prepared: &review_preparation::PreparedLaunchSpec,
+    ) -> Result<Job, SchedulerError> {
+        prepared
+            .validate_for_launch()
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        let workspace = std::fs::canonicalize(&prepared.worktree.path)
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        if workspace != prepared.worktree.path
+            || !workspace.starts_with(&prepared.worktree.scratch_worktrees_root)
+        {
+            return Err(SchedulerError::InvalidConfig(
+                "prepared worktree identity is no longer valid".into(),
+            ));
+        }
+        let agent_id = agent_id.into();
+        let initial_prompt = initial_prompt.into();
+        if agent_id.is_empty() || initial_prompt.is_empty() {
+            return Err(SchedulerError::InvalidConfig(
+                "prepared job requires an agent id and initial prompt".into(),
+            ));
+        }
+        let mut job = NewJob::new(agent_id, workspace.to_string_lossy());
+        job.idempotency_key = Some(prepared.idempotency_key.clone());
+        job.review_kind = Some(prepared.review_kind.as_str().into());
+        job.feature_id = Some(prepared.feature_id.clone());
+        job.section_id = Some(prepared.section_id.clone());
+        job.round_kind = Some(prepared.round_kind.as_str().into());
+        job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+        job.initial_prompt = initial_prompt;
+        job.prepared_launch_json = Some(
+            prepared
+                .canonical_json()
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?,
+        );
+        job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+        self.enqueue(&job)
     }
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, JobState)>, SchedulerError> {
@@ -1728,11 +1799,45 @@ impl Scheduler {
                 },
             ));
         }
-        match self
-            .inner
-            .store
-            .claim_pending_response(agent_id, request_id, decision, content)?
-        {
+        let mut effective_decision = decision;
+        let mut policy_reason = None;
+        if request.request_type == "permission" && decision == "allow" {
+            let job = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+            })?;
+            if let Some(prepared_json) = job.prepared_launch_json.as_deref() {
+                let prepared: review_preparation::PreparedLaunchSpec =
+                    serde_json::from_str(prepared_json).map_err(|error| {
+                        SchedulerError::InvalidConfig(format!(
+                            "stored prepared launch is invalid: {error}"
+                        ))
+                    })?;
+                let launcher = prepared.launcher().map_err(|error| {
+                    SchedulerError::InvalidConfig(format!(
+                        "stored prepared policy is invalid: {error}"
+                    ))
+                })?;
+                let params: serde_json::Value = serde_json::from_str(&request.payload_json)
+                    .map_err(|error| {
+                        SchedulerError::InvalidConfig(format!(
+                            "permission request payload is invalid: {error}"
+                        ))
+                    })?;
+                let policy = launcher
+                    .decide_zcode_permission(&params, review_preparation::ExternalDecision::Allow);
+                if !policy.allowed {
+                    effective_decision = "deny";
+                    policy_reason = Some(policy.reason.to_owned());
+                }
+            }
+        }
+        let effective_content = policy_reason.as_deref().or(content);
+        match self.inner.store.claim_pending_response(
+            agent_id,
+            request_id,
+            effective_decision,
+            effective_content,
+        )? {
             DeliveryClaim::AlreadyDelivered => return Ok(ResponseDisposition::AlreadyResponded),
             DeliveryClaim::InFlight => return Ok(ResponseDisposition::InFlight),
             DeliveryClaim::Claimed => {}
@@ -1759,7 +1864,11 @@ impl Scheduler {
                 message: "runtime is stopping or no longer active".into(),
             });
         }
-        if let Err(error) = runtime.respond_request(&request.correlation_id, decision, content) {
+        if let Err(error) = runtime.respond_request(
+            &request.correlation_id,
+            effective_decision,
+            effective_content,
+        ) {
             self.inner
                 .store
                 .release_pending_response(agent_id, request_id)?;

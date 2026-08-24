@@ -114,6 +114,8 @@ impl From<NewJobInput> for NewJob {
             workspace_path: value.workspace_path,
             report_path: value.report_path,
             runtime_hash: value.runtime_hash,
+            prepared_launch_json: None,
+            prepared_launch_sha256: None,
             initial_prompt: value.initial_prompt,
         }
     }
