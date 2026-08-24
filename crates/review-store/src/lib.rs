@@ -2,12 +2,13 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::{Mutex, TryLockError},
+    sync::{Mutex, OnceLock, TryLockError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_REVIEW_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -566,6 +567,8 @@ pub struct ReviewSnapshot {
     pub finalization: Option<ReviewEntryRecord>,
 }
 
+pub type ReviewSnapshotProjector = fn(&ReviewSnapshot) -> Result<u64, String>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewReportEvent {
     pub revision: u64,
@@ -629,6 +632,7 @@ pub enum DeliveryClaim {
 pub struct Store {
     connection: Mutex<Connection>,
     database_path: PathBuf,
+    review_snapshot_projector: OnceLock<ReviewSnapshotProjector>,
 }
 
 impl Store {
@@ -644,7 +648,12 @@ impl Store {
         Ok(Self {
             connection: Mutex::new(connection),
             database_path,
+            review_snapshot_projector: OnceLock::new(),
         })
+    }
+
+    pub fn install_review_snapshot_projector(&self, projector: ReviewSnapshotProjector) {
+        let _ = self.review_snapshot_projector.set(projector);
     }
 
     pub fn database_path(&self) -> &Path {
@@ -1586,6 +1595,7 @@ impl Store {
                 initialization.agent_id
             )));
         }
+        self.validate_projected_review(&transaction, &initialization.agent_id)?;
         transaction.commit()?;
         Ok(stored.report_state())
     }
@@ -1653,6 +1663,7 @@ impl Store {
             params![desired_runtime, desired_session, desired_model, agent_id],
         )?;
         let revision = advance_review_revision(&transaction, agent_id)?;
+        self.validate_projected_review(&transaction, agent_id)?;
         transaction.commit()?;
         Ok(ReviewMutationResult {
             disposition: ReviewMutationDisposition::Applied,
@@ -1703,6 +1714,7 @@ impl Store {
                 now_millis()
             ],
         )?;
+        self.validate_projected_review(&transaction, agent_id)?;
         transaction.commit()?;
         Ok(ReviewMutationResult {
             disposition: ReviewMutationDisposition::Applied,
@@ -1782,6 +1794,7 @@ impl Store {
                 now
             ],
         )?;
+        self.validate_projected_review(&transaction, agent_id)?;
         transaction.commit()?;
         Ok(ReviewMutationResult {
             disposition: ReviewMutationDisposition::Applied,
@@ -1832,6 +1845,7 @@ impl Store {
                 now_millis()
             ],
         )?;
+        self.validate_projected_review(&transaction, agent_id)?;
         transaction.commit()?;
         Ok(ReviewMutationResult {
             disposition: ReviewMutationDisposition::Applied,
@@ -1894,6 +1908,7 @@ impl Store {
                  updated_at = ?2 WHERE agent_id = ?3",
             params![signal, now_millis(), agent_id],
         )?;
+        self.validate_projected_review(&transaction, agent_id)?;
         transaction.commit()?;
         Ok(ReviewMutationResult {
             disposition: ReviewMutationDisposition::Applied,
@@ -1903,60 +1918,30 @@ impl Store {
 
     pub fn review_snapshot(&self, agent_id: &str) -> StoreResult<Option<ReviewSnapshot>> {
         let connection = self.connection.lock().unwrap();
-        let Some(report) = query_review_report_state(&connection, agent_id)? else {
-            return Ok(None);
-        };
-        let provenance = query_review_provenance(&connection, agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("review provenance is missing".into()))?;
-        let checkpoints = query_review_entries(
-            &connection,
-            "review_checkpoints",
-            "checkpoint_id",
-            false,
-            agent_id,
-        )?;
-        let findings =
-            query_review_entries(&connection, "review_findings", "finding_id", true, agent_id)?;
-        let validations = query_review_entries(
-            &connection,
-            "review_validations",
-            "validation_id",
-            false,
-            agent_id,
-        )?;
-        let finalization = connection
-            .query_row(
-                "SELECT signal, payload_json, revision, created_at
-                 FROM review_finalizations WHERE agent_id = ?1",
-                [agent_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-            .map(|(signal, payload_json, revision, recorded_at)| {
-                Ok::<ReviewEntryRecord, StoreError>(ReviewEntryRecord {
-                    stable_id: "final".into(),
-                    status: Some(signal),
-                    payload_json,
-                    revision: i64_to_u64(revision)?,
-                    recorded_at,
-                })
-            })
-            .transpose()?;
-        Ok(Some(ReviewSnapshot {
-            report,
-            provenance,
-            checkpoints,
-            findings,
-            validations,
-            finalization,
-        }))
+        query_review_snapshot(&connection, agent_id)
+    }
+
+    fn validate_projected_review(
+        &self,
+        connection: &Connection,
+        agent_id: &str,
+    ) -> StoreResult<()> {
+        let projector = self
+            .review_snapshot_projector
+            .get()
+            .copied()
+            .ok_or_else(|| {
+                StoreError::InvalidState("review snapshot projector is not installed".into())
+            })?;
+        let snapshot = query_review_snapshot(connection, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
+        let bytes = projector(&snapshot).map_err(StoreError::InvalidState)?;
+        if bytes > MAX_REVIEW_REPORT_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "projected review report exceeds {MAX_REVIEW_REPORT_BYTES} bytes"
+            )));
+        }
+        Ok(())
     }
 
     pub fn review_finding_history(
@@ -2248,6 +2233,66 @@ impl StoredReviewInitialization {
     fn report_state(self) -> ReviewReportState {
         self.report
     }
+}
+
+fn query_review_snapshot(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<ReviewSnapshot>> {
+    let Some(report) = query_review_report_state(connection, agent_id)? else {
+        return Ok(None);
+    };
+    let provenance = query_review_provenance(connection, agent_id)?
+        .ok_or_else(|| StoreError::InvalidState("review provenance is missing".into()))?;
+    let checkpoints = query_review_entries(
+        connection,
+        "review_checkpoints",
+        "checkpoint_id",
+        false,
+        agent_id,
+    )?;
+    let findings =
+        query_review_entries(connection, "review_findings", "finding_id", true, agent_id)?;
+    let validations = query_review_entries(
+        connection,
+        "review_validations",
+        "validation_id",
+        false,
+        agent_id,
+    )?;
+    let finalization = connection
+        .query_row(
+            "SELECT signal, payload_json, revision, created_at
+             FROM review_finalizations WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(signal, payload_json, revision, recorded_at)| {
+            Ok::<ReviewEntryRecord, StoreError>(ReviewEntryRecord {
+                stable_id: "final".into(),
+                status: Some(signal),
+                payload_json,
+                revision: i64_to_u64(revision)?,
+                recorded_at,
+            })
+        })
+        .transpose()?;
+    Ok(Some(ReviewSnapshot {
+        report,
+        provenance,
+        checkpoints,
+        findings,
+        validations,
+        finalization,
+    }))
 }
 
 fn query_review_initialization(

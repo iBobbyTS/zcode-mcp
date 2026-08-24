@@ -1,11 +1,11 @@
 use review_ledger::{
-    ArtifactIntegrity, LedgerManager, ToolDisposition, REVIEW_CHECKPOINT, REVIEW_FINALIZE,
-    REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
+    ArtifactIntegrity, LedgerManager, ToolDisposition, MAX_TOOL_TEXT_CHARS, REVIEW_CHECKPOINT,
+    REVIEW_FINALIZE, REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
 };
 use review_preparation::{
     NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
 };
-use review_store::{NewJob, ReviewMutationDisposition, Store};
+use review_store::{NewJob, ReviewMutationDisposition, Store, MAX_REVIEW_REPORT_BYTES};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -563,6 +563,190 @@ fn internal_report_and_event_schemas_validate_real_private_instances() {
     )
     .unwrap();
     assert!(!validator.is_valid(&over_max));
+}
+
+#[test]
+fn aggregate_report_overflow_rolls_back_every_mutation_and_reopens() {
+    let fixture = Fixture::new("job-aggregate-cap");
+    let mut initial_finding = finding("withdrawn");
+    initial_finding["finding_id"] = json!("F-overflow");
+    fixture.call(REVIEW_FINDING_UPSERT, initial_finding);
+    let large = "*".repeat(MAX_TOOL_TEXT_CHARS);
+    let mut accepted = 0usize;
+    let overflow_checkpoint = loop {
+        let payload = checkpoint(&format!("fill-{accepted}"), &large);
+        match fixture
+            .ledger
+            .call_tool(&fixture.agent_id, REVIEW_CHECKPOINT, payload.clone())
+        {
+            Ok(_) => accepted += 1,
+            Err(error) => {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("projected review report exceeds"),
+                    "unexpected aggregate rejection: {error}"
+                );
+                break payload;
+            }
+        }
+        assert!(accepted < 300, "aggregate report cap was not enforced");
+    };
+    assert!(accepted > 1);
+
+    let baseline_snapshot = fixture
+        .store
+        .review_snapshot(&fixture.agent_id)
+        .unwrap()
+        .unwrap();
+    let baseline_events = fixture
+        .store
+        .review_report_events(&fixture.agent_id)
+        .unwrap();
+    let baseline_artifact = fixture
+        .ledger
+        .verify_artifact(&fixture.agent_id, 0)
+        .unwrap();
+    let baseline_file = fs::read(&fixture.prepared.report_target).unwrap();
+    assert_eq!(baseline_artifact.integrity, ArtifactIntegrity::Valid);
+    assert_eq!(
+        baseline_artifact.actual_bytes,
+        Some(baseline_file.len() as u64)
+    );
+    assert!(baseline_file.len() as u64 <= MAX_REVIEW_REPORT_BYTES);
+    assert_eq!(
+        baseline_snapshot.report.current_revision,
+        accepted as u64 + 1
+    );
+    assert_eq!(baseline_events.len(), accepted + 1);
+    let baseline_finding_history = fixture
+        .store
+        .review_finding_history(&fixture.agent_id, "F-overflow")
+        .unwrap();
+    assert_eq!(baseline_finding_history.len(), 1);
+
+    let finding_overflow = json!({
+        "finding_id":"F-overflow","severity":"P2","confidence":"high","title":large,
+        "locations":[{"path":"src/lib.rs","start_line":1,"end_line":2}],
+        "evidence":[large],"impact":large,"suggested_remediation":"repair","status":"withdrawn"
+    });
+    let validation_overflow = json!({
+        "validation_id":"val-overflow","command":large,"cwd":"/workspace",
+        "exit_code":0,"duration_ms":1,"stdout_summary":large,"stderr_summary":large,
+        "related_findings":[]
+    });
+    let finalize_overflow = json!({
+        "signal":"no_findings_observed","summary":large,
+        "coverage":{"covered":[large],"not_covered":[]},
+        "uncertainties":[large],"recommended_next_actions":[]
+    });
+
+    for (tool, payload) in [
+        (REVIEW_CHECKPOINT, overflow_checkpoint),
+        (REVIEW_FINDING_UPSERT, finding_overflow),
+        (REVIEW_VALIDATION_RECORD, validation_overflow),
+        (REVIEW_FINALIZE, finalize_overflow),
+    ] {
+        let error = fixture
+            .ledger
+            .call_tool(&fixture.agent_id, tool, payload)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("projected review report exceeds"));
+        assert_eq!(
+            fixture
+                .store
+                .review_snapshot(&fixture.agent_id)
+                .unwrap()
+                .unwrap(),
+            baseline_snapshot
+        );
+        assert_eq!(
+            fixture
+                .store
+                .review_report_events(&fixture.agent_id)
+                .unwrap(),
+            baseline_events
+        );
+        assert_eq!(
+            fixture
+                .ledger
+                .verify_artifact(&fixture.agent_id, 0)
+                .unwrap(),
+            baseline_artifact
+        );
+        assert_eq!(
+            fs::read(&fixture.prepared.report_target).unwrap(),
+            baseline_file
+        );
+    }
+    assert_eq!(
+        fixture
+            .store
+            .review_finding_history(&fixture.agent_id, "F-overflow")
+            .unwrap(),
+        baseline_finding_history
+    );
+    assert!(!baseline_snapshot.report.finalized);
+    assert!(baseline_snapshot.finalization.is_none());
+
+    let mut concurrent = Vec::new();
+    for index in 0..8 {
+        let ledger = Arc::clone(&fixture.ledger);
+        let agent_id = fixture.agent_id.clone();
+        let summary = large.clone();
+        concurrent.push(thread::spawn(move || {
+            ledger.call_tool(
+                &agent_id,
+                REVIEW_CHECKPOINT,
+                checkpoint(&format!("concurrent-overflow-{index}"), &summary),
+            )
+        }));
+    }
+    for result in concurrent {
+        let error = result.join().unwrap().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("projected review report exceeds"));
+    }
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&fixture.agent_id)
+            .unwrap()
+            .unwrap(),
+        baseline_snapshot
+    );
+    assert_eq!(
+        fixture
+            .store
+            .review_report_events(&fixture.agent_id)
+            .unwrap(),
+        baseline_events
+    );
+
+    let Fixture {
+        directory,
+        prepared,
+        store,
+        ledger,
+        agent_id,
+    } = fixture;
+    drop(ledger);
+    drop(store);
+    let reopened = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let reopened_ledger = LedgerManager::new(Arc::clone(&reopened));
+    reopened_ledger.recover(&agent_id).unwrap();
+    assert_eq!(
+        reopened.review_snapshot(&agent_id).unwrap().unwrap(),
+        baseline_snapshot
+    );
+    assert_eq!(
+        reopened_ledger.verify_artifact(&agent_id, 0).unwrap(),
+        baseline_artifact
+    );
+    assert_eq!(fs::read(prepared.report_target).unwrap(), baseline_file);
 }
 
 fn checkpoint(id: &str, summary: &str) -> Value {

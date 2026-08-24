@@ -1,7 +1,7 @@
 use review_preparation::PreparedLaunchSpec;
 use review_store::{
     ReviewInitialization, ReviewMutationDisposition, ReviewMutationResult, ReviewReportState,
-    ReviewSnapshot, Store, StoreError,
+    ReviewSnapshot, Store, StoreError, MAX_REVIEW_REPORT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +15,6 @@ use std::{
 };
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
-const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_TOOL_TEXT_CHARS: usize = 16 * 1024;
 pub const MAX_TOOL_ITEMS: usize = 128;
 pub const MAX_TOOL_ID_BYTES: usize = 128;
@@ -272,6 +271,7 @@ pub struct LedgerManager {
 
 impl LedgerManager {
     pub fn new(store: Arc<Store>) -> Self {
+        store.install_review_snapshot_projector(project_review_snapshot);
         Self {
             store,
             mutation_lock: Mutex::new(()),
@@ -450,7 +450,7 @@ impl LedgerManager {
             .review_snapshot(agent_id)?
             .ok_or_else(|| LedgerError::Missing(format!("unknown review {agent_id}")))?;
         let bytes = render_snapshot(&snapshot)?;
-        if bytes.len() as u64 > MAX_REPORT_BYTES {
+        if bytes.len() as u64 > MAX_REVIEW_REPORT_BYTES {
             return Err(LedgerError::InvalidInput(
                 "rendered report exceeds cap".into(),
             ));
@@ -551,6 +551,11 @@ fn disposition(result: ReviewMutationResult) -> ToolDisposition {
         ReviewMutationDisposition::Applied => ToolDisposition::Applied,
         ReviewMutationDisposition::Duplicate => ToolDisposition::Duplicate,
     }
+}
+
+fn project_review_snapshot(snapshot: &ReviewSnapshot) -> Result<u64, String> {
+    let bytes = render_snapshot(snapshot).map_err(|error| error.to_string())?;
+    u64::try_from(bytes.len()).map_err(|_| "rendered report size exceeds u64".into())
 }
 
 fn validate_checkpoint(input: &CheckpointInput) -> LedgerResult<()> {
@@ -1045,7 +1050,7 @@ fn verify_state(state: &ReviewReportState, preview_bytes: usize) -> LedgerResult
         }
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() || metadata.len() > MAX_REPORT_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_REVIEW_REPORT_BYTES {
         return Ok(VerifiedArtifact {
             integrity: ArtifactIntegrity::Invalid,
             ..base
@@ -1053,7 +1058,8 @@ fn verify_state(state: &ReviewReportState, preview_bytes: usize) -> LedgerResult
     }
     let file = File::open(&expected)?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_REVIEW_REPORT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     let actual_hash = sha256(&bytes);
     let actual_bytes = bytes.len() as u64;
     let utf8 = match std::str::from_utf8(&bytes) {

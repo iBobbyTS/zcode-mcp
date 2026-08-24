@@ -564,6 +564,7 @@ mod tests {
         let report_root = std::fs::canonicalize(report_root).unwrap();
         let report = report_root.join("GLM-RAW.md");
         let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+        let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
         store
             .enqueue_job(&NewJob::new(
                 "bound-job",
@@ -583,7 +584,6 @@ mod tests {
                 requested_model: None,
             })
             .unwrap();
-        let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
         ledger.recover("bound-job").unwrap();
         let socket_root = directory.path().join("socket");
         std::fs::create_dir(&socket_root).unwrap();
