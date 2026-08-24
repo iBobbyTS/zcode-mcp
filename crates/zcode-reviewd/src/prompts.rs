@@ -83,7 +83,7 @@ pub fn build_review_prompt(prepared: &PreparedLaunchSpec) -> Result<ReviewPrompt
     let plan = serde_json::to_string(&prepared.plan.prepared_path.to_string_lossy())
         .map_err(|error| PromptError::Json(error.to_string()))?;
 
-    let text = format!(
+    let header = format!(
         "PROMPT_SCHEMA: {PROMPT_SCHEMA}\n\
 REVIEW_KIND: {}\n\
 FRESH_SESSION_REQUIRED: true\n\
@@ -94,57 +94,89 @@ BASE_SHA: {}\n\
 HEAD_SHA: {}\n\
 PLAN_INPUT: {plan}\n\
 CONTEXT_INPUTS: {context}\n\
-SCOPE_PATHS: {scope}\n\n\
-{template}",
+SCOPE_PATHS: {scope}",
         kind.as_str(),
         prepared.base_sha,
         prepared.head_sha,
     );
+    let text = format!("{header}\n\n{template}");
     validate_review_prompt(kind, &text)?;
     let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     Ok(ReviewPrompt { kind, text, sha256 })
 }
 
 pub fn validate_review_prompt(kind: ReviewPromptKind, text: &str) -> Result<(), PromptError> {
-    let required = [
+    let (header, instructions) = text.split_once("\n\n").ok_or(PromptError::InvalidContract(
+        "prompt header and instructions are not separated",
+    ))?;
+    let lines = header.lines().collect::<Vec<_>>();
+    let fixed = [
         format!("PROMPT_SCHEMA: {PROMPT_SCHEMA}"),
         format!("REVIEW_KIND: {}", kind.as_str()),
         "FRESH_SESSION_REQUIRED: true".into(),
         "PRIOR_REVIEW_CONTEXT: forbidden".into(),
         "LIVE_STEER: false".into(),
         "LEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review".into(),
-        "BASE_SHA:".into(),
-        "HEAD_SHA:".into(),
-        "PLAN_INPUT:".into(),
-        "CONTEXT_INPUTS:".into(),
-        "SCOPE_PATHS:".into(),
-        "review_checkpoint".into(),
-        "review_finding_upsert".into(),
-        "review_validation_record".into(),
-        "review_finalize exactly once".into(),
-        "observable repository".into(),
-        "covered scope, gaps, uncertainty".into(),
-        "one legal final signal".into(),
     ];
-    if required.iter().any(|needle| !text.contains(needle)) {
+    if lines.len() != 11
+        || fixed
+            .iter()
+            .enumerate()
+            .any(|(index, line)| lines[index] != line)
+    {
+        return Err(PromptError::InvalidContract(
+            "fixed prompt header fields are invalid",
+        ));
+    }
+    for (index, field) in [
+        "BASE_SHA:",
+        "HEAD_SHA:",
+        "PLAN_INPUT:",
+        "CONTEXT_INPUTS:",
+        "SCOPE_PATHS:",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if lines[index + fixed.len()]
+            .strip_prefix(&format!("{field} "))
+            .is_none_or(str::is_empty)
+        {
+            return Err(PromptError::InvalidContract(
+                "prompt metadata field is missing or empty",
+            ));
+        }
+    }
+    let required_instructions = [
+        "review_checkpoint",
+        "review_finding_upsert",
+        "review_validation_record",
+        "review_finalize exactly once",
+        "observable repository",
+        "covered scope, gaps, uncertainty",
+        "one legal final signal",
+    ];
+    if required_instructions
+        .iter()
+        .any(|needle| !instructions.contains(needle))
+    {
         return Err(PromptError::InvalidContract(
             "required observable review instruction is missing",
         ));
     }
-    if text.matches("PROMPT_SCHEMA:").count() != 1
-        || text.matches("REVIEW_KIND:").count() != 1
-        || text.matches("review_finalize exactly once").count() != 1
-    {
+    if instructions.matches("review_finalize exactly once").count() != 1 {
         return Err(PromptError::InvalidContract(
             "prompt markers or final signal instruction are ambiguous",
         ));
     }
-    let lowered = text.to_ascii_lowercase();
+    let lowered = instructions.to_ascii_lowercase();
     let forbidden = [
         "chain of thought",
         "hidden reasoning",
         "approval",
+        "you approve",
         "admission",
+        "admission authority",
         "merge readiness",
         "merge-ready",
     ];
@@ -164,15 +196,15 @@ mod tests {
     fn validator_rejects_hidden_and_caller_owned_language() {
         let base = format!(
             "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nFRESH_SESSION_REQUIRED: true\n\
-PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\nreview_checkpoint review_finding_upsert \
+PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_checkpoint review_finding_upsert \
 review_validation_record review_finalize exactly once observable repository covered scope, gaps, \
 uncertainty one legal final signal"
         );
         assert!(validate_review_prompt(ReviewPromptKind::Code, &base).is_ok());
         for forbidden in [
             "hidden reasoning",
-            "approval",
-            "admission",
+            "you approve this change",
+            "admission authority belongs to you",
             "merge readiness",
         ] {
             assert!(
@@ -180,5 +212,14 @@ uncertainty one legal final signal"
                     .is_err()
             );
         }
+
+        let legal_metadata = base
+            .replace("PLAN_INPUT: p", "PLAN_INPUT: \"context/admission.json\"")
+            .replace(
+                "CONTEXT_INPUTS: []",
+                "CONTEXT_INPUTS: [\"context/admission.json\"]",
+            )
+            .replace("SCOPE_PATHS: []", "SCOPE_PATHS: [\"src/approval.rs\"]");
+        assert!(validate_review_prompt(ReviewPromptKind::Code, &legal_metadata).is_ok());
     }
 }

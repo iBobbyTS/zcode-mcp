@@ -1,8 +1,15 @@
 use serde_json::{json, Map, Value};
 use std::{
-    io::{self, BufRead, Write},
-    process::{Child, Command},
+    io::{self, BufRead, BufReader, Write},
+    process::{Child, Command, Stdio},
 };
+
+const LEDGER_TOOLS: [&str; 4] = [
+    "review_checkpoint",
+    "review_finding_upsert",
+    "review_validation_record",
+    "review_finalize",
+];
 
 fn write_value(out: &mut impl Write, value: Value) -> io::Result<()> {
     serde_json::to_writer(&mut *out, &value)?;
@@ -128,6 +135,204 @@ fn valid_permission_response(result: &Value) -> bool {
     )
 }
 
+fn is_review_flow(mode: &str) -> bool {
+    mode.starts_with("review-flow")
+}
+
+fn mcp_request(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> io::Result<Value> {
+    write_value(
+        input,
+        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+    )?;
+    let mut line = String::new();
+    if output.read_line(&mut line)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "ledger MCP closed without a response",
+        ));
+    }
+    let response: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
+    if response.get("id") != Some(&json!(id)) || response.get("error").is_some() {
+        return Err(io::Error::other("ledger MCP returned an invalid response"));
+    }
+    Ok(response)
+}
+
+fn ledger_tool_call(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    id: u64,
+    name: &str,
+    arguments: Value,
+) -> io::Result<()> {
+    let response = mcp_request(
+        input,
+        output,
+        id,
+        "tools/call",
+        json!({"name":name,"arguments":arguments}),
+    )?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| io::Error::other("ledger tool response has no result"))?;
+    if result.get("isError") != Some(&Value::Bool(false))
+        || result.get("structuredContent").is_none()
+    {
+        return Err(io::Error::other("ledger tool call was not successful"));
+    }
+    Ok(())
+}
+
+fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
+    let server = server
+        .as_object()
+        .ok_or_else(|| io::Error::other("ledger MCP descriptor is not an object"))?;
+    if server.get("name").and_then(Value::as_str) != Some("review-ledger") {
+        return Err(io::Error::other("ledger MCP descriptor has the wrong name"));
+    }
+    let command = server
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("ledger MCP command is missing"))?;
+    let args = server
+        .get("args")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::other("ledger MCP args are missing"))?;
+    let env = server
+        .get("env")
+        .and_then(Value::as_array)
+        .ok_or_else(|| io::Error::other("ledger MCP env is missing"))?;
+    let mut process = Command::new(command);
+    for argument in args {
+        process.arg(
+            argument
+                .as_str()
+                .ok_or_else(|| io::Error::other("ledger MCP arg is not text"))?,
+        );
+    }
+    for variable in env {
+        let variable = variable
+            .as_object()
+            .ok_or_else(|| io::Error::other("ledger MCP env entry is not an object"))?;
+        let name = variable
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("ledger MCP env name is missing"))?;
+        let value = variable
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("ledger MCP env value is missing"))?;
+        process.env(name, value);
+    }
+    let mut child = process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("ledger MCP stdin is missing"))?;
+    let mut output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("ledger MCP stdout is missing"))?,
+    );
+
+    let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))?;
+    if initialized["result"]["serverInfo"]["name"] != "zcode-review-ledger" {
+        return Err(io::Error::other(
+            "ledger MCP initialize response is invalid",
+        ));
+    }
+    let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))?;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("ledger MCP tool list is missing"))?
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    if names != LEDGER_TOOLS {
+        return Err(io::Error::other("ledger MCP tool list is not exact"));
+    }
+
+    ledger_tool_call(
+        &mut input,
+        &mut output,
+        3,
+        LEDGER_TOOLS[0],
+        json!({
+            "checkpoint_id":"scope-1","stage":"inspection","summary":"bounded evidence observed",
+            "inspected":[{"path":"src/approval.rs","line_ranges":["1"]}],
+            "commands":[],"open_questions":[],"remaining_scope":[]
+        }),
+    )?;
+    ledger_tool_call(
+        &mut input,
+        &mut output,
+        4,
+        LEDGER_TOOLS[1],
+        json!({
+            "finding_id":"S06-F1","severity":"P2","confidence":"medium",
+            "title":"candidate","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
+            "evidence":["observable fixture"],"impact":"bounded","suggested_remediation":"none",
+            "status":"open"
+        }),
+    )?;
+    ledger_tool_call(
+        &mut input,
+        &mut output,
+        5,
+        LEDGER_TOOLS[1],
+        json!({
+            "finding_id":"S06-F1","severity":"P2","confidence":"high",
+            "title":"candidate disproved","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
+            "evidence":["later observable fixture"],"impact":"none","suggested_remediation":"none",
+            "status":"withdrawn"
+        }),
+    )?;
+    ledger_tool_call(
+        &mut input,
+        &mut output,
+        6,
+        LEDGER_TOOLS[2],
+        json!({
+            "validation_id":"validation-1","command":"cargo test -p fixture","cwd":".",
+            "exit_code":0,"duration_ms":1,"stdout_summary":"passed","stderr_summary":"",
+            "related_findings":[]
+        }),
+    )?;
+    if finalize {
+        ledger_tool_call(
+            &mut input,
+            &mut output,
+            7,
+            LEDGER_TOOLS[3],
+            json!({
+                "signal":"no_findings_observed","summary":"bounded review complete",
+                "coverage":{"covered":["src"],"not_covered":[]},
+                "uncertainties":[],"recommended_next_actions":[]
+            }),
+        )?;
+    }
+    drop(input);
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(
+            "ledger MCP process did not exit successfully",
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "session".into());
     let stdin = io::stdin();
@@ -135,10 +340,12 @@ fn main() {
     let mut active_turn = false;
     let mut next_turn = 1u64;
     let mut sequence = 0u64;
+    let mut ledger_server: Option<Value> = None;
+    let mut ledger_completed = false;
     let session_id =
         std::env::var("ZCODE_FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-7f3a".into());
     let mut pending_permission: Option<Value> = None;
-    let _descendant: Option<Child> = if mode == "review-flow" {
+    let _descendant: Option<Child> = if is_review_flow(&mode) {
         Command::new("sh")
             .args(["-c", "trap '' TERM; sleep 30"])
             .spawn()
@@ -200,14 +407,22 @@ fn main() {
                     .and_then(|result| result.get("decision"))
                     .and_then(Value::as_str)
                     .unwrap_or("invalid");
-                let expected_decision =
-                    if matches!(mode.as_str(), "review-flow" | "review-flow-send-failure") {
-                        "deny"
-                    } else {
-                        "allow"
-                    };
+                let expected_decision = if is_review_flow(&mode) {
+                    "deny"
+                } else {
+                    "allow"
+                };
                 if decision != expected_decision {
                     continue;
+                }
+                if is_review_flow(&mode) && mode != "review-flow-no-ledger" && !ledger_completed {
+                    let Some(server) = ledger_server.as_ref() else {
+                        std::process::exit(23);
+                    };
+                    if run_ledger_flow(server, mode != "review-flow-no-finalize").is_err() {
+                        std::process::exit(23);
+                    }
+                    ledger_completed = true;
                 }
                 pending_permission = None;
                 let _ = write_value(
@@ -219,9 +434,7 @@ fn main() {
                         json!({"accepted": true}),
                     ),
                 );
-                if matches!(mode.as_str(), "review-flow" | "review-flow-send-failure")
-                    && active_turn
-                {
+                if is_review_flow(&mode) && active_turn {
                     active_turn = false;
                     let _ = write_value(
                         &mut out,
@@ -254,6 +467,15 @@ fn main() {
                 let _ = write_value(&mut out, response(id, json!({"ready": true})));
             }
             "session/create" => {
+                ledger_server = params
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .and_then(|servers| {
+                        servers.iter().find(|server| {
+                            server.get("name").and_then(Value::as_str) == Some("review-ledger")
+                        })
+                    })
+                    .cloned();
                 let _ = write_value(
                     &mut out,
                     response(id, json!({"session": {"sessionId": &session_id}})),
@@ -297,9 +519,7 @@ fn main() {
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let review_flow_initial =
-                    matches!(mode.as_str(), "review-flow" | "review-flow-send-failure")
-                        && next_turn == 2;
+                let review_flow_initial = is_review_flow(&mode) && next_turn == 2;
                 if content.contains("permission") || review_flow_initial {
                     let request_id = Value::String("server-1".into());
                     pending_permission = Some(request_id.clone());
@@ -345,6 +565,16 @@ fn main() {
                     );
                 }
                 if content.contains("auto_complete") {
+                    if is_review_flow(&mode) && mode != "review-flow-no-ledger" && !ledger_completed
+                    {
+                        let Some(server) = ledger_server.as_ref() else {
+                            std::process::exit(23);
+                        };
+                        if run_ledger_flow(server, mode != "review-flow-no-finalize").is_err() {
+                            std::process::exit(23);
+                        }
+                        ledger_completed = true;
+                    }
                     let _ = write_value(
                         &mut out,
                         event(

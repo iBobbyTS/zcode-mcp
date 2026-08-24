@@ -6,6 +6,7 @@ use review_preparation::{NetworkPolicy, ReviewKind, ReviewManifest, RoundKind, S
 use review_store::{Job, JobState, MessageState, PendingRequestState, Store};
 use std::{
     fs, io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Barrier},
@@ -16,7 +17,7 @@ use zcode_driver::observe_process_group;
 use zcode_reviewd::{
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
-        ReviewToolInput, RpcErrorCode, RpcMethod, RpcService, RpcSuccess,
+        ReviewToolInput, RpcErrorCode, RpcMethod, RpcServer, RpcService, RpcSuccess, ServerOptions,
     },
     CommandRuntimeFactory, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
 };
@@ -28,6 +29,7 @@ struct Fixture {
     store: Arc<Store>,
     scheduler: Scheduler,
     service: RpcService,
+    _server: RpcServer,
 }
 
 impl Fixture {
@@ -36,13 +38,18 @@ impl Fixture {
         let repository = directory.path().join("repository");
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        fs::write(
+            repository.join("src/approval.rs"),
+            "pub fn metadata_word_is_legal() {}\n",
+        )
+        .unwrap();
         git(&repository, &["init"]);
         git(&repository, &["config", "user.name", "S06 Test"]);
         git(
             &repository,
             &["config", "user.email", "s06@example.invalid"],
         );
-        git(&repository, &["add", "src/lib.rs"]);
+        git(&repository, &["add", "src/lib.rs", "src/approval.rs"]);
         git(&repository, &["commit", "-m", "fixture"]);
         fs::write(repository.join(".git/info/exclude"), ".agent-work/\n").unwrap();
         fs::create_dir_all(repository.join(".agent-work/context")).unwrap();
@@ -54,7 +61,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
-            repository.join(".agent-work/context/S06.md"),
+            repository.join(".agent-work/context/admission.json"),
             "# Current bounded context\n",
         )
         .unwrap();
@@ -70,9 +77,26 @@ impl Fixture {
                     .ok_or_else(|| io::Error::other("prepared launch missing"))?,
             )
             .map_err(io::Error::other)?;
-            let mode = match prepared.section_id.as_str() {
-                "CRASH" => "crash",
-                "SEND-FAIL" => "review-flow-send-failure",
+            let mode = match (
+                prepared.section_id.as_str(),
+                prepared.idempotency_key.as_str(),
+            ) {
+                ("CRASH", _) => "crash",
+                ("SEND-FAIL", _) => "review-flow-send-failure",
+                (_, key) if key.ends_with("missing-final") => "review-flow-no-finalize",
+                (_, key)
+                    if [
+                        "report-replaced",
+                        "source-mutated",
+                        "malformed-ledger",
+                        "duplicate-final",
+                        "cancel",
+                    ]
+                    .iter()
+                    .any(|suffix| key.ends_with(suffix)) =>
+                {
+                    "review-flow-no-ledger"
+                }
                 _ => "review-flow",
             };
             let mut command = Command::new(&runtime);
@@ -88,6 +112,10 @@ impl Fixture {
             Ok(command)
         }));
         let runtime_factory: Arc<dyn RuntimeFactory> = factory;
+        let socket_root = directory.path().join("socket");
+        fs::create_dir(&socket_root).unwrap();
+        fs::set_permissions(&socket_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = socket_root.join("private.sock");
         let scheduler = Scheduler::new(
             "s06-fixture",
             Arc::clone(&store),
@@ -103,13 +131,15 @@ impl Fixture {
         .with_ledger(
             ledger,
             InternalLedgerMcpConfig {
-                command: PathBuf::from("/usr/bin/false"),
-                socket: directory.path().join("private.sock"),
+                command: fs::canonicalize(env!("CARGO_BIN_EXE_zcode-reviewd")).unwrap(),
+                socket: socket.clone(),
                 runtime_sha256: Some("f".repeat(64)),
             },
         )
         .unwrap();
         let service = RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
+        let server =
+            RpcServer::bind(&socket, Arc::new(service.clone()), ServerOptions::default()).unwrap();
         Self {
             _directory: directory,
             repository,
@@ -117,6 +147,7 @@ impl Fixture {
             store,
             scheduler,
             service,
+            _server: server,
         }
     }
 
@@ -135,8 +166,8 @@ impl Fixture {
             base_ref: self.head.clone(),
             head_ref: self.head.clone(),
             plan_path: ".agent-work/PLAN.md".into(),
-            context_paths: vec![".agent-work/context/S06.md".into()],
-            scope_paths: vec!["src".into()],
+            context_paths: vec![".agent-work/context/admission.json".into()],
+            scope_paths: vec!["src/approval.rs".into()],
             forbidden_input_globs: vec![".agent-work/reviews/*".into()],
             validation_commands: Default::default(),
             report_target: format!(".agent-work/reviews/feature/S06/{suffix}.md").into(),
@@ -190,40 +221,41 @@ impl Fixture {
         }
     }
 
-    fn checkpoint_and_finalize(&self, agent_id: &str) {
-        self.tool(
+    // Success-path E2E evidence must come from the fake session's ledger MCP child.
+    fn direct_finalize_for_negative_control(&self, agent_id: &str) {
+        self.direct_tool_for_negative_control(
             agent_id,
             REVIEW_CHECKPOINT,
             serde_json::json!({
                 "checkpoint_id":"scope-1","stage":"inspection","summary":"bounded evidence observed",
-                "inspected":[{"path":"src/lib.rs","line_ranges":["1"]}],
+                "inspected":[{"path":"src/approval.rs","line_ranges":["1"]}],
                 "commands":[],"open_questions":[],"remaining_scope":[]
             }),
         )
         .unwrap();
-        self.tool(
+        self.direct_tool_for_negative_control(
             agent_id,
             REVIEW_FINDING_UPSERT,
             serde_json::json!({
                 "finding_id":"S06-F1","severity":"P2","confidence":"medium",
-                "title":"candidate","locations":[{"path":"src/lib.rs","start_line":1,"end_line":1}],
+                "title":"candidate","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
                 "evidence":["observable fixture"],"impact":"bounded","suggested_remediation":"none",
                 "status":"open"
             }),
         )
         .unwrap();
-        self.tool(
+        self.direct_tool_for_negative_control(
             agent_id,
             REVIEW_FINDING_UPSERT,
             serde_json::json!({
                 "finding_id":"S06-F1","severity":"P2","confidence":"high",
-                "title":"candidate disproved","locations":[{"path":"src/lib.rs","start_line":1,"end_line":1}],
+                "title":"candidate disproved","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
                 "evidence":["later observable fixture"],"impact":"none","suggested_remediation":"none",
                 "status":"withdrawn"
             }),
         )
         .unwrap();
-        self.tool(
+        self.direct_tool_for_negative_control(
             agent_id,
             REVIEW_VALIDATION_RECORD,
             serde_json::json!({
@@ -233,7 +265,7 @@ impl Fixture {
             }),
         )
         .unwrap();
-        self.tool(
+        self.direct_tool_for_negative_control(
             agent_id,
             REVIEW_FINALIZE,
             serde_json::json!({
@@ -245,7 +277,7 @@ impl Fixture {
         .unwrap();
     }
 
-    fn tool(
+    fn direct_tool_for_negative_control(
         &self,
         agent_id: &str,
         tool: &str,
@@ -312,11 +344,19 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(first_running
         .initial_prompt
         .contains("LEGAL_FINAL_SIGNALS:"));
+    assert!(first_running.initial_prompt.contains("src/approval.rs"));
+    assert!(first_running.initial_prompt.contains("admission.json"));
     let first_worktree = PathBuf::from(first_running.workspace_path.clone());
     let identity = first_running.process_identity.clone().unwrap();
     assert!(fs::read_to_string(&first_report)
         .unwrap()
         .contains("FINALIZED: false"));
+    let in_progress = fixture.store.review_snapshot(&first).unwrap().unwrap();
+    assert!(!in_progress.report.finalized);
+    assert!(in_progress.checkpoints.is_empty());
+    assert!(in_progress.findings.is_empty());
+    assert!(in_progress.validations.is_empty());
+    assert!(in_progress.finalization.is_none());
     wait_until(|| {
         (observe_process_group(identity.process_group_id)
             .unwrap()
@@ -343,8 +383,6 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
             .unwrap(),
         RpcSuccess::Message { .. }
     ));
-    fixture.checkpoint_and_finalize(&first);
-
     let (same, resumed, independent) = fixture.spawn(first_manifest.clone());
     assert_eq!(same, first);
     assert!(resumed);
@@ -381,6 +419,21 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(fs::read_to_string(&first_report)
         .unwrap()
         .contains("FINALIZED: true"));
+    let completed_snapshot = fixture.store.review_snapshot(&first).unwrap().unwrap();
+    assert!(completed_snapshot.report.finalized);
+    assert_eq!(completed_snapshot.checkpoints.len(), 1);
+    assert_eq!(completed_snapshot.findings.len(), 1);
+    assert_eq!(
+        completed_snapshot.findings[0].status.as_deref(),
+        Some("withdrawn")
+    );
+    assert_eq!(completed_snapshot.validations.len(), 1);
+    assert!(completed_snapshot.finalization.is_some());
+    let report_events = fixture.store.review_report_events(&first).unwrap();
+    assert!(report_events.len() >= 5);
+    assert!(report_events
+        .windows(2)
+        .all(|pair| pair[0].revision < pair[1].revision));
     let (completed_replay, resumed, independent) = fixture.spawn(first_manifest);
     assert_eq!(completed_replay, first);
     assert!(resumed);
@@ -404,9 +457,22 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert_ne!(first_done.zcode_session_id, second_running.zcode_session_id);
     assert!(!second_running.initial_prompt.contains(&first));
     assert!(!second_running.initial_prompt.contains("RAW"));
-    fixture.checkpoint_and_finalize(&second);
     fixture.respond_permission(&second);
     assert_eq!(fixture.wait_terminal(&second).state, JobState::Completed);
+    let second_snapshot = fixture.store.review_snapshot(&second).unwrap().unwrap();
+    assert_eq!(second_snapshot.checkpoints.len(), 1);
+    assert_eq!(second_snapshot.validations.len(), 1);
+    assert!(second_snapshot.finalization.is_some());
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&first)
+            .unwrap()
+            .unwrap()
+            .report
+            .current_revision,
+        completed_snapshot.report.current_revision
+    );
     assert_eq!(
         git(&fixture.repository, &["status", "--porcelain=v1"]),
         source_before
@@ -544,7 +610,6 @@ fn terminal_event_write_faults_classify_nonclean_before_releasing_slots() {
     let fixture = Fixture::new();
     let (natural, _, _) = fixture.spawn(fixture.manifest("terminal-fault", "S06"));
     fixture.wait_pending(&natural);
-    fixture.checkpoint_and_finalize(&natural);
     fixture.fail_terminal_event_writes();
     fixture.respond_permission(&natural);
     let natural_terminal = fixture.wait_terminal(&natural);
@@ -592,7 +657,6 @@ fn interrupt_and_continue_is_an_observable_separate_next_turn_fixture() {
     let fixture = Fixture::new();
     let (agent_id, _, _) = fixture.spawn(fixture.manifest("interrupt", "S06"));
     fixture.wait_pending(&agent_id);
-    fixture.checkpoint_and_finalize(&agent_id);
     let disposition = fixture
         .service
         .dispatch(RpcMethod::Message(MessageInput {
@@ -624,7 +688,7 @@ fn completion_failure_matrix_is_typed_nonclean_and_reaps_runtime_groups() {
         let running = fixture.store.get_job(&agent_id).unwrap().unwrap();
         let identity = running.process_identity.clone().unwrap();
         if scenario != "missing-final" {
-            fixture.checkpoint_and_finalize(&agent_id);
+            fixture.direct_finalize_for_negative_control(&agent_id);
         }
         if scenario == "report-replaced" {
             fs::write(&report, "substituted final report").unwrap();
@@ -667,7 +731,7 @@ fn completion_failure_matrix_is_typed_nonclean_and_reaps_runtime_groups() {
         match scenario {
             "malformed-ledger" => {
                 assert!(fixture
-                    .tool(
+                    .direct_tool_for_negative_control(
                         &agent_id,
                         REVIEW_CHECKPOINT,
                         serde_json::json!({"checkpoint_id":"bad","stage":"scope","summary":""}),
@@ -675,9 +739,9 @@ fn completion_failure_matrix_is_typed_nonclean_and_reaps_runtime_groups() {
                     .is_err());
             }
             "duplicate-final" => {
-                fixture.checkpoint_and_finalize(&agent_id);
+                fixture.direct_finalize_for_negative_control(&agent_id);
                 assert!(fixture
-                    .tool(
+                    .direct_tool_for_negative_control(
                         &agent_id,
                         REVIEW_FINALIZE,
                         serde_json::json!({
@@ -750,7 +814,7 @@ fn completion_failure_matrix_is_typed_nonclean_and_reaps_runtime_groups() {
     .with_ledger(
         ledger,
         InternalLedgerMcpConfig {
-            command: PathBuf::from("/usr/bin/false"),
+            command: fs::canonicalize(env!("CARGO_BIN_EXE_zcode-reviewd")).unwrap(),
             socket: fixture._directory.path().join("restart-private.sock"),
             runtime_sha256: Some("f".repeat(64)),
         },
