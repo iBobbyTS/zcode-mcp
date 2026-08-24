@@ -552,6 +552,14 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
             )
             .allowed
     );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Delete(prepared.report_target.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
     let external_link = scratch.join("external-link");
     symlink(&external_file, &external_link).unwrap();
     for external in [ExternalDecision::Allow, ExternalDecision::Deny] {
@@ -573,11 +581,19 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
     let broken_link = scratch.join("broken-link");
     symlink(external_root.join("missing"), &broken_link).unwrap();
     let broken = launcher.decide(
-        &PermissionRequest::Write(broken_link),
+        &PermissionRequest::Write(broken_link.clone()),
         ExternalDecision::Allow,
     );
     assert!(!broken.allowed);
     assert_eq!(broken.reason, "write_path_unverifiable");
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Delete(broken_link),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
 
     let loop_a = scratch.join("loop-a");
     let loop_b = scratch.join("loop-b");
@@ -585,7 +601,15 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
     symlink("loop-a", &loop_b).unwrap();
     assert!(
         !launcher
-            .decide(&PermissionRequest::Write(loop_a), ExternalDecision::Allow)
+            .decide(
+                &PermissionRequest::Write(loop_a.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(&PermissionRequest::Delete(loop_a), ExternalDecision::Allow)
             .allowed
     );
 
@@ -609,26 +633,127 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
             )
             .allowed
     );
-    for tool_name in ["edit", "delete"] {
-        let safe = serde_json::json!({
-            "toolName": tool_name,
-            "input": {"path": safe_target.clone()}
-        });
-        assert!(
-            launcher
-                .decide_zcode_permission(&safe, ExternalDecision::Allow)
-                .allowed
-        );
-        let escaped = serde_json::json!({
-            "toolName": tool_name,
-            "input": {"path": external_link.clone()}
-        });
-        assert!(
-            !launcher
-                .decide_zcode_permission(&escaped, ExternalDecision::Allow)
-                .allowed
-        );
-    }
+    let safe_edit = serde_json::json!({
+        "toolName": "edit",
+        "input": {"path": safe_target.clone()}
+    });
+    assert!(
+        launcher
+            .decide_zcode_permission(&safe_edit, ExternalDecision::Allow)
+            .allowed
+    );
+    let escaped_edit = serde_json::json!({
+        "toolName": "edit",
+        "input": {"path": external_link.clone()}
+    });
+    assert!(
+        !launcher
+            .decide_zcode_permission(&escaped_edit, ExternalDecision::Allow)
+            .allowed
+    );
+    let external_link_delete = serde_json::json!({
+        "toolName": "delete",
+        "input": {"path": external_link.clone()}
+    });
+    assert!(
+        launcher
+            .decide_zcode_permission(&external_link_delete, ExternalDecision::Allow)
+            .allowed
+    );
+
+    let scratch_link_to_worktree = scratch.join("link-to-worktree");
+    symlink(
+        prepared.worktree.path.join("src/lib.rs"),
+        &scratch_link_to_worktree,
+    )
+    .unwrap();
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Write(scratch_link_to_worktree.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Edit(scratch_link_to_worktree.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Delete(scratch_link_to_worktree.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+
+    let worktree_link_to_scratch = prepared.worktree.path.join("link-to-scratch");
+    symlink(&safe_target, &worktree_link_to_scratch).unwrap();
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Write(worktree_link_to_scratch.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Delete(worktree_link_to_scratch.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: worktree_link_to_scratch.clone(),
+                    destination: scratch.join("from-worktree-link"),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: safe_target.clone(),
+                    destination: worktree_link_to_scratch,
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: prepared.worktree.path.join("src/lib.rs"),
+                    destination: scratch.join("from-worktree-entry"),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: safe_target.clone(),
+                    destination: prepared.worktree.path.join("src/lib.rs"),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
 
     let safe_directory = scratch.join("safe-directory");
     fs::create_dir(&safe_directory).unwrap();
@@ -681,11 +806,44 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
             .allowed
     );
     assert!(
-        !launcher
+        launcher
             .decide(
                 &PermissionRequest::Move {
                     source: safe_target.clone(),
                     destination: external_link.clone(),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: external_link.clone(),
+                    destination: scratch.join("moved-external-link"),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: scratch_link_to_worktree.clone(),
+                    destination: scratch.join("moved-worktree-link"),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: safe_target.clone(),
+                    destination: scratch_link_to_worktree,
                 },
                 ExternalDecision::Allow,
             )

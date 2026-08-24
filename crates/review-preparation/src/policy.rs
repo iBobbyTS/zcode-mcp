@@ -109,6 +109,12 @@ pub struct ValidationOutput {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryState {
+    Existing,
+    Missing,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyLauncher {
     worktree: PathBuf,
@@ -318,16 +324,15 @@ impl PolicyLauncher {
                     Some("read_path_escape_denied")
                 }
             }
-            PermissionRequest::Write(path) => self.write_path_denial(path, false),
-            PermissionRequest::Edit(path) | PermissionRequest::Delete(path) => {
-                self.write_path_denial(path, true)
-            }
+            PermissionRequest::Write(path) => self.followed_write_denial(path, false),
+            PermissionRequest::Edit(path) => self.followed_write_denial(path, true),
+            PermissionRequest::Delete(path) => self.lexical_entry_denial(path, true),
             PermissionRequest::Move {
                 source,
                 destination,
             } => self
-                .write_path_denial(source, true)
-                .or_else(|| self.write_path_denial(destination, false)),
+                .lexical_entry_denial(source, true)
+                .or_else(|| self.lexical_entry_denial(destination, false)),
             PermissionRequest::Execute { program, args, cwd } => {
                 if self.commands.values().any(|command| {
                     &command.program == program && &command.args == args && &command.cwd == cwd
@@ -349,24 +354,64 @@ impl PolicyLauncher {
         }
     }
 
-    fn write_path_denial(&self, path: &Path, must_exist: bool) -> Option<&'static str> {
+    fn followed_write_denial(&self, path: &Path, must_exist: bool) -> Option<&'static str> {
+        match self.lexical_entry_state(path, must_exist) {
+            Ok(EntryState::Existing) => self.canonical_write_denial(path),
+            Ok(EntryState::Missing) => None,
+            Err(reason) => Some(reason),
+        }
+    }
+
+    fn lexical_entry_denial(&self, path: &Path, must_exist: bool) -> Option<&'static str> {
+        self.lexical_entry_state(path, must_exist).err()
+    }
+
+    fn lexical_entry_state(
+        &self,
+        path: &Path,
+        must_exist: bool,
+    ) -> Result<EntryState, &'static str> {
         if !path.is_absolute()
             || path
                 .components()
                 .any(|component| component == Component::ParentDir)
         {
-            return Some("write_path_unverifiable");
+            return Err("write_path_unverifiable");
+        }
+        if let Some(reason) = self.resolved_write_denial(path) {
+            return Err(reason);
         }
         match fs::symlink_metadata(path) {
-            Ok(_) => self.canonical_write_denial(path),
-            Err(error) if error.kind() == ErrorKind::NotFound && !must_exist => {
-                let Some(candidate) = self.resolve_nonexistent_write_target(path) else {
-                    return Some("write_path_unverifiable");
-                };
-                self.resolved_write_denial(&candidate)
+            Ok(_) => {
+                let candidate = self.canonical_parent_entry(path)?;
+                if let Some(reason) = self.resolved_write_denial(&candidate) {
+                    Err(reason)
+                } else {
+                    Ok(EntryState::Existing)
+                }
             }
-            Err(_) => Some("write_path_unverifiable"),
+            Err(error) if error.kind() == ErrorKind::NotFound && !must_exist => {
+                let Some(candidate) = self.resolve_nonexistent_entry(path) else {
+                    return Err("write_path_unverifiable");
+                };
+                if let Some(reason) = self.resolved_write_denial(&candidate) {
+                    Err(reason)
+                } else {
+                    Ok(EntryState::Missing)
+                }
+            }
+            Err(_) => Err("write_path_unverifiable"),
         }
+    }
+
+    fn canonical_parent_entry(&self, path: &Path) -> Result<PathBuf, &'static str> {
+        let parent = path.parent().ok_or("write_path_unverifiable")?;
+        let filename = path.file_name().ok_or("write_path_unverifiable")?;
+        let canonical_parent = fs::canonicalize(parent).map_err(|_| "write_path_unverifiable")?;
+        if !canonical_parent.is_dir() {
+            return Err("write_path_unverifiable");
+        }
+        Ok(canonical_parent.join(filename))
     }
 
     fn canonical_write_denial(&self, path: &Path) -> Option<&'static str> {
@@ -376,7 +421,7 @@ impl PolicyLauncher {
         self.resolved_write_denial(&canonical)
     }
 
-    fn resolve_nonexistent_write_target(&self, path: &Path) -> Option<PathBuf> {
+    fn resolve_nonexistent_entry(&self, path: &Path) -> Option<PathBuf> {
         let mut current = path.to_path_buf();
         let mut missing = Vec::<OsString>::new();
         loop {
