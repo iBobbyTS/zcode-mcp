@@ -24,6 +24,7 @@ pub const MAX_LIST_JOBS: usize = 100;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 pub const MAX_PAGE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_PREVIEW_BYTES: usize = 8 * 1024;
+pub const MAX_PENDING_REQUESTS: usize = 100;
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 pub const RPC_TRANSPORT_SUPPORTED: bool = cfg!(unix);
 
@@ -332,6 +333,7 @@ pub enum RpcSuccess {
     },
     Reaped {
         state: JobStateView,
+        resources_reaped: bool,
     },
     ReviewTool {
         result: ToolResult,
@@ -833,7 +835,7 @@ impl RpcService {
                 let job = self.require_job(&agent_id)?;
                 let requests = self
                     .store
-                    .pending_requests(&agent_id)
+                    .pending_requests_bounded(&agent_id, MAX_PENDING_REQUESTS)
                     .map_err(map_store)?
                     .into_iter()
                     .map(|request| pending_request_view(&job, request))
@@ -920,8 +922,10 @@ impl RpcService {
             RpcMethod::Reap { agent_id } => {
                 self.require_job(&agent_id)?;
                 let state = self.scheduler.reap_job(&agent_id).map_err(map_scheduler)?;
+                let resources_reaped = self.require_job(&agent_id)?.reaped_at.is_some();
                 Ok(RpcSuccess::Reaped {
                     state: state.into(),
+                    resources_reaped,
                 })
             }
             RpcMethod::ReviewTool(input) => {
@@ -986,11 +990,21 @@ impl RpcService {
         if let Some(runtime_agent_id) = query.runtime_agent_id.as_deref() {
             validate_id(runtime_agent_id, "runtime_agent_id")?;
         }
+        let fallback = match self
+            .store
+            .get_job_snapshot_until(&query.agent_id, deadline)
+            .map_err(map_store)?
+        {
+            DeadlineRead::Ready(Some(job)) => job,
+            DeadlineRead::Ready(None) => {
+                return Err(RpcError::new(RpcErrorCode::NotFound, "job was not found"))
+            }
+            DeadlineRead::TimedOut => return Err(wait_timeout()),
+        };
         let (initial, initial_page) = match self.wait_snapshot(&query, deadline) {
             Ok(snapshot) => snapshot,
             Err(error) if error.code == RpcErrorCode::Timeout => {
-                let job = self.require_job(&query.agent_id)?;
-                return Ok(wait_timed_out(job, query.after));
+                return Ok(wait_timed_out(fallback, query.after))
             }
             Err(error) => return Err(error),
         };
@@ -1020,8 +1034,7 @@ impl RpcService {
             let (job, page) = match self.wait_snapshot(&query, deadline) {
                 Ok(snapshot) => snapshot,
                 Err(error) if error.code == RpcErrorCode::Timeout => {
-                    let job = self.require_job(&query.agent_id)?;
-                    return Ok(wait_timed_out(job, query.after));
+                    return Ok(wait_timed_out(initial, query.after));
                 }
                 Err(error) => return Err(error),
             };

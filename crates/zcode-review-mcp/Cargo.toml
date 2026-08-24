@@ -15,4 +15,7 @@ review-preparation = { path = "../review-preparation" }
 
 [dev-dependencies]
 review-store = { path = "../review-store" }
+review-ledger = { path = "../review-ledger" }
+zcode-driver = { path = "../zcode-driver" }
+zcode-protocol = { path = "../zcode-protocol" }
 tempfile = "3"

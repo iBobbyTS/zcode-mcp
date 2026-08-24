@@ -1,4 +1,6 @@
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -749,6 +751,25 @@ impl Store {
         query_job(&connection, agent_id)
     }
 
+    pub fn get_job_snapshot_until(
+        &self,
+        agent_id: &str,
+        deadline: Instant,
+    ) -> StoreResult<DeadlineRead<Option<Job>>> {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(DeadlineRead::TimedOut);
+        };
+        let connection = Connection::open_with_flags(
+            &self.database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(remaining)?;
+        if Instant::now() >= deadline {
+            return Ok(DeadlineRead::TimedOut);
+        }
+        query_job(&connection, agent_id).map(DeadlineRead::Ready)
+    }
+
     pub fn wait_snapshot_until(
         &self,
         agent_id: &str,
@@ -1419,13 +1440,25 @@ impl Store {
     }
 
     pub fn pending_requests(&self, agent_id: &str) -> StoreResult<Vec<StoredPendingRequest>> {
+        self.pending_requests_bounded(agent_id, i64::MAX as usize)
+    }
+
+    pub fn pending_requests_bounded(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredPendingRequest>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
             "SELECT request_id FROM pending_requests
-             WHERE agent_id = ?1 ORDER BY created_at, rowid",
+             WHERE agent_id = ?1
+             ORDER BY CASE state WHEN 'PENDING' THEN 0 WHEN 'SENDING' THEN 1 ELSE 2 END,
+                      created_at DESC, rowid DESC
+             LIMIT ?2",
         )?;
+        let limit = usize_to_i64(limit)?;
         let ids = statement
-            .query_map([agent_id], |row| row.get::<_, String>(0))?
+            .query_map(params![agent_id, limit], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .map(|request_id| {
@@ -3359,6 +3392,64 @@ mod tests {
         assert_eq!(result, DeadlineRead::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(200));
         drop(connection);
+    }
+
+    #[test]
+    fn readonly_job_snapshot_remains_bounded_during_store_mutex_contention() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "job-readonly", "a");
+        let connection = store.connection.lock().unwrap();
+        let started = Instant::now();
+        let snapshot = store
+            .get_job_snapshot_until("job-readonly", Instant::now() + Duration::from_millis(50))
+            .unwrap();
+        assert!(
+            matches!(snapshot, DeadlineRead::Ready(Some(ref job)) if job.agent_id == "job-readonly")
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(connection);
+    }
+
+    #[test]
+    fn bounded_pending_requests_prioritize_actionable_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path().join("pending.sqlite3")).unwrap();
+        store
+            .enqueue_job(&NewJob::new("pending-bounded", "/workspace"))
+            .unwrap();
+        for index in 0..120 {
+            let request_id = format!("responded-{index:03}");
+            store
+                .insert_pending_request(
+                    &request_id,
+                    "pending-bounded",
+                    &format!("corr-{index}"),
+                    "permission",
+                    "{}",
+                )
+                .unwrap();
+            store
+                .claim_pending_response("pending-bounded", &request_id, "deny", None)
+                .unwrap();
+            store
+                .complete_pending_response("pending-bounded", &request_id)
+                .unwrap();
+        }
+        store
+            .insert_pending_request(
+                "actionable",
+                "pending-bounded",
+                "corr-actionable",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let requests = store
+            .pending_requests_bounded("pending-bounded", 100)
+            .unwrap();
+        assert_eq!(requests.len(), 100);
+        assert_eq!(requests[0].request_id, "actionable");
+        assert_eq!(requests[0].state, PendingRequestState::Pending);
     }
 
     #[test]

@@ -4082,6 +4082,7 @@ mod tests {
             SchedulerConfig::default(),
         )
         .unwrap();
+        let rpc_service = rpc::RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
         scheduler
             .enqueue(&NewJob::new("race-job", "/workspace"))
             .unwrap();
@@ -4091,6 +4092,21 @@ mod tests {
         };
         entered.wait();
         assert_eq!(scheduler.close_job("race-job").unwrap(), JobState::Stopping);
+        match rpc_service
+            .dispatch(rpc::RpcMethod::Reap {
+                agent_id: "race-job".into(),
+            })
+            .unwrap()
+        {
+            rpc::RpcSuccess::Reaped {
+                state,
+                resources_reaped,
+            } => {
+                assert_eq!(state, rpc::JobStateView::Stopping);
+                assert!(!resources_reaped);
+            }
+            other => panic!("unexpected bootstrap reap response: {other:?}"),
+        }
         assert_eq!(store.active_count().unwrap(), 1);
         assert_eq!(scheduler.active_count(), 0);
         release.wait();
@@ -4101,6 +4117,21 @@ mod tests {
         let job = store.get_job("race-job").unwrap().unwrap();
         assert!(job.close_requested);
         assert!(job.closed_at.is_some());
+        match rpc_service
+            .dispatch(rpc::RpcMethod::Reap {
+                agent_id: "race-job".into(),
+            })
+            .unwrap()
+        {
+            rpc::RpcSuccess::Reaped {
+                state,
+                resources_reaped,
+            } => {
+                assert_eq!(state, rpc::JobStateView::Cancelled);
+                assert!(resources_reaped);
+            }
+            other => panic!("unexpected terminal reap response: {other:?}"),
+        }
     }
 
     #[test]

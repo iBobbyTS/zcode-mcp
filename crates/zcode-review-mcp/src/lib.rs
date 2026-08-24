@@ -37,6 +37,7 @@ const MAX_MANIFEST_BYTES: u64 = 128 * 1024;
 const MAX_REASON_BYTES: usize = 2048;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PublicCapabilities {
     pub queue_message: bool,
     pub interrupt_and_continue: bool,
@@ -68,11 +69,62 @@ impl Default for PublicCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicJobState {
+    Queued,
+    Starting,
+    Running,
+    Stopping,
+    Completed,
+    Cancelled,
+    Failed,
+    FailedRuntimeLost,
+    Orphaned,
+    Closed,
+}
+
+impl From<JobStateView> for PublicJobState {
+    fn from(value: JobStateView) -> Self {
+        match value {
+            JobStateView::Queued => Self::Queued,
+            JobStateView::Starting => Self::Starting,
+            JobStateView::Running => Self::Running,
+            JobStateView::Stopping => Self::Stopping,
+            JobStateView::Completed => Self::Completed,
+            JobStateView::Cancelled => Self::Cancelled,
+            JobStateView::Failed => Self::Failed,
+            JobStateView::FailedRuntimeLost => Self::FailedRuntimeLost,
+            JobStateView::Orphaned => Self::Orphaned,
+            JobStateView::Closed => Self::Closed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicTurnState {
+    Idle,
+    Active,
+    Failed,
+}
+
+impl From<TurnStateView> for PublicTurnState {
+    fn from(value: TurnStateView) -> Self {
+        match value {
+            TurnStateView::Idle => Self::Idle,
+            TurnStateView::Active => Self::Active,
+            TurnStateView::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PublicJob {
     pub agent_id: String,
-    pub state: String,
-    pub turn_state: String,
+    pub state: PublicJobState,
+    pub turn_state: PublicTurnState,
     pub review_kind: Option<String>,
     pub feature_id: Option<String>,
     pub section_id: Option<String>,
@@ -96,8 +148,8 @@ impl From<JobView> for PublicJob {
         let provenance = job.provenance;
         Self {
             agent_id: job.agent_id,
-            state: state_name(job.state).into(),
-            turn_state: turn_name(job.turn_state).into(),
+            state: job.state.into(),
+            turn_state: job.turn_state.into(),
             review_kind: job.review_kind,
             feature_id: job.feature_id,
             section_id: job.section_id,
@@ -119,32 +171,91 @@ impl From<JobView> for PublicJob {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPendingKind {
+    Permission,
+    UnsupportedInput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPendingState {
+    Pending,
+    Sending,
+    Responded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPolicyPreview {
+    ExternallyDecidable,
+    HardDeny,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicOperation {
+    Read,
+    Write,
+    Command,
+    Network,
+    GitRefMutation,
+    UserInput,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PublicPendingRequest {
     pub request_id: String,
-    pub kind: String,
-    pub state: String,
+    pub kind: PublicPendingKind,
+    pub state: PublicPendingState,
     pub respondable: bool,
     pub tool_name: Option<String>,
-    pub operation: String,
+    pub operation: PublicOperation,
     pub summary: String,
-    pub policy_preview: String,
+    pub policy_preview: PublicPolicyPreview,
 }
 impl From<PendingRequestView> for PublicPendingRequest {
     fn from(v: PendingRequestView) -> Self {
         Self {
             request_id: v.request_id,
-            kind: v.kind,
-            state: format!("{:?}", v.state).to_ascii_lowercase(),
+            kind: if v.kind == "permission" {
+                PublicPendingKind::Permission
+            } else {
+                PublicPendingKind::UnsupportedInput
+            },
+            state: match v.state {
+                zcode_reviewd::rpc::PendingRequestStateView::Pending => PublicPendingState::Pending,
+                zcode_reviewd::rpc::PendingRequestStateView::Sending => PublicPendingState::Sending,
+                zcode_reviewd::rpc::PendingRequestStateView::Responded => {
+                    PublicPendingState::Responded
+                }
+            },
             respondable: v.respondable,
             tool_name: v.tool_name,
-            operation: v.operation,
+            operation: match v.operation.as_str() {
+                "read" => PublicOperation::Read,
+                "write" => PublicOperation::Write,
+                "command" => PublicOperation::Command,
+                "network" => PublicOperation::Network,
+                "git_ref_mutation" => PublicOperation::GitRefMutation,
+                "user_input" => PublicOperation::UserInput,
+                _ => PublicOperation::Unknown,
+            },
             summary: v.summary,
-            policy_preview: v.policy_preview,
+            policy_preview: match v.policy_preview.as_str() {
+                "externally_decidable" => PublicPolicyPreview::ExternallyDecidable,
+                "hard_deny" => PublicPolicyPreview::HardDeny,
+                _ => PublicPolicyPreview::Unknown,
+            },
         }
     }
 }
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PublicEvent {
     pub sequence: u64,
     pub event_type: String,
@@ -157,13 +268,21 @@ pub struct SpawnInput {
     pub manifest_path: String,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SpawnOutput {
     pub agent_id: String,
-    pub submission_disposition: String,
-    pub state: String,
+    pub submission_disposition: SubmissionDisposition,
+    pub state: PublicJobState,
     pub last_event_sequence: u64,
     pub prompt_sha256: String,
     pub capabilities: PublicCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionDisposition {
+    Created,
+    ExistingCompatible,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +290,7 @@ pub struct AgentInput {
     pub agent_id: String,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct StatusOutput {
     pub job: PublicJob,
     pub pending_requests: Vec<PublicPendingRequest>,
@@ -180,9 +300,11 @@ pub struct StatusOutput {
 pub struct EventsInput {
     pub agent_id: String,
     pub after_sequence: u64,
+    #[schemars(range(min = 1, max = 100))]
     pub limit: usize,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct EventsOutput {
     pub events: Vec<PublicEvent>,
     pub next_sequence: u64,
@@ -193,9 +315,11 @@ pub struct EventsOutput {
 pub struct WaitInput {
     pub agent_id: String,
     pub after_sequence: u64,
+    #[schemars(range(min = 1, max = 5000))]
     pub timeout_ms: u64,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct WaitOutput {
     pub job: PublicJob,
     pub events: Vec<PublicEvent>,
@@ -216,10 +340,21 @@ pub struct MessageInputPublic {
     pub content: String,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct MessageOutput {
-    pub disposition: String,
+    pub disposition: PublicMessageDisposition,
 }
-#[derive(Debug, Deserialize, JsonSchema)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicMessageDisposition {
+    Queued,
+    Delivered,
+    InterruptedThenDelivered,
+    AlreadyDelivered,
+    Failed,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicDecision {
     Allow,
@@ -234,29 +369,42 @@ pub struct RespondInputPublic {
     pub reason: Option<String>,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RespondOutput {
-    pub disposition: String,
-    pub requested_decision: String,
-    pub effective_decision: String,
+    pub disposition: PublicResponseDisposition,
+    pub requested_decision: PublicDecision,
+    pub effective_decision: PublicDecision,
     pub policy_overrode: bool,
     pub policy_reason_code: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicResponseDisposition {
+    Responded,
+    AlreadyResponded,
+    InFlight,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct StateOutput {
     pub agent_id: String,
-    pub state: String,
+    pub state: PublicJobState,
     pub resources_reaped: bool,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResultInput {
     pub agent_id: String,
+    #[schemars(range(min = 0, max = 8192))]
     pub preview_bytes: usize,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ReportSummary {
     pub finalized: bool,
-    pub integrity: String,
+    pub integrity: PublicArtifactIntegrity,
     pub expected_sha256: Option<String>,
     pub observed_sha256: Option<String>,
     pub expected_bytes: Option<u64>,
@@ -264,7 +412,19 @@ pub struct ReportSummary {
     pub checkpoint_number: Option<u64>,
     pub preview: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicArtifactIntegrity {
+    Valid,
+    Missing,
+    Replaced,
+    Binary,
+    Invalid,
+    LegacyUnverified,
+}
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ResultOutput {
     pub job: PublicJob,
     pub report: Option<ReportSummary>,
@@ -280,9 +440,11 @@ pub enum PublicListScope {
 #[serde(deny_unknown_fields)]
 pub struct ListInput {
     pub scope: PublicListScope,
+    #[schemars(range(min = 1, max = 100))]
     pub limit: usize,
 }
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ListOutput {
     pub jobs: Vec<PublicJob>,
 }
@@ -385,12 +547,11 @@ impl ReviewMcp {
             } => Ok(Json(SpawnOutput {
                 agent_id: job.agent_id,
                 submission_disposition: if resumed_existing {
-                    "existing_compatible"
+                    SubmissionDisposition::ExistingCompatible
                 } else {
-                    "created"
-                }
-                .into(),
-                state: state_name(job.state).into(),
+                    SubmissionDisposition::Created
+                },
+                state: job.state.into(),
                 last_event_sequence: job.last_event_seq,
                 prompt_sha256,
                 capabilities: PublicCapabilities::default(),
@@ -498,7 +659,7 @@ impl ReviewMcp {
             content: i.content,
         }))? {
             RpcSuccess::Message { disposition } => Ok(Json(MessageOutput {
-                disposition: message_name(disposition).into(),
+                disposition: disposition.into(),
             })),
             _ => Err(protocol_error()),
         }
@@ -556,7 +717,7 @@ impl ReviewMcp {
         })? {
             RpcSuccess::Stopped { state } => Ok(Json(StateOutput {
                 agent_id: i.agent_id,
-                state: state_name(state).into(),
+                state: state.into(),
                 resources_reaped: false,
             })),
             _ => Err(protocol_error()),
@@ -636,10 +797,13 @@ impl ReviewMcp {
         match self.rpc(RpcMethod::Reap {
             agent_id: i.agent_id.clone(),
         })? {
-            RpcSuccess::Reaped { state } => Ok(Json(StateOutput {
+            RpcSuccess::Reaped {
+                state,
+                resources_reaped,
+            } => Ok(Json(StateOutput {
                 agent_id: i.agent_id,
-                state: state_name(state).into(),
-                resources_reaped: true,
+                state: state.into(),
+                resources_reaped,
             })),
             _ => Err(protocol_error()),
         }
@@ -691,9 +855,27 @@ fn project_events(p: EventPage) -> EventsOutput {
 }
 fn project_response(v: ResponseOutcomeView) -> RespondOutput {
     RespondOutput {
-        disposition: format!("{:?}", v.disposition).to_ascii_lowercase(),
-        requested_decision: v.requested_decision,
-        effective_decision: v.effective_decision,
+        disposition: match v.disposition {
+            zcode_reviewd::rpc::ResponseDispositionView::Responded => {
+                PublicResponseDisposition::Responded
+            }
+            zcode_reviewd::rpc::ResponseDispositionView::AlreadyResponded => {
+                PublicResponseDisposition::AlreadyResponded
+            }
+            zcode_reviewd::rpc::ResponseDispositionView::InFlight => {
+                PublicResponseDisposition::InFlight
+            }
+        },
+        requested_decision: if v.requested_decision == "allow" {
+            PublicDecision::Allow
+        } else {
+            PublicDecision::Deny
+        },
+        effective_decision: if v.effective_decision == "allow" {
+            PublicDecision::Allow
+        } else {
+            PublicDecision::Deny
+        },
         policy_overrode: v.policy_overrode,
         policy_reason_code: v.policy_reason_code,
     }
@@ -701,7 +883,18 @@ fn project_response(v: ResponseOutcomeView) -> RespondOutput {
 fn project_report(v: ArtifactView) -> ReportSummary {
     ReportSummary {
         finalized: v.finalized,
-        integrity: format!("{:?}", v.integrity).to_ascii_lowercase(),
+        integrity: match v.integrity {
+            zcode_reviewd::rpc::ArtifactIntegrityView::Valid => PublicArtifactIntegrity::Valid,
+            zcode_reviewd::rpc::ArtifactIntegrityView::Missing => PublicArtifactIntegrity::Missing,
+            zcode_reviewd::rpc::ArtifactIntegrityView::Replaced => {
+                PublicArtifactIntegrity::Replaced
+            }
+            zcode_reviewd::rpc::ArtifactIntegrityView::Binary => PublicArtifactIntegrity::Binary,
+            zcode_reviewd::rpc::ArtifactIntegrityView::Invalid => PublicArtifactIntegrity::Invalid,
+            zcode_reviewd::rpc::ArtifactIntegrityView::LegacyUnverified => {
+                PublicArtifactIntegrity::LegacyUnverified
+            }
+        },
         expected_sha256: v.expected_sha256,
         observed_sha256: v.observed_sha256,
         expected_bytes: v.expected_bytes,
@@ -734,34 +927,15 @@ fn public_error(e: RpcError) -> String {
 fn protocol_error() -> String {
     "protocol_error: unexpected daemon response".into()
 }
-fn state_name(v: JobStateView) -> &'static str {
-    match v {
-        JobStateView::Queued => "QUEUED",
-        JobStateView::Starting => "STARTING",
-        JobStateView::Running => "RUNNING",
-        JobStateView::Stopping => "STOPPING",
-        JobStateView::Completed => "COMPLETED",
-        JobStateView::Cancelled => "CANCELLED",
-        JobStateView::Failed => "FAILED",
-        JobStateView::FailedRuntimeLost => "FAILED_RUNTIME_LOST",
-        JobStateView::Orphaned => "ORPHANED",
-        JobStateView::Closed => "CLOSED",
-    }
-}
-fn turn_name(v: TurnStateView) -> &'static str {
-    match v {
-        TurnStateView::Idle => "IDLE",
-        TurnStateView::Active => "ACTIVE",
-        TurnStateView::Failed => "FAILED",
-    }
-}
-fn message_name(v: MessageDispositionView) -> &'static str {
-    match v {
-        MessageDispositionView::Queued => "queued",
-        MessageDispositionView::Delivered => "delivered",
-        MessageDispositionView::InterruptedThenDelivered => "interrupted_then_delivered",
-        MessageDispositionView::AlreadyDelivered => "already_delivered",
-        MessageDispositionView::Failed => "failed",
+impl From<MessageDispositionView> for PublicMessageDisposition {
+    fn from(value: MessageDispositionView) -> Self {
+        match value {
+            MessageDispositionView::Queued => Self::Queued,
+            MessageDispositionView::Delivered => Self::Delivered,
+            MessageDispositionView::InterruptedThenDelivered => Self::InterruptedThenDelivered,
+            MessageDispositionView::AlreadyDelivered => Self::AlreadyDelivered,
+            MessageDispositionView::Failed => Self::Failed,
+        }
     }
 }
 
@@ -863,7 +1037,7 @@ mod tests {
             .job_with_pending("stable-agent")
             .unwrap();
         assert_eq!(restarted.job.agent_id, "stable-agent");
-        assert_eq!(restarted.job.state, "QUEUED");
+        assert_eq!(restarted.job.state, PublicJobState::Queued);
     }
 
     #[tokio::test]
@@ -903,7 +1077,7 @@ mod tests {
                 .0
                 .job
                 .state,
-            "QUEUED"
+            PublicJobState::Queued
         );
         assert!(facade
             .events(Parameters(EventsInput {
@@ -958,7 +1132,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(stopped.state, "CANCELLED");
+        assert_eq!(stopped.state, PublicJobState::Cancelled);
         assert!(!stopped.resources_reaped);
         let closed = facade
             .close(Parameters(AgentInput {
@@ -967,7 +1141,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert_eq!(closed.state, "CANCELLED");
+        assert_eq!(closed.state, PublicJobState::Cancelled);
         assert!(closed.resources_reaped);
     }
 }

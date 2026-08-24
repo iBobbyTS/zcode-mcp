@@ -2,11 +2,13 @@ use super::{
     RpcError, RpcErrorCode, RpcOutcome, RpcRequest, RpcResponse, RpcService, MAX_FRAME_BYTES,
     RPC_VERSION,
 };
+use socket2::{Domain, SockAddr, Socket, Type};
 use std::{
     fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        io::{FromRawFd, IntoRawFd},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -15,7 +17,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -152,9 +154,10 @@ impl RpcClient {
     }
 
     pub fn call(&self, request: &RpcRequest) -> io::Result<RpcResponse> {
-        let mut stream = UnixStream::connect(&self.path)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
+        let deadline = Instant::now() + self.timeout;
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.connect_timeout(&SockAddr::unix(&self.path)?, remaining(deadline)?)?;
+        let mut stream = unsafe { UnixStream::from_raw_fd(socket.into_raw_fd()) };
         let mut frame = serde_json::to_vec(request)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         if frame.len() > MAX_FRAME_BYTES {
@@ -164,11 +167,70 @@ impl RpcClient {
             ));
         }
         frame.push(b'\n');
-        stream.write_all(&frame)?;
-        let mut reader = BufReader::new(stream);
-        let response = read_limited_frame(&mut reader, MAX_FRAME_BYTES)?;
+        write_all_until(&mut stream, &frame, deadline)?;
+        let response = read_limited_frame_until(&mut stream, MAX_FRAME_BYTES, deadline)?;
         serde_json::from_slice(&response)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "RPC deadline elapsed"))
+}
+
+fn write_all_until(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "RPC peer closed")),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn read_limited_frame_until(
+    stream: &mut UnixStream,
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        let read = match stream.read(&mut buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "RPC peer closed before frame",
+                ))
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(newline) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            frame.extend_from_slice(&buffer[..newline]);
+            if frame.len() > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame exceeds cap",
+                ));
+            }
+            return Ok(frame);
+        }
+        frame.extend_from_slice(&buffer[..read]);
+        if frame.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame exceeds cap",
+            ));
+        }
     }
 }
 
@@ -365,6 +427,7 @@ fn read_limited_frame<R: BufRead>(reader: &mut R, cap: usize) -> io::Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn ambiguous_connect_error_preserves_socket() {
@@ -401,5 +464,45 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(path.exists());
         drop(replacement);
+    }
+
+    #[test]
+    fn client_total_deadline_bounds_a_slowly_progressing_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("slow.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            for byte in b"{\"version\":" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let client = RpcClient::new(&path, Duration::from_millis(80));
+        let started = Instant::now();
+        let error = client
+            .call(&RpcRequest {
+                version: RPC_VERSION,
+                request_id: "deadline".into(),
+                method: super::super::RpcMethod::Start,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        peer.join().unwrap();
     }
 }
