@@ -2,7 +2,8 @@ use crate::rpc::{
     ReviewToolInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
 };
 use review_ledger::{
-    REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
+    MAX_TOOL_ID_BYTES, MAX_TOOL_ITEMS, MAX_TOOL_TEXT_BYTES, REVIEW_CHECKPOINT, REVIEW_FINALIZE,
+    REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
 };
 use serde_json::{json, Value};
 use std::{
@@ -20,24 +21,19 @@ pub fn serve<R: BufRead, W: Write>(
     mut writer: W,
 ) -> io::Result<()> {
     let client = RpcClient::new(socket, Duration::from_secs(5));
-    let mut line = Vec::new();
     let mut sequence = 0u64;
     loop {
-        line.clear();
-        let bytes = reader.read_until(b'\n', &mut line)?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        if line.len() > MAX_MCP_FRAME_BYTES {
-            write_response(
-                &mut writer,
-                &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"request exceeds cap"}}),
-            )?;
-            continue;
-        }
-        while matches!(line.last(), Some(b'\n' | b'\r')) {
-            line.pop();
-        }
+        let line = match read_frame(&mut reader, MAX_MCP_FRAME_BYTES)? {
+            FrameRead::Eof => return Ok(()),
+            FrameRead::Oversized => {
+                write_response(
+                    &mut writer,
+                    &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"request exceeds cap"}}),
+                )?;
+                continue;
+            }
+            FrameRead::Frame(line) => line,
+        };
         let value: Value = match serde_json::from_slice(&line) {
             Ok(value) => value,
             Err(_) => {
@@ -87,6 +83,49 @@ pub fn serve<R: BufRead, W: Write>(
             }),
         };
         write_response(&mut writer, &response)?;
+    }
+}
+
+enum FrameRead {
+    Eof,
+    Frame(Vec<u8>),
+    Oversized,
+}
+
+fn read_frame(reader: &mut impl BufRead, cap: usize) -> io::Result<FrameRead> {
+    let mut frame = Vec::with_capacity(cap.min(8 * 1024));
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if oversized {
+                Ok(FrameRead::Oversized)
+            } else if frame.is_empty() {
+                Ok(FrameRead::Eof)
+            } else {
+                Ok(FrameRead::Frame(frame))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if !oversized {
+            if frame.len().saturating_add(take) > cap {
+                frame.clear();
+                oversized = true;
+            } else {
+                frame.extend_from_slice(&available[..take]);
+            }
+        }
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            if oversized {
+                return Ok(FrameRead::Oversized);
+            }
+            if frame.last() == Some(&b'\r') {
+                frame.pop();
+            }
+            return Ok(FrameRead::Frame(frame));
+        }
     }
 }
 
@@ -170,6 +209,30 @@ fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<()> {
 }
 
 fn tool_definitions() -> Value {
+    let id = || {
+        json!({
+            "type":"string",
+            "minLength":1,
+            "maxLength":MAX_TOOL_ID_BYTES,
+            "pattern":"^[A-Za-z0-9._:-]+$"
+        })
+    };
+    let text = || {
+        json!({
+            "type":"string",
+            "minLength":1,
+            "maxLength":MAX_TOOL_TEXT_BYTES,
+            "pattern":"^[^\\u0000]+$"
+        })
+    };
+    let optional_text = || {
+        json!({
+            "type":"string",
+            "maxLength":MAX_TOOL_TEXT_BYTES,
+            "pattern":"^[^\\u0000]*$"
+        })
+    };
+    let text_array = || json!({"type":"array","maxItems":MAX_TOOL_ITEMS,"items":text()});
     json!([
         {
             "name": REVIEW_CHECKPOINT,
@@ -178,19 +241,19 @@ fn tool_definitions() -> Value {
                 "type":"object","additionalProperties":false,
                 "required":["checkpoint_id","stage","summary"],
                 "properties":{
-                    "checkpoint_id":{"type":"string"},
+                    "checkpoint_id":id(),
                     "stage":{"enum":["scope","inspection","validation","synthesis"]},
-                    "summary":{"type":"string"},
-                    "inspected":{"type":"array","items":{
+                    "summary":text(),
+                    "inspected":{"type":"array","maxItems":MAX_TOOL_ITEMS,"items":{
                         "type":"object","additionalProperties":false,"required":["path"],
-                        "properties":{"path":{"type":"string"},"line_ranges":{"type":"array","items":{"type":"string"}}}
+                        "properties":{"path":text(),"line_ranges":text_array()}
                     }},
-                    "commands":{"type":"array","items":{
+                    "commands":{"type":"array","maxItems":MAX_TOOL_ITEMS,"items":{
                         "type":"object","additionalProperties":false,"required":["command","result_summary"],
-                        "properties":{"command":{"type":"string"},"result_summary":{"type":"string"}}
+                        "properties":{"command":text(),"result_summary":text()}
                     }},
-                    "open_questions":{"type":"array","items":{"type":"string"}},
-                    "remaining_scope":{"type":"array","items":{"type":"string"}}
+                    "open_questions":text_array(),
+                    "remaining_scope":text_array()
                 }
             }
         },
@@ -201,16 +264,16 @@ fn tool_definitions() -> Value {
                 "type":"object","additionalProperties":false,
                 "required":["finding_id","severity","confidence","title","impact","suggested_remediation","status"],
                 "properties":{
-                    "finding_id":{"type":"string"},"severity":{"enum":["P0","P1","P2","P3"]},
-                    "confidence":{"enum":["high","medium","low"]},"title":{"type":"string"},
-                    "locations":{"type":"array","items":{
+                    "finding_id":id(),"severity":{"enum":["P0","P1","P2","P3"]},
+                    "confidence":{"enum":["high","medium","low"]},"title":text(),
+                    "locations":{"type":"array","maxItems":MAX_TOOL_ITEMS,"items":{
                         "type":"object","additionalProperties":false,"required":["path","start_line","end_line"],
                         "properties":{
-                            "path":{"type":"string"},"start_line":{"type":"integer","minimum":1},
+                            "path":text(),"start_line":{"type":"integer","minimum":1},
                             "end_line":{"type":"integer","minimum":1}
                         }
-                    }},"evidence":{"type":"array","items":{"type":"string"}},
-                    "impact":{"type":"string"},"suggested_remediation":{"type":"string"},
+                    }},"evidence":text_array(),
+                    "impact":text(),"suggested_remediation":text(),
                     "status":{"enum":["open","withdrawn"]}
                 }
             }
@@ -222,10 +285,11 @@ fn tool_definitions() -> Value {
                 "type":"object","additionalProperties":false,
                 "required":["validation_id","command","cwd","exit_code","duration_ms","stdout_summary","stderr_summary"],
                 "properties":{
-                    "validation_id":{"type":"string"},"command":{"type":"string"},"cwd":{"type":"string"},
-                    "exit_code":{"type":"integer"},"duration_ms":{"type":"integer","minimum":0},
-                    "stdout_summary":{"type":"string"},"stderr_summary":{"type":"string"},
-                    "related_findings":{"type":"array","items":{"type":"string"}}
+                    "validation_id":id(),"command":text(),"cwd":text(),
+                    "exit_code":{"type":"integer","minimum":-2147483648,"maximum":2147483647},
+                    "duration_ms":{"type":"integer","minimum":0,"maximum":18446744073709551615u64},
+                    "stdout_summary":optional_text(),"stderr_summary":optional_text(),
+                    "related_findings":{"type":"array","maxItems":MAX_TOOL_ITEMS,"items":id()}
                 }
             }
         },
@@ -237,15 +301,15 @@ fn tool_definitions() -> Value {
                 "required":["signal","summary","coverage"],
                 "properties":{
                     "signal":{"enum":["findings_present","no_findings_observed","incomplete_evidence","unable_to_review"]},
-                    "summary":{"type":"string"},"coverage":{
+                    "summary":text(),"coverage":{
                         "type":"object","additionalProperties":false,"required":["covered","not_covered"],
                         "properties":{
-                            "covered":{"type":"array","items":{"type":"string"}},
-                            "not_covered":{"type":"array","items":{"type":"string"}}
+                            "covered":text_array(),
+                            "not_covered":text_array()
                         }
                     },
-                    "uncertainties":{"type":"array","items":{"type":"string"}},
-                    "recommended_next_actions":{"type":"array","items":{"type":"string"}}
+                    "uncertainties":text_array(),
+                    "recommended_next_actions":text_array()
                 }
             }
         }
@@ -259,7 +323,7 @@ mod tests {
         rpc::{RpcServer, RpcService, ServerOptions},
         LifecycleSink, ManagedRuntime, RuntimeFactory, Scheduler, SchedulerConfig,
     };
-    use review_ledger::LedgerManager;
+    use review_ledger::{validate_tool_arguments, LedgerManager};
     use review_store::{NewJob, ReviewInitialization, Store};
     use std::{io::Cursor, sync::Arc};
 
@@ -273,6 +337,164 @@ mod tests {
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
             Err(io::Error::other("runtime is unused"))
         }
+    }
+
+    #[test]
+    fn oversized_frame_is_drained_without_retention_and_next_frame_is_processed() {
+        let mut input = vec![b'x'; MAX_MCP_FRAME_BYTES * 8];
+        input.push(b'\n');
+        input.extend_from_slice(
+            serde_json::to_string(&json!({"jsonrpc":"2.0","id":7,"method":"ping"}))
+                .unwrap()
+                .as_bytes(),
+        );
+        input.push(b'\n');
+        let mut output = Vec::new();
+        serve(
+            Path::new("/unused/socket"),
+            "bound-job",
+            Cursor::new(input),
+            &mut output,
+        )
+        .unwrap();
+        let responses: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["message"], "request exceeds cap");
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["result"], json!({}));
+
+        let mut output = Vec::new();
+        serve(
+            Path::new("/unused/socket"),
+            "bound-job",
+            Cursor::new(vec![b'x'; MAX_MCP_FRAME_BYTES * 8]),
+            &mut output,
+        )
+        .unwrap();
+        let response: Value = serde_json::from_slice(
+            output
+                .strip_suffix(b"\n")
+                .expect("one newline-terminated response"),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["message"], "request exceeds cap");
+    }
+
+    #[test]
+    fn advertised_tool_schemas_match_rust_shape_constraints() {
+        let definitions = tool_definitions();
+        let definitions = definitions.as_array().unwrap();
+        let cases = [
+            (
+                REVIEW_CHECKPOINT,
+                json!({
+                    "checkpoint_id":"cp-1","stage":"inspection","summary":"observed",
+                    "inspected":[],"commands":[],"open_questions":[],"remaining_scope":[]
+                }),
+                true,
+            ),
+            (
+                REVIEW_CHECKPOINT,
+                json!({"checkpoint_id":"bad/id","stage":"inspection","summary":"observed"}),
+                false,
+            ),
+            (
+                REVIEW_FINDING_UPSERT,
+                json!({
+                    "finding_id":"F-1","severity":"P2","confidence":"high","title":"issue",
+                    "locations":[{"path":"src/lib.rs","start_line":9,"end_line":2}],
+                    "evidence":[],"impact":"impact","suggested_remediation":"repair","status":"open"
+                }),
+                true,
+            ),
+            (
+                REVIEW_FINDING_UPSERT,
+                json!({
+                    "finding_id":"F-2","severity":"P2","confidence":"high","title":"issue",
+                    "locations":[{"path":"src/lib.rs","start_line":0,"end_line":2}],
+                    "impact":"impact","suggested_remediation":"repair","status":"open"
+                }),
+                false,
+            ),
+            (
+                REVIEW_VALIDATION_RECORD,
+                json!({
+                    "validation_id":"val-1","command":"cargo test","cwd":"/workspace",
+                    "exit_code":0,"duration_ms":1,"stdout_summary":"","stderr_summary":"",
+                    "related_findings":["F-1"]
+                }),
+                true,
+            ),
+            (
+                REVIEW_VALIDATION_RECORD,
+                json!({
+                    "validation_id":"val-2","command":"","cwd":"/workspace",
+                    "exit_code":0,"duration_ms":1,"stdout_summary":"","stderr_summary":""
+                }),
+                false,
+            ),
+            (
+                REVIEW_FINALIZE,
+                json!({
+                    "signal":"incomplete_evidence","summary":"bounded",
+                    "coverage":{"covered":[],"not_covered":[]},
+                    "uncertainties":[],"recommended_next_actions":[]
+                }),
+                true,
+            ),
+            (
+                REVIEW_FINALIZE,
+                json!({
+                    "signal":"incomplete_evidence","summary":"",
+                    "coverage":{"covered":[],"not_covered":[]}
+                }),
+                false,
+            ),
+        ];
+
+        for (tool, arguments, expected) in cases {
+            let schema = &definitions
+                .iter()
+                .find(|definition| definition["name"] == tool)
+                .unwrap()["inputSchema"];
+            jsonschema::draft202012::meta::validate(schema).unwrap();
+            let validator = jsonschema::draft202012::options().build(schema).unwrap();
+            assert_eq!(
+                validator.is_valid(&arguments),
+                expected,
+                "schema parity for {tool}: {arguments}"
+            );
+            assert_eq!(
+                validate_tool_arguments(tool, &arguments).is_ok(),
+                expected,
+                "Rust parity for {tool}: {arguments}"
+            );
+        }
+
+        let mut too_many = json!({
+            "checkpoint_id":"cp-many","stage":"inspection","summary":"observed",
+            "inspected":[],"commands":[],"open_questions":[],"remaining_scope":[]
+        });
+        too_many["remaining_scope"] = Value::Array(
+            (0..=MAX_TOOL_ITEMS)
+                .map(|index| json!(format!("item-{index}")))
+                .collect(),
+        );
+        let schema = &definitions[0]["inputSchema"];
+        let validator = jsonschema::draft202012::options().build(schema).unwrap();
+        assert!(!validator.is_valid(&too_many));
+        assert!(validate_tool_arguments(REVIEW_CHECKPOINT, &too_many).is_err());
+
+        let mut too_long = json!({
+            "checkpoint_id":"cp-long","stage":"inspection","summary":"observed"
+        });
+        too_long["summary"] = json!("x".repeat(MAX_TOOL_TEXT_BYTES + 1));
+        assert!(!validator.is_valid(&too_long));
+        assert!(validate_tool_arguments(REVIEW_CHECKPOINT, &too_long).is_err());
     }
 
     #[test]

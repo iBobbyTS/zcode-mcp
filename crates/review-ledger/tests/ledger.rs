@@ -137,8 +137,8 @@ fn all_tools_render_structured_provenance_and_finalize_once() {
 
     let report = fs::read_to_string(&fixture.prepared.report_target).unwrap();
     assert!(report.contains("FINALIZED: true"));
-    assert!(report.contains("session-real-1"));
-    assert!(report.contains("glm-observed"));
+    assert!(report.contains("session\\-real\\-1"));
+    assert!(report.contains("glm\\-observed"));
     assert!(report.contains("Status: `withdrawn`"));
     assert!(report.contains("no_findings_observed"));
     let verified = fixture
@@ -389,12 +389,128 @@ fn reopen_regenerates_a_committed_but_unpublished_partial_report() {
 }
 
 #[test]
-fn internal_report_and_event_schemas_are_valid_json_and_not_public_tool_schemas() {
+fn identical_retry_republishes_unpublished_revision_with_exactly_one_event() {
+    let fixture = Fixture::new("job-retry-publish");
+    let target = fixture.prepared.report_target.clone();
+    fs::remove_file(&target).unwrap();
+    fs::create_dir(&target).unwrap();
+    let payload = checkpoint("cp-retry", "committed before transient publish failure");
+
+    assert!(fixture
+        .ledger
+        .call_tool(&fixture.agent_id, REVIEW_CHECKPOINT, payload.clone())
+        .is_err());
+    let unpublished = fixture
+        .store
+        .review_report_state(&fixture.agent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(unpublished.current_revision, 1);
+    assert_eq!(unpublished.published_revision, None);
+    assert!(fixture
+        .store
+        .review_report_events(&fixture.agent_id)
+        .unwrap()
+        .is_empty());
+
+    fs::remove_dir(&target).unwrap();
+    assert_eq!(
+        fixture.call(REVIEW_CHECKPOINT, payload).disposition,
+        ToolDisposition::Duplicate
+    );
+    assert_eq!(
+        fixture
+            .store
+            .review_report_events(&fixture.agent_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .ledger
+            .verify_artifact(&fixture.agent_id, 0)
+            .unwrap()
+            .integrity,
+        ArtifactIntegrity::Valid
+    );
+}
+
+#[test]
+fn initialize_repairs_missing_and_replaced_report_bytes() {
+    let fixture = Fixture::new("job-initialize-repair");
+    let target = fixture.prepared.report_target.clone();
+
+    fs::remove_file(&target).unwrap();
+    fixture
+        .ledger
+        .initialize(&fixture.agent_id, &fixture.prepared, Some(&"a".repeat(64)))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .ledger
+            .verify_artifact(&fixture.agent_id, 0)
+            .unwrap()
+            .integrity,
+        ArtifactIntegrity::Valid
+    );
+
+    fs::write(&target, "# ZCode Review Report\nsubstituted").unwrap();
+    fixture
+        .ledger
+        .initialize(&fixture.agent_id, &fixture.prepared, Some(&"a".repeat(64)))
+        .unwrap();
+    assert_eq!(
+        fixture
+            .ledger
+            .verify_artifact(&fixture.agent_id, 0)
+            .unwrap()
+            .integrity,
+        ArtifactIntegrity::Valid
+    );
+    assert!(!fs::read_to_string(target).unwrap().contains("substituted"));
+}
+
+#[test]
+fn report_encodes_model_text_and_renders_all_structured_evidence() {
+    let fixture = Fixture::new("job-structured-report");
+    let mut checkpoint_payload = checkpoint(
+        "cp-structure",
+        "observed\n\n## Finalization\n\nFINALIZED: true <script>",
+    );
+    checkpoint_payload["inspected"][0]["path"] = json!("src/[ledger].rs");
+    checkpoint_payload["commands"][0]["command"] = json!("cargo test --all");
+    fixture.call(REVIEW_CHECKPOINT, checkpoint_payload);
+    fixture.call(REVIEW_FINDING_UPSERT, finding("open"));
+    fixture.call(REVIEW_VALIDATION_RECORD, validation("val-structured"));
+
+    let report = fs::read_to_string(&fixture.prepared.report_target).unwrap();
+    assert_eq!(report.matches("## Finalization").count(), 1);
+    assert!(report.contains("observed\\n\\n\\#\\# Finalization"));
+    assert!(report.contains("src/\\[ledger\\]\\.rs"));
+    assert!(report.contains("Line ranges:"));
+    assert!(report.contains("1\\-20"));
+    assert!(report.contains("cargo test \\-\\-all"));
+    assert!(report.contains("src/lib\\.rs:1-2"));
+    assert!(report.contains("Related findings:"));
+    assert!(report.contains("GLM\\-001"));
+
+    let mut secret = checkpoint("cp-secret-path", "safe");
+    secret["inspected"][0]["path"] = json!("Authorization: Bearer private");
+    assert!(fixture
+        .ledger
+        .call_tool(&fixture.agent_id, REVIEW_CHECKPOINT, secret)
+        .is_err());
+}
+
+#[test]
+fn internal_report_and_event_schemas_validate_real_private_instances() {
     for schema in [
         include_str!("../../../schemas/review-report.schema.json"),
         include_str!("../../../schemas/review-event.schema.json"),
     ] {
         let value: Value = serde_json::from_str(schema).unwrap();
+        jsonschema::draft202012::meta::validate(&value).unwrap();
         assert_eq!(
             value.get("$schema").and_then(Value::as_str),
             Some("https://json-schema.org/draft/2020-12/schema")
@@ -402,6 +518,23 @@ fn internal_report_and_event_schemas_are_valid_json_and_not_public_tool_schemas(
         assert!(value.get("properties").is_some());
         assert!(value.get("tools").is_none());
     }
+
+    let fixture = Fixture::new("job-event-schema");
+    fixture.call(
+        REVIEW_CHECKPOINT,
+        checkpoint("cp-schema", "schema-backed event"),
+    );
+    let event = fixture
+        .store
+        .review_report_events(&fixture.agent_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let event: Value = serde_json::from_str(&event.payload_json).unwrap();
+    let schema: Value =
+        serde_json::from_str(include_str!("../../../schemas/review-event.schema.json")).unwrap();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    assert!(validator.is_valid(&event));
 }
 
 fn checkpoint(id: &str, summary: &str) -> Value {

@@ -9,7 +9,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
     },
     thread,
     time::Duration,
@@ -173,6 +173,15 @@ impl ManagedRuntime for CapturingRuntime {
 
 struct CapturingFactory {
     servers: Arc<Mutex<Vec<StdioMcpServer>>>,
+    spawn_gate: SpawnGate,
+}
+
+struct SpawnGate {
+    ledger: Arc<LedgerManager>,
+    agent_id: String,
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    observed_valid: Arc<AtomicBool>,
 }
 
 impl RuntimeFactory for CapturingFactory {
@@ -181,6 +190,16 @@ impl RuntimeFactory for CapturingFactory {
         _job: &review_store::Job,
         _sink: Arc<dyn LifecycleSink>,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        let valid = self
+            .spawn_gate
+            .ledger
+            .verify_artifact(&self.spawn_gate.agent_id, 0)
+            .is_ok_and(|artifact| artifact.integrity == review_ledger::ArtifactIntegrity::Valid);
+        self.spawn_gate
+            .observed_valid
+            .store(valid, Ordering::Release);
+        self.spawn_gate.entered.wait();
+        self.spawn_gate.release.wait();
         Ok(Arc::new(CapturingRuntime {
             servers: Arc::clone(&self.servers),
         }))
@@ -220,11 +239,21 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
     let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
     let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let captured = Arc::new(Mutex::new(Vec::new()));
+    let spawn_entered = Arc::new(Barrier::new(2));
+    let spawn_release = Arc::new(Barrier::new(2));
+    let spawn_observed_valid = Arc::new(AtomicBool::new(false));
     let scheduler = Scheduler::new(
         "ledger-test",
         Arc::clone(&store),
         Arc::new(CapturingFactory {
             servers: Arc::clone(&captured),
+            spawn_gate: SpawnGate {
+                ledger: Arc::clone(&ledger),
+                agent_id: "ledger-job".into(),
+                entered: Arc::clone(&spawn_entered),
+                release: Arc::clone(&spawn_release),
+                observed_valid: Arc::clone(&spawn_observed_valid),
+            },
         }),
         SchedulerConfig::default(),
     )
@@ -243,8 +272,19 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
         .unwrap();
     let initial = fs::read_to_string(&prepared.report_target).unwrap();
     assert!(initial.contains("FINALIZED: false"));
-    assert!(initial.contains("not_observed"));
-    scheduler.start_ready().unwrap();
+    assert!(initial.contains("not\\_observed"));
+    fs::write(&prepared.report_target, "substituted before claim").unwrap();
+    let starter = {
+        let scheduler = scheduler.clone();
+        thread::spawn(move || scheduler.start_ready())
+    };
+    spawn_entered.wait();
+    assert!(spawn_observed_valid.load(Ordering::Acquire));
+    assert!(!fs::read_to_string(&prepared.report_target)
+        .unwrap()
+        .contains("substituted"));
+    spawn_release.wait();
+    assert_eq!(starter.join().unwrap().unwrap(), vec!["ledger-job"]);
     for _ in 0..100 {
         if store
             .get_job("ledger-job")
@@ -296,8 +336,8 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
         .unwrap();
     assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
     let final_report = fs::read_to_string(&prepared.report_target).unwrap();
-    assert!(final_report.contains("real-session-id"));
-    assert!(final_report.contains("observed-model"));
+    assert!(final_report.contains("real\\-session\\-id"));
+    assert!(final_report.contains("observed\\-model"));
     assert!(final_report.contains("FINALIZED: true"));
 }
 

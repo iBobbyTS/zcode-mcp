@@ -16,8 +16,9 @@ use std::{
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TEXT_BYTES: usize = 16 * 1024;
-const MAX_ITEMS: usize = 128;
+pub const MAX_TOOL_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_TOOL_ITEMS: usize = 128;
+pub const MAX_TOOL_ID_BYTES: usize = 128;
 
 pub const REVIEW_CHECKPOINT: &str = "review_checkpoint";
 pub const REVIEW_FINDING_UPSERT: &str = "review_finding_upsert";
@@ -337,18 +338,17 @@ impl LedgerManager {
     ) -> LedgerResult<ToolResult> {
         let _guard = self.mutation_lock.lock().unwrap();
         validate_id(agent_id, "agent_id")?;
-        validate_payload(&arguments)?;
+        validate_tool_arguments(tool, &arguments)?;
         let result = match tool {
             REVIEW_CHECKPOINT => {
                 let input: CheckpointInput = serde_json::from_value(arguments)?;
-                validate_checkpoint(&input)?;
                 let (json, hash) = canonical_payload(&input)?;
                 self.store
                     .apply_review_checkpoint(agent_id, &input.checkpoint_id, &json, &hash)?
             }
             REVIEW_FINDING_UPSERT => {
-                let input: FindingInput = serde_json::from_value(arguments)?;
-                validate_finding(&input)?;
+                let mut input: FindingInput = serde_json::from_value(arguments)?;
+                normalize_finding(&mut input);
                 let (json, hash) = canonical_payload(&input)?;
                 self.store.upsert_review_finding(
                     agent_id,
@@ -360,14 +360,12 @@ impl LedgerManager {
             }
             REVIEW_VALIDATION_RECORD => {
                 let input: ValidationInput = serde_json::from_value(arguments)?;
-                validate_validation(&input)?;
                 let (json, hash) = canonical_payload(&input)?;
                 self.store
                     .apply_review_validation(agent_id, &input.validation_id, &json, &hash)?
             }
             REVIEW_FINALIZE => {
                 let input: FinalizeInput = serde_json::from_value(arguments)?;
-                validate_finalize(&input)?;
                 let snapshot = self
                     .store
                     .review_snapshot(agent_id)?
@@ -486,7 +484,7 @@ impl LedgerManager {
     ) -> LedgerResult<ReviewReportState> {
         match result.disposition {
             ReviewMutationDisposition::Applied => self.render_and_publish(agent_id, true),
-            ReviewMutationDisposition::Duplicate => self.ensure_published(agent_id, false),
+            ReviewMutationDisposition::Duplicate => self.ensure_published(agent_id, true),
         }
     }
 
@@ -499,9 +497,9 @@ impl LedgerManager {
             .store
             .review_report_state(agent_id)?
             .ok_or_else(|| LedgerError::Missing(format!("unknown review {agent_id}")))?;
+        let verified = verify_state(&state, 0)?;
         if state.published_revision == Some(state.current_revision)
-            && state.sha256.is_some()
-            && state.bytes.is_some()
+            && verified.integrity == ArtifactIntegrity::Valid
         {
             Ok(state)
         } else {
@@ -521,6 +519,31 @@ impl LedgerManager {
             return Ok(state);
         }
         self.render_and_publish(agent_id, state.current_revision > 0)
+    }
+}
+
+pub fn validate_tool_arguments(tool: &str, arguments: &Value) -> LedgerResult<()> {
+    validate_payload(arguments)?;
+    match tool {
+        REVIEW_CHECKPOINT => {
+            let input: CheckpointInput = serde_json::from_value(arguments.clone())?;
+            validate_checkpoint(&input)
+        }
+        REVIEW_FINDING_UPSERT => {
+            let input: FindingInput = serde_json::from_value(arguments.clone())?;
+            validate_finding(&input)
+        }
+        REVIEW_VALIDATION_RECORD => {
+            let input: ValidationInput = serde_json::from_value(arguments.clone())?;
+            validate_validation(&input)
+        }
+        REVIEW_FINALIZE => {
+            let input: FinalizeInput = serde_json::from_value(arguments.clone())?;
+            validate_finalize(&input)
+        }
+        _ => Err(LedgerError::InvalidInput(
+            "unknown internal ledger tool".into(),
+        )),
     }
 }
 
@@ -558,13 +581,21 @@ fn validate_finding(input: &FindingInput) -> LedgerResult<()> {
     validate_text(&input.suggested_remediation, "suggested_remediation")?;
     for location in &input.locations {
         validate_text(&location.path, "location.path")?;
-        if location.start_line == 0 || location.end_line < location.start_line {
+        if location.start_line == 0 || location.end_line == 0 {
             return Err(LedgerError::InvalidInput(
                 "finding line range is invalid".into(),
             ));
         }
     }
     Ok(())
+}
+
+fn normalize_finding(input: &mut FindingInput) {
+    for location in &mut input.locations {
+        if location.end_line < location.start_line {
+            std::mem::swap(&mut location.start_line, &mut location.end_line);
+        }
+    }
 }
 
 fn validate_validation(input: &ValidationInput) -> LedgerResult<()> {
@@ -644,7 +675,7 @@ fn reject_sensitive(value: &Value) -> LedgerResult<()> {
 
 fn validate_id(value: &str, field: &str) -> LedgerResult<()> {
     if value.is_empty()
-        || value.len() > 128
+        || value.len() > MAX_TOOL_ID_BYTES
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
@@ -662,7 +693,7 @@ fn validate_text(value: &str, field: &str) -> LedgerResult<()> {
 }
 
 fn validate_text_allow_empty(value: &str, field: &str) -> LedgerResult<()> {
-    if value.len() > MAX_TEXT_BYTES || value.contains('\0') {
+    if value.len() > MAX_TOOL_TEXT_BYTES || value.contains('\0') {
         return Err(LedgerError::InvalidInput(format!("{field} is invalid")));
     }
     Ok(())
@@ -677,7 +708,7 @@ fn validate_strings(values: &[String], field: &str) -> LedgerResult<()> {
 }
 
 fn validate_len<T>(values: &[T], field: &str) -> LedgerResult<()> {
-    if values.len() > MAX_ITEMS {
+    if values.len() > MAX_TOOL_ITEMS {
         return Err(LedgerError::InvalidInput(format!("{field} exceeds cap")));
     }
     Ok(())
@@ -811,10 +842,7 @@ fn render_snapshot(snapshot: &ReviewSnapshot) -> LedgerResult<Vec<u8>> {
         ("Requested Model", provenance.requested_model.as_deref()),
         ("Observed Model", provenance.observed_model.as_deref()),
     ] {
-        report.push_str(&format!(
-            "- {label}: `{}`\n",
-            value.unwrap_or("not_observed")
-        ));
+        render_value(&mut report, label, value.unwrap_or("not_observed"));
     }
     report.push_str("\n## Checkpoints\n\n");
     if snapshot.checkpoints.is_empty() {
@@ -823,9 +851,14 @@ fn render_snapshot(snapshot: &ReviewSnapshot) -> LedgerResult<Vec<u8>> {
     for entry in &snapshot.checkpoints {
         let input: CheckpointInput = serde_json::from_str(&entry.payload_json)?;
         report.push_str(&format!(
-            "### {} (revision {})\n\n- Stage: `{:?}`\n- Summary: {}\n",
-            input.checkpoint_id, entry.revision, input.stage, input.summary
+            "### {} (revision {})\n\n- Stage: `{:?}`\n",
+            markdown_text(&input.checkpoint_id),
+            entry.revision,
+            input.stage
         ));
+        render_value(&mut report, "Summary", &input.summary);
+        render_inspected(&mut report, &input.inspected);
+        render_commands(&mut report, &input.commands);
         render_string_list(&mut report, "Open questions", &input.open_questions);
         render_string_list(&mut report, "Remaining scope", &input.remaining_scope);
     }
@@ -836,16 +869,21 @@ fn render_snapshot(snapshot: &ReviewSnapshot) -> LedgerResult<Vec<u8>> {
     for entry in &snapshot.findings {
         let input: FindingInput = serde_json::from_str(&entry.payload_json)?;
         report.push_str(&format!(
-            "### {}: {}\n\n- Status: `{}`\n- Severity: `{:?}`\n- Confidence: `{:?}`\n- Impact: {}\n- Suggested remediation: {}\n",
-            input.finding_id,
-            input.title,
+            "### {}: {}\n\n- Status: `{}`\n- Severity: `{:?}`\n- Confidence: `{:?}`\n",
+            markdown_text(&input.finding_id),
+            markdown_text(&input.title),
             input.status.as_str(),
             input.severity,
-            input.confidence,
-            input.impact,
-            input.suggested_remediation
+            input.confidence
         ));
+        render_locations(&mut report, &input.locations);
         render_string_list(&mut report, "Evidence", &input.evidence);
+        render_value(&mut report, "Impact", &input.impact);
+        render_value(
+            &mut report,
+            "Suggested remediation",
+            &input.suggested_remediation,
+        );
     }
     report.push_str("\n## Validation\n\n");
     if snapshot.validations.is_empty() {
@@ -854,24 +892,22 @@ fn render_snapshot(snapshot: &ReviewSnapshot) -> LedgerResult<Vec<u8>> {
     for entry in &snapshot.validations {
         let input: ValidationInput = serde_json::from_str(&entry.payload_json)?;
         report.push_str(&format!(
-            "### {}\n\n- Command: `{}`\n- CWD: `{}`\n- Exit code: `{}`\n- Duration ms: `{}`\n- Stdout summary: {}\n- Stderr summary: {}\n",
-            input.validation_id,
-            input.command,
-            input.cwd,
+            "### {}\n\n- Exit code: `{}`\n- Duration ms: `{}`\n",
+            markdown_text(&input.validation_id),
             input.exit_code,
-            input.duration_ms,
-            input.stdout_summary,
-            input.stderr_summary
+            input.duration_ms
         ));
+        render_value(&mut report, "Command", &input.command);
+        render_value(&mut report, "CWD", &input.cwd);
+        render_value(&mut report, "Stdout summary", &input.stdout_summary);
+        render_value(&mut report, "Stderr summary", &input.stderr_summary);
+        render_string_list(&mut report, "Related findings", &input.related_findings);
     }
     report.push_str("\n## Finalization\n\n");
     if let Some(entry) = &snapshot.finalization {
         let input: FinalizeInput = serde_json::from_str(&entry.payload_json)?;
-        report.push_str(&format!(
-            "- Signal: `{}`\n- Summary: {}\n",
-            input.signal.as_str(),
-            input.summary
-        ));
+        report.push_str(&format!("- Signal: `{}`\n", input.signal.as_str()));
+        render_value(&mut report, "Summary", &input.summary);
         render_string_list(&mut report, "Covered", &input.coverage.covered);
         render_string_list(&mut report, "Not covered", &input.coverage.not_covered);
         render_string_list(&mut report, "Uncertainties", &input.uncertainties);
@@ -891,6 +927,10 @@ fn render_snapshot(snapshot: &ReviewSnapshot) -> LedgerResult<Vec<u8>> {
     Ok(report.into_bytes())
 }
 
+fn render_value(report: &mut String, label: &str, value: &str) {
+    report.push_str(&format!("- {label}: {}\n", markdown_text(value)));
+}
+
 fn render_string_list(report: &mut String, label: &str, values: &[String]) {
     report.push_str(&format!("- {label}:"));
     if values.is_empty() {
@@ -898,9 +938,89 @@ fn render_string_list(report: &mut String, label: &str, values: &[String]) {
     } else {
         report.push('\n');
         for value in values {
-            report.push_str(&format!("  - {value}\n"));
+            report.push_str(&format!("  - {}\n", markdown_text(value)));
         }
     }
+}
+
+fn render_inspected(report: &mut String, inspected: &[InspectedPath]) {
+    report.push_str("- Inspected:");
+    if inspected.is_empty() {
+        report.push_str(" none\n");
+        return;
+    }
+    report.push('\n');
+    for item in inspected {
+        report.push_str(&format!("  - Path: {}\n", markdown_text(&item.path)));
+        render_nested_list(report, "Line ranges", &item.line_ranges, 4);
+    }
+}
+
+fn render_commands(report: &mut String, commands: &[CommandSummary]) {
+    report.push_str("- Commands:");
+    if commands.is_empty() {
+        report.push_str(" none\n");
+        return;
+    }
+    report.push('\n');
+    for command in commands {
+        report.push_str(&format!(
+            "  - Command: {}\n    Result: {}\n",
+            markdown_text(&command.command),
+            markdown_text(&command.result_summary)
+        ));
+    }
+}
+
+fn render_locations(report: &mut String, locations: &[FindingLocation]) {
+    report.push_str("- Locations:");
+    if locations.is_empty() {
+        report.push_str(" none\n");
+        return;
+    }
+    report.push('\n');
+    for location in locations {
+        report.push_str(&format!(
+            "  - {}:{}-{}\n",
+            markdown_text(&location.path),
+            location.start_line,
+            location.end_line
+        ));
+    }
+}
+
+fn render_nested_list(report: &mut String, label: &str, values: &[String], indent: usize) {
+    let padding = " ".repeat(indent);
+    report.push_str(&format!("{padding}{label}:"));
+    if values.is_empty() {
+        report.push_str(" none\n");
+        return;
+    }
+    report.push('\n');
+    for value in values {
+        report.push_str(&format!("{padding}  - {}\n", markdown_text(value)));
+    }
+}
+
+fn markdown_text(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            character if character.is_control() => {
+                encoded.push_str(&format!("\\u{{{:04x}}}", character as u32));
+            }
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '(' | ')' | '#' | '+'
+            | '-' | '.' | '!' | '|' | '~' | '&' => {
+                encoded.push('\\');
+                encoded.push(character);
+            }
+            _ => encoded.push(character),
+        }
+    }
+    encoded
 }
 
 fn verify_state(state: &ReviewReportState, preview_bytes: usize) -> LedgerResult<VerifiedArtifact> {

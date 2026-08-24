@@ -239,6 +239,36 @@ fn request(request_id: &str, method: RpcMethod) -> RpcRequest {
     }
 }
 
+#[test]
+fn private_report_result_keeps_expected_and_observed_integrity_distinct() {
+    let view = verified_artifact_view(
+        VerifiedArtifact {
+            integrity: ArtifactIntegrity::Missing,
+            locator: "/prepared/report.md".into(),
+            expected_sha256: Some("a".repeat(64)),
+            expected_bytes: Some(128),
+            actual_sha256: None,
+            actual_bytes: None,
+            checkpoint_number: 3,
+            finalized: false,
+            preview: None,
+        },
+        64,
+    );
+    assert_eq!(view.integrity, ArtifactIntegrityView::Missing);
+    assert_eq!(view.expected_sha256, Some("a".repeat(64)));
+    assert_eq!(view.expected_bytes, Some(128));
+    assert_eq!(view.observed_sha256, None);
+    assert_eq!(view.observed_bytes, None);
+
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../../schemas/review-report.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    assert!(validator.is_valid(&serde_json::to_value(view).unwrap()));
+}
+
 fn client(path: &Path) -> RpcClient {
     RpcClient::new(path, Duration::from_secs(3))
 }
@@ -674,7 +704,7 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
             agent_id: "job-1".into(),
             artifact_type: "report".into(),
             path: report_path.to_string_lossy().into_owned(),
-            sha256: "abc123".into(),
+            sha256: "a".repeat(64),
             bytes: 22,
             checkpoint_number: Some(1),
         })
@@ -689,18 +719,27 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
         ))
         .unwrap(),
     );
-    assert!(matches!(
-        result,
+    let artifact = match result {
         RpcSuccess::Result {
-            artifact: Some(ArtifactView {
-                preview_state: PreviewState::Unavailable,
-                preview: None,
-                integrity: ArtifactIntegrityView::LegacyUnverified,
-                ..
-            }),
+            artifact: Some(artifact),
             ..
-        }
-    ));
+        } => artifact,
+        other => panic!("unexpected result: {other:?}"),
+    };
+    assert_eq!(artifact.preview_state, PreviewState::Unavailable);
+    assert_eq!(artifact.preview, None);
+    assert_eq!(artifact.integrity, ArtifactIntegrityView::LegacyUnverified);
+    assert_eq!(artifact.expected_sha256, Some("a".repeat(64)));
+    assert_eq!(artifact.expected_bytes, Some(22));
+    assert_eq!(artifact.observed_sha256, None);
+    assert_eq!(artifact.observed_bytes, None);
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../../schemas/review-report.schema.json"
+    ))
+    .unwrap();
+    jsonschema::draft202012::meta::validate(&schema).unwrap();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    assert!(validator.is_valid(&serde_json::to_value(artifact).unwrap()));
 
     assert_eq!(
         error(

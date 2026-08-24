@@ -1,66 +1,53 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://zcode.local/schemas/review-report.schema.json",
-  "title": "ZCode review report metadata",
+  "title": "ZCode private review report artifact result",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema",
-    "agent_id",
-    "revision",
-    "finalized",
-    "provenance",
-    "checkpoint_count",
-    "finding_count",
-    "validation_count",
-    "artifact"
+    "artifact_id",
+    "artifact_type",
+    "locator",
+    "expected_sha256",
+    "expected_bytes",
+    "observed_sha256",
+    "observed_bytes",
+    "checkpoint_number",
+    "integrity",
+    "preview_state",
+    "preview"
   ],
   "properties": {
-    "schema": { "const": "sectioned-zcode-review-report/v1" },
-    "agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "revision": { "type": "integer", "minimum": 0 },
-    "finalized": { "type": "boolean" },
-    "final_signal": {
-      "type": ["string", "null"],
-      "enum": [
-        "findings_present",
-        "no_findings_observed",
-        "incomplete_evidence",
-        "unable_to_review",
-        null
-      ]
+    "artifact_id": { "type": "string", "minLength": 1 },
+    "artifact_type": { "type": "string", "minLength": 1 },
+    "locator": { "type": "string", "minLength": 1 },
+    "expected_sha256": {
+      "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
     },
-    "provenance": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["manifest_sha256", "prepared_sha256", "base_sha", "head_sha"],
-      "properties": {
-        "manifest_sha256": { "$ref": "#/$defs/sha256" },
-        "prepared_sha256": { "$ref": "#/$defs/sha256" },
-        "base_sha": { "$ref": "#/$defs/gitSha" },
-        "head_sha": { "$ref": "#/$defs/gitSha" },
-        "runtime_sha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
-        "zcode_session_id": { "type": ["string", "null"] },
-        "requested_model": { "type": ["string", "null"] },
-        "observed_model": { "type": ["string", "null"] }
-      }
+    "expected_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
     },
-    "checkpoint_count": { "type": "integer", "minimum": 0 },
-    "finding_count": { "type": "integer", "minimum": 0 },
-    "validation_count": { "type": "integer", "minimum": 0 },
-    "artifact": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["path", "sha256", "bytes"],
-      "properties": {
-        "path": { "type": "string", "minLength": 1 },
-        "sha256": { "$ref": "#/$defs/sha256" },
-        "bytes": { "type": "integer", "minimum": 1 }
-      }
-    }
+    "observed_sha256": {
+      "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "observed_bytes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "checkpoint_number": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "integrity": {
+      "enum": ["valid", "missing", "replaced", "binary", "invalid", "legacy_unverified"]
+    },
+    "preview_state": {
+      "enum": ["available", "not_requested", "unavailable"]
+    },
+    "preview": { "type": ["string", "null"] }
   },
   "$defs": {
-    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
   }
 }

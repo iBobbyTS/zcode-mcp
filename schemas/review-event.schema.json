@@ -8,7 +8,12 @@
   "properties": {
     "schema": { "const": "sectioned-zcode-review-event/v1" },
     "type": { "const": "report.checkpoint" },
-    "agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
     "revision": { "type": "integer", "minimum": 1 },
     "finalized": { "type": "boolean" }
   }

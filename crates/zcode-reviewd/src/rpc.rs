@@ -506,8 +506,10 @@ pub struct ArtifactView {
     pub artifact_id: String,
     pub artifact_type: String,
     pub locator: String,
-    pub sha256: String,
-    pub bytes: u64,
+    pub expected_sha256: Option<String>,
+    pub expected_bytes: Option<u64>,
+    pub observed_sha256: Option<String>,
+    pub observed_bytes: Option<u64>,
     pub checkpoint_number: Option<u64>,
     pub integrity: ArtifactIntegrityView,
     pub preview_state: PreviewState,
@@ -848,8 +850,10 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
         artifact_id: artifact.artifact_id,
         artifact_type: artifact.artifact_type,
         locator: artifact.path,
-        sha256: artifact.sha256,
-        bytes: artifact.bytes,
+        expected_sha256: Some(artifact.sha256),
+        expected_bytes: Some(artifact.bytes),
+        observed_sha256: None,
+        observed_bytes: None,
         checkpoint_number: artifact.checkpoint_number,
         integrity: ArtifactIntegrityView::LegacyUnverified,
         preview_state,
@@ -869,14 +873,10 @@ fn verified_artifact_view(artifact: VerifiedArtifact, requested: usize) -> Artif
         artifact_id: "review-report".into(),
         artifact_type: "review_report".into(),
         locator: artifact.locator,
-        sha256: artifact
-            .actual_sha256
-            .or(artifact.expected_sha256)
-            .unwrap_or_default(),
-        bytes: artifact
-            .actual_bytes
-            .or(artifact.expected_bytes)
-            .unwrap_or(0),
+        expected_sha256: artifact.expected_sha256,
+        expected_bytes: artifact.expected_bytes,
+        observed_sha256: artifact.actual_sha256,
+        observed_bytes: artifact.actual_bytes,
         checkpoint_number: Some(artifact.checkpoint_number),
         integrity: artifact.integrity.into(),
         preview_state,
