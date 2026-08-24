@@ -54,10 +54,9 @@
       "uniqueItems": true
     },
     "validation_commands": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/command" },
-      "uniqueItems": true,
-      "x-unique-by": "id"
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/id" },
+      "additionalProperties": { "$ref": "#/$defs/command" }
     },
     "report_target": { "type": "string", "minLength": 1 },
     "scratch_root": { "type": "string", "minLength": 1 },
@@ -74,9 +73,8 @@
     "command": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "program", "args", "cwd", "timeout_ms", "max_output_bytes"],
+      "required": ["program", "args", "cwd", "timeout_ms", "max_output_bytes"],
       "properties": {
-        "id": { "$ref": "#/$defs/id" },
         "program": { "type": "string", "minLength": 1 },
         "args": { "type": "array", "items": { "type": "string" } },
         "cwd": { "type": "string", "minLength": 1 },

@@ -72,7 +72,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
             context_paths: Vec::new(),
             scope_paths: vec!["src".into()],
             forbidden_input_globs: Vec::new(),
-            validation_commands: Vec::new(),
+            validation_commands: Default::default(),
             report_target: ".agent-work/reviews/daemon/report.md".into(),
             scratch_root: ".agent-work/scratch/jobs".into(),
             model: None,

@@ -4,6 +4,7 @@ use review_preparation::{
     ValidationCommand, WorktreeManager,
 };
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -65,14 +66,16 @@ impl RepositoryFixture {
             context_paths: vec![".agent-work/context/S04.md".into()],
             scope_paths: vec!["src".into()],
             forbidden_input_globs: vec![".agent-work/reviews/*".into()],
-            validation_commands: vec![ValidationCommand {
-                id: "print".into(),
-                program: executable("printf"),
-                args: vec!["prepared".into()],
-                cwd: ".".into(),
-                timeout_ms: 1_000,
-                max_output_bytes: 1_024,
-            }],
+            validation_commands: BTreeMap::from([(
+                "print".into(),
+                ValidationCommand {
+                    program: executable("printf"),
+                    args: vec!["prepared".into()],
+                    cwd: ".".into(),
+                    timeout_ms: 1_000,
+                    max_output_bytes: 1_024,
+                },
+            )]),
             report_target: ".agent-work/reviews/feature/S04/report.md".into(),
             scratch_root: ".agent-work/scratch/jobs".into(),
             model: None,
@@ -124,6 +127,15 @@ fn schema_and_valid_manifest_prepare_canonical_immutable_launch() {
         .network_control
         .contains("unsupported"));
     assert!(prepared.manifest_provenance_path.is_file());
+    let mut changed_command_key = prepared.clone();
+    let command = changed_command_key
+        .validation_commands
+        .remove("print")
+        .unwrap();
+    changed_command_key
+        .validation_commands
+        .insert("renamed".into(), command);
+    assert!(changed_command_key.validate_digest().is_err());
 
     let original_context_hash = prepared.context[0].sha256.clone();
     fs::write(
@@ -150,27 +162,8 @@ fn schema_and_rust_field_rules_have_table_parity() {
         "../../../schemas/review-manifest.schema.json"
     ))
     .unwrap();
-    assert_eq!(schema["$defs"]["id"]["maxLength"], 256);
-    assert_eq!(schema["$defs"]["idempotencyKey"]["maxLength"], 512);
-    assert_eq!(schema["properties"]["model"]["pattern"], "\\S");
-    assert_eq!(schema["properties"]["context_paths"]["uniqueItems"], true);
-    assert_eq!(schema["properties"]["scope_paths"]["uniqueItems"], true);
-    assert_eq!(
-        schema["properties"]["forbidden_input_globs"]["uniqueItems"],
-        true
-    );
-    assert_eq!(
-        schema["properties"]["validation_commands"]["x-unique-by"],
-        "id"
-    );
-    assert_eq!(
-        schema["$defs"]["command"]["properties"]["timeout_ms"]["maximum"],
-        3_600_000
-    );
-    assert_eq!(
-        schema["$defs"]["command"]["properties"]["max_output_bytes"]["maximum"],
-        16 * 1024 * 1024
-    );
+    jsonschema::draft202012::meta::validate(&schema).unwrap();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
 
     let valid = serde_json::to_value(fixture.manifest()).unwrap();
     let mut cases = Vec::new();
@@ -183,7 +176,11 @@ fn schema_and_rust_field_rules_have_table_parity() {
     value["feature_id"] = "a".repeat(257).into();
     cases.push(("identifier over bound", value, false));
     let mut value = valid.clone();
-    value["validation_commands"][0]["id"] = "bad/id".into();
+    value["section_id"] = "bad/id".into();
+    cases.push(("identifier alphabet", value, false));
+    let mut value = valid.clone();
+    let command = value["validation_commands"]["print"].take();
+    value["validation_commands"] = serde_json::json!({"bad/id": command});
     cases.push(("command identifier alphabet", value, false));
     let mut value = valid.clone();
     value["idempotency_key"] = "a".repeat(512).into();
@@ -191,6 +188,9 @@ fn schema_and_rust_field_rules_have_table_parity() {
     let mut value = valid.clone();
     value["idempotency_key"] = "has space".into();
     cases.push(("idempotency alphabet", value, false));
+    let mut value = valid.clone();
+    value["idempotency_key"] = "a".repeat(513).into();
+    cases.push(("idempotency over bound", value, false));
     let mut value = valid.clone();
     value["model"] = serde_json::Value::Null;
     cases.push(("null optional model", value, true));
@@ -211,19 +211,40 @@ fn schema_and_rust_field_rules_have_table_parity() {
     value["forbidden_input_globs"] = serde_json::json!(["*.raw", "*.raw"]);
     cases.push(("duplicate forbidden glob", value, false));
     let mut value = valid.clone();
-    let duplicate = value["validation_commands"][0].clone();
-    value["validation_commands"] = serde_json::json!([duplicate.clone(), duplicate]);
-    cases.push(("duplicate command id", value, false));
+    let mut first = value["validation_commands"]["print"].clone();
+    first["id"] = "print".into();
+    let mut second = first.clone();
+    second["args"] = serde_json::json!(["different"]);
+    value["validation_commands"] = serde_json::json!([first, second]);
+    cases.push((
+        "same command id with different args in legacy array",
+        value,
+        false,
+    ));
     let mut value = valid.clone();
-    value["validation_commands"][0]["timeout_ms"] = 3_600_001u64.into();
+    value["validation_commands"]["print"]["timeout_ms"] = 3_600_001u64.into();
     cases.push(("timeout over bound", value, false));
-    let mut value = valid;
-    value["validation_commands"][0]["max_output_bytes"] = (16 * 1024 * 1024 + 1).into();
+    let mut value = valid.clone();
+    value["validation_commands"]["print"]["timeout_ms"] = 0u64.into();
+    cases.push(("timeout under bound", value, false));
+    let mut value = valid.clone();
+    value["validation_commands"]["print"]["max_output_bytes"] = (16 * 1024 * 1024 + 1).into();
     cases.push(("output over bound", value, false));
+    let mut value = valid.clone();
+    value["validation_commands"]["print"]["max_output_bytes"] = 0u64.into();
+    cases.push(("output under bound", value, false));
+    let mut value = valid.clone();
+    value["unexpected"] = true.into();
+    cases.push(("unknown manifest field", value, false));
+    let mut value = valid;
+    value["validation_commands"]["print"]["unexpected"] = true.into();
+    cases.push(("unknown command field", value, false));
 
     for (name, manifest, expected) in cases {
-        let parsed = ReviewManifest::from_json(&serde_json::to_vec(&manifest).unwrap());
-        assert_eq!(parsed.is_ok(), expected, "manifest parity case: {name}");
+        let schema_valid = validator.is_valid(&manifest);
+        let rust_valid = ReviewManifest::from_json(&serde_json::to_vec(&manifest).unwrap()).is_ok();
+        assert_eq!(schema_valid, expected, "JSON Schema parity case: {name}");
+        assert_eq!(rust_valid, expected, "Rust parity case: {name}");
     }
 }
 
@@ -402,24 +423,28 @@ fn rejected_external_scratch_and_report_paths_have_no_external_side_effect() {
 fn launcher_sanitizes_environment_bounds_output_and_times_out() {
     let fixture = RepositoryFixture::new();
     let mut manifest = fixture.manifest();
-    manifest.validation_commands = vec![
-        ValidationCommand {
-            id: "environment".into(),
-            program: executable("env"),
-            args: Vec::new(),
-            cwd: ".".into(),
-            timeout_ms: 1_000,
-            max_output_bytes: 4_096,
-        },
-        ValidationCommand {
-            id: "bounded".into(),
-            program: executable("yes"),
-            args: Vec::new(),
-            cwd: ".".into(),
-            timeout_ms: 25,
-            max_output_bytes: 32,
-        },
-    ];
+    manifest.validation_commands = BTreeMap::from([
+        (
+            "environment".into(),
+            ValidationCommand {
+                program: executable("env"),
+                args: Vec::new(),
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                max_output_bytes: 4_096,
+            },
+        ),
+        (
+            "bounded".into(),
+            ValidationCommand {
+                program: executable("yes"),
+                args: Vec::new(),
+                cwd: ".".into(),
+                timeout_ms: 25,
+                max_output_bytes: 32,
+            },
+        ),
+    ]);
     let prepared = ReviewPreparer.prepare(&manifest).unwrap();
     let launcher = prepared.launcher().unwrap();
     let environment = launcher.run("environment").unwrap();
@@ -613,8 +638,13 @@ fn large_integrity_diff_is_streamed_and_retained_at_the_fixed_cap() {
 fn forbidden_command_classes_fail_during_preparation() {
     let fixture = RepositoryFixture::new();
     let mut network = fixture.manifest();
-    network.validation_commands[0].program = executable("curl");
-    network.validation_commands[0].args = vec!["https://example.invalid".into()];
+    network
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .program = executable("curl");
+    network.validation_commands.get_mut("print").unwrap().args =
+        vec!["https://example.invalid".into()];
     assert!(matches!(
         ReviewPreparer.prepare(&network),
         Err(PreparationError::Policy(_))
@@ -626,8 +656,16 @@ fn forbidden_command_classes_fail_during_preparation() {
     );
 
     let mut git_mutation = fixture.manifest();
-    git_mutation.validation_commands[0].program = executable("git");
-    git_mutation.validation_commands[0].args = vec!["commit".into()];
+    git_mutation
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .program = executable("git");
+    git_mutation
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .args = vec!["commit".into()];
     assert!(matches!(
         ReviewPreparer.prepare(&git_mutation),
         Err(PreparationError::Policy(_))
@@ -641,8 +679,16 @@ fn forbidden_command_classes_fail_during_preparation() {
     let external_output = fixture._directory.path().join("git-output.txt");
     let mut git_output = fixture.manifest();
     git_output.idempotency_key = "git-output".into();
-    git_output.validation_commands[0].program = executable("git");
-    git_output.validation_commands[0].args = vec![
+    git_output
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .program = executable("git");
+    git_output
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .args = vec![
         "diff".into(),
         "--no-ext-diff".into(),
         "--no-textconv".into(),
@@ -656,8 +702,12 @@ fn forbidden_command_classes_fail_during_preparation() {
 
     let mut safe_git = fixture.manifest();
     safe_git.idempotency_key = "safe-git-status".into();
-    safe_git.validation_commands[0].program = executable("git");
-    safe_git.validation_commands[0].args = vec![
+    safe_git
+        .validation_commands
+        .get_mut("print")
+        .unwrap()
+        .program = executable("git");
+    safe_git.validation_commands.get_mut("print").unwrap().args = vec![
         "status".into(),
         "--porcelain=v1".into(),
         "--untracked-files=no".into(),

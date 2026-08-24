@@ -55,7 +55,7 @@ fn prepared_launch_is_the_only_workspace_consumed_by_scheduler_adapter() {
         context_paths: Vec::new(),
         scope_paths: vec!["src".into()],
         forbidden_input_globs: Vec::new(),
-        validation_commands: Vec::new(),
+        validation_commands: Default::default(),
         report_target: ".agent-work/reviews/feature/S04/report.md".into(),
         scratch_root: ".agent-work/scratch/jobs".into(),
         model: None,

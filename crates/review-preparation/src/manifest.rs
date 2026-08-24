@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -70,7 +70,6 @@ pub enum ScratchPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationCommand {
-    pub id: String,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
@@ -93,7 +92,7 @@ pub struct ReviewManifest {
     pub context_paths: Vec<PathBuf>,
     pub scope_paths: Vec<PathBuf>,
     pub forbidden_input_globs: Vec<String>,
-    pub validation_commands: Vec<ValidationCommand>,
+    pub validation_commands: BTreeMap<String, ValidationCommand>,
     pub report_target: PathBuf,
     pub scratch_root: PathBuf,
     #[serde(default)]
@@ -141,7 +140,7 @@ pub struct PreparedLaunchSpec {
     pub context: Vec<InputArtifact>,
     pub scope: Vec<PreparedScopePath>,
     pub forbidden_input_globs: Vec<String>,
-    pub validation_commands: Vec<PreparedCommand>,
+    pub validation_commands: BTreeMap<String, PreparedCommand>,
     pub report_target: PathBuf,
     pub scratch_root: PathBuf,
     pub manifest_provenance_path: PathBuf,
@@ -431,15 +430,8 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
             "model cannot be empty when supplied".into(),
         ));
     }
-    let mut command_ids = HashSet::new();
-    for command in &manifest.validation_commands {
-        validate_identifier("validation command id", &command.id, MAX_IDENTIFIER_BYTES)?;
-        if !command_ids.insert(command.id.as_str()) {
-            return Err(PreparationError::InvalidManifest(format!(
-                "duplicate validation command id {}",
-                command.id
-            )));
-        }
+    for (command_id, command) in &manifest.validation_commands {
+        validate_identifier("validation command id", command_id, MAX_IDENTIFIER_BYTES)?;
         if command.timeout_ms == 0
             || command.timeout_ms > 3_600_000
             || command.max_output_bytes == 0
@@ -447,7 +439,7 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
         {
             return Err(PreparationError::InvalidManifest(format!(
                 "validation command {} has invalid bounds",
-                command.id
+                command_id
             )));
         }
     }
@@ -716,17 +708,16 @@ fn snapshot_input(source: &Path, root: &Path, index: usize) -> PreparationResult
 }
 
 fn prepare_commands(
-    commands: &[ValidationCommand],
+    commands: &BTreeMap<String, ValidationCommand>,
     worktree: &Path,
     scratch_root: &Path,
     network_allowed: bool,
-) -> PreparationResult<Vec<PreparedCommand>> {
+) -> PreparationResult<BTreeMap<String, PreparedCommand>> {
     commands
         .iter()
-        .map(|command| {
+        .map(|(command_id, command)| {
             let relative_cwd = validated_relative(&command.cwd)?;
-            prepare_command(
-                &command.id,
+            let prepared = prepare_command(
                 &command.program,
                 &command.args,
                 &worktree.join(relative_cwd),
@@ -737,7 +728,8 @@ fn prepare_commands(
                     command.max_output_bytes,
                     network_allowed,
                 ),
-            )
+            )?;
+            Ok((command_id.clone(), prepared))
         })
         .collect()
 }

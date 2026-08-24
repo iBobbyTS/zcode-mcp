@@ -59,7 +59,6 @@ impl PolicyCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedCommand {
-    pub id: String,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
@@ -110,7 +109,7 @@ pub struct PolicyLauncher {
     scratch_root: PathBuf,
     report_target: PathBuf,
     readable_inputs: Vec<PathBuf>,
-    commands: Vec<PreparedCommand>,
+    commands: BTreeMap<String, PreparedCommand>,
     network_allowed: bool,
     capabilities: PolicyCapabilities,
 }
@@ -121,7 +120,7 @@ impl PolicyLauncher {
         scratch_root: PathBuf,
         report_target: PathBuf,
         readable_inputs: Vec<PathBuf>,
-        commands: Vec<PreparedCommand>,
+        commands: BTreeMap<String, PreparedCommand>,
         network_allowed: bool,
         capabilities: PolicyCapabilities,
     ) -> PreparationResult<Self> {
@@ -242,15 +241,11 @@ impl PolicyLauncher {
     }
 
     pub fn run(&self, command_id: &str) -> PreparationResult<ValidationOutput> {
-        let prepared = self
-            .commands
-            .iter()
-            .find(|command| command.id == command_id)
-            .ok_or_else(|| {
-                PreparationError::Policy(format!(
-                    "command {command_id} is not in the exact allowlist"
-                ))
-            })?;
+        let prepared = self.commands.get(command_id).ok_or_else(|| {
+            PreparationError::Policy(format!(
+                "command {command_id} is not in the exact allowlist"
+            ))
+        })?;
         let request = PermissionRequest::Execute {
             program: prepared.program.clone(),
             args: prepared.args.clone(),
@@ -312,7 +307,7 @@ impl PolicyLauncher {
                 }
             }
             PermissionRequest::Execute { program, args, cwd } => {
-                if self.commands.iter().any(|command| {
+                if self.commands.values().any(|command| {
                     &command.program == program && &command.args == args && &command.cwd == cwd
                 }) {
                     None
@@ -334,7 +329,6 @@ impl PolicyLauncher {
 }
 
 pub(crate) fn prepare_command(
-    id: &str,
     program: &Path,
     args: &[String],
     cwd: &Path,
@@ -343,9 +337,9 @@ pub(crate) fn prepare_command(
     bounds: (u64, usize, bool),
 ) -> PreparationResult<PreparedCommand> {
     let (timeout_ms, max_output_bytes, network_allowed) = bounds;
-    if id.is_empty() || timeout_ms == 0 || max_output_bytes == 0 {
+    if timeout_ms == 0 || max_output_bytes == 0 {
         return Err(PreparationError::InvalidManifest(
-            "validation command id and bounds must be non-empty".into(),
+            "validation command bounds must be non-zero".into(),
         ));
     }
     let program = fs::canonicalize(program).map_err(|error| PreparationError::InvalidPath {
@@ -380,7 +374,6 @@ pub(crate) fn prepare_command(
     environment.insert("LANG".into(), "C".into());
     environment.insert("LC_ALL".into(), "C".into());
     Ok(PreparedCommand {
-        id: id.into(),
         program,
         args: args.to_vec(),
         cwd,
