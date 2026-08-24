@@ -1891,6 +1891,42 @@ impl Scheduler {
         terminal
     }
 
+    fn finish_terminal_or_fail(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        sink: &StoreLifecycleSink,
+        terminal: &RuntimeTerminal,
+    ) -> Result<JobState, SchedulerError> {
+        match sink.finish(terminal) {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                let message = error.to_string();
+                self.record_failure(
+                    agent_id,
+                    format!("terminal lifecycle persistence failed: {message}"),
+                );
+                match self.inner.store.fail_claim(
+                    agent_id,
+                    owner_epoch,
+                    "LIFECYCLE_SINK_FAILED",
+                    &message,
+                ) {
+                    Ok(state) => Ok(state),
+                    Err(fallback) => {
+                        self.record_failure(
+                            agent_id,
+                            format!(
+                                "terminal failure classification was not persisted: {fallback}"
+                            ),
+                        );
+                        Err(SchedulerError::Store(fallback))
+                    }
+                }
+            }
+        }
+    }
+
     fn spawn_monitor(
         &self,
         agent_id: String,
@@ -1906,17 +1942,9 @@ impl Scheduler {
             loop {
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
                     let terminal = scheduler.review_terminal(&agent_id, terminal, false);
-                    if let Some(error) = sink.error() {
-                        if let Err(store_error) = scheduler.inner.store.fail_claim(
-                            &agent_id,
-                            owner_epoch,
-                            "LIFECYCLE_SINK_FAILED",
-                            &error,
-                        ) {
-                            scheduler.record_failure(&agent_id, store_error.to_string());
-                        }
-                        scheduler.record_failure(&agent_id, error);
-                    } else if let Err(error) = sink.finish(&terminal) {
+                    if let Err(error) =
+                        scheduler.finish_terminal_or_fail(&agent_id, owner_epoch, &sink, &terminal)
+                    {
                         scheduler.record_failure(&agent_id, error.to_string());
                     }
                     scheduler.release_active(&agent_id, owner_epoch);
@@ -1963,7 +1991,12 @@ impl Scheduler {
                                 terminal,
                                 boundary == TurnBoundary::Completed,
                             );
-                            if let Err(error) = sink.finish(&terminal) {
+                            if let Err(error) = scheduler.finish_terminal_or_fail(
+                                &agent_id,
+                                owner_epoch,
+                                &sink,
+                                &terminal,
+                            ) {
                                 scheduler.record_failure(&agent_id, error.to_string());
                             }
                             scheduler.release_active(&agent_id, owner_epoch);
@@ -1979,8 +2012,18 @@ impl Scheduler {
                                 scheduler.inner.config.stop_grace,
                             );
                             let terminal = scheduler.review_terminal(&agent_id, terminal, false);
-                            let _ = sink.finish(&terminal);
+                            if let Err(finish_error) = scheduler.finish_terminal_or_fail(
+                                &agent_id,
+                                owner_epoch,
+                                &sink,
+                                &terminal,
+                            ) {
+                                scheduler.record_failure(&agent_id, finish_error.to_string());
+                            }
                             scheduler.release_active(&agent_id, owner_epoch);
+                            if let Err(start_error) = scheduler.start_ready() {
+                                scheduler.record_failure(&agent_id, start_error.to_string());
+                            }
                             return;
                         }
                     }

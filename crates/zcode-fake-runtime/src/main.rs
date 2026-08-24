@@ -195,6 +195,20 @@ fn main() {
                 && object.get("error").is_none()
                 && object.get("result").is_some_and(valid_permission_response)
             {
+                let decision = object
+                    .get("result")
+                    .and_then(|result| result.get("decision"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("invalid");
+                let expected_decision =
+                    if matches!(mode.as_str(), "review-flow" | "review-flow-send-failure") {
+                        "deny"
+                    } else {
+                        "allow"
+                    };
+                if decision != expected_decision {
+                    continue;
+                }
                 pending_permission = None;
                 let _ = write_value(
                     &mut out,
@@ -205,7 +219,9 @@ fn main() {
                         json!({"accepted": true}),
                     ),
                 );
-                if mode == "review-flow" && active_turn {
+                if matches!(mode.as_str(), "review-flow" | "review-flow-send-failure")
+                    && active_turn
+                {
                     active_turn = false;
                     let _ = write_value(
                         &mut out,
@@ -253,6 +269,10 @@ fn main() {
                 );
             }
             "session/send" => {
+                if mode == "review-flow-send-failure" && next_turn > 1 {
+                    let _ = write_value(&mut out, error(id, -32011, "SCRIPTED_SEND_FAILURE"));
+                    continue;
+                }
                 if active_turn {
                     let _ = write_value(&mut out, error(id, -32010, "PROMPT_ALREADY_RUNNING"));
                     continue;
@@ -277,10 +297,13 @@ fn main() {
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let review_flow_initial = mode == "review-flow" && next_turn == 2;
+                let review_flow_initial =
+                    matches!(mode.as_str(), "review-flow" | "review-flow-send-failure")
+                        && next_turn == 2;
                 if content.contains("permission") || review_flow_initial {
                     let request_id = Value::String("server-1".into());
                     pending_permission = Some(request_id.clone());
+                    let hard_deny = review_flow_initial;
                     let _ = write_value(
                         &mut out,
                         json!({
@@ -288,10 +311,10 @@ fn main() {
                             "method": "interaction/requestPermission",
                             "params": {
                                 "toolCallId": "tool-1",
-                                "toolName": "read",
+                                "toolName": if hard_deny { "git_ref_mutation" } else { "read" },
                                 "riskLevel": "low",
                                 "reason": "fixture permission",
-                                "input": {"path": "fixture.txt"},
+                                "input": if hard_deny { json!({}) } else { json!({"path": "fixture.txt"}) },
                                 "options": [
                                     {"optionId": "allow-once", "kind": "allow", "name": "Allow once", "response": {"decision": "allow"}},
                                     {"optionId": "deny-once", "kind": "deny", "name": "Deny", "response": {"decision": "deny"}}

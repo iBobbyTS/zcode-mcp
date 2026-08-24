@@ -8,7 +8,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
@@ -16,7 +16,7 @@ use zcode_driver::observe_process_group;
 use zcode_reviewd::{
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
-        ReviewToolInput, RpcMethod, RpcService, RpcSuccess,
+        ReviewToolInput, RpcErrorCode, RpcMethod, RpcService, RpcSuccess,
     },
     CommandRuntimeFactory, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
 };
@@ -70,10 +70,10 @@ impl Fixture {
                     .ok_or_else(|| io::Error::other("prepared launch missing"))?,
             )
             .map_err(io::Error::other)?;
-            let mode = if prepared.section_id == "CRASH" {
-                "crash"
-            } else {
-                "review-flow"
+            let mode = match prepared.section_id.as_str() {
+                "CRASH" => "crash",
+                "SEND-FAIL" => "review-flow-send-failure",
+                _ => "review-flow",
             };
             let mut command = Command::new(&runtime);
             command
@@ -174,10 +174,20 @@ impl Fixture {
     }
 
     fn wait_pending(&self, agent_id: &str) -> Vec<review_store::StoredPendingRequest> {
-        wait_until(|| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let pending = self.store.pending_requests(agent_id).unwrap();
-            (pending.len() == 2).then_some(pending)
-        })
+            if pending.len() == 2 {
+                return pending;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending requests did not arrive: job={:?}, pending={pending:?}, scheduler={:?}",
+                self.store.get_job(agent_id).unwrap(),
+                self.scheduler.last_error(agent_id)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn checkpoint_and_finalize(&self, agent_id: &str) {
@@ -265,6 +275,20 @@ impl Fixture {
             .unwrap();
     }
 
+    fn fail_terminal_event_writes(&self) {
+        let connection = rusqlite::Connection::open(self.store.database_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_terminal_event_write
+                 BEFORE INSERT ON events
+                 WHEN NEW.event_type LIKE 'runtime.%'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'scripted terminal event failure');
+                 END;",
+            )
+            .unwrap();
+    }
+
     fn wait_terminal(&self, agent_id: &str) -> Job {
         wait_until(|| {
             self.store
@@ -321,7 +345,7 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     ));
     fixture.checkpoint_and_finalize(&first);
 
-    let (same, resumed, independent) = fixture.spawn(first_manifest);
+    let (same, resumed, independent) = fixture.spawn(first_manifest.clone());
     assert_eq!(same, first);
     assert!(resumed);
     assert!(!independent);
@@ -357,6 +381,19 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(fs::read_to_string(&first_report)
         .unwrap()
         .contains("FINALIZED: true"));
+    let (completed_replay, resumed, independent) = fixture.spawn(first_manifest);
+    assert_eq!(completed_replay, first);
+    assert!(resumed);
+    assert!(!independent);
+    assert_eq!(
+        fixture
+            .store
+            .get_job(&completed_replay)
+            .unwrap()
+            .unwrap()
+            .zcode_session_id,
+        first_done.zcode_session_id
+    );
 
     let second_manifest = fixture.manifest("plan-second", "S06");
     let (second, resumed, independent) = fixture.spawn(second_manifest);
@@ -406,6 +443,148 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
         .find(|request| request.request_type == "permission")
         .unwrap();
     assert_eq!(permission.state, PendingRequestState::Responded);
+    assert_eq!(permission.response_decision.as_deref(), Some("deny"));
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| {
+                event.event_type == "driver.message"
+                    && serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                        .is_ok_and(|payload| payload["type"] == "permission.responded")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .store
+            .pending_requests(&first)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.request_type == "permission")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn concurrent_first_spawn_is_one_independent_job_and_conflicts_stay_rejected() {
+    let fixture = Fixture::new();
+    let manifest = fixture.manifest("concurrent-spawn", "S06");
+    let barrier = Arc::new(Barrier::new(3));
+    let responses = thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let service = fixture.service.clone();
+            let manifest = manifest.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(scope.spawn(move || {
+                barrier.wait();
+                match service
+                    .dispatch(RpcMethod::SpawnReview { manifest })
+                    .unwrap()
+                {
+                    RpcSuccess::ReviewSpawned {
+                        job,
+                        resumed_existing,
+                        counts_as_independent,
+                        ..
+                    } => (
+                        job.agent_id,
+                        job.zcode_session_id,
+                        resumed_existing,
+                        counts_as_independent,
+                    ),
+                    other => panic!("unexpected spawn response: {other:?}"),
+                }
+            }));
+        }
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(responses[0].0, responses[1].0);
+    assert_eq!(responses[0].1, responses[1].1);
+    assert!(responses[0].1.is_some());
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, _, _, independent)| *independent)
+            .count(),
+        1
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, _, resumed, _)| *resumed)
+            .count(),
+        1
+    );
+
+    let mut conflicting = manifest;
+    conflicting.model = Some("conflicting-model".into());
+    let conflict = fixture
+        .service
+        .dispatch(RpcMethod::SpawnReview {
+            manifest: conflicting,
+        })
+        .unwrap_err();
+    assert_eq!(conflict.code, RpcErrorCode::Validation);
+    assert!(conflict.message.contains("idempotency conflict"));
+    assert_eq!(
+        fixture.scheduler.stop_job(&responses[0].0).unwrap(),
+        JobState::Cancelled
+    );
+}
+
+#[test]
+fn terminal_event_write_faults_classify_nonclean_before_releasing_slots() {
+    let fixture = Fixture::new();
+    let (natural, _, _) = fixture.spawn(fixture.manifest("terminal-fault", "S06"));
+    fixture.wait_pending(&natural);
+    fixture.checkpoint_and_finalize(&natural);
+    fixture.fail_terminal_event_writes();
+    fixture.respond_permission(&natural);
+    let natural_terminal = fixture.wait_terminal(&natural);
+    assert_eq!(natural_terminal.state, JobState::FailedRuntimeLost);
+    assert_eq!(
+        natural_terminal.failure_code.as_deref(),
+        Some("LIFECYCLE_SINK_FAILED")
+    );
+    wait_until(|| (fixture.scheduler.active_count() == 0).then_some(()));
+
+    let fixture = Fixture::new();
+    let (delivery, _, _) = fixture.spawn(fixture.manifest("delivery-fault", "SEND-FAIL"));
+    fixture.wait_pending(&delivery);
+    fixture
+        .service
+        .dispatch(RpcMethod::Message(MessageInput {
+            agent_id: delivery.clone(),
+            message_id: "scripted-send-failure".into(),
+            mode: "queue".into(),
+            content: "this queued delivery must fail".into(),
+        }))
+        .unwrap();
+    fixture.fail_terminal_event_writes();
+    fixture.respond_permission(&delivery);
+    let delivery_terminal = fixture.wait_terminal(&delivery);
+    assert_eq!(delivery_terminal.state, JobState::FailedRuntimeLost);
+    assert_eq!(
+        delivery_terminal.failure_code.as_deref(),
+        Some("LIFECYCLE_SINK_FAILED")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .message("scripted-send-failure")
+            .unwrap()
+            .unwrap()
+            .state,
+        MessageState::Failed
+    );
+    wait_until(|| (fixture.scheduler.active_count() == 0).then_some(()));
 }
 
 #[test]

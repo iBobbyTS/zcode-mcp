@@ -43,6 +43,7 @@ impl std::error::Error for OrchestrationError {}
 #[derive(Clone)]
 pub struct ReviewJobOrchestrator {
     scheduler: Scheduler,
+    spawn_lock: Arc<Mutex<()>>,
 }
 
 impl ReviewJobOrchestrator {
@@ -52,7 +53,10 @@ impl ReviewJobOrchestrator {
                 "scheduler has no job-scoped ledger completion gate",
             ));
         }
-        Ok(Self { scheduler })
+        Ok(Self {
+            scheduler,
+            spawn_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn spawn_review(
@@ -65,12 +69,30 @@ impl ReviewJobOrchestrator {
         let prompt = build_review_prompt(&prepared)
             .map_err(|error| OrchestrationError::Prompt(error.to_string()))?;
         let agent_id = format!("review-{}", prepared.prepared_sha256);
-        let resumed_existing = self
+        let _guard = self
+            .spawn_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self
             .scheduler
             .store()
             .get_job(&agent_id)
             .map_err(OrchestrationError::Store)?
-            .is_some();
+            .is_some()
+        {
+            let _ = self.scheduler.start_ready();
+            let job = self
+                .scheduler
+                .store()
+                .get_job(&agent_id)
+                .map_err(OrchestrationError::Store)?
+                .ok_or_else(|| OrchestrationError::Unavailable("scheduled job disappeared"))?;
+            return Ok(SpawnedReview {
+                job,
+                prompt_sha256: prompt.sha256,
+                resumed_existing: true,
+            });
+        }
         let stored = self
             .scheduler
             .enqueue_prepared(agent_id, prompt.text, &prepared)
@@ -88,7 +110,7 @@ impl ReviewJobOrchestrator {
         Ok(SpawnedReview {
             job,
             prompt_sha256: prompt.sha256,
-            resumed_existing,
+            resumed_existing: false,
         })
     }
 }
