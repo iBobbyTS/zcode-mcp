@@ -19,7 +19,7 @@ use zcode_driver::{
 };
 use zcode_protocol::{
     event_type, session_id_from_result, turn_id_from_result, CreateSessionParams, LifecycleOrder,
-    SendParams, SessionParams, SubscribeParams, WireMessage, WorkspaceRef,
+    SendParams, SessionParams, SubscribeParams, WireId, WireMessage, WorkspaceRef,
     INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_SEND,
     SESSION_STOP, SESSION_SUBSCRIBE, WORKSPACE_READ_STATE,
 };
@@ -460,7 +460,7 @@ impl RuntimeOwner {
         decision: &str,
         content: Option<&str>,
     ) -> Result<(), RuntimeCommandError> {
-        let id = serde_json::from_str(correlation_id).map_err(|_| {
+        let id = serde_json::from_str::<WireId>(correlation_id).map_err(|_| {
             RuntimeCommandError::InvalidSession("stored request correlation is invalid".into())
         })?;
         if !matches!(decision, "allow" | "deny") {
@@ -2084,7 +2084,7 @@ mod tests {
     use super::*;
     use review_store::NewArtifact;
     use std::sync::Barrier;
-    use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope};
+    use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
 
     #[derive(Default)]
     struct MemorySink {
@@ -2998,14 +2998,14 @@ mod tests {
         let runtime = factory.runtime("job-redaction");
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
             WireMessage::Request(RequestEnvelope {
-                id: serde_json::json!({"token": TOKEN}),
+                id: WireId::String(TOKEN.into()),
                 method: "tool/call".into(),
                 params: serde_json::json!({"path": PATH, "arguments": TOOL_ARGS}),
             }),
         )));
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
             WireMessage::Response(ResponseEnvelope {
-                id: serde_json::json!({"token": TOKEN}),
+                id: WireId::String(TOKEN.into()),
                 result: Some(serde_json::json!({"reasoning": REASONING, "path": PATH})),
                 error: None,
             }),

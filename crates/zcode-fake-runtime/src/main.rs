@@ -37,11 +37,24 @@ fn exact_keys(object: &Map<String, Value>, required: &[&str], optional: &[&str])
             .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()))
 }
 
+fn valid_wire_id(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| value.as_i64().is_some() || value.is_string())
+}
+
 fn valid_request_envelope(value: &Value) -> bool {
     value.get("jsonrpc").is_none()
-        && value
-            .as_object()
-            .is_some_and(|object| exact_keys(object, &["id", "method", "params"], &[]))
+        && value.as_object().is_some_and(|object| {
+            exact_keys(object, &["id", "method", "params"], &[]) && valid_wire_id(object.get("id"))
+        })
+}
+
+fn valid_response_envelope(value: &Value) -> bool {
+    value.get("jsonrpc").is_none()
+        && value.as_object().is_some_and(|object| {
+            exact_keys(object, &["id", "result"], &[])
+                && valid_wire_id(object.get("id"))
+                && object.get("result").is_some_and(|result| !result.is_null())
+        })
 }
 
 fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
@@ -137,7 +150,11 @@ fn main() {
             break;
         }
 
-        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let id = value
+            .get("id")
+            .filter(|_| valid_wire_id(value.get("id")))
+            .cloned()
+            .unwrap_or_else(|| Value::String("invalid-id".into()));
         if value.get("jsonrpc").is_some() {
             let _ = write_value(&mut out, error(id, -32600, "jsonrpc is not accepted"));
             continue;
@@ -146,10 +163,10 @@ fn main() {
             continue;
         };
         if object.get("method").is_none() {
-            if pending_permission.as_ref() == Some(&id)
+            if valid_response_envelope(&value)
+                && pending_permission.as_ref() == Some(&id)
                 && object.get("error").is_none()
                 && object.get("result").is_some_and(valid_permission_response)
-                && exact_keys(object, &["id", "result"], &[])
             {
                 pending_permission = None;
                 let _ = write_value(
@@ -329,6 +346,22 @@ mod tests {
         ));
         assert!(valid_request_envelope(
             &json!({"id":1,"method":"session/stop","params":{"sessionId":"s1"}})
+        ));
+    }
+
+    #[test]
+    fn strict_envelope_rejects_non_wire_ids_and_null_response_outcomes() {
+        for id in [json!(true), json!(null), json!({}), json!([]), json!(1.5)] {
+            assert!(!valid_request_envelope(
+                &json!({"id":id,"method":"session/stop","params":{}})
+            ));
+            assert!(!valid_response_envelope(&json!({"id":id,"result":{}})));
+        }
+        assert!(!valid_response_envelope(
+            &json!({"id":"server-1","result":null})
+        ));
+        assert!(valid_response_envelope(
+            &json!({"id":"server-1","result":{"decision":"allow"}})
         ));
     }
 

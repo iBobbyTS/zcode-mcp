@@ -11,10 +11,17 @@ pub const SESSION_EVENT: &str = "session/event";
 pub const INTERACTION_REQUEST_PERMISSION: &str = "interaction/requestPermission";
 pub const INTERACTION_REQUEST_USER_INPUT: &str = "interaction/requestUserInput";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WireId {
+    Integer(i64),
+    String(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
-    pub id: Value,
+    pub id: WireId,
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -23,7 +30,7 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseEnvelope {
-    pub id: Value,
+    pub id: WireId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,7 +54,7 @@ pub enum WireMessage {
 }
 
 impl RequestEnvelope {
-    pub fn new(id: Value, method: impl Into<String>, params: Value) -> Self {
+    pub fn new(id: WireId, method: impl Into<String>, params: Value) -> Self {
         Self {
             id,
             method: method.into(),
@@ -57,7 +64,7 @@ impl RequestEnvelope {
 }
 
 impl ResponseEnvelope {
-    pub fn success(id: Value, result: Value) -> Self {
+    pub fn success(id: WireId, result: Value) -> Self {
         Self {
             id,
             result: Some(result),
@@ -65,7 +72,7 @@ impl ResponseEnvelope {
         }
     }
 
-    pub fn failure(id: Value, error: Value) -> Self {
+    pub fn failure(id: WireId, error: Value) -> Self {
         Self {
             id,
             result: None,
@@ -148,6 +155,15 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
         if obj.contains_key("result") && obj.contains_key("error") {
             return Err(ParseError::ContradictoryResponse);
         }
+        if obj
+            .get("result")
+            .or_else(|| obj.get("error"))
+            .is_none_or(Value::is_null)
+        {
+            return Err(ParseError::InvalidEnvelope(
+                "response requires exactly one non-null result or error".into(),
+            ));
+        }
         return serde_json::from_value(value)
             .map(WireMessage::Response)
             .map_err(|e| ParseError::InvalidEnvelope(e.to_string()));
@@ -215,14 +231,14 @@ mod tests {
     #[test]
     fn round_trip() {
         let req = RequestEnvelope {
-            id: Value::from(1),
+            id: WireId::Integer(1),
             method: SESSION_CREATE.into(),
             params: serde_json::json!({"x":1}),
         };
         let parsed = parse_line(&encode(&req).unwrap()).unwrap();
         assert_eq!(parsed, WireMessage::Request(req));
         assert!(!encode(&RequestEnvelope::new(
-            Value::from(2),
+            WireId::Integer(2),
             SESSION_SEND,
             serde_json::json!({"sessionId":"s1","content":"review"}),
         ))
@@ -245,6 +261,55 @@ mod tests {
             parse_line(r#"{"id":1,"result":{},"error":{}}"#),
             Err(ParseError::ContradictoryResponse)
         );
+    }
+
+    #[test]
+    fn wire_ids_are_limited_to_integer_or_string() {
+        for id in ["true", "null", "{}", "[]", "1.5"] {
+            let request = format!(r#"{{"id":{id},"method":"session/stop","params":{{}}}}"#);
+            assert!(matches!(
+                parse_line(&request),
+                Err(ParseError::InvalidEnvelope(_))
+            ));
+            let response = format!(r#"{{"id":{id},"result":{{}}}}"#);
+            assert!(matches!(
+                parse_line(&response),
+                Err(ParseError::InvalidEnvelope(_))
+            ));
+        }
+        assert!(matches!(
+            parse_line(r#"{"id":"server-1","method":"interaction/requestPermission","params":{}}"#),
+            Ok(WireMessage::Request(RequestEnvelope {
+                id: WireId::String(ref id),
+                ..
+            })) if id == "server-1"
+        ));
+    }
+
+    #[test]
+    fn response_requires_exactly_one_non_null_outcome() {
+        for frame in [
+            r#"{"id":1}"#,
+            r#"{"id":1,"result":null}"#,
+            r#"{"id":1,"error":null}"#,
+            r#"{"id":1,"result":null,"error":null}"#,
+            r#"{"id":1,"result":{},"error":null}"#,
+            r#"{"id":1,"result":null,"error":{}}"#,
+            r#"{"id":1,"result":{},"error":{}}"#,
+        ] {
+            assert!(
+                parse_line(frame).is_err(),
+                "accepted malformed response: {frame}"
+            );
+        }
+        assert!(matches!(
+            parse_line(r#"{"id":1,"result":{}}"#),
+            Ok(WireMessage::Response(ResponseEnvelope {
+                id: WireId::Integer(1),
+                result: Some(_),
+                error: None,
+            }))
+        ));
     }
 
     #[test]

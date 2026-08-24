@@ -17,7 +17,7 @@ use std::{
 };
 use zcode_protocol::{
     classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
-    ResponseEnvelope, WireMessage,
+    ResponseEnvelope, WireId, WireMessage,
 };
 
 pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
@@ -51,7 +51,7 @@ pub enum Inbound {
     },
     ChildExited(ChildExit),
     UnmatchedResponse {
-        id: serde_json::Value,
+        id: WireId,
         outcome: String,
     },
 }
@@ -253,14 +253,12 @@ impl Driver {
         })
     }
     #[cfg(test)]
-    fn send_request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> std::io::Result<serde_json::Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.send(&RequestEnvelope::new(id.into(), method, params))?;
-        Ok(id.into())
+    fn send_request(&self, method: &str, params: serde_json::Value) -> std::io::Result<WireId> {
+        let id = i64::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
+            .map_err(|_| io::Error::other("request id space exhausted"))?;
+        let id = WireId::Integer(id);
+        self.send(&RequestEnvelope::new(id.clone(), method, params))?;
+        Ok(id)
     }
 
     pub fn begin_request(
@@ -268,8 +266,10 @@ impl Driver {
         method: &str,
         params: serde_json::Value,
     ) -> Result<PendingRequest, RequestError> {
-        let id = serde_json::Value::from(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let key = response_key(&id).ok_or(RequestError::StreamClosed)?;
+        let id = i64::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
+            .map(WireId::Integer)
+            .map_err(|_| RequestError::StreamClosed)?;
+        let key = response_key(&id);
         let (sender, receiver) = mpsc::channel();
         {
             let mut pending = self.pending.lock().unwrap();
@@ -298,11 +298,11 @@ impl Driver {
         self.begin_request(method, params)?.wait(timeout)
     }
 
-    pub fn respond(&self, id: serde_json::Value, result: serde_json::Value) -> io::Result<()> {
+    pub fn respond(&self, id: WireId, result: serde_json::Value) -> io::Result<()> {
         self.send(&ResponseEnvelope::success(id, result))
     }
 
-    pub fn respond_error(&self, id: serde_json::Value, error: serde_json::Value) -> io::Result<()> {
+    pub fn respond_error(&self, id: WireId, error: serde_json::Value) -> io::Result<()> {
         self.send(&ResponseEnvelope::failure(id, error))
     }
     pub fn send<T: serde::Serialize>(&self, value: &T) -> std::io::Result<()> {
@@ -825,13 +825,8 @@ impl Drop for Driver {
     }
 }
 
-fn response_key(id: &serde_json::Value) -> Option<String> {
-    match id {
-        serde_json::Value::String(_) | serde_json::Value::Number(_) => {
-            serde_json::to_string(id).ok()
-        }
-        _ => None,
-    }
+fn response_key(id: &WireId) -> String {
+    serde_json::to_string(id).expect("WireId serialization cannot fail")
 }
 
 fn spawn_dispatcher(
@@ -843,8 +838,7 @@ fn spawn_dispatcher(
         while let Ok(inbound) = incoming.recv() {
             match inbound {
                 Inbound::Message(WireMessage::Response(response)) => {
-                    let matched = response_key(&response.id)
-                        .and_then(|key| pending.lock().unwrap().remove(&key));
+                    let matched = pending.lock().unwrap().remove(&response_key(&response.id));
                     if let Some(waiter) = matched {
                         let _ = waiter.send(Ok(response));
                     } else {
@@ -1211,7 +1205,7 @@ mod tests {
         let response = d
             .request("probe", serde_json::json!({}), Duration::from_secs(3))
             .unwrap();
-        assert_eq!(response.id, serde_json::json!(1));
+        assert_eq!(response.id, WireId::Integer(1));
         d.stop().unwrap();
     }
 
@@ -1293,9 +1287,37 @@ mod tests {
                 unmatched.push(id);
             }
         }
-        assert!(unmatched.contains(&serde_json::json!(99)));
-        assert!(unmatched.contains(&serde_json::json!(2)));
-        assert!(unmatched.contains(&serde_json::json!(3)));
+        assert!(unmatched.contains(&WireId::Integer(99)));
+        assert!(unmatched.contains(&WireId::Integer(2)));
+        assert!(unmatched.contains(&WireId::Integer(3)));
+        driver.stop().unwrap();
+    }
+
+    #[test]
+    fn malformed_ids_and_null_outcomes_cannot_complete_a_waiter() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "read request; printf '%s\n' '{\"id\":1,\"result\":null}' '{\"id\":1,\"error\":null}' '{\"id\":1}' '{\"id\":1,\"result\":{},\"error\":{}}' '{\"id\":true,\"result\":{\"invalid\":true}}' '{\"id\":{},\"result\":{\"invalid\":true}}' '{\"id\":[],\"result\":{\"invalid\":true}}' '{\"id\":null,\"result\":{\"invalid\":true}}' '{\"id\":1,\"result\":{\"accepted\":true}}'; sleep 1",
+        ]);
+        let driver = Driver::spawn(command).unwrap();
+        let events = driver.subscribe();
+        let response = driver
+            .begin_request("strict", serde_json::json!({}))
+            .unwrap()
+            .wait(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(response.id, WireId::Integer(1));
+        assert_eq!(response.result, Some(serde_json::json!({"accepted": true})));
+
+        let mut malformed = 0;
+        while malformed < 8 {
+            match events.recv_timeout(Duration::from_secs(1)) {
+                Ok(Inbound::Malformed(_)) => malformed += 1,
+                Ok(_) => {}
+                Err(error) => panic!("missing malformed frame {malformed}: {error}"),
+            }
+        }
         driver.stop().unwrap();
     }
 
