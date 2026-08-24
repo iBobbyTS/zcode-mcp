@@ -525,6 +525,219 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
 }
 
 #[test]
+fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let launcher = prepared.launcher().unwrap();
+    let scratch = &prepared.scratch_root;
+
+    let external_root = fixture._directory.path().join("external-artifacts");
+    fs::create_dir_all(&external_root).unwrap();
+    let external_file = external_root.join("outside.txt");
+    fs::write(&external_file, "outside").unwrap();
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Write(prepared.report_target.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    symlink(&external_file, &prepared.report_target).unwrap();
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Write(prepared.report_target.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    let external_link = scratch.join("external-link");
+    symlink(&external_file, &external_link).unwrap();
+    for external in [ExternalDecision::Allow, ExternalDecision::Deny] {
+        let decision = launcher.decide(&PermissionRequest::Write(external_link.clone()), external);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "write_outside_artifact_roots_denied");
+    }
+    let external_directory_link = scratch.join("external-directory-link");
+    symlink(&external_root, &external_directory_link).unwrap();
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Write(external_directory_link.join("new.txt")),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+
+    let broken_link = scratch.join("broken-link");
+    symlink(external_root.join("missing"), &broken_link).unwrap();
+    let broken = launcher.decide(
+        &PermissionRequest::Write(broken_link),
+        ExternalDecision::Allow,
+    );
+    assert!(!broken.allowed);
+    assert_eq!(broken.reason, "write_path_unverifiable");
+
+    let loop_a = scratch.join("loop-a");
+    let loop_b = scratch.join("loop-b");
+    symlink("loop-b", &loop_a).unwrap();
+    symlink("loop-a", &loop_b).unwrap();
+    assert!(
+        !launcher
+            .decide(&PermissionRequest::Write(loop_a), ExternalDecision::Allow)
+            .allowed
+    );
+
+    let safe_target = scratch.join("safe-target.txt");
+    fs::write(&safe_target, "safe").unwrap();
+    let safe_link = scratch.join("safe-link");
+    symlink("safe-target.txt", &safe_link).unwrap();
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Edit(safe_link.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Delete(safe_link),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    for tool_name in ["edit", "delete"] {
+        let safe = serde_json::json!({
+            "toolName": tool_name,
+            "input": {"path": safe_target.clone()}
+        });
+        assert!(
+            launcher
+                .decide_zcode_permission(&safe, ExternalDecision::Allow)
+                .allowed
+        );
+        let escaped = serde_json::json!({
+            "toolName": tool_name,
+            "input": {"path": external_link.clone()}
+        });
+        assert!(
+            !launcher
+                .decide_zcode_permission(&escaped, ExternalDecision::Allow)
+                .allowed
+        );
+    }
+
+    let safe_directory = scratch.join("safe-directory");
+    fs::create_dir(&safe_directory).unwrap();
+    let safe_directory_link = scratch.join("safe-directory-link");
+    symlink("safe-directory", &safe_directory_link).unwrap();
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Write(safe_directory_link.join("new.txt")),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    let nonexistent_leaf = scratch.join("new/deep/output.txt");
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Write(nonexistent_leaf.clone()),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Edit(nonexistent_leaf),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Delete(scratch.join("missing-delete")),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+
+    let move_destination = scratch.join("moved.txt");
+    assert!(
+        launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: safe_target.clone(),
+                    destination: move_destination.clone(),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: safe_target.clone(),
+                    destination: external_link.clone(),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(
+        !launcher
+            .decide(
+                &PermissionRequest::Move {
+                    source: scratch.join("missing-source"),
+                    destination: move_destination.clone(),
+                },
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+
+    let zcode_move = serde_json::json!({
+        "toolName": "move",
+        "input": {
+            "source": safe_target,
+            "destination": move_destination,
+        }
+    });
+    assert!(
+        launcher
+            .decide_zcode_permission(&zcode_move, ExternalDecision::Allow)
+            .allowed
+    );
+    let incomplete_move = serde_json::json!({
+        "toolName": "move",
+        "input": {"source": prepared.scratch_root.join("safe-target.txt")}
+    });
+    assert!(
+        !launcher
+            .decide_zcode_permission(&incomplete_move, ExternalDecision::Allow)
+            .allowed
+    );
+
+    let zcode_external_write = serde_json::json!({
+        "toolName": "write",
+        "input": {"path": external_link}
+    });
+    assert_eq!(
+        launcher
+            .decide_zcode_permission(&zcode_external_write, ExternalDecision::Deny)
+            .reason,
+        "write_outside_artifact_roots_denied"
+    );
+}
+
+#[test]
 fn integrity_diagnostics_preserve_source_and_enable_recoverable_cleanup() {
     let fixture = RepositoryFixture::new();
     let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();

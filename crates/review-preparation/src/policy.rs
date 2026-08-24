@@ -2,9 +2,9 @@ use crate::{PreparationError, PreparationResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
-    io::Read,
+    io::{ErrorKind, Read},
     os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -77,6 +77,12 @@ pub enum ExternalDecision {
 pub enum PermissionRequest {
     Read(PathBuf),
     Write(PathBuf),
+    Edit(PathBuf),
+    Delete(PathBuf),
+    Move {
+        source: PathBuf,
+        destination: PathBuf,
+    },
     Execute {
         program: PathBuf,
         args: Vec<String>,
@@ -195,10 +201,35 @@ impl PolicyLauncher {
                 .get("path")
                 .and_then(serde_json::Value::as_str)
                 .map(|path| PermissionRequest::Read(self.resolve_job_path(path))),
-            "write" | "edit" | "delete" | "move" => input
+            "write" => input
                 .get("path")
                 .and_then(serde_json::Value::as_str)
                 .map(|path| PermissionRequest::Write(self.resolve_job_path(path))),
+            "edit" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Edit(self.resolve_job_path(path))),
+            "delete" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Delete(self.resolve_job_path(path))),
+            "move" => {
+                let source = input
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|path| self.resolve_job_path(path));
+                let destination = input
+                    .get("destination")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|path| self.resolve_job_path(path));
+                match (source, destination) {
+                    (Some(source), Some(destination)) => Some(PermissionRequest::Move {
+                        source,
+                        destination,
+                    }),
+                    _ => None,
+                }
+            }
             "network" => input
                 .get("target")
                 .and_then(serde_json::Value::as_str)
@@ -287,25 +318,16 @@ impl PolicyLauncher {
                     Some("read_path_escape_denied")
                 }
             }
-            PermissionRequest::Write(path) => {
-                let Some(parent) = existing_parent(path) else {
-                    return Some("write_path_unverifiable");
-                };
-                let Ok(parent) = fs::canonicalize(parent) else {
-                    return Some("write_path_unverifiable");
-                };
-                if parent.starts_with(&self.scratch_root)
-                    || path == &self.report_target
-                    || self
-                        .report_target
-                        .parent()
-                        .is_some_and(|report_parent| parent.starts_with(report_parent))
-                {
-                    None
-                } else {
-                    Some("write_outside_artifact_roots_denied")
-                }
+            PermissionRequest::Write(path) => self.write_path_denial(path, false),
+            PermissionRequest::Edit(path) | PermissionRequest::Delete(path) => {
+                self.write_path_denial(path, true)
             }
+            PermissionRequest::Move {
+                source,
+                destination,
+            } => self
+                .write_path_denial(source, true)
+                .or_else(|| self.write_path_denial(destination, false)),
             PermissionRequest::Execute { program, args, cwd } => {
                 if self.commands.values().any(|command| {
                     &command.program == program && &command.args == args && &command.cwd == cwd
@@ -324,6 +346,75 @@ impl PolicyLauncher {
             path.to_path_buf()
         } else {
             self.worktree.join(path)
+        }
+    }
+
+    fn write_path_denial(&self, path: &Path, must_exist: bool) -> Option<&'static str> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Some("write_path_unverifiable");
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => self.canonical_write_denial(path),
+            Err(error) if error.kind() == ErrorKind::NotFound && !must_exist => {
+                let Some(candidate) = self.resolve_nonexistent_write_target(path) else {
+                    return Some("write_path_unverifiable");
+                };
+                self.resolved_write_denial(&candidate)
+            }
+            Err(_) => Some("write_path_unverifiable"),
+        }
+    }
+
+    fn canonical_write_denial(&self, path: &Path) -> Option<&'static str> {
+        let Ok(canonical) = fs::canonicalize(path) else {
+            return Some("write_path_unverifiable");
+        };
+        self.resolved_write_denial(&canonical)
+    }
+
+    fn resolve_nonexistent_write_target(&self, path: &Path) -> Option<PathBuf> {
+        let mut current = path.to_path_buf();
+        let mut missing = Vec::<OsString>::new();
+        loop {
+            match fs::symlink_metadata(&current) {
+                Ok(_) => {
+                    let canonical = fs::canonicalize(&current).ok()?;
+                    if !canonical.is_dir() {
+                        return None;
+                    }
+                    let mut candidate = canonical;
+                    for component in missing.iter().rev() {
+                        candidate.push(component);
+                    }
+                    return Some(candidate);
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    missing.push(current.file_name()?.to_os_string());
+                    if !current.pop() {
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn resolved_write_denial(&self, target: &Path) -> Option<&'static str> {
+        let Some(report_root) = self.report_target.parent() else {
+            return Some("write_path_unverifiable");
+        };
+        if target.starts_with(&self.worktree)
+            || target == self.scratch_root
+            || target == report_root
+            || (!target.starts_with(&self.scratch_root) && !target.starts_with(report_root))
+        {
+            Some("write_outside_artifact_roots_denied")
+        } else {
+            None
         }
     }
 }
@@ -875,12 +966,4 @@ pub(crate) fn is_prior_review_artifact(path: &Path) -> bool {
         || normalized.contains("gpt-admission")
         || normalized.contains("glm-raw")
         || normalized.contains("glm-admission")
-}
-
-fn existing_parent(path: &Path) -> Option<&Path> {
-    let mut current = path.parent()?;
-    while !current.exists() {
-        current = current.parent()?;
-    }
-    Some(current)
 }
