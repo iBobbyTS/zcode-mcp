@@ -9,11 +9,13 @@ use std::{
     collections::HashSet,
     fs,
     path::{Component, Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::Mutex,
 };
 
 pub const MANIFEST_SCHEMA: &str = "sectioned-zcode-review/v1";
+const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
 static PREPARATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +106,9 @@ pub struct ReviewManifest {
 
 impl ReviewManifest {
     pub fn from_json(bytes: &[u8]) -> PreparationResult<Self> {
-        Ok(serde_json::from_slice(bytes)?)
+        let manifest = serde_json::from_slice(bytes)?;
+        validate_manifest_fields(&manifest)?;
+        Ok(manifest)
     }
 }
 
@@ -250,10 +254,8 @@ impl ReviewPreparer {
             .map(|scope| validated_relative(scope))
             .collect::<PreparationResult<Vec<_>>>()?;
         for scope in &scope_relative {
-            let source = canonical_input(&repository, scope, false)?;
-            if is_credential_path(&source) || is_prior_review_artifact(&source) {
-                return Err(PreparationError::ForbiddenInput(source));
-            }
+            validate_scope_policy(scope, &manifest.forbidden_input_globs)?;
+            ensure_source_scope_clean(&repository, scope)?;
         }
 
         let scratch_root = canonical_scratch_root(&repository, &manifest.scratch_root)?;
@@ -300,15 +302,13 @@ impl ReviewPreparer {
                 .iter()
                 .cloned()
                 .map(|relative| {
-                    let candidate = worktree.path.join(&relative);
-                    let worktree_path = fs::canonicalize(&candidate)
-                        .map_err(|_| PreparationError::MissingInput(candidate.clone()))?;
-                    if !worktree_path.starts_with(&worktree.path) {
-                        return Err(PreparationError::PathEscape {
-                            path: worktree_path,
-                            root: worktree.path.clone(),
-                        });
-                    }
+                    let worktree_path = canonical_input(&worktree.path, &relative, false)?;
+                    validate_allowed_input(
+                        &worktree.path,
+                        &worktree_path,
+                        &relative,
+                        &manifest.forbidden_input_globs,
+                    )?;
                     Ok(PreparedScopePath {
                         repository_relative: relative,
                         worktree_path,
@@ -393,21 +393,24 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
             manifest.schema
         )));
     }
-    for (name, value) in [
-        ("feature_id", manifest.feature_id.as_str()),
-        ("section_id", manifest.section_id.as_str()),
-        ("idempotency_key", manifest.idempotency_key.as_str()),
-    ] {
-        if value.is_empty()
-            || value.len() > 512
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
-        {
-            return Err(PreparationError::InvalidManifest(format!(
-                "{name} has an invalid format"
-            )));
-        }
+    validate_identifier("feature_id", &manifest.feature_id, MAX_IDENTIFIER_BYTES)?;
+    validate_identifier("section_id", &manifest.section_id, MAX_IDENTIFIER_BYTES)?;
+    validate_identifier(
+        "idempotency_key",
+        &manifest.idempotency_key,
+        MAX_IDEMPOTENCY_KEY_BYTES,
+    )?;
+    ensure_unique("context_paths", &manifest.context_paths)?;
+    ensure_unique("scope_paths", &manifest.scope_paths)?;
+    ensure_unique("forbidden_input_globs", &manifest.forbidden_input_globs)?;
+    if manifest
+        .forbidden_input_globs
+        .iter()
+        .any(|pattern| pattern.is_empty())
+    {
+        return Err(PreparationError::InvalidManifest(
+            "forbidden_input_globs cannot contain an empty pattern".into(),
+        ));
     }
     if !manifest.fresh_session {
         return Err(PreparationError::InvalidManifest(
@@ -430,6 +433,7 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
     }
     let mut command_ids = HashSet::new();
     for command in &manifest.validation_commands {
+        validate_identifier("validation command id", &command.id, MAX_IDENTIFIER_BYTES)?;
         if !command_ids.insert(command.id.as_str()) {
             return Err(PreparationError::InvalidManifest(format!(
                 "duplicate validation command id {}",
@@ -445,6 +449,88 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
                 "validation command {} has invalid bounds",
                 command.id
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identifier(name: &str, value: &str, max_bytes: usize) -> PreparationResult<()> {
+    if value.is_empty()
+        || value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        return Err(PreparationError::InvalidManifest(format!(
+            "{name} has an invalid format"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_unique<T>(name: &str, values: &[T]) -> PreparationResult<()>
+where
+    T: Eq + std::hash::Hash,
+{
+    let mut unique = HashSet::with_capacity(values.len());
+    if values.iter().all(|value| unique.insert(value)) {
+        Ok(())
+    } else {
+        Err(PreparationError::InvalidManifest(format!(
+            "{name} cannot contain duplicates"
+        )))
+    }
+}
+
+fn validate_scope_policy(scope: &Path, forbidden_globs: &[String]) -> PreparationResult<()> {
+    if is_credential_path(scope) {
+        return Err(PreparationError::CredentialInput(scope.to_path_buf()));
+    }
+    let normalized = scope.to_string_lossy().replace('\\', "/");
+    if is_prior_review_artifact(scope)
+        || forbidden_globs
+            .iter()
+            .any(|pattern| wildcard_match(pattern, &normalized))
+    {
+        return Err(PreparationError::ForbiddenInput(scope.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn ensure_source_scope_clean(repository: &Path, scope: &Path) -> PreparationResult<()> {
+    for cached in [false, true] {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repository).arg("diff");
+        if cached {
+            command.arg("--cached");
+        }
+        let status = command
+            .args(["--quiet", "--no-ext-diff", "--no-textconv", "--"])
+            .arg(scope)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(PreparationError::Worktree(format!(
+                    "source scope {} has tracked {} changes",
+                    scope.display(),
+                    if cached { "staged" } else { "unstaged" }
+                )));
+            }
+            _ => {
+                return Err(PreparationError::Git(format!(
+                    "could not inspect tracked changes for source scope {}",
+                    scope.display()
+                )));
+            }
         }
     }
     Ok(())
@@ -549,16 +635,18 @@ fn validate_allowed_input(
 
 fn canonical_scratch_root(repository: &Path, path: &Path) -> PreparationResult<PathBuf> {
     let allowed_root = repository.join(".agent-work").join("scratch");
-    fs::create_dir_all(&allowed_root)?;
     reject_symlink_components(&allowed_root)?;
-    let allowed_root = fs::canonicalize(allowed_root)?;
     let candidate = if path.is_absolute() {
+        reject_parent_components(path)?;
         path.to_path_buf()
     } else {
         repository.join(validated_relative(path)?)
     };
-    fs::create_dir_all(&candidate)?;
+    ensure_lexically_confined(&candidate, &allowed_root, false)?;
     reject_symlink_components(&candidate)?;
+    fs::create_dir_all(&allowed_root)?;
+    let allowed_root = fs::canonicalize(allowed_root)?;
+    fs::create_dir_all(&candidate)?;
     let canonical = fs::canonicalize(&candidate)?;
     if canonical == allowed_root || !canonical.starts_with(&allowed_root) {
         return Err(PreparationError::PathEscape {
@@ -571,10 +659,9 @@ fn canonical_scratch_root(repository: &Path, path: &Path) -> PreparationResult<P
 
 fn canonical_report_target(repository: &Path, path: &Path) -> PreparationResult<PathBuf> {
     let allowed_root = repository.join(".agent-work").join("reviews");
-    fs::create_dir_all(&allowed_root)?;
     reject_symlink_components(&allowed_root)?;
-    let allowed_root = fs::canonicalize(allowed_root)?;
     let candidate = if path.is_absolute() {
+        reject_parent_components(path)?;
         path.to_path_buf()
     } else {
         repository.join(validated_relative(path)?)
@@ -592,8 +679,12 @@ fn canonical_report_target(repository: &Path, path: &Path) -> PreparationResult<
             path: candidate.clone(),
             reason: "report target has no parent".into(),
         })?;
-    fs::create_dir_all(parent)?;
+    ensure_lexically_confined(parent, &allowed_root, true)?;
+    reject_symlink_components(&candidate)?;
     reject_symlink_components(parent)?;
+    fs::create_dir_all(&allowed_root)?;
+    let allowed_root = fs::canonicalize(allowed_root)?;
+    fs::create_dir_all(parent)?;
     let parent = fs::canonicalize(parent)?;
     if parent != allowed_root && !parent.starts_with(&allowed_root) {
         return Err(PreparationError::PathEscape {
@@ -673,14 +764,15 @@ fn validated_relative(path: &Path) -> PreparationResult<PathBuf> {
 }
 
 fn create_confined_directory(root: &Path, name: &str) -> PreparationResult<PathBuf> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".." {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || matches!(name, "." | "..") {
         return Err(PreparationError::InvalidManifest(
             "scratch directory name is invalid".into(),
         ));
     }
     let path = root.join(name);
-    fs::create_dir_all(&path)?;
+    ensure_lexically_confined(&path, root, false)?;
     reject_symlink_components(&path)?;
+    fs::create_dir_all(&path)?;
     let path = fs::canonicalize(path)?;
     if path == root || !path.starts_with(root) {
         return Err(PreparationError::PathEscape {
@@ -689,6 +781,30 @@ fn create_confined_directory(root: &Path, name: &str) -> PreparationResult<PathB
         });
     }
     Ok(path)
+}
+
+fn ensure_lexically_confined(path: &Path, root: &Path, allow_root: bool) -> PreparationResult<()> {
+    reject_parent_components(path)?;
+    if (!allow_root && path == root) || !path.starts_with(root) {
+        return Err(PreparationError::PathEscape {
+            path: path.to_path_buf(),
+            root: root.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn reject_parent_components(path: &Path) -> PreparationResult<()> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PreparationError::InvalidPath {
+            path: path.to_path_buf(),
+            reason: "path traversal is forbidden".into(),
+        });
+    }
+    Ok(())
 }
 
 fn reject_symlink_components(path: &Path) -> PreparationResult<()> {

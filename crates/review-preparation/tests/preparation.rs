@@ -1,6 +1,6 @@
 use review_preparation::{
-    ExternalDecision, NetworkPolicy, PermissionRequest, PreparationError, ReviewKind,
-    ReviewManifest, ReviewPreparer, RoundKind, SandboxEnforcement, ScratchPolicy,
+    CleanupRecord, ExternalDecision, NetworkPolicy, PermissionRequest, PreparationError,
+    ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, SandboxEnforcement, ScratchPolicy,
     ValidationCommand, WorktreeManager,
 };
 use std::{
@@ -144,6 +144,90 @@ fn schema_and_valid_manifest_prepare_canonical_immutable_launch() {
 }
 
 #[test]
+fn schema_and_rust_field_rules_have_table_parity() {
+    let fixture = RepositoryFixture::new();
+    let schema: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/review-manifest.schema.json"
+    ))
+    .unwrap();
+    assert_eq!(schema["$defs"]["id"]["maxLength"], 256);
+    assert_eq!(schema["$defs"]["idempotencyKey"]["maxLength"], 512);
+    assert_eq!(schema["properties"]["model"]["pattern"], "\\S");
+    assert_eq!(schema["properties"]["context_paths"]["uniqueItems"], true);
+    assert_eq!(schema["properties"]["scope_paths"]["uniqueItems"], true);
+    assert_eq!(
+        schema["properties"]["forbidden_input_globs"]["uniqueItems"],
+        true
+    );
+    assert_eq!(
+        schema["properties"]["validation_commands"]["x-unique-by"],
+        "id"
+    );
+    assert_eq!(
+        schema["$defs"]["command"]["properties"]["timeout_ms"]["maximum"],
+        3_600_000
+    );
+    assert_eq!(
+        schema["$defs"]["command"]["properties"]["max_output_bytes"]["maximum"],
+        16 * 1024 * 1024
+    );
+
+    let valid = serde_json::to_value(fixture.manifest()).unwrap();
+    let mut cases = Vec::new();
+    cases.push(("valid", valid.clone(), true));
+
+    let mut value = valid.clone();
+    value["feature_id"] = "a".repeat(256).into();
+    cases.push(("identifier at bound", value, true));
+    let mut value = valid.clone();
+    value["feature_id"] = "a".repeat(257).into();
+    cases.push(("identifier over bound", value, false));
+    let mut value = valid.clone();
+    value["validation_commands"][0]["id"] = "bad/id".into();
+    cases.push(("command identifier alphabet", value, false));
+    let mut value = valid.clone();
+    value["idempotency_key"] = "a".repeat(512).into();
+    cases.push(("idempotency at bound", value, true));
+    let mut value = valid.clone();
+    value["idempotency_key"] = "has space".into();
+    cases.push(("idempotency alphabet", value, false));
+    let mut value = valid.clone();
+    value["model"] = serde_json::Value::Null;
+    cases.push(("null optional model", value, true));
+    let mut value = valid.clone();
+    value.as_object_mut().unwrap().remove("model");
+    cases.push(("absent optional model", value, true));
+    let mut value = valid.clone();
+    value["model"] = "  ".into();
+    cases.push(("blank optional model", value, false));
+    let mut value = valid.clone();
+    value["context_paths"] =
+        serde_json::json!([".agent-work/context/S04.md", ".agent-work/context/S04.md"]);
+    cases.push(("duplicate context", value, false));
+    let mut value = valid.clone();
+    value["scope_paths"] = serde_json::json!(["src", "src"]);
+    cases.push(("duplicate scope", value, false));
+    let mut value = valid.clone();
+    value["forbidden_input_globs"] = serde_json::json!(["*.raw", "*.raw"]);
+    cases.push(("duplicate forbidden glob", value, false));
+    let mut value = valid.clone();
+    let duplicate = value["validation_commands"][0].clone();
+    value["validation_commands"] = serde_json::json!([duplicate.clone(), duplicate]);
+    cases.push(("duplicate command id", value, false));
+    let mut value = valid.clone();
+    value["validation_commands"][0]["timeout_ms"] = 3_600_001u64.into();
+    cases.push(("timeout over bound", value, false));
+    let mut value = valid;
+    value["validation_commands"][0]["max_output_bytes"] = (16 * 1024 * 1024 + 1).into();
+    cases.push(("output over bound", value, false));
+
+    for (name, manifest, expected) in cases {
+        let parsed = ReviewManifest::from_json(&serde_json::to_vec(&manifest).unwrap());
+        assert_eq!(parsed.is_ok(), expected, "manifest parity case: {name}");
+    }
+}
+
+#[test]
 fn traversal_symlink_report_escape_missing_ref_and_mutable_ref_fail_closed() {
     let fixture = RepositoryFixture::new();
 
@@ -236,6 +320,82 @@ fn prior_review_credentials_and_uncommitted_scope_are_rejected() {
         ReviewPreparer.prepare(&mutable_scope),
         Err(PreparationError::MissingInput(_))
     ));
+}
+
+#[test]
+fn scope_uses_fixed_head_and_rejects_tracked_staged_or_unstaged_source_changes() {
+    let historical = RepositoryFixture::new();
+    fs::write(historical.repository.join("historical.rs"), "historical\n").unwrap();
+    git(&historical.repository, &["add", "historical.rs"]).unwrap();
+    git(&historical.repository, &["commit", "-m", "add historical"]).unwrap();
+    let historical_head = git(&historical.repository, &["rev-parse", "HEAD"]).unwrap();
+    git(&historical.repository, &["rm", "historical.rs"]).unwrap();
+    git(
+        &historical.repository,
+        &["commit", "-m", "remove historical"],
+    )
+    .unwrap();
+    assert!(!historical.repository.join("historical.rs").exists());
+    let mut manifest = historical.manifest();
+    manifest.base_ref = historical_head.clone();
+    manifest.head_ref = historical_head;
+    manifest.scope_paths = vec!["historical.rs".into()];
+    manifest.idempotency_key = "historical-head".into();
+    let prepared = ReviewPreparer.prepare(&manifest).unwrap();
+    assert!(prepared.scope[0].worktree_path.is_file());
+
+    let unstaged = RepositoryFixture::new();
+    fs::write(
+        unstaged.repository.join("src/lib.rs"),
+        "pub fn value() -> u8 { 2 }\n",
+    )
+    .unwrap();
+    let mut manifest = unstaged.manifest();
+    manifest.scope_paths = vec!["src/lib.rs".into()];
+    assert!(matches!(
+        ReviewPreparer.prepare(&manifest),
+        Err(PreparationError::Worktree(message)) if message.contains("unstaged")
+    ));
+
+    let staged = RepositoryFixture::new();
+    fs::write(
+        staged.repository.join("src/lib.rs"),
+        "pub fn value() -> u8 { 3 }\n",
+    )
+    .unwrap();
+    git(&staged.repository, &["add", "src/lib.rs"]).unwrap();
+    let mut manifest = staged.manifest();
+    manifest.scope_paths = vec!["src/lib.rs".into()];
+    assert!(matches!(
+        ReviewPreparer.prepare(&manifest),
+        Err(PreparationError::Worktree(message)) if message.contains("staged")
+    ));
+}
+
+#[test]
+fn rejected_external_scratch_and_report_paths_have_no_external_side_effect() {
+    let fixture = RepositoryFixture::new();
+    let external_scratch = fixture._directory.path().join("external-scratch/new");
+    let mut manifest = fixture.manifest();
+    manifest.scratch_root = external_scratch.clone();
+    assert!(matches!(
+        ReviewPreparer.prepare(&manifest),
+        Err(PreparationError::PathEscape { .. })
+    ));
+    assert!(!external_scratch.exists());
+
+    let external_report = fixture
+        ._directory
+        .path()
+        .join("external-report/new/report.md");
+    let mut manifest = fixture.manifest();
+    manifest.idempotency_key = "external-report".into();
+    manifest.report_target = external_report.clone();
+    assert!(matches!(
+        ReviewPreparer.prepare(&manifest),
+        Err(PreparationError::PathEscape { .. })
+    ));
+    assert!(!external_report.parent().unwrap().exists());
 }
 
 #[test]
@@ -378,6 +538,78 @@ fn integrity_diagnostics_preserve_source_and_enable_recoverable_cleanup() {
 }
 
 #[test]
+fn cleanup_record_is_bound_to_its_repository_job_roots_target_and_head() {
+    let first = RepositoryFixture::new();
+    let first_prepared = ReviewPreparer.prepare(&first.manifest()).unwrap();
+    let first_manager = manager_for(&first_prepared);
+    let first_diagnostics = first_manager
+        .capture_integrity(&first_prepared.worktree)
+        .unwrap();
+    let first_record = first_manager
+        .persist_integrity(&first_prepared.worktree, first_diagnostics)
+        .unwrap();
+
+    let second = RepositoryFixture::new();
+    let second_prepared = ReviewPreparer.prepare(&second.manifest()).unwrap();
+    let second_manager = manager_for(&second_prepared);
+    let second_diagnostics = second_manager
+        .capture_integrity(&second_prepared.worktree)
+        .unwrap();
+    assert!(first_manager
+        .persist_integrity(&second_prepared.worktree, second_diagnostics.clone())
+        .is_err());
+    let second_record = second_manager
+        .persist_integrity(&second_prepared.worktree, second_diagnostics)
+        .unwrap();
+    let mismatched: CleanupRecord =
+        serde_json::from_slice(&fs::read(second_record).unwrap()).unwrap();
+    fs::write(
+        &first_record,
+        serde_json::to_vec_pretty(&mismatched).unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        first_manager.cleanup_from_record(&first_record),
+        Err(PreparationError::Worktree(_))
+    ));
+    assert!(second_prepared.worktree.path.exists());
+    assert!(
+        git(&second.repository, &["worktree", "list", "--porcelain"])
+            .unwrap()
+            .contains(second_prepared.worktree.path.to_str().unwrap())
+    );
+}
+
+#[test]
+fn large_integrity_diff_is_streamed_and_retained_at_the_fixed_cap() {
+    const DIAGNOSTIC_CAP: usize = 4 * 1024 * 1024;
+    let fixture = RepositoryFixture::new();
+    let mut initial = vec![b'a'; DIAGNOSTIC_CAP + 1024 * 1024];
+    initial.push(b'\n');
+    fs::write(fixture.repository.join("large.txt"), &initial).unwrap();
+    git(&fixture.repository, &["add", "large.txt"]).unwrap();
+    git(&fixture.repository, &["commit", "-m", "add large fixture"]).unwrap();
+    let head = git(&fixture.repository, &["rev-parse", "HEAD"]).unwrap();
+    let mut manifest = fixture.manifest();
+    manifest.base_ref = head.clone();
+    manifest.head_ref = head;
+    manifest.scope_paths = vec!["large.txt".into()];
+    manifest.idempotency_key = "large-diagnostic".into();
+    let prepared = ReviewPreparer.prepare(&manifest).unwrap();
+
+    let mut changed = vec![b'b'; DIAGNOSTIC_CAP + 1024 * 1024];
+    changed.push(b'\n');
+    fs::write(prepared.worktree.path.join("large.txt"), changed).unwrap();
+    let diagnostics = manager_for(&prepared)
+        .capture_integrity(&prepared.worktree)
+        .unwrap();
+    assert!(diagnostics.diagnostic_truncated);
+    assert_eq!(diagnostics.tracked_diff.len(), DIAGNOSTIC_CAP);
+    assert!(diagnostics.has_policy_violation());
+}
+
+#[test]
 fn forbidden_command_classes_fail_during_preparation() {
     let fixture = RepositoryFixture::new();
     let mut network = fixture.manifest();
@@ -405,6 +637,56 @@ fn forbidden_command_classes_fail_during_preparation() {
             .unwrap()
             .contains("/worktrees/")
     );
+
+    let external_output = fixture._directory.path().join("git-output.txt");
+    let mut git_output = fixture.manifest();
+    git_output.idempotency_key = "git-output".into();
+    git_output.validation_commands[0].program = executable("git");
+    git_output.validation_commands[0].args = vec![
+        "diff".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        format!("--output={}", external_output.display()),
+    ];
+    assert!(matches!(
+        ReviewPreparer.prepare(&git_output),
+        Err(PreparationError::Policy(_))
+    ));
+    assert!(!external_output.exists());
+
+    let mut safe_git = fixture.manifest();
+    safe_git.idempotency_key = "safe-git-status".into();
+    safe_git.validation_commands[0].program = executable("git");
+    safe_git.validation_commands[0].args = vec![
+        "status".into(),
+        "--porcelain=v1".into(),
+        "--untracked-files=no".into(),
+        "--".into(),
+        "src".into(),
+    ];
+    let prepared = ReviewPreparer.prepare(&safe_git).unwrap();
+    assert_eq!(
+        prepared
+            .launcher()
+            .unwrap()
+            .run("print")
+            .unwrap()
+            .status_code,
+        Some(0)
+    );
+}
+
+fn manager_for(prepared: &review_preparation::PreparedLaunchSpec) -> WorktreeManager {
+    WorktreeManager::new(
+        prepared.repository.clone(),
+        prepared
+            .worktree
+            .scratch_worktrees_root
+            .parent()
+            .unwrap()
+            .to_path_buf(),
+    )
+    .unwrap()
 }
 
 fn executable(name: &str) -> PathBuf {

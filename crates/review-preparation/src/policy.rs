@@ -423,12 +423,7 @@ fn validate_program_and_args(
         ));
     }
     if name == "git" {
-        let action = args.first().map(String::as_str).unwrap_or_default();
-        if !matches!(action, "diff" | "status" | "log" | "show" | "rev-parse") {
-            return Err(PreparationError::Policy(
-                "Git command may read state but may not mutate refs or files".into(),
-            ));
-        }
+        validate_git_args(args, worktree, scratch_root)?;
     }
     for argument in args {
         if argument.contains('\0') || argument.contains('\n') || argument.contains('\r') {
@@ -470,6 +465,234 @@ fn validate_program_and_args(
                 "credential-oriented command argument is forbidden".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_git_args(
+    args: &[String],
+    worktree: &Path,
+    scratch_root: &Path,
+) -> PreparationResult<()> {
+    let verb = args.first().map(String::as_str).unwrap_or_default();
+    if !matches!(verb, "diff" | "status" | "log" | "show" | "rev-parse") {
+        return Err(PreparationError::Policy(
+            "Git command may read state but may not mutate refs or files".into(),
+        ));
+    }
+    let mut index = 1usize;
+    let mut pathspecs = false;
+    let mut no_ext_diff = false;
+    let mut no_textconv = false;
+    while index < args.len() {
+        let argument = &args[index];
+        if pathspecs {
+            validate_git_path_value(argument, worktree, scratch_root)?;
+            index += 1;
+            continue;
+        }
+        if argument == "--" {
+            pathspecs = true;
+            index += 1;
+            continue;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            if verb == "status" {
+                return Err(PreparationError::Policy(
+                    "Git status pathspecs must follow an explicit -- separator".into(),
+                ));
+            }
+            index += 1;
+            continue;
+        }
+        if argument == "--no-ext-diff" {
+            no_ext_diff = true;
+        }
+        if argument == "--no-textconv" {
+            no_textconv = true;
+        }
+        if git_flag_allowed(verb, argument) {
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--max-count=") {
+            if verb == "log" && valid_positive_integer(value) {
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(value) = argument.strip_prefix("--unified=") {
+            if verb == "diff" && valid_nonnegative_integer(value) {
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(value) = argument
+            .strip_prefix("--format=")
+            .or_else(|| argument.strip_prefix("--pretty="))
+        {
+            if matches!(verb, "log" | "show") && !value.is_empty() {
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(value) = argument.strip_prefix("--color=") {
+            if matches!(verb, "diff" | "log" | "show") && value == "never" {
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(value) = argument.strip_prefix("--porcelain=") {
+            if verb == "status" && matches!(value, "v1" | "v2") {
+                index += 1;
+                continue;
+            }
+        }
+        if let Some(value) = argument.strip_prefix("--untracked-files=") {
+            if verb == "status" && matches!(value, "no" | "normal" | "all") {
+                index += 1;
+                continue;
+            }
+        }
+        if argument == "-n" || argument == "--max-count" {
+            let value = args.get(index + 1).ok_or_else(|| {
+                PreparationError::Policy("Git max-count option requires a value".into())
+            })?;
+            if verb == "log" && valid_positive_integer(value) {
+                index += 2;
+                continue;
+            }
+        }
+        return Err(PreparationError::Policy(format!(
+            "Git {verb} option is not in the strict read-only grammar: {argument}"
+        )));
+    }
+    if matches!(verb, "diff" | "log" | "show") && (!no_ext_diff || !no_textconv) {
+        return Err(PreparationError::Policy(format!(
+            "Git {verb} must explicitly disable external diff and textconv execution"
+        )));
+    }
+    Ok(())
+}
+
+fn git_flag_allowed(verb: &str, argument: &str) -> bool {
+    match verb {
+        "diff" => matches!(
+            argument,
+            "--no-ext-diff"
+                | "--no-textconv"
+                | "--cached"
+                | "--staged"
+                | "--stat"
+                | "--name-only"
+                | "--name-status"
+                | "--check"
+                | "--binary"
+                | "--full-index"
+                | "--no-renames"
+                | "--exit-code"
+                | "--quiet"
+                | "--no-color"
+                | "--patch"
+                | "--no-patch"
+                | "-p"
+                | "-s"
+        ),
+        "status" => matches!(
+            argument,
+            "--short"
+                | "-s"
+                | "--branch"
+                | "-b"
+                | "--porcelain"
+                | "--long"
+                | "--no-ahead-behind"
+                | "--show-stash"
+                | "--no-renames"
+        ),
+        "log" => matches!(
+            argument,
+            "--no-ext-diff"
+                | "--no-textconv"
+                | "--stat"
+                | "--name-only"
+                | "--name-status"
+                | "--no-color"
+                | "--no-patch"
+                | "-s"
+                | "--oneline"
+                | "--decorate"
+                | "--no-decorate"
+                | "--first-parent"
+                | "--all"
+        ),
+        "show" => matches!(
+            argument,
+            "--no-ext-diff"
+                | "--no-textconv"
+                | "--stat"
+                | "--name-only"
+                | "--name-status"
+                | "--no-color"
+                | "--no-patch"
+                | "-s"
+                | "--oneline"
+                | "--decorate"
+                | "--no-decorate"
+        ),
+        "rev-parse" => matches!(
+            argument,
+            "--verify"
+                | "--quiet"
+                | "-q"
+                | "--short"
+                | "--show-toplevel"
+                | "--show-prefix"
+                | "--is-inside-work-tree"
+                | "--is-bare-repository"
+                | "--is-shallow-repository"
+                | "--show-object-format"
+        ),
+        _ => false,
+    }
+}
+
+fn valid_positive_integer(value: &str) -> bool {
+    value.parse::<u32>().is_ok_and(|value| value > 0)
+}
+
+fn valid_nonnegative_integer(value: &str) -> bool {
+    value.parse::<u16>().is_ok()
+}
+
+fn validate_git_path_value(
+    value: &str,
+    worktree: &Path,
+    scratch_root: &Path,
+) -> PreparationResult<()> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(PreparationError::Policy(
+            "Git pathspec is empty or option-like".into(),
+        ));
+    }
+    let path = Path::new(value);
+    if path.is_absolute() && !path.starts_with(worktree) && !path.starts_with(scratch_root) {
+        return Err(PreparationError::Policy(
+            "Git pathspec escapes job roots".into(),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(PreparationError::Policy(
+            "Git pathspec contains parent traversal".into(),
+        ));
+    }
+    if is_credential_path(path) {
+        return Err(PreparationError::Policy(
+            "Git credential-oriented pathspec is forbidden".into(),
+        ));
     }
     Ok(())
 }
