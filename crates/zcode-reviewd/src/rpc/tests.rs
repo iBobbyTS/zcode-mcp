@@ -333,6 +333,30 @@ fn raw_call(path: &Path, frame: &[u8]) -> RpcResponse {
 #[test]
 fn typed_protocol_round_trips_every_method_and_outer_error() {
     let methods = vec![
+        RpcMethod::SpawnReview {
+            manifest: ReviewManifest {
+                schema: "sectioned-zcode-review/v1".into(),
+                review_kind: review_preparation::ReviewKind::Code,
+                feature_id: "feature".into(),
+                section_id: "S06".into(),
+                round_kind: review_preparation::RoundKind::InitialBounded,
+                repository: "/repository".into(),
+                base_ref: "a".repeat(40),
+                head_ref: "b".repeat(40),
+                plan_path: ".agent-work/PLAN.md".into(),
+                context_paths: vec![],
+                scope_paths: vec!["src".into()],
+                forbidden_input_globs: vec![".agent-work/reviews/*".into()],
+                validation_commands: Default::default(),
+                report_target: ".agent-work/reviews/report.md".into(),
+                scratch_root: ".agent-work/scratch/jobs".into(),
+                model: None,
+                fresh_session: true,
+                network_policy: review_preparation::NetworkPolicy::Deny,
+                scratch_policy: review_preparation::ScratchPolicy::Isolated,
+                idempotency_key: "feature:S06:initial".into(),
+            },
+        },
         enqueue_request("job-1", "key-1"),
         RpcMethod::Start,
         RpcMethod::Status {
@@ -423,14 +447,14 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     );
     let unsupported = raw_call(
         &fixture.socket,
-        b"{\"version\":4,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
+        b"{\"version\":3,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
     );
     assert_eq!(unsupported.request_id.as_deref(), Some("v"));
     assert_eq!(error(unsupported).code, RpcErrorCode::UnsupportedVersion);
     assert_eq!(
         error(raw_call(
             &fixture.socket,
-            b"{\"version\":3,\"request_id\":\"m\",\"method\":\"missing\"}\n"
+            b"{\"version\":4,\"request_id\":\"m\",\"method\":\"missing\"}\n"
         ))
         .code,
         RpcErrorCode::UnknownMethod

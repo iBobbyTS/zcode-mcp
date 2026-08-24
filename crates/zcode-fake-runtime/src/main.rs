@@ -1,5 +1,8 @@
 use serde_json::{json, Map, Value};
-use std::io::{self, BufRead, Write};
+use std::{
+    io::{self, BufRead, Write},
+    process::{Child, Command},
+};
 
 fn write_value(out: &mut impl Write, value: Value) -> io::Result<()> {
     serde_json::to_writer(&mut *out, &value)?;
@@ -132,8 +135,17 @@ fn main() {
     let mut active_turn = false;
     let mut next_turn = 1u64;
     let mut sequence = 0u64;
-    let session_id = "fake-session-7f3a";
+    let session_id =
+        std::env::var("ZCODE_FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-7f3a".into());
     let mut pending_permission: Option<Value> = None;
+    let _descendant: Option<Child> = if mode == "review-flow" {
+        Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30"])
+            .spawn()
+            .ok()
+    } else {
+        None
+    };
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -146,7 +158,7 @@ fn main() {
                 &mut out,
                 event(
                     &mut sequence,
-                    session_id,
+                    &session_id,
                     "future.event",
                     json!({"raw": "sensitive"}),
                 ),
@@ -156,11 +168,11 @@ fn main() {
         if mode == "out-of-order" {
             let _ = write_value(
                 &mut out,
-                event(&mut sequence, session_id, "turn.completed", json!({})),
+                event(&mut sequence, &session_id, "turn.completed", json!({})),
             );
             let _ = write_value(
                 &mut out,
-                event(&mut sequence, session_id, "turn.started", json!({})),
+                event(&mut sequence, &session_id, "turn.started", json!({})),
             );
             break;
         }
@@ -188,11 +200,23 @@ fn main() {
                     &mut out,
                     event(
                         &mut sequence,
-                        session_id,
+                        &session_id,
                         "permission.responded",
                         json!({"accepted": true}),
                     ),
                 );
+                if mode == "review-flow" && active_turn {
+                    active_turn = false;
+                    let _ = write_value(
+                        &mut out,
+                        event(
+                            &mut sequence,
+                            &session_id,
+                            "turn.completed",
+                            json!({"response": "permission settled"}),
+                        ),
+                    );
+                }
             }
             continue;
         }
@@ -205,7 +229,7 @@ fn main() {
             continue;
         };
         let params = object.get("params").unwrap_or(&Value::Null);
-        if !valid_params(method, params, session_id) {
+        if !valid_params(method, params, &session_id) {
             let _ = write_value(&mut out, error(id, -32602, "invalid method parameters"));
             continue;
         }
@@ -216,7 +240,7 @@ fn main() {
             "session/create" => {
                 let _ = write_value(
                     &mut out,
-                    response(id, json!({"session": {"sessionId": session_id}})),
+                    response(id, json!({"session": {"sessionId": &session_id}})),
                 );
             }
             "session/subscribe" => {
@@ -224,7 +248,7 @@ fn main() {
                     &mut out,
                     response(
                         id,
-                        json!({"sessionId": session_id, "eventSeq": sequence, "events": []}),
+                        json!({"sessionId": &session_id, "eventSeq": sequence, "events": []}),
                     ),
                 );
             }
@@ -238,13 +262,13 @@ fn main() {
                 active_turn = true;
                 let _ = write_value(
                     &mut out,
-                    response(id, json!({"sessionId": session_id, "accepted": true})),
+                    response(id, json!({"sessionId": &session_id, "accepted": true})),
                 );
                 let _ = write_value(
                     &mut out,
                     event(
                         &mut sequence,
-                        session_id,
+                        &session_id,
                         "turn.started",
                         json!({"turnId": turn_id, "turnNumber": next_turn - 1}),
                     ),
@@ -253,7 +277,8 @@ fn main() {
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if content.contains("permission") {
+                let review_flow_initial = mode == "review-flow" && next_turn == 2;
+                if content.contains("permission") || review_flow_initial {
                     let request_id = Value::String("server-1".into());
                     pending_permission = Some(request_id.clone());
                     let _ = write_value(
@@ -275,7 +300,7 @@ fn main() {
                         }),
                     );
                 }
-                if content.contains("input") {
+                if content.contains("input") || review_flow_initial {
                     let _ = write_value(
                         &mut out,
                         json!({
@@ -285,12 +310,12 @@ fn main() {
                         }),
                     );
                 }
-                if content.contains("unknown_event") {
+                if content.contains("unknown_event") || review_flow_initial {
                     let _ = write_value(
                         &mut out,
                         event(
                             &mut sequence,
-                            session_id,
+                            &session_id,
                             "future.event",
                             json!({"secret": "redacted"}),
                         ),
@@ -301,12 +326,15 @@ fn main() {
                         &mut out,
                         event(
                             &mut sequence,
-                            session_id,
+                            &session_id,
                             "turn.completed",
                             json!({"response": "fixture complete"}),
                         ),
                     );
                     active_turn = false;
+                }
+                if mode == "crash" {
+                    std::process::exit(17);
                 }
             }
             "session/stop" => {
@@ -317,7 +345,7 @@ fn main() {
                         &mut out,
                         event(
                             &mut sequence,
-                            session_id,
+                            &session_id,
                             "turn.completed",
                             json!({"stopped": true}),
                         ),

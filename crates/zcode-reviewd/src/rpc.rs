@@ -1,18 +1,23 @@
-use crate::{MessageDisposition, ResponseDisposition, Scheduler, SchedulerError};
+use crate::{
+    orchestration::{OrchestrationError, ReviewJobOrchestrator},
+    MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
+};
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
+use review_preparation::ReviewManifest;
 use review_store::{
     DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent, TurnState,
     WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 3;
+pub const RPC_VERSION: u16 = 4;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -38,6 +43,7 @@ pub struct RpcRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RpcMethod {
+    SpawnReview { manifest: ReviewManifest },
     Enqueue { job: NewJobInput },
     Start,
     Status { agent_id: String },
@@ -57,7 +63,8 @@ impl RpcMethod {
     fn is_known(name: &str) -> bool {
         matches!(
             name,
-            "enqueue"
+            "spawn_review"
+                | "enqueue"
                 | "start"
                 | "status"
                 | "events"
@@ -230,6 +237,13 @@ pub enum RpcOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RpcSuccess {
+    ReviewSpawned {
+        job: JobView,
+        prompt_sha256: String,
+        resumed_existing: bool,
+        counts_as_independent: bool,
+        capabilities: ReviewCapabilitiesView,
+    },
     Enqueued {
         job: JobView,
     },
@@ -412,11 +426,71 @@ pub struct JobView {
     pub closed: bool,
     pub reaped: bool,
     pub live_steer: bool,
+    pub review_kind: Option<String>,
+    pub feature_id: Option<String>,
+    pub section_id: Option<String>,
+    pub round_kind: Option<String>,
+    pub prompt_sha256: String,
+    pub provenance: Option<ReviewProvenanceView>,
+    pub capabilities: ReviewCapabilitiesView,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCapabilitiesView {
+    pub private_review_orchestration: bool,
+    pub public_mcp: bool,
+    pub fresh_session: bool,
+    pub independent_session_observed: bool,
+    pub resume_counts_as_independent: bool,
+    pub live_steer: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewProvenanceView {
+    pub manifest_sha256: String,
+    pub prepared_sha256: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub requested_model: Option<String>,
 }
 
 impl From<Job> for JobView {
     fn from(value: Job) -> Self {
+        let prepared = value.prepared_launch_json.as_deref().and_then(|json| {
+            serde_json::from_str::<review_preparation::PreparedLaunchSpec>(json).ok()
+        });
+        let fresh_session = prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.fresh_session);
+        let review_kind = prepared
+            .as_ref()
+            .map(|prepared| prepared.review_kind.as_str().to_owned());
+        let feature_id = prepared
+            .as_ref()
+            .map(|prepared| prepared.feature_id.clone());
+        let section_id = prepared
+            .as_ref()
+            .map(|prepared| prepared.section_id.clone());
+        let round_kind = prepared
+            .as_ref()
+            .map(|prepared| prepared.round_kind.as_str().to_owned());
+        let provenance = prepared.as_ref().map(|prepared| ReviewProvenanceView {
+            manifest_sha256: prepared.manifest_sha256.clone(),
+            prepared_sha256: prepared.prepared_sha256.clone(),
+            base_sha: prepared.base_sha.clone(),
+            head_sha: prepared.head_sha.clone(),
+            requested_model: prepared.model.clone(),
+        });
+        let prompt_sha256 = format!("{:x}", Sha256::digest(value.initial_prompt.as_bytes()));
+        let capabilities = ReviewCapabilitiesView {
+            private_review_orchestration: fresh_session,
+            public_mcp: false,
+            fresh_session,
+            independent_session_observed: fresh_session && value.zcode_session_id.is_some(),
+            resume_counts_as_independent: false,
+            live_steer: false,
+        };
         Self {
             agent_id: value.agent_id,
             idempotency_key: value.idempotency_key,
@@ -434,6 +508,13 @@ impl From<Job> for JobView {
             closed: value.closed_at.is_some(),
             reaped: value.reaped_at.is_some(),
             live_steer: false,
+            review_kind,
+            feature_id,
+            section_id,
+            round_kind,
+            prompt_sha256,
+            provenance,
+            capabilities,
             created_at: value.created_at,
         }
     }
@@ -520,6 +601,7 @@ pub struct ArtifactView {
 pub struct RpcService {
     scheduler: Scheduler,
     store: Arc<Store>,
+    orchestrator: Option<ReviewJobOrchestrator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,7 +614,12 @@ impl RpcService {
         if !Arc::ptr_eq(&scheduler.store(), &store) {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
-        Ok(Self { scheduler, store })
+        let orchestrator = ReviewJobOrchestrator::new(scheduler.clone()).ok();
+        Ok(Self {
+            scheduler,
+            store,
+            orchestrator,
+        })
     }
 
     pub fn handle_bytes(&self, frame: &[u8]) -> RpcResponse {
@@ -593,6 +680,27 @@ impl RpcService {
 
     pub fn dispatch(&self, method: RpcMethod) -> Result<RpcSuccess, RpcError> {
         match method {
+            RpcMethod::SpawnReview { manifest } => {
+                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        RpcErrorCode::Unavailable,
+                        "private review orchestration is unavailable",
+                    )
+                })?;
+                let spawned = orchestrator
+                    .spawn_review(&manifest)
+                    .map_err(map_orchestration)?;
+                let capabilities = JobView::from(spawned.job.clone()).capabilities;
+                let counts_as_independent =
+                    !spawned.resumed_existing && spawned.job.zcode_session_id.is_some();
+                Ok(RpcSuccess::ReviewSpawned {
+                    job: spawned.job.into(),
+                    prompt_sha256: spawned.prompt_sha256,
+                    resumed_existing: spawned.resumed_existing,
+                    counts_as_independent,
+                    capabilities,
+                })
+            }
             RpcMethod::Enqueue { job } => {
                 validate_id(&job.agent_id, "agent_id")?;
                 validate_text(&job.workspace_path, "workspace_path", 4096)?;
@@ -953,6 +1061,19 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
         }
         SchedulerError::RuntimeCommand { .. } => {
             RpcError::new(RpcErrorCode::Unavailable, "runtime command failed")
+        }
+    }
+}
+
+fn map_orchestration(error: OrchestrationError) -> RpcError {
+    match error {
+        OrchestrationError::Preparation(message) | OrchestrationError::Prompt(message) => {
+            RpcError::new(RpcErrorCode::Validation, message)
+        }
+        OrchestrationError::Scheduler(error) => map_scheduler(error),
+        OrchestrationError::Store(error) => map_store(error),
+        OrchestrationError::Unavailable(message) => {
+            RpcError::new(RpcErrorCode::Unavailable, message)
         }
     }
 }

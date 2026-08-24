@@ -1,4 +1,4 @@
-use review_ledger::{LedgerManager, ToolResult, VerifiedArtifact};
+use review_ledger::{LedgerError, LedgerManager, ToolResult, VerifiedArtifact, REVIEW_FINALIZE};
 use review_store::{
     DeliveryClaim, Job, JobClaim, JobState, LifecycleWrite, MessageState, NewJob, Store,
     StoreError, StoredMessage, StoredProcessIdentity, TerminalUpdate, TurnState,
@@ -27,6 +27,8 @@ use zcode_protocol::{
 };
 
 pub mod ledger_mcp;
+pub mod orchestration;
+pub mod prompts;
 pub mod rpc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,52 @@ pub enum RuntimeLoss {
     EventStreamLost,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFailure {
+    PreparedLaunchInvalid,
+    MissingFinalization,
+    EvidenceIncomplete,
+    ReportMissing,
+    ReportInvalid,
+    ProvenanceMismatch,
+    SourceIntegrity,
+    CleanupFailed,
+    LedgerMalformed,
+    FinalizationConflict,
+}
+
+impl ReviewFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::PreparedLaunchInvalid => "PREPARED_LAUNCH_INVALID",
+            Self::MissingFinalization => "REVIEW_NOT_FINALIZED",
+            Self::EvidenceIncomplete => "REVIEW_EVIDENCE_INCOMPLETE",
+            Self::ReportMissing => "REVIEW_REPORT_MISSING",
+            Self::ReportInvalid => "REVIEW_REPORT_INVALID",
+            Self::ProvenanceMismatch => "REVIEW_PROVENANCE_MISMATCH",
+            Self::SourceIntegrity => "SOURCE_INTEGRITY_FAILED",
+            Self::CleanupFailed => "WORKTREE_CLEANUP_FAILED",
+            Self::LedgerMalformed => "REVIEW_LEDGER_INVALID",
+            Self::FinalizationConflict => "REVIEW_FINALIZE_CONFLICT",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::PreparedLaunchInvalid => "prepared_launch_invalid",
+            Self::MissingFinalization => "review_not_finalized",
+            Self::EvidenceIncomplete => "review_evidence_incomplete",
+            Self::ReportMissing => "review_report_missing",
+            Self::ReportInvalid => "review_report_invalid",
+            Self::ProvenanceMismatch => "review_provenance_mismatch",
+            Self::SourceIntegrity => "source_integrity_failed",
+            Self::CleanupFailed => "worktree_cleanup_failed",
+            Self::LedgerMalformed => "review_ledger_invalid",
+            Self::FinalizationConflict => "review_finalize_conflict",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeTerminal {
     Stopped(StopOutcome),
@@ -49,6 +97,7 @@ pub enum RuntimeTerminal {
     Exited(ChildExit),
     FailedRuntimeLost(RuntimeLoss),
     Orphaned(RuntimeLoss),
+    ReviewFailed(ReviewFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +1030,7 @@ struct SchedulerInner {
     config: SchedulerConfig,
     ledger: Option<Arc<LedgerManager>>,
     ledger_mcp: Option<InternalLedgerMcpConfig>,
+    review_completion: Option<Arc<orchestration::ReviewCompletionGate>>,
     state: Mutex<SchedulerState>,
 }
 
@@ -1027,6 +1077,9 @@ struct StoreLifecycleSink {
 #[derive(Default)]
 struct SinkWriteState {
     first_error: Option<String>,
+    last_source_sequence: u64,
+    pending_terminal_sequence: Option<u64>,
+    terminal_written: bool,
 }
 
 struct LifecycleProjection {
@@ -1052,21 +1105,44 @@ impl StoreLifecycleSink {
     }
 
     fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
-        let state = self.write_state.lock().unwrap();
+        let mut state = self.write_state.lock().unwrap();
         if let Some(error) = &state.first_error {
-            self.store.fail_claim(
+            return self.store.fail_claim(
                 &self.agent_id,
                 self.owner_epoch,
                 "LIFECYCLE_SINK_FAILED",
                 error,
-            )
-        } else {
-            self.store.transition_terminal(
-                &self.agent_id,
-                self.owner_epoch,
-                &terminal_update(terminal),
-            )
+            );
         }
+        if state.terminal_written {
+            return self
+                .store
+                .get_job(&self.agent_id)?
+                .map(|job| job.state)
+                .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()));
+        }
+        let source_sequence = state
+            .pending_terminal_sequence
+            .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
+        let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
+        let write = LifecycleWrite {
+            agent_id: self.agent_id.clone(),
+            runtime_agent_id: self.runtime_agent_id.clone(),
+            owner_epoch: self.owner_epoch,
+            source_sequence,
+            event_type: projection.event_type.into(),
+            turn_id: None,
+            payload_json: projection.payload_json,
+            redaction_level: projection.redaction_level.into(),
+            terminal: Some(terminal_update(terminal)),
+            turn_state: None,
+        };
+        self.store.append_lifecycle(&write)?;
+        state.terminal_written = true;
+        self.store
+            .get_job(&self.agent_id)?
+            .map(|job| job.state)
+            .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()))
     }
 
     fn error(&self) -> Option<String> {
@@ -1078,6 +1154,11 @@ impl LifecycleSink for StoreLifecycleSink {
     fn emit(&self, record: LifecycleRecord) {
         let mut state = self.write_state.lock().unwrap();
         if state.first_error.is_some() {
+            return;
+        }
+        state.last_source_sequence = state.last_source_sequence.max(record.sequence);
+        if matches!(record.event, RuntimeEvent::Terminal(_)) {
+            state.pending_terminal_sequence = Some(record.sequence);
             return;
         }
         let pending_request_id = match &record.event {
@@ -1115,10 +1196,6 @@ impl LifecycleSink for StoreLifecycleSink {
             _ => None,
         };
         let projection = lifecycle_projection(&record.event, pending_request_id.as_deref());
-        let terminal = match &record.event {
-            RuntimeEvent::Terminal(terminal) => Some(terminal_update(terminal)),
-            _ => None,
-        };
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -1128,7 +1205,7 @@ impl LifecycleSink for StoreLifecycleSink {
             turn_id: None,
             payload_json: projection.payload_json,
             redaction_level: projection.redaction_level.into(),
-            terminal,
+            terminal: None,
             turn_state: match &record.event {
                 RuntimeEvent::Driver(Inbound::Lifecycle { method, .. }) => match method.as_str() {
                     "turn.started" => Some(TurnState::Active),
@@ -1245,6 +1322,11 @@ fn lifecycle_projection(
             serde_json::json!({"kind": "orphaned", "reason": runtime_loss_name(loss)}),
             runtime_loss_redaction(loss),
         ),
+        RuntimeEvent::Terminal(RuntimeTerminal::ReviewFailed(failure)) => (
+            "runtime.review_failed",
+            serde_json::json!({"kind": "review_failed", "reason": failure.reason()}),
+            "allowlisted",
+        ),
     };
     LifecycleProjection {
         event_type,
@@ -1331,6 +1413,11 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
             failure_code: Some("ORPHANED".into()),
             failure_message: Some(runtime_loss_name(loss).into()),
         },
+        RuntimeTerminal::ReviewFailed(failure) => TerminalUpdate {
+            state: JobState::Failed,
+            failure_code: Some(failure.code().into()),
+            failure_message: Some(failure.reason().into()),
+        },
     }
 }
 
@@ -1357,6 +1444,7 @@ impl Scheduler {
                 config,
                 ledger: None,
                 ledger_mcp: None,
+                review_completion: None,
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
@@ -1380,6 +1468,9 @@ impl Scheduler {
         let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
             SchedulerError::InvalidConfig("ledger must attach before scheduler cloning".into())
         })?;
+        inner.review_completion = Some(Arc::new(orchestration::ReviewCompletionGate::new(
+            Arc::clone(&ledger),
+        )));
         inner.ledger = Some(ledger);
         inner.ledger_mcp = Some(config);
         Ok(self)
@@ -1387,6 +1478,10 @@ impl Scheduler {
 
     pub fn ledger(&self) -> Option<Arc<LedgerManager>> {
         self.inner.ledger.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn review_completion_enabled(&self) -> bool {
+        self.inner.review_completion.is_some()
     }
 
     pub fn store(&self) -> Arc<Store> {
@@ -1735,6 +1830,7 @@ impl Scheduler {
                 .fail_claim(agent_id, owner_epoch, code, &message)
         });
         let terminal = runtime.stop(self.inner.config.stop_grace);
+        let terminal = self.review_terminal(agent_id, terminal, false);
         let finished = sink.finish(&terminal);
         self.release_active(agent_id, owner_epoch);
 
@@ -1767,6 +1863,34 @@ impl Scheduler {
         }
     }
 
+    fn review_terminal(
+        &self,
+        agent_id: &str,
+        terminal: RuntimeTerminal,
+        natural_completion: bool,
+    ) -> RuntimeTerminal {
+        let Some(gate) = &self.inner.review_completion else {
+            return terminal;
+        };
+        let job = match self.inner.store.get_job(agent_id) {
+            Ok(Some(job)) => job,
+            Ok(None) | Err(_) if natural_completion => {
+                return RuntimeTerminal::ReviewFailed(ReviewFailure::ReportMissing)
+            }
+            Ok(None) | Err(_) => return terminal,
+        };
+        if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
+            return match gate.complete(&job) {
+                Ok(()) => terminal,
+                Err(failure) => RuntimeTerminal::ReviewFailed(failure),
+            };
+        }
+        if let Err(error) = gate.cleanup_nonclean(&job) {
+            self.record_failure(agent_id, error.reason().into());
+        }
+        terminal
+    }
+
     fn spawn_monitor(
         &self,
         agent_id: String,
@@ -1781,6 +1905,7 @@ impl Scheduler {
             let mut handled_generation = 0;
             loop {
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
+                    let terminal = scheduler.review_terminal(&agent_id, terminal, false);
                     if let Some(error) = sink.error() {
                         if let Err(store_error) = scheduler.inner.store.fail_claim(
                             &agent_id,
@@ -1833,6 +1958,11 @@ impl Scheduler {
                         Ok(None) => {
                             let terminal =
                                 runtime.finish_turn(boundary, scheduler.inner.config.stop_grace);
+                            let terminal = scheduler.review_terminal(
+                                &agent_id,
+                                terminal,
+                                boundary == TurnBoundary::Completed,
+                            );
                             if let Err(error) = sink.finish(&terminal) {
                                 scheduler.record_failure(&agent_id, error.to_string());
                             }
@@ -1848,6 +1978,7 @@ impl Scheduler {
                                 TurnBoundary::Failed,
                                 scheduler.inner.config.stop_grace,
                             );
+                            let terminal = scheduler.review_terminal(&agent_id, terminal, false);
                             let _ = sink.finish(&terminal);
                             scheduler.release_active(&agent_id, owner_epoch);
                             return;
@@ -1911,9 +2042,48 @@ impl Scheduler {
         let ledger = self.inner.ledger.as_ref().ok_or_else(|| {
             SchedulerError::InvalidConfig("internal review ledger is unavailable".into())
         })?;
-        ledger
-            .call_tool(agent_id, tool, arguments)
-            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
+        match ledger.call_tool(agent_id, tool, arguments) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let failure =
+                    if tool == REVIEW_FINALIZE && matches!(&error, LedgerError::Conflict(_)) {
+                        ReviewFailure::FinalizationConflict
+                    } else {
+                        ReviewFailure::LedgerMalformed
+                    };
+                self.fail_active_review(agent_id, failure);
+                Err(SchedulerError::InvalidConfig(error.to_string()))
+            }
+        }
+    }
+
+    fn fail_active_review(&self, agent_id: &str, failure: ReviewFailure) {
+        let Some((owner_epoch, runtime, _session_id, operation)) = self.active_session(agent_id)
+        else {
+            return;
+        };
+        let _guard = operation.lock().unwrap();
+        let sink = {
+            let state = self.inner.state.lock().unwrap();
+            state
+                .active
+                .get(agent_id)
+                .map(|active| Arc::clone(&active.sink))
+        };
+        let update = terminal_update(&RuntimeTerminal::ReviewFailed(failure));
+        if let Err(error) = self
+            .inner
+            .store
+            .transition_terminal(agent_id, owner_epoch, &update)
+        {
+            self.record_failure(agent_id, error.to_string());
+        }
+        let terminal = runtime.stop(self.inner.config.stop_grace);
+        let terminal = self.review_terminal(agent_id, terminal, false);
+        if let Some(sink) = sink {
+            let _ = sink.finish(&terminal);
+        }
+        self.release_active(agent_id, owner_epoch);
     }
 
     pub fn verify_review_artifact(
@@ -2165,6 +2335,7 @@ impl Scheduler {
             None
         };
         let terminal = runtime.stop(self.inner.config.stop_grace);
+        let terminal = self.review_terminal(agent_id, terminal, false);
         let result = if let Some(message) = sink.error() {
             let fallback = self.inner.store.fail_claim(
                 agent_id,
@@ -2191,10 +2362,13 @@ impl Scheduler {
                     match self.inner.store.fail_claim(
                         agent_id,
                         decision.owner_epoch,
-                        "TERMINAL_WRITE_FAILED",
+                        "LIFECYCLE_SINK_FAILED",
                         &error.to_string(),
                     ) {
-                        Ok(state) => Ok(state),
+                        Ok(_) => Err(SchedulerError::LifecycleSink {
+                            agent_id: agent_id.into(),
+                            message: error.to_string(),
+                        }),
                         Err(fallback) => {
                             self.record_failure(agent_id, fallback.to_string());
                             Err(SchedulerError::Store(fallback))
