@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
     },
     time::Duration,
 };
@@ -123,6 +123,15 @@ impl FacadeProcess {
         );
         structured
     }
+
+    fn tool_error(&mut self, name: &str, arguments: Value) -> String {
+        let response = self.request("tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
 }
 
 impl Drop for FacadeProcess {
@@ -195,6 +204,8 @@ struct PublicFakeRuntime {
     sequence: AtomicU64,
     terminal: Mutex<Option<RuntimeTerminal>>,
     turn: Mutex<TurnSnapshot>,
+    bootstrap_entered: Arc<Barrier>,
+    bootstrap_release: Arc<Barrier>,
 }
 
 impl PublicFakeRuntime {
@@ -225,6 +236,8 @@ impl ManagedRuntime for PublicFakeRuntime {
         job: &review_store::Job,
         _timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
+        self.bootstrap_entered.wait();
+        self.bootstrap_release.wait();
         *self.turn.lock().unwrap() = TurnSnapshot {
             generation: 1,
             active: true,
@@ -281,7 +294,10 @@ impl ManagedRuntime for PublicFakeRuntime {
     }
 }
 
-struct PublicFakeFactory;
+struct PublicFakeFactory {
+    bootstrap_entered: Arc<Barrier>,
+    bootstrap_release: Arc<Barrier>,
+}
 impl RuntimeFactory for PublicFakeFactory {
     fn spawn(
         &self,
@@ -297,6 +313,8 @@ impl RuntimeFactory for PublicFakeFactory {
                 active: false,
                 boundary: None,
             }),
+            bootstrap_entered: Arc::clone(&self.bootstrap_entered),
+            bootstrap_release: Arc::clone(&self.bootstrap_release),
         }))
     }
 }
@@ -453,7 +471,12 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("review.sqlite3");
     let store = Arc::new(Store::open(&database).unwrap());
-    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory);
+    let bootstrap_entered = Arc::new(Barrier::new(2));
+    let bootstrap_release = Arc::new(Barrier::new(2));
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
+        bootstrap_entered: Arc::clone(&bootstrap_entered),
+        bootstrap_release: Arc::clone(&bootstrap_release),
+    });
     let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let scheduler = Scheduler::new(
         "s07-process",
@@ -475,16 +498,45 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
     let socket = directory.path().join("rpc/review.sock");
     let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
     let manifest = manifest_fixture(directory.path());
+    let claim_loop = {
+        let scheduler = scheduler.clone();
+        std::thread::spawn(move || loop {
+            let started = scheduler.start_ready().unwrap();
+            if !started.is_empty() {
+                return started;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        })
+    };
 
     let mut first = FacadeProcess::start(&socket);
+    assert_eq!(
+        first.tool_error(
+            "zcode_review_events",
+            json!({"agent_id":"missing","after_sequence":0,"limit":0}),
+        ),
+        "validation: limit must be between 1 and 100"
+    );
+    assert_eq!(
+        first.tool_error("zcode_review_status", json!({"agent_id":"missing"})),
+        "not_found: review job was not found"
+    );
     let spawned = first.tool("zcode_review_spawn", json!({"manifest_path":manifest}));
     let agent_id = spawned["agent_id"].as_str().unwrap().to_owned();
     assert_eq!(spawned["submission_disposition"], "created");
-    assert_eq!(spawned["state"], "QUEUED");
+    assert!(matches!(
+        spawned["state"].as_str(),
+        Some("QUEUED" | "STARTING")
+    ));
+    bootstrap_entered.wait();
+    assert_eq!(
+        store.get_job(&agent_id).unwrap().unwrap().state,
+        review_store::JobState::Starting
+    );
     assert_eq!(
         scheduler.active_count(),
         0,
-        "public spawn must not enter runtime bootstrap"
+        "bootstrap must not register a ready runtime before release"
     );
     let replay = first.tool("zcode_review_spawn", json!({"manifest_path":manifest}));
     assert_eq!(replay["agent_id"], agent_id);
@@ -493,11 +545,13 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
 
     let mut restarted = FacadeProcess::start(&socket);
     let status = restarted.tool("zcode_review_status", json!({"agent_id":agent_id}));
-    assert_eq!(status["job"]["state"], "QUEUED");
+    assert_eq!(status["job"]["state"], "STARTING");
     assert!(serde_json::to_string(&status)
         .unwrap()
         .find(directory.path().to_string_lossy().as_ref())
         .is_none());
+    bootstrap_release.wait();
+    assert_eq!(claim_loop.join().unwrap(), vec![agent_id.clone()]);
     let queued = restarted.tool(
         "zcode_review_message",
         json!({
@@ -519,7 +573,6 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
     assert!(!conflict
         .to_string()
         .contains(directory.path().to_string_lossy().as_ref()));
-    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let pending = loop {
         let pending = store.pending_requests(&agent_id).unwrap();
@@ -551,6 +604,20 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
     }));
     assert_eq!(responded_again["disposition"], "already_responded");
     assert_eq!(responded_again["effective_decision"], "deny");
+
+    let events = restarted.tool(
+        "zcode_review_events",
+        json!({"agent_id":agent_id,"after_sequence":0,"limit":100}),
+    );
+    let event_rows = events["events"].as_array().unwrap();
+    assert!(!event_rows.is_empty());
+    assert!(event_rows
+        .windows(2)
+        .all(|pair| pair[0]["sequence"].as_u64() < pair[1]["sequence"].as_u64()));
+    assert!(event_rows.iter().all(|event| matches!(
+        event["redaction_level"].as_str(),
+        Some("allowlisted" | "redacted")
+    )));
 
     let pending = restarted.tool("zcode_review_status", json!({"agent_id":agent_id}));
     let request = pending["pending_requests"]

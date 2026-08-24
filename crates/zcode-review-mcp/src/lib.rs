@@ -473,17 +473,7 @@ impl ReviewMcp {
         };
         let response = RpcClient::new(&self.socket, self.timeout)
             .call(&request)
-            .map_err(|e| {
-                String::from(match e.kind() {
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                        "timeout: daemon call exceeded its bound"
-                    }
-                    std::io::ErrorKind::InvalidData => {
-                        "protocol_error: daemon returned an invalid or oversized frame"
-                    }
-                    _ => "daemon_unavailable: review daemon is unavailable",
-                })
-            })?;
+            .map_err(public_transport_error)?;
         if response.version != RPC_VERSION {
             return Err("protocol_version_mismatch: incompatible review daemon".into());
         }
@@ -924,6 +914,17 @@ fn public_error(e: RpcError) -> String {
     };
     format!("{c}: {m}")
 }
+fn public_transport_error(error: std::io::Error) -> String {
+    String::from(match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            "timeout: daemon call exceeded its bound"
+        }
+        std::io::ErrorKind::InvalidData => {
+            "protocol_error: daemon returned an invalid or oversized frame"
+        }
+        _ => "daemon_unavailable: review daemon is unavailable",
+    })
+}
 fn protocol_error() -> String {
     "protocol_error: unexpected daemon response".into()
 }
@@ -957,6 +958,60 @@ mod tests {
         let l = d.path().join("large.json");
         fs::write(&l, vec![b'x'; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
         assert!(read_manifest(&l).unwrap_err().contains("128 KiB"));
+    }
+    #[test]
+    fn public_errors_are_stable_redacted_and_bounded() {
+        let cases = [
+            (
+                RpcErrorCode::Validation,
+                "validation: request validation failed",
+            ),
+            (
+                RpcErrorCode::Oversized,
+                "oversized: bounded response or request was too large",
+            ),
+            (
+                RpcErrorCode::UnsupportedVersion,
+                "protocol_version_mismatch: incompatible review daemon",
+            ),
+            (
+                RpcErrorCode::NotFound,
+                "not_found: review job was not found",
+            ),
+            (RpcErrorCode::Timeout, "timeout: daemon operation timed out"),
+            (
+                RpcErrorCode::RuntimeLost,
+                "runtime_lost: review runtime was lost",
+            ),
+            (
+                RpcErrorCode::Unavailable,
+                "daemon_unavailable: review daemon could not complete the operation",
+            ),
+        ];
+        for (code, expected) in cases {
+            let projected = public_error(RpcError::new(code, "SECRET /private/path pid=123"));
+            assert_eq!(projected, expected);
+            assert!(projected.len() < 128);
+            assert!(!projected.contains("SECRET"));
+        }
+        assert_eq!(
+            public_transport_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "SECRET")),
+            "timeout: daemon call exceeded its bound"
+        );
+        assert_eq!(
+            public_transport_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SECRET"
+            )),
+            "protocol_error: daemon returned an invalid or oversized frame"
+        );
+        assert_eq!(
+            public_transport_error(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "SECRET"
+            )),
+            "daemon_unavailable: review daemon is unavailable"
+        );
     }
     #[test]
     fn inventory_and_schemas_are_exact() {
