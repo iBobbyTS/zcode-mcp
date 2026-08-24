@@ -1,14 +1,15 @@
 #![cfg(unix)]
 
-use review_store::{JobState, Store};
+use review_store::{JobState, NewJob, Store};
 use std::{
-    io::Read,
+    io::{Read, Write},
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
-use zcode_driver::observe_process_group;
+use zcode_driver::{observe_process, observe_process_group};
 use zcode_reviewd::rpc::{
     JobStateView, NewJobInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
     RPC_VERSION,
@@ -206,4 +207,97 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .unwrap();
     assert_eq!(job.state, JobState::Cancelled);
     assert!(job.closed_at.is_some());
+}
+
+#[test]
+fn signal_before_daemon_start_exits_without_socket_runtime_or_durable_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("startup.sqlite3");
+    let socket = directory.path().join("private").join("startup.sock");
+    let gate_path = directory.path().join("startup-gate.sock");
+    let gate_listener = UnixListener::bind(&gate_path).unwrap();
+    gate_listener.set_nonblocking(true).unwrap();
+    let store = Store::open(&database).unwrap();
+    store
+        .enqueue_job(&NewJob::new("startup-job", "/workspace"))
+        .unwrap();
+    drop(store);
+
+    let daemon_executable = env!("CARGO_BIN_EXE_zcode-reviewd");
+    let runtime = fake_runtime();
+    let mut daemon = Command::new(daemon_executable)
+        .env("ZCODE_REVIEWD_DATABASE", &database)
+        .env("ZCODE_REVIEWD_SOCKET", &socket)
+        .env("ZCODE_RUNTIME_PATH", &runtime)
+        .env("ZCODE_REVIEWD_TEST_STARTUP_GATE", &gate_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let daemon_pid = daemon.id();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut gate = loop {
+        match gate_listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not reach the post-signal-registration gate"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("startup gate accept failed: {error}"),
+        }
+    };
+    let mut ready = [0u8; 1];
+    gate.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    assert!(
+        !socket.exists(),
+        "daemon published its socket before the gate"
+    );
+
+    unsafe {
+        assert_eq!(libc::kill(daemon_pid as i32, libc::SIGTERM), 0);
+    }
+    gate.write_all(&[1]).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!("daemon did not honor the startup-window signal");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(status.success());
+    let mut stdout = Vec::new();
+    daemon
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    assert!(stdout.is_empty(), "startup shutdown polluted stdout");
+    assert!(!socket.exists());
+    assert!(matches!(
+        observe_process(daemon_pid),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+
+    let store = Store::open(&database).unwrap();
+    let job = store.get_job("startup-job").unwrap().unwrap();
+    assert_eq!(job.state, JobState::Queued);
+    assert!(
+        job.process_identity.is_none(),
+        "a runtime process group started"
+    );
+    assert!(job.runtime_agent_id.is_none());
+    assert!(job.zcode_session_id.is_none());
+    assert_eq!(store.active_count().unwrap(), 0);
 }

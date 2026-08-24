@@ -1958,7 +1958,8 @@ impl Scheduler {
 #[cfg(unix)]
 pub struct Daemon {
     scheduler: Scheduler,
-    shutdown: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+    shutdown_started: AtomicBool,
     claim_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     server: Mutex<Option<rpc::RpcServer>>,
     _singleton_lock: SingletonLock,
@@ -2009,7 +2010,30 @@ impl Daemon {
         server_options: rpc::ServerOptions,
         claim_interval: Duration,
     ) -> io::Result<Self> {
-        Self::start_inner(socket, scheduler, server_options, claim_interval, || {})
+        Self::start_with_shutdown(
+            socket,
+            scheduler,
+            server_options,
+            claim_interval,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub fn start_with_shutdown(
+        socket: impl AsRef<std::path::Path>,
+        scheduler: Scheduler,
+        server_options: rpc::ServerOptions,
+        claim_interval: Duration,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            socket,
+            scheduler,
+            server_options,
+            claim_interval,
+            shutdown_requested,
+            || {},
+        )
     }
 
     fn start_inner<F>(
@@ -2017,6 +2041,7 @@ impl Daemon {
         scheduler: Scheduler,
         server_options: rpc::ServerOptions,
         claim_interval: Duration,
+        shutdown_requested: Arc<AtomicBool>,
         before_reconcile: F,
     ) -> io::Result<Self>
     where
@@ -2028,18 +2053,25 @@ impl Daemon {
                 "claim interval must be positive",
             ));
         }
+        check_startup_shutdown(&shutdown_requested)?;
         let singleton_lock = SingletonLock::acquire(scheduler.store().database_path())?;
+        check_startup_shutdown(&shutdown_requested)?;
         before_reconcile();
+        check_startup_shutdown(&shutdown_requested)?;
         scheduler
             .reconcile_startup()
             .map_err(|error| io::Error::other(error.to_string()))?;
+        check_startup_shutdown(&shutdown_requested)?;
         let service = Arc::new(
             rpc::RpcService::new(scheduler.clone(), scheduler.store())
                 .map_err(|_| io::Error::other("scheduler store ownership mismatch"))?,
         );
         let server = rpc::RpcServer::bind(socket, service, server_options)?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let loop_shutdown = Arc::clone(&shutdown);
+        if let Err(error) = check_startup_shutdown(&shutdown_requested) {
+            server.shutdown();
+            return Err(error);
+        }
+        let loop_shutdown = Arc::clone(&shutdown_requested);
         let loop_scheduler = scheduler.clone();
         let claim_thread = thread::spawn(move || {
             while !loop_shutdown.load(Ordering::Acquire) {
@@ -2051,7 +2083,8 @@ impl Daemon {
         });
         Ok(Self {
             scheduler,
-            shutdown,
+            shutdown_requested,
+            shutdown_started: AtomicBool::new(false),
             claim_thread: Mutex::new(Some(claim_thread)),
             server: Mutex::new(Some(server)),
             _singleton_lock: singleton_lock,
@@ -2059,7 +2092,8 @@ impl Daemon {
     }
 
     pub fn shutdown(&self) {
-        if self.shutdown.swap(true, Ordering::AcqRel) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
         if let Some(server) = self.server.lock().unwrap().take() {
@@ -2069,6 +2103,18 @@ impl Daemon {
             let _ = claim_thread.join();
         }
         self.scheduler.shutdown_all();
+    }
+}
+
+#[cfg(unix)]
+fn check_startup_shutdown(shutdown_requested: &AtomicBool) -> io::Result<()> {
+    if shutdown_requested.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "daemon shutdown requested during startup",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -3312,6 +3358,7 @@ mod tests {
                 start_scheduler,
                 rpc::ServerOptions::default(),
                 Duration::from_millis(20),
+                Arc::new(AtomicBool::new(false)),
                 || {
                     thread_entered.wait();
                     thread_release.wait();
@@ -3335,6 +3382,39 @@ mod tests {
             JobState::FailedRuntimeLost
         );
         daemon.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_startup_honors_shutdown_request_before_reconcile_or_publication() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        scheduler
+            .enqueue(&NewJob::new("startup-stop-job", "workspace"))
+            .unwrap();
+        let socket = directory.path().join("stopped").join("review.sock");
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let request = Arc::clone(&shutdown_requested);
+
+        let error = Daemon::start_inner(
+            &socket,
+            scheduler.clone(),
+            rpc::ServerOptions::default(),
+            Duration::from_millis(20),
+            shutdown_requested,
+            move || request.store(true, Ordering::Release),
+        )
+        .err()
+        .expect("shutdown request must stop daemon startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!socket.exists());
+        assert!(factory.runtimes.lock().unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(store.active_count().unwrap(), 0);
+        assert_eq!(
+            store.get_job("startup-stop-job").unwrap().unwrap().state,
+            JobState::Queued
+        );
     }
 
     #[test]
