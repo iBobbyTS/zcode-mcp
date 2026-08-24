@@ -310,6 +310,13 @@ pub fn write_admission(path: &Path, decisions: &[AdmissionDecision]) -> Result<(
     atomic_write(path, render_admission(decisions).as_bytes())
 }
 
+pub fn normalized_manifest_sha256(manifest: &ReviewManifest) -> Result<String, ShadowError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec_pretty(manifest)?)
+    ))
+}
+
 pub trait PublicMcpClient {
     fn call(
         &self,
@@ -537,29 +544,28 @@ pub async fn run_shadow<C: PublicMcpClient>(
         .and_then(|value| value["resources_reaped"].as_bool())
         .unwrap_or(false);
     runtime_failure |= !close_reaped;
+    let expected_manifest_sha256 = normalized_manifest_sha256(&manifest)?;
     let provenance_valid = job["base_sha"].as_str() == Some(manifest.base_ref.as_str())
         && job["head_sha"].as_str() == Some(manifest.head_ref.as_str())
-        && job["manifest_sha256"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
+        && job["manifest_sha256"].as_str() == Some(expected_manifest_sha256.as_str())
         && job["prepared_sha256"]
             .as_str()
             .is_some_and(|value| !value.is_empty())
         && job["prompt_sha256"].as_str() == Some(prompt_sha256.as_str());
-    let full_independent = config.mode == ShadowMode::Full
-        && submission == "created"
-        && fresh_session
-        && session_id.as_deref().is_some_and(|value| !value.is_empty())
-        && provenance_valid
-        && report_valid
-        && !unsupported
-        && !runtime_failure;
-    let classification = if full_independent {
-        EvidenceClassification::IndependentEvidence
-    } else if config.mode != ShadowMode::Full && report_valid && !runtime_failure {
-        EvidenceClassification::Consultation
-    } else {
-        EvidenceClassification::EvidenceIncomplete
+    let complete_evidence = provenance_valid && report_valid && !unsupported && !runtime_failure;
+    let classification = match config.mode {
+        ShadowMode::Full
+            if complete_evidence
+                && submission == "created"
+                && fresh_session
+                && session_id.as_deref().is_some_and(|value| !value.is_empty()) =>
+        {
+            EvidenceClassification::IndependentEvidence
+        }
+        ShadowMode::DeltaConsultation | ShadowMode::ResumeConsultation if complete_evidence => {
+            EvidenceClassification::Consultation
+        }
+        _ => EvidenceClassification::EvidenceIncomplete,
     };
     let provenance = ShadowProvenance {
         schema: SHADOW_SCHEMA.into(),

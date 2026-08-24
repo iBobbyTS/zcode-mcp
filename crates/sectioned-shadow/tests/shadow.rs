@@ -1,10 +1,12 @@
 use review_preparation::{NetworkPolicy, ReviewKind, ReviewManifest, RoundKind, ScratchPolicy};
 use sectioned_shadow::{
-    calibration, render_admission, run_shadow, write_admission, AdmissionDecision,
-    AdmissionDisposition, CalibrationRecord, EvidenceClassification, PublicMcpClient, ShadowConfig,
-    ShadowError, ShadowMode, ShadowProvenance, REQUIRED_ARTIFACT_SUFFIXES, SHADOW_SCHEMA,
+    calibration, normalized_manifest_sha256, render_admission, run_shadow, write_admission,
+    AdmissionDecision, AdmissionDisposition, CalibrationRecord, EvidenceClassification,
+    PublicMcpClient, ShadowConfig, ShadowError, ShadowMode, ShadowProvenance,
+    REQUIRED_ARTIFACT_SUFFIXES, SHADOW_SCHEMA,
 };
 use serde_json::{json, Value};
+use sha2::Digest;
 use std::{
     collections::{BTreeMap, VecDeque},
     future::{self, Future},
@@ -23,6 +25,35 @@ impl FakeClient {
             calls: Mutex::new(Vec::new()),
             responses: Mutex::new(responses.into()),
         }
+    }
+
+    fn complete(config: &ShadowConfig, mut responses: Vec<(&'static str, Value)>) -> Self {
+        let manifest =
+            ReviewManifest::from_json(&std::fs::read(&config.manifest_path).unwrap()).unwrap();
+        let digest = normalized_manifest_sha256(&manifest).unwrap();
+        for (_, response) in &mut responses {
+            replace_manifest_digest(response, &digest);
+        }
+        Self::new(responses)
+    }
+}
+
+fn replace_manifest_digest(value: &mut Value, digest: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("manifest_sha256") {
+                object.insert("manifest_sha256".into(), Value::String(digest.into()));
+            }
+            for value in object.values_mut() {
+                replace_manifest_digest(value, digest);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                replace_manifest_digest(value, digest);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -178,7 +209,7 @@ async fn full_plan_and_code_runs_produce_independent_separate_artifacts() {
         std::fs::create_dir_all(paths.gpt_raw.parent().unwrap()).unwrap();
         std::fs::write(&paths.gpt_raw, "# independent GPT raw\n").unwrap();
         std::fs::write(&paths.gpt_admission, "# GPT admission\n").unwrap();
-        let client = FakeClient::new(successful_responses(stem));
+        let client = FakeClient::complete(&config, successful_responses(stem));
         let run = run_shadow(&client, &config).await.unwrap();
         assert_eq!(
             run.provenance.classification,
@@ -222,21 +253,24 @@ async fn duplicate_spawn_and_missing_fresh_session_never_count() {
         "duplicate",
         ShadowMode::Full,
     );
-    let client = FakeClient::new(vec![
-        (
-            "zcode_review_spawn",
-            spawn("same-agent", "existing_compatible"),
-        ),
-        (
-            "zcode_review_status",
-            json!({"job":job("same-agent","COMPLETED",false),"pending_requests":[]}),
-        ),
-        ("zcode_review_result", report("same-agent", true)),
-        (
-            "zcode_review_close",
-            json!({"agent_id":"same-agent","state":"COMPLETED","resources_reaped":true}),
-        ),
-    ]);
+    let client = FakeClient::complete(
+        &transport_config,
+        vec![
+            (
+                "zcode_review_spawn",
+                spawn("same-agent", "existing_compatible"),
+            ),
+            (
+                "zcode_review_status",
+                json!({"job":job("same-agent","COMPLETED",false),"pending_requests":[]}),
+            ),
+            ("zcode_review_result", report("same-agent", true)),
+            (
+                "zcode_review_close",
+                json!({"agent_id":"same-agent","state":"COMPLETED","resources_reaped":true}),
+            ),
+        ],
+    );
     let run = run_shadow(&client, &transport_config).await.unwrap();
     assert_eq!(
         run.provenance.classification,
@@ -244,6 +278,48 @@ async fn duplicate_spawn_and_missing_fresh_session_never_count() {
     );
     assert_eq!(run.provenance.submission_disposition, "existing_compatible");
     assert!(!run.provenance.fresh_session_observed);
+}
+
+#[tokio::test]
+async fn normalized_manifest_digest_must_match_public_provenance_exactly() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = manifest(
+        directory.path(),
+        ReviewKind::Code,
+        RoundKind::InitialBounded,
+        "manifest-digest",
+    );
+    let config = config(
+        directory.path(),
+        manifest_path,
+        "manifest-digest",
+        ShadowMode::Full,
+    );
+    let parsed = ReviewManifest::from_json(&std::fs::read(&config.manifest_path).unwrap()).unwrap();
+    let expected = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec_pretty(&parsed).unwrap())
+    );
+    assert_eq!(normalized_manifest_sha256(&parsed).unwrap(), expected);
+    let valid = FakeClient::complete(&config, successful_responses("manifest-digest"));
+    assert_eq!(
+        run_shadow(&valid, &config)
+            .await
+            .unwrap()
+            .provenance
+            .classification,
+        EvidenceClassification::IndependentEvidence
+    );
+
+    let wrong = FakeClient::new(successful_responses("manifest-digest"));
+    assert_eq!(
+        run_shadow(&wrong, &config)
+            .await
+            .unwrap()
+            .provenance
+            .classification,
+        EvidenceClassification::EvidenceIncomplete
+    );
 }
 
 #[tokio::test]
@@ -263,24 +339,104 @@ async fn delta_and_resume_are_consultation_only() {
         let directory = tempfile::tempdir().unwrap();
         let manifest_path = manifest(directory.path(), ReviewKind::Code, round, stem);
         let config = config(directory.path(), manifest_path, stem, mode);
-        let client = FakeClient::new(vec![
-            ("zcode_review_spawn", spawn(stem, "created")),
-            (
-                "zcode_review_status",
-                json!({"job":job(stem,"COMPLETED",true),"pending_requests":[]}),
-            ),
-            ("zcode_review_result", report(stem, true)),
-            (
-                "zcode_review_close",
-                json!({"agent_id":stem,"state":"COMPLETED","resources_reaped":true}),
-            ),
-        ]);
+        let client = FakeClient::complete(
+            &config,
+            vec![
+                ("zcode_review_spawn", spawn(stem, "created")),
+                (
+                    "zcode_review_status",
+                    json!({"job":job(stem,"COMPLETED",true),"pending_requests":[]}),
+                ),
+                ("zcode_review_result", report(stem, true)),
+                (
+                    "zcode_review_close",
+                    json!({"agent_id":stem,"state":"COMPLETED","resources_reaped":true}),
+                ),
+            ],
+        );
         let run = run_shadow(&client, &config).await.unwrap();
         assert_eq!(
             run.provenance.classification,
             EvidenceClassification::Consultation
         );
     }
+}
+
+#[tokio::test]
+async fn consultation_requires_complete_supported_matching_evidence() {
+    let delta = tempfile::tempdir().unwrap();
+    let delta_manifest = manifest(
+        delta.path(),
+        ReviewKind::Code,
+        RoundKind::RepairDelta,
+        "delta-unsupported",
+    );
+    let delta_config = config(
+        delta.path(),
+        delta_manifest,
+        "delta-unsupported",
+        ShadowMode::DeltaConsultation,
+    );
+    let delta_client = FakeClient::complete(
+        &delta_config,
+        vec![
+            ("zcode_review_spawn", spawn("delta-unsupported", "created")),
+            (
+                "zcode_review_status",
+                json!({
+                    "job":job("delta-unsupported","COMPLETED",true),
+                    "pending_requests":[{"kind":"unsupported_input","respondable":false}]
+                }),
+            ),
+            ("zcode_review_result", report("delta-unsupported", true)),
+            (
+                "zcode_review_close",
+                json!({"agent_id":"delta-unsupported","state":"COMPLETED","resources_reaped":true}),
+            ),
+        ],
+    );
+    assert_eq!(
+        run_shadow(&delta_client, &delta_config)
+            .await
+            .unwrap()
+            .provenance
+            .classification,
+        EvidenceClassification::EvidenceIncomplete
+    );
+
+    let resume = tempfile::tempdir().unwrap();
+    let resume_manifest = manifest(
+        resume.path(),
+        ReviewKind::Code,
+        RoundKind::FinalBounded,
+        "resume-provenance",
+    );
+    let resume_config = config(
+        resume.path(),
+        resume_manifest,
+        "resume-provenance",
+        ShadowMode::ResumeConsultation,
+    );
+    let resume_client = FakeClient::new(vec![
+        ("zcode_review_spawn", spawn("resume-provenance", "created")),
+        (
+            "zcode_review_status",
+            json!({"job":job("resume-provenance","COMPLETED",true),"pending_requests":[]}),
+        ),
+        ("zcode_review_result", report("resume-provenance", true)),
+        (
+            "zcode_review_close",
+            json!({"agent_id":"resume-provenance","state":"COMPLETED","resources_reaped":true}),
+        ),
+    ]);
+    assert_eq!(
+        run_shadow(&resume_client, &resume_config)
+            .await
+            .unwrap()
+            .provenance
+            .classification,
+        EvidenceClassification::EvidenceIncomplete
+    );
 }
 
 #[tokio::test]
@@ -301,18 +457,21 @@ async fn unsupported_input_and_runtime_failure_are_evidence_incomplete() {
             stem,
         );
         let config = config(directory.path(), manifest_path, stem, ShadowMode::Full);
-        let client = FakeClient::new(vec![
-            ("zcode_review_spawn", spawn(stem, "created")),
-            (
-                "zcode_review_status",
-                json!({"job":job(stem,state,true),"pending_requests":pending}),
-            ),
-            ("zcode_review_result", report(stem, true)),
-            (
-                "zcode_review_close",
-                json!({"agent_id":stem,"state":state,"resources_reaped":true}),
-            ),
-        ]);
+        let client = FakeClient::complete(
+            &config,
+            vec![
+                ("zcode_review_spawn", spawn(stem, "created")),
+                (
+                    "zcode_review_status",
+                    json!({"job":job(stem,state,true),"pending_requests":pending}),
+                ),
+                ("zcode_review_result", report(stem, true)),
+                (
+                    "zcode_review_close",
+                    json!({"agent_id":stem,"state":state,"resources_reaped":true}),
+                ),
+            ],
+        );
         let run = run_shadow(&client, &config).await.unwrap();
         assert_eq!(
             run.provenance.classification,
@@ -336,10 +495,13 @@ async fn transport_failure_and_report_replacement_are_evidence_incomplete() {
         "transport",
         ShadowMode::Full,
     );
-    let client = FakeClient::new(vec![
-        ("zcode_review_spawn", spawn("transport", "created")),
-        ("wrong_tool", json!({})),
-    ]);
+    let client = FakeClient::complete(
+        &transport_config,
+        vec![
+            ("zcode_review_spawn", spawn("transport", "created")),
+            ("wrong_tool", json!({})),
+        ],
+    );
     let run = run_shadow(&client, &transport_config).await.unwrap();
     assert_eq!(
         run.provenance.classification,
@@ -361,18 +523,21 @@ async fn transport_failure_and_report_replacement_are_evidence_incomplete() {
     )
     .unwrap();
     let config = config(replaced.path(), manifest_path, "replaced", ShadowMode::Full);
-    let client = FakeClient::new(vec![
-        ("zcode_review_spawn", spawn("replaced", "created")),
-        (
-            "zcode_review_status",
-            json!({"job":job("replaced","COMPLETED",true),"pending_requests":[]}),
-        ),
-        ("zcode_review_result", report("replaced", true)),
-        (
-            "zcode_review_close",
-            json!({"agent_id":"replaced","state":"COMPLETED","resources_reaped":true}),
-        ),
-    ]);
+    let client = FakeClient::complete(
+        &config,
+        vec![
+            ("zcode_review_spawn", spawn("replaced", "created")),
+            (
+                "zcode_review_status",
+                json!({"job":job("replaced","COMPLETED",true),"pending_requests":[]}),
+            ),
+            ("zcode_review_result", report("replaced", true)),
+            (
+                "zcode_review_close",
+                json!({"agent_id":"replaced","state":"COMPLETED","resources_reaped":true}),
+            ),
+        ],
+    );
     let run = run_shadow(&client, &config).await.unwrap();
     assert_eq!(
         run.provenance.classification,

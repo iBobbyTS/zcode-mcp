@@ -5,6 +5,7 @@ use rmcp::{
     tool, tool_handler, tool_router, Json, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
+use sectioned_shadow::normalized_manifest_sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -41,6 +42,7 @@ struct ResultInput {
 struct FixtureState {
     agent_id: String,
     manifest: ReviewManifest,
+    manifest_sha256: String,
     report: Arc<Vec<u8>>,
 }
 
@@ -91,6 +93,8 @@ impl FixtureMcp {
     ) -> Result<Json<Value>, String> {
         let bytes = fs::read(&input.manifest_path).map_err(|error| error.to_string())?;
         let manifest = ReviewManifest::from_json(&bytes).map_err(|error| error.to_string())?;
+        let manifest_sha256 =
+            normalized_manifest_sha256(&manifest).map_err(|error| error.to_string())?;
         let agent_id = format!(
             "fixture-{}-{}",
             manifest.review_kind.as_str(),
@@ -121,6 +125,7 @@ impl FixtureMcp {
             .map_err(|_| "fixture state unavailable".to_owned())? = Some(FixtureState {
             agent_id: agent_id.clone(),
             manifest,
+            manifest_sha256,
             report,
         });
         self.status_calls
@@ -222,7 +227,7 @@ fn job(state: &FixtureState, job_state: &str) -> Value {
         "zcode_session_id":format!("fixture-session-{}",state.agent_id),
         "fresh_session_observed":true,
         "failure_code":Value::Null,
-        "manifest_sha256":"fixture-manifest",
+        "manifest_sha256":state.manifest_sha256,
         "prepared_sha256":"fixture-prepared",
         "prompt_sha256":"fixture-prompt",
         "base_sha":state.manifest.base_ref,
