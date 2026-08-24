@@ -1,0 +1,9 @@
+{
+  "schema": "sectioned-zcode-shadow/v1",
+  "manifest_path": "/absolute/path/.agent-work/manifests/S08-FINAL-GLM.json",
+  "artifact_directory": "/absolute/path/.agent-work/reviews",
+  "artifact_stem": "S08-FINAL",
+  "mode": "full",
+  "wait_timeout_ms": 5000,
+  "max_waits": 120
+}

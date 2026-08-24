@@ -1,0 +1,17 @@
+[package]
+name = "sectioned-shadow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmcp = { version = "=3.1.4", features = ["client", "transport-child-process"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
+review-preparation = { path = "../review-preparation" }
+
+[dev-dependencies]
+jsonschema = { version = "0.51", default-features = false }
+tempfile = "3"

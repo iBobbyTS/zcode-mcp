@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode.local/schemas/shadow-calibration.schema.json",
+  "title": "Sectioned ZCode Shadow Calibration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "unique_findings", "duplicate_findings", "admitted_findings",
+    "rejected_findings", "deferred_findings", "unsupported_evidence_rate",
+    "runtime_failure_rate", "report_schema_compliance", "wall_time_ms",
+    "checkpoint_count"
+  ],
+  "properties": {
+    "schema": { "const": "sectioned-zcode-shadow/v1" },
+    "unique_findings": { "type": "integer", "minimum": 0 },
+    "duplicate_findings": { "type": "integer", "minimum": 0 },
+    "admitted_findings": { "type": "integer", "minimum": 0 },
+    "rejected_findings": { "type": "integer", "minimum": 0 },
+    "deferred_findings": { "type": "integer", "minimum": 0 },
+    "unsupported_evidence_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "runtime_failure_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "report_schema_compliance": { "type": "boolean" },
+    "wall_time_ms": { "type": "integer", "minimum": 0 },
+    "checkpoint_count": { "type": "integer", "minimum": 0 }
+  }
+}
