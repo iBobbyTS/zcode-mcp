@@ -16,7 +16,7 @@ use std::{
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_TOOL_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_TOOL_TEXT_CHARS: usize = 16 * 1024;
 pub const MAX_TOOL_ITEMS: usize = 128;
 pub const MAX_TOOL_ID_BYTES: usize = 128;
 
@@ -347,8 +347,7 @@ impl LedgerManager {
                     .apply_review_checkpoint(agent_id, &input.checkpoint_id, &json, &hash)?
             }
             REVIEW_FINDING_UPSERT => {
-                let mut input: FindingInput = serde_json::from_value(arguments)?;
-                normalize_finding(&mut input);
+                let input: FindingInput = serde_json::from_value(arguments)?;
                 let (json, hash) = canonical_payload(&input)?;
                 self.store.upsert_review_finding(
                     agent_id,
@@ -581,21 +580,13 @@ fn validate_finding(input: &FindingInput) -> LedgerResult<()> {
     validate_text(&input.suggested_remediation, "suggested_remediation")?;
     for location in &input.locations {
         validate_text(&location.path, "location.path")?;
-        if location.start_line == 0 || location.end_line == 0 {
+        if location.start_line == 0 || location.end_line < location.start_line {
             return Err(LedgerError::InvalidInput(
                 "finding line range is invalid".into(),
             ));
         }
     }
     Ok(())
-}
-
-fn normalize_finding(input: &mut FindingInput) {
-    for location in &mut input.locations {
-        if location.end_line < location.start_line {
-            std::mem::swap(&mut location.start_line, &mut location.end_line);
-        }
-    }
 }
 
 fn validate_validation(input: &ValidationInput) -> LedgerResult<()> {
@@ -693,7 +684,7 @@ fn validate_text(value: &str, field: &str) -> LedgerResult<()> {
 }
 
 fn validate_text_allow_empty(value: &str, field: &str) -> LedgerResult<()> {
-    if value.len() > MAX_TOOL_TEXT_BYTES || value.contains('\0') {
+    if value.chars().count() > MAX_TOOL_TEXT_CHARS || value.contains('\0') {
         return Err(LedgerError::InvalidInput(format!("{field} is invalid")));
     }
     Ok(())

@@ -2,7 +2,7 @@ use crate::rpc::{
     ReviewToolInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
 };
 use review_ledger::{
-    MAX_TOOL_ID_BYTES, MAX_TOOL_ITEMS, MAX_TOOL_TEXT_BYTES, REVIEW_CHECKPOINT, REVIEW_FINALIZE,
+    MAX_TOOL_ID_BYTES, MAX_TOOL_ITEMS, MAX_TOOL_TEXT_CHARS, REVIEW_CHECKPOINT, REVIEW_FINALIZE,
     REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
 };
 use serde_json::{json, Value};
@@ -221,14 +221,14 @@ fn tool_definitions() -> Value {
         json!({
             "type":"string",
             "minLength":1,
-            "maxLength":MAX_TOOL_TEXT_BYTES,
+            "maxLength":MAX_TOOL_TEXT_CHARS,
             "pattern":"^[^\\u0000]+$"
         })
     };
     let optional_text = || {
         json!({
             "type":"string",
-            "maxLength":MAX_TOOL_TEXT_BYTES,
+            "maxLength":MAX_TOOL_TEXT_CHARS,
             "pattern":"^[^\\u0000]*$"
         })
     };
@@ -269,8 +269,9 @@ fn tool_definitions() -> Value {
                     "locations":{"type":"array","maxItems":MAX_TOOL_ITEMS,"items":{
                         "type":"object","additionalProperties":false,"required":["path","start_line","end_line"],
                         "properties":{
-                            "path":text(),"start_line":{"type":"integer","minimum":1},
-                            "end_line":{"type":"integer","minimum":1}
+                            "path":text(),
+                            "start_line":{"type":"integer","minimum":1,"maximum":18446744073709551615u64},
+                            "end_line":{"type":"integer","minimum":1,"maximum":18446744073709551615u64}
                         }
                     }},"evidence":text_array(),
                     "impact":text(),"suggested_remediation":text(),
@@ -406,7 +407,7 @@ mod tests {
                 REVIEW_FINDING_UPSERT,
                 json!({
                     "finding_id":"F-1","severity":"P2","confidence":"high","title":"issue",
-                    "locations":[{"path":"src/lib.rs","start_line":9,"end_line":2}],
+                    "locations":[{"path":"src/lib.rs","start_line":1,"end_line":2}],
                     "evidence":[],"impact":"impact","suggested_remediation":"repair","status":"open"
                 }),
                 true,
@@ -489,12 +490,70 @@ mod tests {
         assert!(!validator.is_valid(&too_many));
         assert!(validate_tool_arguments(REVIEW_CHECKPOINT, &too_many).is_err());
 
-        let mut too_long = json!({
-            "checkpoint_id":"cp-long","stage":"inspection","summary":"observed"
+        for (characters, expected) in [
+            ("é".repeat(MAX_TOOL_TEXT_CHARS), true),
+            ("é".repeat(MAX_TOOL_TEXT_CHARS + 1), false),
+        ] {
+            let arguments = json!({
+                "checkpoint_id":"cp-unicode","stage":"inspection","summary":characters
+            });
+            assert_eq!(validator.is_valid(&arguments), expected);
+            assert_eq!(
+                validate_tool_arguments(REVIEW_CHECKPOINT, &arguments).is_ok(),
+                expected
+            );
+        }
+
+        let finding_schema = &definitions[1]["inputSchema"];
+        let finding_validator = jsonschema::draft202012::options()
+            .build(finding_schema)
+            .unwrap();
+        let reversed = json!({
+            "finding_id":"F-reversed","severity":"P2","confidence":"high","title":"issue",
+            "locations":[{"path":"src/lib.rs","start_line":9,"end_line":2}],
+            "evidence":[],"impact":"impact","suggested_remediation":"repair","status":"open"
         });
-        too_long["summary"] = json!("x".repeat(MAX_TOOL_TEXT_BYTES + 1));
-        assert!(!validator.is_valid(&too_long));
-        assert!(validate_tool_arguments(REVIEW_CHECKPOINT, &too_long).is_err());
+        assert!(finding_validator.is_valid(&reversed));
+        assert!(validate_tool_arguments(REVIEW_FINDING_UPSERT, &reversed).is_err());
+
+        let at_u64_max = json!({
+            "finding_id":"F-max","severity":"P2","confidence":"high","title":"issue",
+            "locations":[{"path":"src/lib.rs","start_line":u64::MAX,"end_line":u64::MAX}],
+            "evidence":[],"impact":"impact","suggested_remediation":"repair","status":"open"
+        });
+        assert!(finding_validator.is_valid(&at_u64_max));
+        assert!(validate_tool_arguments(REVIEW_FINDING_UPSERT, &at_u64_max).is_ok());
+        let over_u64_max: Value = serde_json::from_str(
+            r#"{
+                "finding_id":"F-over","severity":"P2","confidence":"high","title":"issue",
+                "locations":[{"path":"src/lib.rs","start_line":18446744073709551616,"end_line":18446744073709551616}],
+                "evidence":[],"impact":"impact","suggested_remediation":"repair","status":"open"
+            }"#,
+        )
+        .unwrap();
+        assert!(!finding_validator.is_valid(&over_u64_max));
+        assert!(validate_tool_arguments(REVIEW_FINDING_UPSERT, &over_u64_max).is_err());
+
+        let validation_schema = &definitions[2]["inputSchema"];
+        let validation_validator = jsonschema::draft202012::options()
+            .build(validation_schema)
+            .unwrap();
+        let at_duration_max = json!({
+            "validation_id":"val-max","command":"cargo test","cwd":"/workspace",
+            "exit_code":0,"duration_ms":u64::MAX,"stdout_summary":"","stderr_summary":""
+        });
+        assert!(validation_validator.is_valid(&at_duration_max));
+        assert!(validate_tool_arguments(REVIEW_VALIDATION_RECORD, &at_duration_max).is_ok());
+        let over_duration_max: Value = serde_json::from_str(
+            r#"{
+                "validation_id":"val-over","command":"cargo test","cwd":"/workspace",
+                "exit_code":0,"duration_ms":18446744073709551616,
+                "stdout_summary":"","stderr_summary":""
+            }"#,
+        )
+        .unwrap();
+        assert!(!validation_validator.is_valid(&over_duration_max));
+        assert!(validate_tool_arguments(REVIEW_VALIDATION_RECORD, &over_duration_max).is_err());
     }
 
     #[test]

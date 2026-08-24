@@ -266,7 +266,16 @@ fn private_report_result_keeps_expected_and_observed_integrity_distinct() {
     ))
     .unwrap();
     let validator = jsonschema::draft202012::options().build(&schema).unwrap();
-    assert!(validator.is_valid(&serde_json::to_value(view).unwrap()));
+    let mut at_max = serde_json::to_value(view).unwrap();
+    at_max["expected_bytes"] = serde_json::json!(u64::MAX);
+    at_max["observed_bytes"] = serde_json::json!(u64::MAX);
+    at_max["checkpoint_number"] = serde_json::json!(u64::MAX);
+    assert!(validator.is_valid(&at_max));
+    for field in ["expected_bytes", "observed_bytes", "checkpoint_number"] {
+        let mut over_max = at_max.clone();
+        over_max[field] = serde_json::from_str("18446744073709551616").unwrap();
+        assert!(!validator.is_valid(&over_max), "over-u64 {field}");
+    }
 }
 
 fn client(path: &Path) -> RpcClient {

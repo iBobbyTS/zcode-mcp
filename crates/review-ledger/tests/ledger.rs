@@ -291,6 +291,20 @@ fn sensitive_unknown_and_conflicting_stable_inputs_are_rejected() {
             checkpoint("cp-fixed", "different"),
         )
         .is_err());
+
+    let mut reversed = finding("open");
+    reversed["finding_id"] = json!("GLM-reversed");
+    reversed["locations"][0]["start_line"] = json!(9);
+    reversed["locations"][0]["end_line"] = json!(2);
+    assert!(fixture
+        .ledger
+        .call_tool(&fixture.agent_id, REVIEW_FINDING_UPSERT, reversed)
+        .is_err());
+    assert!(fixture
+        .store
+        .review_finding_history(&fixture.agent_id, "GLM-reversed")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -535,6 +549,20 @@ fn internal_report_and_event_schemas_validate_real_private_instances() {
         serde_json::from_str(include_str!("../../../schemas/review-event.schema.json")).unwrap();
     let validator = jsonschema::draft202012::options().build(&schema).unwrap();
     assert!(validator.is_valid(&event));
+    let mut at_max = event;
+    at_max["revision"] = json!(u64::MAX);
+    assert!(validator.is_valid(&at_max));
+    let over_max: Value = serde_json::from_str(
+        r#"{
+            "schema":"sectioned-zcode-review-event/v1",
+            "type":"report.checkpoint",
+            "agent_id":"job-event-schema",
+            "revision":18446744073709551616,
+            "finalized":false
+        }"#,
+    )
+    .unwrap();
+    assert!(!validator.is_valid(&over_max));
 }
 
 fn checkpoint(id: &str, summary: &str) -> Value {

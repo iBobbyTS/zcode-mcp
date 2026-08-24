@@ -26,18 +26,21 @@
     },
     "expected_bytes": {
       "type": ["integer", "null"],
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 18446744073709551615
     },
     "observed_sha256": {
       "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
     },
     "observed_bytes": {
       "type": ["integer", "null"],
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 18446744073709551615
     },
     "checkpoint_number": {
       "type": ["integer", "null"],
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 18446744073709551615
     },
     "integrity": {
       "enum": ["valid", "missing", "replaced", "binary", "invalid", "legacy_unverified"]
