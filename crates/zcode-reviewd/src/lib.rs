@@ -1,3 +1,4 @@
+use review_ledger::{LedgerManager, ToolResult, VerifiedArtifact};
 use review_store::{
     DeliveryClaim, Job, JobClaim, JobState, LifecycleWrite, MessageState, NewJob, Store,
     StoreError, StoredMessage, StoredProcessIdentity, TerminalUpdate, TurnState,
@@ -5,6 +6,7 @@ use review_store::{
 use std::{
     collections::HashMap,
     fmt, io,
+    path::PathBuf,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,11 +21,12 @@ use zcode_driver::{
 };
 use zcode_protocol::{
     event_type, session_id_from_result, turn_id_from_result, CreateSessionParams, LifecycleOrder,
-    SendParams, SessionParams, SubscribeParams, WireId, WireMessage, WorkspaceRef,
+    SendParams, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
     INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_SEND,
     SESSION_STOP, SESSION_SUBSCRIBE, WORKSPACE_READ_STATE,
 };
 
+pub mod ledger_mcp;
 pub mod rpc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +68,31 @@ pub struct TurnSnapshot {
 pub struct SessionReady {
     pub session_id: String,
     pub initial_turn_id: Option<String>,
+    pub observed_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalLedgerMcpConfig {
+    pub command: PathBuf,
+    pub socket: PathBuf,
+    pub runtime_sha256: Option<String>,
+}
+
+impl InternalLedgerMcpConfig {
+    pub fn server_for(&self, agent_id: &str) -> StdioMcpServer {
+        StdioMcpServer {
+            name: "review-ledger".into(),
+            command: self.command.to_string_lossy().into_owned(),
+            args: vec![
+                "--ledger-mcp".into(),
+                "--socket".into(),
+                self.socket.to_string_lossy().into_owned(),
+                "--agent-id".into(),
+                agent_id.into(),
+            ],
+            env: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +405,16 @@ impl RuntimeOwner {
         initial_prompt: &str,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
+        self.bootstrap_session_with_mcp(workspace_path, initial_prompt, &[], timeout)
+    }
+
+    pub fn bootstrap_session_with_mcp(
+        &self,
+        workspace_path: &str,
+        initial_prompt: &str,
+        mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
         self.driver
             .request(WORKSPACE_READ_STATE, serde_json::json!({}), timeout)?;
         let create_params = serde_json::to_value(CreateSessionParams {
@@ -384,6 +422,7 @@ impl RuntimeOwner {
                 workspace_key: workspace_path,
                 workspace_path,
             },
+            mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         let created = self
@@ -398,6 +437,7 @@ impl RuntimeOwner {
                 RuntimeCommandError::InvalidSession("session/create returned no session id".into())
             })?
             .to_owned();
+        let observed_model = observed_model_from_result(result).map(str::to_owned);
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
@@ -411,6 +451,7 @@ impl RuntimeOwner {
         Ok(SessionReady {
             session_id,
             initial_turn_id,
+            observed_model,
         })
     }
 
@@ -546,6 +587,18 @@ impl RuntimeOwner {
     }
 }
 
+fn observed_model_from_result(result: &serde_json::Value) -> Option<&str> {
+    result
+        .get("modelId")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            result
+                .get("session")
+                .and_then(|session| session.get("modelId"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
         let _ = self.stop(Duration::from_secs(1));
@@ -675,6 +728,14 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     ) -> Result<SessionReady, RuntimeCommandError> {
         Err(RuntimeCommandError::Unsupported)
     }
+    fn bootstrap_session_with_mcp(
+        &self,
+        job: &Job,
+        _mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        self.bootstrap_session(job, timeout)
+    }
     fn send_turn(
         &self,
         _session_id: &str,
@@ -737,6 +798,20 @@ impl ManagedRuntime for RuntimeOwner {
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
         self.bootstrap_session(&job.workspace_path, &job.initial_prompt, timeout)
+    }
+
+    fn bootstrap_session_with_mcp(
+        &self,
+        job: &Job,
+        mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        self.bootstrap_session_with_mcp(
+            &job.workspace_path,
+            &job.initial_prompt,
+            mcp_servers,
+            timeout,
+        )
     }
 
     fn send_turn(
@@ -904,6 +979,8 @@ struct SchedulerInner {
     store: Arc<Store>,
     factory: Arc<dyn RuntimeFactory>,
     config: SchedulerConfig,
+    ledger: Option<Arc<LedgerManager>>,
+    ledger_mcp: Option<InternalLedgerMcpConfig>,
     state: Mutex<SchedulerState>,
 }
 
@@ -1278,9 +1355,38 @@ impl Scheduler {
                 store,
                 factory,
                 config,
+                ledger: None,
+                ledger_mcp: None,
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
+    }
+
+    pub fn with_ledger(
+        mut self,
+        ledger: Arc<LedgerManager>,
+        config: InternalLedgerMcpConfig,
+    ) -> Result<Self, SchedulerError> {
+        if !Arc::ptr_eq(&ledger.store(), &self.inner.store) {
+            return Err(SchedulerError::InvalidConfig(
+                "ledger and scheduler must share one store".into(),
+            ));
+        }
+        if !config.command.is_absolute() || !config.socket.is_absolute() {
+            return Err(SchedulerError::InvalidConfig(
+                "internal ledger command and socket must be absolute".into(),
+            ));
+        }
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            SchedulerError::InvalidConfig("ledger must attach before scheduler cloning".into())
+        })?;
+        inner.ledger = Some(ledger);
+        inner.ledger_mcp = Some(config);
+        Ok(self)
+    }
+
+    pub fn ledger(&self) -> Option<Arc<LedgerManager>> {
+        self.inner.ledger.as_ref().map(Arc::clone)
     }
 
     pub fn store(&self) -> Arc<Store> {
@@ -1323,6 +1429,11 @@ impl Scheduler {
         job.section_id = Some(prepared.section_id.clone());
         job.round_kind = Some(prepared.round_kind.as_str().into());
         job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+        job.runtime_hash = self
+            .inner
+            .ledger_mcp
+            .as_ref()
+            .and_then(|config| config.runtime_sha256.clone());
         job.initial_prompt = initial_prompt;
         job.prepared_launch_json = Some(
             prepared
@@ -1330,7 +1441,13 @@ impl Scheduler {
                 .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?,
         );
         job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
-        self.enqueue(&job)
+        let stored = self.enqueue(&job)?;
+        if let Some(ledger) = &self.inner.ledger {
+            ledger
+                .initialize(&stored.agent_id, prepared, job.runtime_hash.as_deref())
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        }
+        Ok(stored)
     }
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, JobState)>, SchedulerError> {
@@ -1341,6 +1458,11 @@ impl Scheduler {
             return Err(SchedulerError::InvalidConfig(
                 "startup reconciliation requires an empty active set".into(),
             ));
+        }
+        if let Some(ledger) = &self.inner.ledger {
+            ledger
+                .recover_all()
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         }
         Ok(self.inner.store.reconcile_startup()?)
     }
@@ -1365,7 +1487,41 @@ impl Scheduler {
         }
     }
 
+    fn ensure_job_ledger(&self, job: &Job) -> Result<(), SchedulerError> {
+        let Some(ledger) = &self.inner.ledger else {
+            return Ok(());
+        };
+        let prepared_json = job.prepared_launch_json.as_deref().ok_or_else(|| {
+            SchedulerError::InvalidConfig("ledger job requires a prepared launch".into())
+        })?;
+        let prepared: review_preparation::PreparedLaunchSpec = serde_json::from_str(prepared_json)
+            .map_err(|error| {
+                SchedulerError::InvalidConfig(format!("stored prepared launch is invalid: {error}"))
+            })?;
+        ledger
+            .initialize(
+                &job.agent_id,
+                &prepared,
+                self.inner
+                    .ledger_mcp
+                    .as_ref()
+                    .and_then(|config| config.runtime_sha256.as_deref()),
+            )
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        Ok(())
+    }
+
     fn start_claim(&self, claim: JobClaim) -> Result<bool, SchedulerError> {
+        if let Err(error) = self.ensure_job_ledger(&claim.job) {
+            let message = error.to_string();
+            self.inner.store.fail_claim(
+                &claim.job.agent_id,
+                claim.owner_epoch,
+                "REPORT_INITIALIZATION_FAILED",
+                &message,
+            )?;
+            return Err(error);
+        }
         let runtime_agent_id = format!("{}:{}", claim.job.agent_id, claim.owner_epoch);
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
@@ -1392,8 +1548,17 @@ impl Scheduler {
                 });
             }
         };
-        let session = match runtime.bootstrap_session(&claim.job, self.inner.config.command_timeout)
-        {
+        let mcp_servers = self
+            .inner
+            .ledger_mcp
+            .as_ref()
+            .map(|config| vec![config.server_for(&claim.job.agent_id)])
+            .unwrap_or_default();
+        let session = match runtime.bootstrap_session_with_mcp(
+            &claim.job,
+            &mcp_servers,
+            self.inner.config.command_timeout,
+        ) {
             Ok(session) => session,
             Err(error) => {
                 let message = error.to_string();
@@ -1498,6 +1663,26 @@ impl Scheduler {
                 Some(("RUNTIME_START_RACE", message.into())),
             )?;
             return Ok(false);
+        }
+        if let Some(ledger) = &self.inner.ledger {
+            if let Err(error) = ledger.record_runtime(
+                &claim.job.agent_id,
+                self.inner
+                    .ledger_mcp
+                    .as_ref()
+                    .and_then(|config| config.runtime_sha256.as_deref()),
+                &session.session_id,
+                session.observed_model.as_deref(),
+            ) {
+                let _ = self.cleanup_registered_runtime(
+                    &claim.job.agent_id,
+                    claim.owner_epoch,
+                    &runtime,
+                    &sink,
+                    Some(("REPORT_PROVENANCE_FAILED", error.to_string())),
+                );
+                return Err(SchedulerError::InvalidConfig(error.to_string()));
+            }
         }
         let current = match self.inner.store.get_job(&claim.job.agent_id) {
             Ok(current) => current,
@@ -1712,6 +1897,40 @@ impl Scheduler {
                 })
             }
         }
+    }
+
+    pub fn call_review_tool(
+        &self,
+        agent_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResult, SchedulerError> {
+        self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+        })?;
+        let ledger = self.inner.ledger.as_ref().ok_or_else(|| {
+            SchedulerError::InvalidConfig("internal review ledger is unavailable".into())
+        })?;
+        ledger
+            .call_tool(agent_id, tool, arguments)
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
+    }
+
+    pub fn verify_review_artifact(
+        &self,
+        agent_id: &str,
+        preview_bytes: usize,
+    ) -> Result<Option<VerifiedArtifact>, SchedulerError> {
+        let Some(ledger) = &self.inner.ledger else {
+            return Ok(None);
+        };
+        if self.inner.store.review_report_state(agent_id)?.is_none() {
+            return Ok(None);
+        }
+        ledger
+            .verify_artifact(agent_id, preview_bytes)
+            .map(Some)
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
     }
 
     pub fn message_job(
@@ -2745,6 +2964,7 @@ mod tests {
             Ok(SessionReady {
                 session_id: format!("session-{}", job.agent_id),
                 initial_turn_id: Some("turn-1".into()),
+                observed_model: None,
             })
         }
 

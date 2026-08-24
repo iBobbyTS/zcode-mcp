@@ -143,9 +143,99 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS review_reports (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    expected_path TEXT NOT NULL,
+    report_root TEXT NOT NULL,
+    current_revision INTEGER NOT NULL DEFAULT 0,
+    published_revision INTEGER,
+    sha256 TEXT,
+    bytes INTEGER,
+    finalized INTEGER NOT NULL DEFAULT 0,
+    final_signal TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_provenance (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    manifest_sha256 TEXT NOT NULL,
+    prepared_sha256 TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    runtime_sha256 TEXT,
+    zcode_session_id TEXT,
+    requested_model TEXT,
+    observed_model TEXT
+);
+
+CREATE TABLE IF NOT EXISTS review_checkpoints (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    checkpoint_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, checkpoint_id),
+    UNIQUE (agent_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS review_findings (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    finding_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS review_finding_history (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    finding_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, finding_id, version),
+    UNIQUE (agent_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS review_validations (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    validation_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, validation_id),
+    UNIQUE (agent_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS review_finalizations (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    signal TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_report_events (
+    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, revision)
+);
+
 "#;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -406,6 +496,85 @@ pub struct StoredArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewInitialization {
+    pub agent_id: String,
+    pub expected_path: String,
+    pub report_root: String,
+    pub manifest_sha256: String,
+    pub prepared_sha256: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub runtime_sha256: Option<String>,
+    pub requested_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMutationDisposition {
+    Applied,
+    Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewMutationResult {
+    pub disposition: ReviewMutationDisposition,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReportState {
+    pub agent_id: String,
+    pub expected_path: String,
+    pub report_root: String,
+    pub current_revision: u64,
+    pub published_revision: Option<u64>,
+    pub sha256: Option<String>,
+    pub bytes: Option<u64>,
+    pub finalized: bool,
+    pub final_signal: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewProvenanceRecord {
+    pub manifest_sha256: String,
+    pub prepared_sha256: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub runtime_sha256: Option<String>,
+    pub zcode_session_id: Option<String>,
+    pub requested_model: Option<String>,
+    pub observed_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEntryRecord {
+    pub stable_id: String,
+    pub status: Option<String>,
+    pub payload_json: String,
+    pub revision: u64,
+    pub recorded_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSnapshot {
+    pub report: ReviewReportState,
+    pub provenance: ReviewProvenanceRecord,
+    pub checkpoints: Vec<ReviewEntryRecord>,
+    pub findings: Vec<ReviewEntryRecord>,
+    pub validations: Vec<ReviewEntryRecord>,
+    pub finalization: Option<ReviewEntryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReportEvent {
+    pub revision: u64,
+    pub event_type: String,
+    pub payload_json: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseDecision {
     pub state: JobState,
     pub owner_epoch: u64,
@@ -468,7 +637,7 @@ impl Store {
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.execute_batch(SCHEMA)?;
-        migrate_to_v3(&mut connection)?;
+        migrate_to_v4(&mut connection)?;
         let database_path = std::fs::canonicalize(path.as_ref()).map_err(|error| {
             StoreError::InvalidState(format!("database path cannot be canonicalized: {error}"))
         })?;
@@ -1368,6 +1537,554 @@ impl Store {
         Ok(changed == 1)
     }
 
+    pub fn initialize_review(
+        &self,
+        initialization: &ReviewInitialization,
+    ) -> StoreResult<ReviewReportState> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_millis();
+        transaction.execute(
+            "INSERT OR IGNORE INTO review_reports (
+                agent_id, expected_path, report_root, current_revision,
+                finalized, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 0, 0, ?4, ?4)",
+            params![
+                initialization.agent_id,
+                initialization.expected_path,
+                initialization.report_root,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO review_provenance (
+                agent_id, manifest_sha256, prepared_sha256, base_sha, head_sha,
+                runtime_sha256, requested_model
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                initialization.agent_id,
+                initialization.manifest_sha256,
+                initialization.prepared_sha256,
+                initialization.base_sha,
+                initialization.head_sha,
+                initialization.runtime_sha256,
+                initialization.requested_model,
+            ],
+        )?;
+        let stored = query_review_initialization(&transaction, &initialization.agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("initialized review is missing".into()))?;
+        if stored.report.expected_path != initialization.expected_path
+            || stored.report.report_root != initialization.report_root
+            || stored.manifest_sha256 != initialization.manifest_sha256
+            || stored.prepared_sha256 != initialization.prepared_sha256
+            || stored.base_sha != initialization.base_sha
+            || stored.head_sha != initialization.head_sha
+            || stored.requested_model != initialization.requested_model
+        {
+            return Err(StoreError::Conflict(format!(
+                "job {} already owns different review provenance",
+                initialization.agent_id
+            )));
+        }
+        transaction.commit()?;
+        Ok(stored.report_state())
+    }
+
+    pub fn review_report_state(&self, agent_id: &str) -> StoreResult<Option<ReviewReportState>> {
+        let connection = self.connection.lock().unwrap();
+        query_review_report_state(&connection, agent_id)
+    }
+
+    pub fn review_report_agent_ids(&self) -> StoreResult<Vec<String>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT agent_id FROM review_reports ORDER BY created_at, agent_id")?;
+        let agent_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(agent_ids)
+    }
+
+    pub fn record_review_runtime(
+        &self,
+        agent_id: &str,
+        runtime_sha256: Option<&str>,
+        zcode_session_id: &str,
+        observed_model: Option<&str>,
+    ) -> StoreResult<ReviewMutationResult> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_review_mutable(&transaction, agent_id)?;
+        let current = transaction
+            .query_row(
+                "SELECT runtime_sha256, zcode_session_id, observed_model
+                 FROM review_provenance WHERE agent_id = ?1",
+                [agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
+        let desired_runtime = runtime_sha256.map(str::to_owned).or(current.0.clone());
+        let desired_session = Some(zcode_session_id.to_owned());
+        let desired_model = observed_model.map(str::to_owned).or(current.2.clone());
+        if current
+            == (
+                desired_runtime.clone(),
+                desired_session.clone(),
+                desired_model.clone(),
+            )
+        {
+            let revision = review_current_revision(&transaction, agent_id)?;
+            transaction.commit()?;
+            return Ok(ReviewMutationResult {
+                disposition: ReviewMutationDisposition::Duplicate,
+                revision,
+            });
+        }
+        transaction.execute(
+            "UPDATE review_provenance SET runtime_sha256 = ?1,
+                 zcode_session_id = ?2, observed_model = ?3 WHERE agent_id = ?4",
+            params![desired_runtime, desired_session, desired_model, agent_id],
+        )?;
+        let revision = advance_review_revision(&transaction, agent_id)?;
+        transaction.commit()?;
+        Ok(ReviewMutationResult {
+            disposition: ReviewMutationDisposition::Applied,
+            revision,
+        })
+    }
+
+    pub fn apply_review_checkpoint(
+        &self,
+        agent_id: &str,
+        checkpoint_id: &str,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) -> StoreResult<ReviewMutationResult> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_review_mutable(&transaction, agent_id)?;
+        if let Some(existing) = query_review_entry_hash(
+            &transaction,
+            "review_checkpoints",
+            "checkpoint_id",
+            agent_id,
+            checkpoint_id,
+        )? {
+            if existing != payload_sha256 {
+                return Err(StoreError::Conflict(format!(
+                    "checkpoint {checkpoint_id} already has different content"
+                )));
+            }
+            let revision = review_current_revision(&transaction, agent_id)?;
+            transaction.commit()?;
+            return Ok(ReviewMutationResult {
+                disposition: ReviewMutationDisposition::Duplicate,
+                revision,
+            });
+        }
+        let revision = advance_review_revision(&transaction, agent_id)?;
+        transaction.execute(
+            "INSERT INTO review_checkpoints (
+                agent_id, checkpoint_id, payload_json, payload_sha256, revision, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                agent_id,
+                checkpoint_id,
+                payload_json,
+                payload_sha256,
+                u64_to_i64(revision)?,
+                now_millis()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ReviewMutationResult {
+            disposition: ReviewMutationDisposition::Applied,
+            revision,
+        })
+    }
+
+    pub fn upsert_review_finding(
+        &self,
+        agent_id: &str,
+        finding_id: &str,
+        status: &str,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) -> StoreResult<ReviewMutationResult> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_review_mutable(&transaction, agent_id)?;
+        let existing = transaction
+            .query_row(
+                "SELECT payload_sha256 FROM review_findings
+                 WHERE agent_id = ?1 AND finding_id = ?2",
+                params![agent_id, finding_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing.as_deref() == Some(payload_sha256) {
+            let revision = review_current_revision(&transaction, agent_id)?;
+            transaction.commit()?;
+            return Ok(ReviewMutationResult {
+                disposition: ReviewMutationDisposition::Duplicate,
+                revision,
+            });
+        }
+        let version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM review_finding_history
+             WHERE agent_id = ?1 AND finding_id = ?2",
+            params![agent_id, finding_id],
+            |row| row.get(0),
+        )?;
+        let revision = advance_review_revision(&transaction, agent_id)?;
+        let now = now_millis();
+        transaction.execute(
+            "INSERT INTO review_finding_history (
+                agent_id, finding_id, version, status, payload_json,
+                payload_sha256, revision, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                agent_id,
+                finding_id,
+                version,
+                status,
+                payload_json,
+                payload_sha256,
+                u64_to_i64(revision)?,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO review_findings (
+                agent_id, finding_id, status, payload_json, payload_sha256,
+                revision, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(agent_id, finding_id) DO UPDATE SET
+                status = excluded.status,
+                payload_json = excluded.payload_json,
+                payload_sha256 = excluded.payload_sha256,
+                revision = excluded.revision,
+                updated_at = excluded.updated_at",
+            params![
+                agent_id,
+                finding_id,
+                status,
+                payload_json,
+                payload_sha256,
+                u64_to_i64(revision)?,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ReviewMutationResult {
+            disposition: ReviewMutationDisposition::Applied,
+            revision,
+        })
+    }
+
+    pub fn apply_review_validation(
+        &self,
+        agent_id: &str,
+        validation_id: &str,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) -> StoreResult<ReviewMutationResult> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_review_mutable(&transaction, agent_id)?;
+        if let Some(existing) = query_review_entry_hash(
+            &transaction,
+            "review_validations",
+            "validation_id",
+            agent_id,
+            validation_id,
+        )? {
+            if existing != payload_sha256 {
+                return Err(StoreError::Conflict(format!(
+                    "validation {validation_id} already has different content"
+                )));
+            }
+            let revision = review_current_revision(&transaction, agent_id)?;
+            transaction.commit()?;
+            return Ok(ReviewMutationResult {
+                disposition: ReviewMutationDisposition::Duplicate,
+                revision,
+            });
+        }
+        let revision = advance_review_revision(&transaction, agent_id)?;
+        transaction.execute(
+            "INSERT INTO review_validations (
+                agent_id, validation_id, payload_json, payload_sha256, revision, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                agent_id,
+                validation_id,
+                payload_json,
+                payload_sha256,
+                u64_to_i64(revision)?,
+                now_millis()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ReviewMutationResult {
+            disposition: ReviewMutationDisposition::Applied,
+            revision,
+        })
+    }
+
+    pub fn finalize_review(
+        &self,
+        agent_id: &str,
+        signal: &str,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) -> StoreResult<ReviewMutationResult> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT signal, payload_sha256, revision FROM review_finalizations
+                 WHERE agent_id = ?1",
+                [agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            if existing.0 == signal && existing.1 == payload_sha256 {
+                transaction.commit()?;
+                return Ok(ReviewMutationResult {
+                    disposition: ReviewMutationDisposition::Duplicate,
+                    revision: i64_to_u64(existing.2)?,
+                });
+            }
+            return Err(StoreError::Conflict(format!(
+                "review {agent_id} is already finalized"
+            )));
+        }
+        ensure_review_mutable(&transaction, agent_id)?;
+        let revision = advance_review_revision(&transaction, agent_id)?;
+        transaction.execute(
+            "INSERT INTO review_finalizations (
+                agent_id, signal, payload_json, payload_sha256, revision, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                agent_id,
+                signal,
+                payload_json,
+                payload_sha256,
+                u64_to_i64(revision)?,
+                now_millis()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE review_reports SET finalized = 1, final_signal = ?1,
+                 updated_at = ?2 WHERE agent_id = ?3",
+            params![signal, now_millis(), agent_id],
+        )?;
+        transaction.commit()?;
+        Ok(ReviewMutationResult {
+            disposition: ReviewMutationDisposition::Applied,
+            revision,
+        })
+    }
+
+    pub fn review_snapshot(&self, agent_id: &str) -> StoreResult<Option<ReviewSnapshot>> {
+        let connection = self.connection.lock().unwrap();
+        let Some(report) = query_review_report_state(&connection, agent_id)? else {
+            return Ok(None);
+        };
+        let provenance = query_review_provenance(&connection, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("review provenance is missing".into()))?;
+        let checkpoints = query_review_entries(
+            &connection,
+            "review_checkpoints",
+            "checkpoint_id",
+            false,
+            agent_id,
+        )?;
+        let findings =
+            query_review_entries(&connection, "review_findings", "finding_id", true, agent_id)?;
+        let validations = query_review_entries(
+            &connection,
+            "review_validations",
+            "validation_id",
+            false,
+            agent_id,
+        )?;
+        let finalization = connection
+            .query_row(
+                "SELECT signal, payload_json, revision, created_at
+                 FROM review_finalizations WHERE agent_id = ?1",
+                [agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(signal, payload_json, revision, recorded_at)| {
+                Ok::<ReviewEntryRecord, StoreError>(ReviewEntryRecord {
+                    stable_id: "final".into(),
+                    status: Some(signal),
+                    payload_json,
+                    revision: i64_to_u64(revision)?,
+                    recorded_at,
+                })
+            })
+            .transpose()?;
+        Ok(Some(ReviewSnapshot {
+            report,
+            provenance,
+            checkpoints,
+            findings,
+            validations,
+            finalization,
+        }))
+    }
+
+    pub fn review_finding_history(
+        &self,
+        agent_id: &str,
+        finding_id: &str,
+    ) -> StoreResult<Vec<ReviewEntryRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT version, status, payload_json, revision, created_at
+             FROM review_finding_history
+             WHERE agent_id = ?1 AND finding_id = ?2 ORDER BY version",
+        )?;
+        let history = statement
+            .query_map(params![agent_id, finding_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (version, status, payload_json, revision, recorded_at) = row?;
+                Ok(ReviewEntryRecord {
+                    stable_id: format!("{finding_id}:v{}", i64_to_u64(version)?),
+                    status: Some(status),
+                    payload_json,
+                    revision: i64_to_u64(revision)?,
+                    recorded_at,
+                })
+            })
+            .collect();
+        history
+    }
+
+    pub fn publish_review_report(
+        &self,
+        agent_id: &str,
+        revision: u64,
+        sha256: &str,
+        bytes: u64,
+        event_payload_json: Option<&str>,
+    ) -> StoreResult<ReviewReportState> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = review_current_revision(&transaction, agent_id)?;
+        if current != revision {
+            return Err(StoreError::Conflict(format!(
+                "review {agent_id} advanced while report revision {revision} rendered"
+            )));
+        }
+        let now = now_millis();
+        transaction.execute(
+            "UPDATE review_reports SET published_revision = ?1, sha256 = ?2,
+                 bytes = ?3, updated_at = ?4 WHERE agent_id = ?5",
+            params![
+                u64_to_i64(revision)?,
+                sha256,
+                u64_to_i64(bytes)?,
+                now,
+                agent_id
+            ],
+        )?;
+        if let Some(event_payload_json) = event_payload_json {
+            transaction.execute(
+                "INSERT OR IGNORE INTO review_report_events (
+                    agent_id, revision, event_type, payload_json, created_at
+                 ) VALUES (?1, ?2, 'report.checkpoint', ?3, ?4)",
+                params![agent_id, u64_to_i64(revision)?, event_payload_json, now],
+            )?;
+        }
+        let report = query_review_report_state(&transaction, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("published review is missing".into()))?;
+        transaction.execute(
+            "INSERT INTO artifacts (
+                artifact_id, agent_id, artifact_type, path, sha256, bytes,
+                checkpoint_number, created_at
+             ) VALUES (?1, ?2, 'review_report', ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(artifact_id) DO UPDATE SET
+                path = excluded.path,
+                sha256 = excluded.sha256,
+                bytes = excluded.bytes,
+                checkpoint_number = excluded.checkpoint_number,
+                created_at = excluded.created_at",
+            params![
+                format!("review-report:{agent_id}"),
+                agent_id,
+                report.expected_path,
+                sha256,
+                u64_to_i64(bytes)?,
+                u64_to_i64(revision)?,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(report)
+    }
+
+    pub fn review_report_events(&self, agent_id: &str) -> StoreResult<Vec<ReviewReportEvent>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT revision, event_type, payload_json, created_at
+             FROM review_report_events WHERE agent_id = ?1 ORDER BY revision",
+        )?;
+        let events = statement
+            .query_map([agent_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (revision, event_type, payload_json, created_at) = row?;
+                Ok(ReviewReportEvent {
+                    revision: i64_to_u64(revision)?,
+                    event_type,
+                    payload_json,
+                    created_at,
+                })
+            })
+            .collect();
+        events
+    }
+
     pub fn record_compatibility_run(
         &self,
         runtime_hash: &str,
@@ -1518,7 +2235,291 @@ impl Store {
     }
 }
 
-fn migrate_to_v3(connection: &mut Connection) -> StoreResult<()> {
+struct StoredReviewInitialization {
+    report: ReviewReportState,
+    manifest_sha256: String,
+    prepared_sha256: String,
+    base_sha: String,
+    head_sha: String,
+    requested_model: Option<String>,
+}
+
+impl StoredReviewInitialization {
+    fn report_state(self) -> ReviewReportState {
+        self.report
+    }
+}
+
+fn query_review_initialization(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<StoredReviewInitialization>> {
+    let row = connection
+        .query_row(
+            "SELECT r.expected_path, r.report_root, r.current_revision,
+                    r.published_revision, r.sha256, r.bytes, r.finalized,
+                    r.final_signal, r.created_at, r.updated_at,
+                    p.manifest_sha256, p.prepared_sha256, p.base_sha, p.head_sha,
+                    p.requested_model
+             FROM review_reports r
+             JOIN review_provenance p ON p.agent_id = r.agent_id
+             WHERE r.agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            expected_path,
+            report_root,
+            current_revision,
+            published_revision,
+            sha256,
+            bytes,
+            finalized,
+            final_signal,
+            created_at,
+            updated_at,
+            manifest_sha256,
+            prepared_sha256,
+            base_sha,
+            head_sha,
+            requested_model,
+        )| {
+            Ok(StoredReviewInitialization {
+                report: ReviewReportState {
+                    agent_id: agent_id.to_owned(),
+                    expected_path,
+                    report_root,
+                    current_revision: i64_to_u64(current_revision)?,
+                    published_revision: published_revision.map(i64_to_u64).transpose()?,
+                    sha256,
+                    bytes: bytes.map(i64_to_u64).transpose()?,
+                    finalized: finalized != 0,
+                    final_signal,
+                    created_at,
+                    updated_at,
+                },
+                manifest_sha256,
+                prepared_sha256,
+                base_sha,
+                head_sha,
+                requested_model,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn query_review_report_state(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<ReviewReportState>> {
+    let row = connection
+        .query_row(
+            "SELECT expected_path, report_root, current_revision, published_revision,
+                    sha256, bytes, finalized, final_signal, created_at, updated_at
+             FROM review_reports WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            expected_path,
+            report_root,
+            current_revision,
+            published_revision,
+            sha256,
+            bytes,
+            finalized,
+            final_signal,
+            created_at,
+            updated_at,
+        )| {
+            Ok(ReviewReportState {
+                agent_id: agent_id.to_owned(),
+                expected_path,
+                report_root,
+                current_revision: i64_to_u64(current_revision)?,
+                published_revision: published_revision.map(i64_to_u64).transpose()?,
+                sha256,
+                bytes: bytes.map(i64_to_u64).transpose()?,
+                finalized: finalized != 0,
+                final_signal,
+                created_at,
+                updated_at,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn query_review_provenance(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<ReviewProvenanceRecord>> {
+    connection
+        .query_row(
+            "SELECT manifest_sha256, prepared_sha256, base_sha, head_sha,
+                    runtime_sha256, zcode_session_id, requested_model, observed_model
+             FROM review_provenance WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok(ReviewProvenanceRecord {
+                    manifest_sha256: row.get(0)?,
+                    prepared_sha256: row.get(1)?,
+                    base_sha: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    runtime_sha256: row.get(4)?,
+                    zcode_session_id: row.get(5)?,
+                    requested_model: row.get(6)?,
+                    observed_model: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn query_review_entries(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    has_status: bool,
+    agent_id: &str,
+) -> StoreResult<Vec<ReviewEntryRecord>> {
+    let status = if has_status { "status" } else { "NULL" };
+    let timestamp = if table == "review_findings" {
+        "updated_at"
+    } else {
+        "created_at"
+    };
+    let sql = format!(
+        "SELECT {id_column}, {status}, payload_json, revision, {timestamp}
+         FROM {table} WHERE agent_id = ?1 ORDER BY revision, {id_column}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let entries = statement
+        .query_map([agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .map(|row| {
+            let (stable_id, status, payload_json, revision, recorded_at) = row?;
+            Ok(ReviewEntryRecord {
+                stable_id,
+                status,
+                payload_json,
+                revision: i64_to_u64(revision)?,
+                recorded_at,
+            })
+        })
+        .collect();
+    entries
+}
+
+fn query_review_entry_hash(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    agent_id: &str,
+    stable_id: &str,
+) -> StoreResult<Option<String>> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT payload_sha256 FROM {table}
+                 WHERE agent_id = ?1 AND {id_column} = ?2"
+            ),
+            params![agent_id, stable_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn review_current_revision(connection: &Connection, agent_id: &str) -> StoreResult<u64> {
+    let revision = connection
+        .query_row(
+            "SELECT current_revision FROM review_reports WHERE agent_id = ?1",
+            [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
+    i64_to_u64(revision)
+}
+
+fn ensure_review_mutable(connection: &Connection, agent_id: &str) -> StoreResult<()> {
+    let finalized = connection
+        .query_row(
+            "SELECT finalized FROM review_reports WHERE agent_id = ?1",
+            [agent_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
+    if finalized != 0 {
+        return Err(StoreError::Conflict(format!(
+            "review {agent_id} is finalized"
+        )));
+    }
+    Ok(())
+}
+
+fn advance_review_revision(connection: &Connection, agent_id: &str) -> StoreResult<u64> {
+    let changed = connection.execute(
+        "UPDATE review_reports SET current_revision = current_revision + 1,
+             published_revision = NULL, sha256 = NULL, bytes = NULL, updated_at = ?1
+         WHERE agent_id = ?2",
+        params![now_millis(), agent_id],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidState(format!(
+            "unknown review {agent_id}"
+        )));
+    }
+    review_current_revision(connection, agent_id)
+}
+
+fn migrate_to_v4(connection: &mut Connection) -> StoreResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(StoreError::InvalidState(format!(
@@ -2517,6 +3518,39 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn accepted_v3_job_rows_migrate_to_empty_v4_review_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v3.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    agent_id, state, workspace_path, initial_prompt, turn_state, created_at
+                 ) VALUES ('v3-job', 'QUEUED', '/v3', 'preserved', 'IDLE', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_job("v3-job").unwrap().unwrap().initial_prompt,
+            "preserved"
+        );
+        assert!(store.review_report_state("v3-job").unwrap().is_none());
+        assert!(store.review_report_agent_ids().unwrap().is_empty());
+        let version: i64 = store
+            .connection
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]

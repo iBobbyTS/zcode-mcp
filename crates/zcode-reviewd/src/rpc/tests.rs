@@ -97,6 +97,7 @@ impl ManagedRuntime for FakeRuntime {
         Ok(SessionReady {
             session_id: format!("session-{}", job.agent_id),
             initial_turn_id: Some("turn-1".into()),
+            observed_model: None,
         })
     }
 
@@ -336,6 +337,11 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcMethod::Reap {
             agent_id: "job-1".into(),
         },
+        RpcMethod::ReviewTool(ReviewToolInput {
+            agent_id: "job-1".into(),
+            tool: "review_checkpoint".into(),
+            arguments: serde_json::json!({"checkpoint_id":"cp-1"}),
+        }),
     ];
     for (index, method) in methods.into_iter().enumerate() {
         let request = request(&format!("request-{index}"), method);
@@ -378,14 +384,14 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     );
     let unsupported = raw_call(
         &fixture.socket,
-        b"{\"version\":3,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
+        b"{\"version\":4,\"request_id\":\"v\",\"method\":\"status\",\"params\":{\"agent_id\":\"job\"}}\n",
     );
     assert_eq!(unsupported.request_id.as_deref(), Some("v"));
     assert_eq!(error(unsupported).code, RpcErrorCode::UnsupportedVersion);
     assert_eq!(
         error(raw_call(
             &fixture.socket,
-            b"{\"version\":2,\"request_id\":\"m\",\"method\":\"missing\"}\n"
+            b"{\"version\":3,\"request_id\":\"m\",\"method\":\"missing\"}\n"
         ))
         .code,
         RpcErrorCode::UnknownMethod
@@ -687,12 +693,13 @@ fn lifecycle_methods_preserve_idempotency_events_wait_result_and_reconnect() {
         result,
         RpcSuccess::Result {
             artifact: Some(ArtifactView {
-                preview_state: PreviewState::Available,
-                preview: Some(ref preview),
+                preview_state: PreviewState::Unavailable,
+                preview: None,
+                integrity: ArtifactIntegrityView::LegacyUnverified,
                 ..
             }),
             ..
-        } if preview == "bounded"
+        }
     ));
 
     assert_eq!(

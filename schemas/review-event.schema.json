@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode.local/schemas/review-event.schema.json",
+  "title": "ZCode review report checkpoint event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "type", "agent_id", "revision", "finalized"],
+  "properties": {
+    "schema": { "const": "sectioned-zcode-review-event/v1" },
+    "type": { "const": "report.checkpoint" },
+    "agent_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "finalized": { "type": "boolean" }
+  }
+}

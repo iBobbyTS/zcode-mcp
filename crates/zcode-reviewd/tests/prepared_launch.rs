@@ -1,3 +1,4 @@
+use review_ledger::{LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE};
 use review_preparation::{
     NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
 };
@@ -8,13 +9,18 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
+    thread,
+    time::Duration,
 };
 use tempfile::TempDir;
+use zcode_driver::{ChildExit, StopOutcome};
+use zcode_protocol::StdioMcpServer;
 use zcode_reviewd::{
-    CommandRuntimeFactory, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeFactory,
-    Scheduler, SchedulerConfig,
+    CommandRuntimeFactory, InternalLedgerMcpConfig, LifecycleRecord, LifecycleSink, ManagedRuntime,
+    RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig, SessionReady, TurnBoundary,
+    TurnSnapshot,
 };
 
 struct UnusedFactory;
@@ -123,6 +129,176 @@ fn production_factory_rejects_unprepared_job_before_command_construction() {
         .unwrap();
     assert!(factory.spawn(&raw, Arc::new(NullSink)).is_err());
     assert!(!called.load(Ordering::Acquire));
+}
+
+struct CapturingRuntime {
+    servers: Arc<Mutex<Vec<StdioMcpServer>>>,
+}
+
+impl ManagedRuntime for CapturingRuntime {
+    fn identity(&self) -> Option<zcode_driver::ProcessIdentity> {
+        None
+    }
+
+    fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+        RuntimeTerminal::Completed(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+    }
+
+    fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+        None
+    }
+
+    fn bootstrap_session_with_mcp(
+        &self,
+        _job: &review_store::Job,
+        servers: &[StdioMcpServer],
+        _timeout: Duration,
+    ) -> Result<SessionReady, zcode_reviewd::RuntimeCommandError> {
+        *self.servers.lock().unwrap() = servers.to_vec();
+        Ok(SessionReady {
+            session_id: "real-session-id".into(),
+            initial_turn_id: Some("turn-1".into()),
+            observed_model: Some("observed-model".into()),
+        })
+    }
+
+    fn turn_snapshot(&self) -> TurnSnapshot {
+        TurnSnapshot {
+            generation: 1,
+            active: false,
+            boundary: Some(TurnBoundary::Completed),
+        }
+    }
+}
+
+struct CapturingFactory {
+    servers: Arc<Mutex<Vec<StdioMcpServer>>>,
+}
+
+impl RuntimeFactory for CapturingFactory {
+    fn spawn(
+        &self,
+        _job: &review_store::Job,
+        _sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        Ok(Arc::new(CapturingRuntime {
+            servers: Arc::clone(&self.servers),
+        }))
+    }
+}
+
+#[test]
+fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = create_repository(&directory);
+    fs::create_dir_all(repository.join(".agent-work/reviews/feature/S05")).unwrap();
+    fs::create_dir_all(repository.join(".agent-work/scratch/jobs")).unwrap();
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    let manifest = ReviewManifest {
+        schema: "sectioned-zcode-review/v1".into(),
+        review_kind: ReviewKind::Code,
+        feature_id: "feature".into(),
+        section_id: "S05".into(),
+        round_kind: RoundKind::InitialBounded,
+        repository: repository.clone(),
+        base_ref: head.clone(),
+        head_ref: head,
+        plan_path: ".agent-work/PLAN.md".into(),
+        context_paths: Vec::new(),
+        scope_paths: vec!["src".into()],
+        forbidden_input_globs: Vec::new(),
+        validation_commands: Default::default(),
+        report_target: ".agent-work/reviews/feature/S05/GLM-RAW.md".into(),
+        scratch_root: ".agent-work/scratch/jobs".into(),
+        model: Some("requested-model".into()),
+        fresh_session: true,
+        network_policy: NetworkPolicy::Deny,
+        scratch_policy: ScratchPolicy::Isolated,
+        idempotency_key: "feature:S05:initial".into(),
+    };
+    let prepared = ReviewPreparer.prepare(&manifest).unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let scheduler = Scheduler::new(
+        "ledger-test",
+        Arc::clone(&store),
+        Arc::new(CapturingFactory {
+            servers: Arc::clone(&captured),
+        }),
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        Arc::clone(&ledger),
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join("reviewd.sock"),
+            runtime_sha256: Some("c".repeat(64)),
+        },
+    )
+    .unwrap();
+    scheduler
+        .enqueue_prepared("ledger-job", "review", &prepared)
+        .unwrap();
+    let initial = fs::read_to_string(&prepared.report_target).unwrap();
+    assert!(initial.contains("FINALIZED: false"));
+    assert!(initial.contains("not_observed"));
+    scheduler.start_ready().unwrap();
+    for _ in 0..100 {
+        if store
+            .get_job("ledger-job")
+            .unwrap()
+            .is_some_and(|job| job.state.is_terminal())
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let servers = captured.lock().unwrap().clone();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "review-ledger");
+    assert_eq!(servers[0].command, "/usr/bin/false");
+    assert_eq!(
+        servers[0].args,
+        vec![
+            "--ledger-mcp",
+            "--socket",
+            directory.path().join("reviewd.sock").to_str().unwrap(),
+            "--agent-id",
+            "ledger-job"
+        ]
+    );
+    scheduler
+        .call_review_tool(
+            "ledger-job",
+            REVIEW_CHECKPOINT,
+            serde_json::json!({
+                "checkpoint_id":"cp-1","stage":"inspection","summary":"observed",
+                "inspected":[],"commands":[],"open_questions":[],"remaining_scope":[]
+            }),
+        )
+        .unwrap();
+    scheduler
+        .call_review_tool(
+            "ledger-job",
+            REVIEW_FINALIZE,
+            serde_json::json!({
+                "signal":"no_findings_observed","summary":"clean",
+                "coverage":{"covered":["scope"],"not_covered":[]},
+                "uncertainties":[],"recommended_next_actions":[]
+            }),
+        )
+        .unwrap();
+    let artifact = scheduler
+        .verify_review_artifact("ledger-job", 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
+    let final_report = fs::read_to_string(&prepared.report_target).unwrap();
+    assert!(final_report.contains("real-session-id"));
+    assert!(final_report.contains("observed-model"));
+    assert!(final_report.contains("FINALIZED: true"));
 }
 
 fn create_repository(directory: &TempDir) -> PathBuf {

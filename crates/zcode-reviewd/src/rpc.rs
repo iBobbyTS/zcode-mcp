@@ -1,4 +1,5 @@
 use crate::{MessageDisposition, ResponseDisposition, Scheduler, SchedulerError};
+use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
 use review_store::{
     DeadlineRead, Job, JobState, NewJob, Store, StoreError, StoredArtifact, StoredEvent, TurnState,
     WaitSnapshot,
@@ -6,14 +7,12 @@ use review_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fs::File,
-    io::Read,
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 2;
+pub const RPC_VERSION: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -51,6 +50,7 @@ pub enum RpcMethod {
     List { limit: usize },
     Close { agent_id: String },
     Reap { agent_id: String },
+    ReviewTool(ReviewToolInput),
 }
 
 impl RpcMethod {
@@ -69,6 +69,7 @@ impl RpcMethod {
                 | "list"
                 | "close"
                 | "reap"
+                | "review_tool"
         )
     }
 }
@@ -184,6 +185,14 @@ pub struct ResultQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewToolInput {
+    pub agent_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub version: u16,
     pub request_id: Option<String>,
@@ -258,6 +267,9 @@ pub enum RpcSuccess {
     },
     Reaped {
         state: JobStateView,
+    },
+    ReviewTool {
+        result: ToolResult,
     },
 }
 
@@ -466,6 +478,29 @@ pub enum PreviewState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactIntegrityView {
+    Valid,
+    Missing,
+    Replaced,
+    Binary,
+    Invalid,
+    LegacyUnverified,
+}
+
+impl From<ArtifactIntegrity> for ArtifactIntegrityView {
+    fn from(value: ArtifactIntegrity) -> Self {
+        match value {
+            ArtifactIntegrity::Valid => Self::Valid,
+            ArtifactIntegrity::Missing => Self::Missing,
+            ArtifactIntegrity::Replaced => Self::Replaced,
+            ArtifactIntegrity::Binary => Self::Binary,
+            ArtifactIntegrity::Invalid => Self::Invalid,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactView {
     pub artifact_id: String,
@@ -474,6 +509,7 @@ pub struct ArtifactView {
     pub sha256: String,
     pub bytes: u64,
     pub checkpoint_number: Option<u64>,
+    pub integrity: ArtifactIntegrityView,
     pub preview_state: PreviewState,
     pub preview: Option<String>,
 }
@@ -655,6 +691,15 @@ impl RpcService {
                     state: state.into(),
                 })
             }
+            RpcMethod::ReviewTool(input) => {
+                self.require_job(&input.agent_id)?;
+                validate_text(&input.tool, "review tool", 128)?;
+                let result = self
+                    .scheduler
+                    .call_review_tool(&input.agent_id, &input.tool, input.arguments)
+                    .map_err(map_scheduler)?;
+                Ok(RpcSuccess::ReviewTool { result })
+            }
         }
     }
 
@@ -769,6 +814,16 @@ impl RpcService {
             ));
         }
         let job = self.require_job(&query.agent_id)?;
+        if let Some(verified) = self
+            .scheduler
+            .verify_review_artifact(&query.agent_id, query.preview_bytes)
+            .map_err(map_scheduler)?
+        {
+            return Ok(RpcSuccess::Result {
+                job: job.into(),
+                artifact: Some(verified_artifact_view(verified, query.preview_bytes)),
+            });
+        }
         let artifact = self
             .store
             .artifacts(&query.agent_id, 1)
@@ -784,19 +839,10 @@ impl RpcService {
 }
 
 fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
-    let (preview_state, preview) = if requested == 0 {
-        (PreviewState::NotRequested, None)
+    let preview_state = if requested == 0 {
+        PreviewState::NotRequested
     } else {
-        let mut bytes = Vec::with_capacity(requested);
-        let loaded = File::open(&artifact.path).and_then(|mut file| {
-            file.by_ref()
-                .take(u64::try_from(requested).unwrap_or(0))
-                .read_to_end(&mut bytes)
-        });
-        match loaded.ok().and_then(|_| String::from_utf8(bytes).ok()) {
-            Some(preview) => (PreviewState::Available, Some(preview)),
-            None => (PreviewState::Unavailable, None),
-        }
+        PreviewState::Unavailable
     };
     ArtifactView {
         artifact_id: artifact.artifact_id,
@@ -805,8 +851,36 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
         sha256: artifact.sha256,
         bytes: artifact.bytes,
         checkpoint_number: artifact.checkpoint_number,
+        integrity: ArtifactIntegrityView::LegacyUnverified,
         preview_state,
-        preview,
+        preview: None,
+    }
+}
+
+fn verified_artifact_view(artifact: VerifiedArtifact, requested: usize) -> ArtifactView {
+    let preview_state = if requested == 0 {
+        PreviewState::NotRequested
+    } else if artifact.preview.is_some() {
+        PreviewState::Available
+    } else {
+        PreviewState::Unavailable
+    };
+    ArtifactView {
+        artifact_id: "review-report".into(),
+        artifact_type: "review_report".into(),
+        locator: artifact.locator,
+        sha256: artifact
+            .actual_sha256
+            .or(artifact.expected_sha256)
+            .unwrap_or_default(),
+        bytes: artifact
+            .actual_bytes
+            .or(artifact.expected_bytes)
+            .unwrap_or(0),
+        checkpoint_number: Some(artifact.checkpoint_number),
+        integrity: artifact.integrity.into(),
+        preview_state,
+        preview: artifact.preview,
     }
 }
 

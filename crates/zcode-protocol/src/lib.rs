@@ -108,8 +108,31 @@ pub struct WorkspaceRef<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSessionParams<'a> {
     pub workspace: WorkspaceRef<'a>,
+    #[serde(skip_serializing_if = "is_empty_mcp_servers")]
+    pub mcp_servers: &'a [StdioMcpServer],
+}
+
+fn is_empty_mcp_servers(servers: &&[StdioMcpServer]) -> bool {
+    servers.is_empty()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StdioMcpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<McpEnvironmentVariable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpEnvironmentVariable {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -355,5 +378,33 @@ mod tests {
             panic!("session/event must remain on the event stream");
         };
         assert_eq!(event_type(&event), Some("turn.started"));
+    }
+
+    #[test]
+    fn session_create_serializes_the_observed_acp_mcp_array_shape() {
+        let servers = vec![StdioMcpServer {
+            name: "review-ledger".into(),
+            command: "/usr/bin/reviewd".into(),
+            args: vec!["--ledger-mcp".into(), "--agent-id".into(), "job".into()],
+            env: Vec::new(),
+        }];
+        let value = serde_json::to_value(CreateSessionParams {
+            workspace: WorkspaceRef {
+                workspace_key: "/work",
+                workspace_path: "/work",
+            },
+            mcp_servers: &servers,
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "workspace":{"workspaceKey":"/work","workspacePath":"/work"},
+                "mcpServers":[{
+                    "name":"review-ledger","command":"/usr/bin/reviewd",
+                    "args":["--ledger-mcp","--agent-id","job"],"env":[]
+                }]
+            })
+        );
     }
 }

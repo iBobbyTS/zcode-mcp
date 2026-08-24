@@ -64,15 +64,30 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
     match method {
         "workspace/readState" => params.is_empty(),
         "session/create" => {
-            if !exact_keys(params, &["workspace"], &[]) {
+            if !exact_keys(params, &["workspace"], &["mcpServers"]) {
                 return false;
             }
             let Some(workspace) = params.get("workspace").and_then(Value::as_object) else {
                 return false;
             };
-            exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
+            let workspace_valid = exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
                 && workspace.get("workspaceKey").is_some_and(Value::is_string)
-                && workspace.get("workspacePath").is_some_and(Value::is_string)
+                && workspace.get("workspacePath").is_some_and(Value::is_string);
+            let mcp_valid = params.get("mcpServers").is_none_or(|servers| {
+                servers.as_array().is_some_and(|servers| {
+                    !servers.is_empty()
+                        && servers.iter().all(|server| {
+                            server.as_object().is_some_and(|server| {
+                                exact_keys(server, &["name", "command", "args", "env"], &[])
+                                    && server.get("name").is_some_and(Value::is_string)
+                                    && server.get("command").is_some_and(Value::is_string)
+                                    && server.get("args").is_some_and(Value::is_array)
+                                    && server.get("env").is_some_and(Value::is_array)
+                            })
+                        })
+                })
+            });
+            workspace_valid && mcp_valid
         }
         "session/subscribe" => {
             exact_keys(
