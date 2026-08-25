@@ -400,6 +400,46 @@ impl WorktreeManager {
         Ok(())
     }
 
+    pub fn cleanup_registered_under_job_root(&self, job_root: &Path) -> PreparationResult<()> {
+        let job_root = fs::canonicalize(job_root)?;
+        if job_root != self.scratch_root {
+            return Err(PreparationError::Worktree(
+                "malformed-record cleanup is not bound to this manager job root".into(),
+            ));
+        }
+        let (worktrees_root, _) = self.expected_roots()?;
+        let registrations = registered_worktrees_under(&self.repository, &worktrees_root)?;
+        for registration in &registrations {
+            if registration.path.parent() != Some(worktrees_root.as_path())
+                || registration.path == worktrees_root
+                || !registration.detached
+            {
+                return Err(PreparationError::Worktree(
+                    "registered malformed-record cleanup target is not a trusted detached child"
+                        .into(),
+                ));
+            }
+        }
+        for registration in registrations {
+            let output = git(
+                &self.repository,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    path_to_str(&registration.path)?,
+                ],
+            )?;
+            ensure_success(output, "git worktree remove malformed record")?;
+        }
+        if !registered_worktrees_under(&self.repository, &worktrees_root)?.is_empty() {
+            return Err(PreparationError::Worktree(
+                "Git registration remains after malformed-record cleanup".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn expected_roots(&self) -> PreparationResult<(PathBuf, PathBuf)> {
         Ok((
             fs::canonicalize(self.scratch_root.join("worktrees"))?,
@@ -467,6 +507,7 @@ fn is_detached(path: &Path) -> PreparationResult<bool> {
 
 #[derive(Debug)]
 struct RegisteredWorktree {
+    path: PathBuf,
     head: String,
     detached: bool,
 }
@@ -489,6 +530,7 @@ fn registered_worktree(
         if field.is_empty() {
             if current_path.as_deref() == Some(target) {
                 return Ok(Some(RegisteredWorktree {
+                    path: target.to_path_buf(),
                     head: current_head.unwrap_or_default(),
                     detached,
                 }));
@@ -508,6 +550,48 @@ fn registered_worktree(
         }
     }
     Ok(None)
+}
+
+fn registered_worktrees_under(
+    repository: &Path,
+    root: &Path,
+) -> PreparationResult<Vec<RegisteredWorktree>> {
+    let output = git(repository, &["worktree", "list", "--porcelain", "-z"])?;
+    let output = ensure_success(output, "Git worktree registration query")?;
+    if output.stdout.truncated {
+        return Err(PreparationError::Worktree(
+            "Git worktree registration list exceeds the bounded capture limit".into(),
+        ));
+    }
+    let mut result = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_head: Option<String> = None;
+    let mut detached = false;
+    for field in output.stdout.retained.split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if let Some(path) = current_path.take() {
+                if path.starts_with(root) {
+                    result.push(RegisteredWorktree {
+                        path,
+                        head: current_head.take().unwrap_or_default(),
+                        detached,
+                    });
+                }
+            }
+            current_head = None;
+            detached = false;
+            continue;
+        }
+        let field = String::from_utf8_lossy(field);
+        if let Some(value) = field.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(value));
+        } else if let Some(value) = field.strip_prefix("HEAD ") {
+            current_head = Some(value.into());
+        } else if field == "detached" {
+            detached = true;
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Debug)]

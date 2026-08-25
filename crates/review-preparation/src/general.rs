@@ -328,6 +328,7 @@ impl GeneralTaskPreparer {
             });
             return match reusable {
                 Ok(existing) => Ok(existing),
+                Err(error @ PreparationError::IdempotencyConflict(_)) => Err(error),
                 Err(error) => {
                     let cleanup = cleanup_stale_record(&manager, &job_root, &existing_bytes);
                     match cleanup {
@@ -1629,19 +1630,7 @@ fn cleanup_stale_record(
         }
         return bounded_cleanup_worktree(manager, &prepared.worktree, job_root);
     }
-    let worktree_path = job_root.join("worktrees");
-    if worktree_path.exists() {
-        let mut last_error = None;
-        for _ in 0..3 {
-            match cleanup_job_root_path(job_root) {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        return Err(last_error.unwrap_or_else(|| {
-            PreparationError::Worktree("malformed prepared record cleanup exhausted".into())
-        }));
-    }
+    manager.cleanup_registered_under_job_root(job_root)?;
     cleanup_job_root_path(job_root)
 }
 fn cleanup_if_trusted(prepared: &PreparedGeneralTask) -> bool {

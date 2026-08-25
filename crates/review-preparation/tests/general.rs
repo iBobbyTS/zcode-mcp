@@ -421,7 +421,12 @@ fn null_budget_and_idempotency_conflicts_are_rejected() {
         preparer.prepare(&changed),
         Err(PreparationError::IdempotencyConflict(_))
     ));
-    assert!(!first.prompt_path.exists());
+    assert!(first.prompt_path.exists());
+    let compatible = preparer
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    assert_eq!(compatible.prepared_sha256, first.prepared_sha256);
+    assert!(compatible.worktree.path.exists());
 }
 
 #[test]
@@ -900,6 +905,31 @@ fn stale_prepared_record_never_returns_dangling_task_and_retries_deterministical
         PreparationError::Worktree(_) | PreparationError::InvalidManifest(_)
     ));
     assert!(!retry.worktree.path.exists());
+}
+
+#[test]
+fn malformed_prepared_record_cleans_registered_worktree_before_private_root() {
+    let f = Fixture::new();
+    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let prepared = f.preparer().prepare(&manifest).unwrap();
+    let job_root = prepared
+        .worktree
+        .scratch_worktrees_root
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let record = job_root.join("prepared-general.json");
+    assert!(git(&f.repository, &["worktree", "list", "--porcelain"])
+        .contains(prepared.worktree.path.to_str().unwrap()));
+    fs::write(&record, b"{malformed").unwrap();
+    assert!(f.preparer().prepare(&manifest).is_err());
+    assert!(!job_root.exists());
+    assert!(!git(&f.repository, &["worktree", "list", "--porcelain"])
+        .contains(prepared.worktree.path.to_str().unwrap()));
+
+    let retry = f.preparer().prepare(&manifest).unwrap();
+    retry.validate_digest().unwrap();
+    assert!(retry.worktree.path.exists());
 }
 
 fn git(path: &Path, args: &[&str]) -> String {
