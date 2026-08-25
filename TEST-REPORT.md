@@ -2,7 +2,8 @@
 
 ## Evidence identity
 
-- Product/test head: `9c5276e8acbece92dc9f8272a426de767b504466`
+- Product/test head H: `1b5cf12834ce1b9b74e77e853b8ba90d7572fc99`
+- Reports-only commit R: this report update follows H and is docs-only.
 - Date: 2026-08-24
 - Host: macOS 26.5.1 (Darwin 25.5.0, arm64)
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
@@ -17,7 +18,7 @@
 | `cargo fmt --all -- --check` | PASS |
 | `cargo check --workspace --all-targets` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace --all-targets` | PASS, 158 tests, 0 failed |
+| `cargo test --workspace --all-targets` | PASS, all workspace targets, 0 failed |
 | official `runtime-preflight` | PASS, strict NDJSON `workspace/readState` tested |
 
 The workspace run exercised every target once at the exact product/test head.
@@ -79,4 +80,4 @@ projection.
 
 The final behavioral checks cover the compatibility-delta product/test head.
 Any later product or test change requires bounded closure of that changed range.
-`Clean A` is satisfied at this head; `Clean B` is not yet claimed.
+The exact-head H evidence is complete for the audit-remediation scope. S01/S02/S03 retain independent Clean A/Clean B ledgers; S04 has mechanical FINAL_CLEAN. No later product/test commit exists after H.

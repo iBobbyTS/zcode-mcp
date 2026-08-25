@@ -3,22 +3,32 @@
 ## Release identity
 
 - Feature: `zcode-review-mcp`
-- Branch: `codex/zcode-review-mcp`
+- Branch: `codex/audit-remediation-20260824`
 - Feature base: `73c379e04a09015c29591214eb29093da7300e10`
-- Final product/test head: `9c5276e8acbece92dc9f8272a426de767b504466`
+- Final product/test head H: `1b5cf12834ce1b9b74e77e853b8ba90d7572fc99`
+- Reports-only commit R: this report update is committed after H; R is not the tested product head.
 - Authoritative PLAN-FULL SHA-256:
   `3d12938489faf5629bde074cd277799b1d0de9352d9e273c00d85ed6397270f8`
 - S09 documentation is a later docs-only commit. Its exact Git identity is
   recorded in `.agent-work/sections/S09-HANDOFF.md` and the final audit record;
   a Git commit cannot contain its own hash.
-- Assurance: `Clean A` closure evidence satisfied; fresh `Clean B`
-  `FINAL_BOUNDED` remains pending.
-- Readiness: `pending Clean B`; this report does not claim final S09 acceptance.
+- Assurance: S01/S02/S03 TWO evidence is Clean A + Clean B; S04 mechanical assurance is FINAL_CLEAN.
+- Readiness at H: `mergeable` for the bounded audit-remediation scope; accepted prior S00-S09 lineage is unchanged.
 - Real official ZCode runtime: `VERIFIED_ZCODE_3_8_1_GLM_5_3`.
-- Audit pack: finalized separately by the workflow orchestrator after S09
-  acceptance; this report does not claim pack completion.
+- Audit pack: finalized separately by the workflow orchestrator after exact-head evidence collection; this report does not claim pack completion.
 
 ## Accepted section heads
+
+Audit-remediation sections:
+
+| Section | Accepted head | Result |
+|---|---|---|
+| S01 audit remediation | `8500bb8af10a091b8d7a9aef8bcabc241e9cd34b` | AUD-002 closed; Clean A/B |
+| S02 audit remediation | `94fc245b62d4d000ab1813176775d3e30dfdb305` | AUD-003 closed; one repair wave; Clean A/B |
+| S03 audit remediation | `b460c36b4171caf1753ffd1b7ddb2d715acf86bc` | AUD-004/005 closed; one repair wave; Clean A/B |
+| S04 audit remediation | `1b5cf12834ce1b9b74e77e853b8ba90d7572fc99` | AUD-007 closed; mechanical FINAL_CLEAN |
+
+`AUD-001` is closed by this exact-head evidence order. `AUD-006` remains an owner-decision retention item and `AUD-008` remains bounded maintainability debt.
 
 | Section | Accepted head | Result |
 |---|---|---|
@@ -31,7 +41,7 @@
 | S06 | `af74e67a932be707677e7405f070098454b887fd` | internal orchestration accepted |
 | S07 | `20ee37c2f4c70c9acd98ba53b48aeba2199a8f14` | public MCP accepted |
 | S08 | `b8da3d250732b7788c6522dc36f5b723a1eed17d` | shadow integration accepted |
-| S09 compatibility delta | `9c5276e8acbece92dc9f8272a426de767b504466` | Clean A, Clean B pending |
+| S09 compatibility delta (preserved prior feature) | `9c5276e8acbece92dc9f8272a426de767b504466` | historical accepted compatibility predecessor |
 
 The historical S02 supervisor commits remain visible in Git as unaccepted
 evidence. The accepted tree contains no `zcode-supervisor` product owner.

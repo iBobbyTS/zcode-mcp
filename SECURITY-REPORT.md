@@ -98,9 +98,7 @@ back.
 
 ## Residual risks
 
-- `Clean A` is satisfied at product/test head `9c5276e8...`; independent
-  `Clean B` final review remains pending, so final S09 acceptance is not yet
-  claimed.
+- Audit-remediation exact product/test head H is `1b5cf12834ce1b9b74e77e853b8ba90d7572fc99`; S01/S02/S03 have independent Clean A/Clean B evidence and S04 has mechanical FINAL_CLEAN. The four reports are updated afterward in reports-only commit R.
 
 - Official ZCode 3.8.1 behavior was verified locally. Compatibility remains
   hash/version-specific and does not imply future runtime compatibility.
@@ -110,5 +108,4 @@ back.
 - Linux behavior was not executed; Windows is unsupported.
 - A runtime crash cannot resume the original live session; partial evidence is
   retained and runtime loss is classified.
-- The repository has a top-level MIT license, but Cargo package license metadata
-  and a complete dependency license report remain outstanding.
+- The repository has a top-level MIT license; all ten Cargo packages inherit MIT metadata, and the exact-lockfile dependency inventory is tracked in `docs/dependency-licenses.md`. The inventory is declared metadata evidence, not legal advice.

@@ -18,12 +18,14 @@ delivery, stop/later-send interruption behavior, offered-option policy
 responses, unsupported input, ledger checkpoints/validation/finalization,
 valid final report bytes/hash, and process-group reap.
 
-The exact final product/test head is
-`9c5276e8acbece92dc9f8272a426de767b504466`. Its fresh real
+The prior compatibility product/test head was
+`9c5276e8acbece92dc9f8272a426de767b504466`. The audit-remediation product/test head H is
+`1b5cf12834ce1b9b74e77e853b8ba90d7572fc99`; its S03 exact-head official matrix
+and final bounded evidence are recorded in the remediation handoff/review ledger. Its fresh real
 `interrupt_and_continue` oracle passed in 192.92 seconds and distinguished a
 real stop-current-turn boundary from natural completion by observing an active
 turn immediately before the call and one exact stop-boundary increment before
-the next active turn. `Clean A` is satisfied; fresh `Clean B` remains pending.
+the next active turn. The later S03 repair preserved this contract and passed the exact official matrix at H.
 
 ## Pinned seam
 
@@ -100,8 +102,7 @@ the official runtime and do not create a redistribution claim.
 `rmcp-macros 3.1.4`, `rusqlite 0.32.1`, `tokio 1.53.1`, `serde 1.0.229`, and
 `sha2 0.10.9`. The repository has a top-level MIT `LICENSE` (SHA-256
 `896a6f2cea528ff8046c268b290f90d47907ecbaff081f4d140b104f7d17917b`).
-Local Cargo packages still have no `license` metadata and a complete dependency
-license audit remains outstanding.
+All ten local Cargo packages inherit `license = "MIT"`; `docs/dependency-licenses.md` records the exact Cargo.lock-derived 189-package declared-license inventory, including eight legacy slash expressions retained raw and normalized with deprecation notes.
 
 ## Real-runtime smoke matrix
 
