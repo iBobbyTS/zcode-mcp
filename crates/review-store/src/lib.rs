@@ -1140,6 +1140,16 @@ impl Store {
         let task = query_task_record(&transaction, execution_agent_id)?.ok_or_else(|| {
             StoreError::InvalidState(format!("unknown task {execution_agent_id}"))
         })?;
+        let (stop_requested, close_requested): (bool, bool) = transaction.query_row(
+            "SELECT stop_requested, close_requested FROM agents WHERE agent_id=?1",
+            [execution_agent_id],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+        )?;
+        if (stop_requested || close_requested) && result.outcome != TaskOutcome::Cancelled {
+            return Err(StoreError::Conflict(
+                "cancellation or close intent wins over late completion".into(),
+            ));
+        }
         if canonical.len() as u64 > task.effective_budget.max_result_bytes {
             return Err(StoreError::InvalidState(
                 "task result exceeds effective max_result_bytes".into(),
@@ -1200,8 +1210,16 @@ impl Store {
             TaskOutcome::Failed => ("FAILED", Some("FAILED")),
         };
         transaction.execute(
-            "UPDATE agents SET state=?1,completed_at=?2,failure_code=?3 WHERE agent_id=?4",
-            params![legacy_state, now_millis(), failure_code, execution_agent_id],
+            "UPDATE agents SET state=?1,completed_at=?2,
+             closed_at=CASE WHEN ?4=1 THEN COALESCE(closed_at,?2) ELSE closed_at END,
+             failure_code=?3 WHERE agent_id=?5",
+            params![
+                legacy_state,
+                now_millis(),
+                failure_code,
+                close_requested,
+                execution_agent_id
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -5501,6 +5519,64 @@ mod tests {
                     .retained,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn cancellation_and_close_win_against_late_success_or_blocked_completion() {
+        for (index, close) in [(1, false), (2, true)] {
+            let (_directory, _path, store) = file_store();
+            let id = format!("cancel-race-{index}");
+            let task = general_task(
+                &id,
+                &format!("cancel-public-{index}"),
+                &format!("cancel-key-{index}"),
+            );
+            store.enqueue_task(&task).unwrap();
+            store.set_task_phase(&id, TaskPhase::Preparing).unwrap();
+            store.set_task_phase(&id, TaskPhase::Running).unwrap();
+            if close {
+                store.request_close(&id).unwrap();
+            } else {
+                store.request_stop(&id).unwrap();
+            }
+            for outcome in [TaskOutcome::Succeeded, TaskOutcome::Blocked] {
+                let result = TaskResult {
+                    outcome,
+                    summary: "late".into(),
+                    partial: false,
+                    base_commit: None,
+                    head_commit: None,
+                    changed_files: vec![],
+                    diff_stat: None,
+                    checks: vec![],
+                    residual_gaps: vec![],
+                    artifacts: vec![],
+                };
+                assert!(matches!(
+                    store.store_task_result(&id, &result),
+                    Err(StoreError::Conflict(_))
+                ));
+            }
+            let cancelled = TaskResult {
+                outcome: TaskOutcome::Cancelled,
+                summary: "cancelled".into(),
+                partial: false,
+                base_commit: None,
+                head_commit: None,
+                changed_files: vec![],
+                diff_stat: None,
+                checks: vec![],
+                residual_gaps: vec![],
+                artifacts: vec![],
+            };
+            store.store_task_result(&id, &cancelled).unwrap();
+            let job = store.get_job(&id).unwrap().unwrap();
+            assert_eq!(job.state, JobState::Cancelled);
+            if close {
+                assert!(job.closed_at.is_some());
+            }
+            assert_eq!(store.store_task_result(&id, &cancelled).unwrap(), ());
         }
     }
 }
