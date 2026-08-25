@@ -183,6 +183,28 @@ impl PreparedGeneralTask {
         Ok(())
     }
     pub fn validate_prepared_content(&self) -> PreparationResult<()> {
+        self.validate_immutable_inputs()?;
+        for context in &self.context {
+            self.validate_context(context)?;
+        }
+        Ok(())
+    }
+    fn validate_finalization_content(&self) -> PreparationResult<()> {
+        self.validate_immutable_inputs()?;
+        for context in &self.context {
+            let writable_implementation_context = self.profile
+                == GeneralProfile::ImplementationWorktree
+                && self
+                    .write_manifest
+                    .iter()
+                    .any(|root| context.repository_relative.starts_with(root));
+            if !writable_implementation_context {
+                self.validate_context(context)?;
+            }
+        }
+        Ok(())
+    }
+    fn validate_immutable_inputs(&self) -> PreparationResult<()> {
         let job_root = self
             .worktree
             .scratch_worktrees_root
@@ -197,11 +219,11 @@ impl PreparedGeneralTask {
                 Some(attachment.size_bytes),
             )?;
         }
-        for context in &self.context {
-            let path = reject_symlink_path(&self.worktree.path, &context.repository_relative)?;
-            verify_file(&path, &context.sha256, Some(context.size_bytes))?;
-        }
         Ok(())
+    }
+    fn validate_context(&self, context: &PreparedContext) -> PreparationResult<()> {
+        let path = reject_symlink_path(&self.worktree.path, &context.repository_relative)?;
+        verify_file(&path, &context.sha256, Some(context.size_bytes))
     }
     pub fn launcher(&self) -> PreparationResult<PolicyLauncher> {
         self.validate_digest()?;
@@ -639,7 +661,7 @@ impl GeneralFinalizer {
             .validate_digest()
             .map_err(|_| "PREPARED_TASK_INVALID".to_owned())?;
         prepared
-            .validate_prepared_content()
+            .validate_finalization_content()
             .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
         let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
         prefinalization_integrity(prepared, &manager)?;
@@ -928,18 +950,89 @@ fn reject_gitlinks(repository: &Path) -> Result<(), String> {
             "diff",
             "--cached",
             "--raw",
+            "--no-abbrev",
             "-z",
             "--no-ext-diff",
             "--no-textconv",
         ],
     )?;
-    if raw
-        .windows(b"160000".len())
-        .any(|window| window == b"160000")
-    {
-        return Err("GITLINK_CHANGE_DENIED".into());
+    match raw_diff_has_gitlink(&raw) {
+        Ok(true) => Err("GITLINK_CHANGE_DENIED".into()),
+        Ok(false) => Ok(()),
+        Err(()) => Err("GIT_RAW_DIFF_INVALID".into()),
     }
-    Ok(())
+}
+
+fn raw_diff_has_gitlink(raw: &[u8]) -> Result<bool, ()> {
+    let mut cursor = 0;
+    let mut has_gitlink = false;
+    while cursor < raw.len() {
+        let header = take_nul_record(raw, &mut cursor).ok_or(())?;
+        let mut fields = header.split(|byte| *byte == b' ');
+        let old_mode = fields.next().and_then(|field| field.strip_prefix(b":"));
+        let new_mode = fields.next();
+        let old_object = fields.next();
+        let new_object = fields.next();
+        let status = fields.next();
+        if fields.next().is_some()
+            || !old_mode.is_some_and(valid_raw_mode)
+            || !new_mode.is_some_and(valid_raw_mode)
+            || !old_object.is_some_and(valid_raw_object_id)
+            || !new_object.is_some_and(valid_raw_object_id)
+        {
+            return Err(());
+        }
+        let path_count = raw_status_path_count(status.ok_or(())?)?;
+        for _ in 0..path_count {
+            if take_nul_record(raw, &mut cursor).is_none_or(|path| path.is_empty()) {
+                return Err(());
+            }
+        }
+        has_gitlink |= old_mode == Some(b"160000") || new_mode == Some(b"160000");
+    }
+    Ok(has_gitlink)
+}
+
+fn take_nul_record<'a>(raw: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let relative_end = raw.get(*cursor..)?.iter().position(|byte| *byte == 0)?;
+    let start = *cursor;
+    let end = start + relative_end;
+    *cursor = end + 1;
+    Some(&raw[start..end])
+}
+
+fn valid_raw_mode(mode: &[u8]) -> bool {
+    matches!(
+        mode,
+        b"000000" | b"100644" | b"100755" | b"120000" | b"160000"
+    )
+}
+
+fn valid_raw_object_id(object: &[u8]) -> bool {
+    matches!(object.len(), 40 | 64)
+        && object
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn raw_status_path_count(status: &[u8]) -> Result<usize, ()> {
+    let (&kind, detail) = status.split_first().ok_or(())?;
+    match kind {
+        b'R' | b'C' => {
+            if detail.is_empty() || detail.len() > 3 || !detail.iter().all(u8::is_ascii_digit) {
+                return Err(());
+            }
+            let score = detail
+                .iter()
+                .fold(0u16, |score, digit| score * 10 + u16::from(*digit - b'0'));
+            if score > 100 {
+                return Err(());
+            }
+            Ok(2)
+        }
+        b'A' | b'D' | b'M' | b'T' | b'U' | b'X' | b'B' if detail.is_empty() => Ok(1),
+        _ => Err(()),
+    }
 }
 
 fn validate_final_commit(repository: &Path, base: &str, head: &str) -> Result<(), String> {
@@ -1717,4 +1810,70 @@ fn parse_status_paths(bytes: &[u8]) -> Result<Vec<String>, String> {
     result.sort();
     result.dedup();
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raw_diff_has_gitlink;
+
+    #[test]
+    fn raw_diff_parser_ignores_mode_digits_outside_exact_mode_fields() {
+        let raw = concat!(
+            ":100644 100644 160000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb M\0",
+            "src/160000_notes.txt\0",
+            ":100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100\0",
+            ":160000-looking-path\0src/renamed.txt\0",
+            ":100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb C75\0",
+            "src/original.txt\0src/160000_copy.txt\0",
+        )
+        .as_bytes();
+
+        assert_eq!(raw_diff_has_gitlink(raw), Ok(false));
+    }
+
+    #[test]
+    fn raw_diff_parser_rejects_exact_gitlink_modes() {
+        let additions = concat!(
+            ":000000 160000 0000000000000000000000000000000000000000 ",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa A\0vendor/new\0",
+        )
+        .as_bytes();
+        let deletions = concat!(
+            ":160000 000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "0000000000000000000000000000000000000000 D\0vendor/old\0",
+        )
+        .as_bytes();
+        let replacements = concat!(
+            ":160000 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb T\0vendor/replaced\0",
+        )
+        .as_bytes();
+
+        assert_eq!(raw_diff_has_gitlink(additions), Ok(true));
+        assert_eq!(raw_diff_has_gitlink(deletions), Ok(true));
+        assert_eq!(raw_diff_has_gitlink(replacements), Ok(true));
+    }
+
+    #[test]
+    fn raw_diff_parser_fails_closed_on_malformed_headers_and_records() {
+        let malformed: &[&[u8]] = &[
+            b"100644 100644 aa bb M\0src/lib.rs\0",
+            b":10064x 100644 aa bb M\0src/lib.rs\0",
+            b":100600 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb M\0src/lib.rs\0",
+            b":100644 100644 gg bb M\0src/lib.rs\0",
+            b":100644 100644 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb M\0src/lib.rs\0",
+            b":100644 100644 aa bb Z\0src/lib.rs\0",
+            b":100644 100644 aa bb M\0",
+            b":100644 100644 aa bb R100\0src/old.rs\0",
+            b":100644 100644 aa bb C101\0src/old.rs\0src/new.rs\0",
+            b":100644 100644 aa bb M\0src/lib.rs",
+        ];
+
+        for raw in malformed {
+            assert_eq!(raw_diff_has_gitlink(raw), Err(()), "raw={raw:?}");
+        }
+    }
 }

@@ -345,6 +345,58 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
 }
 
 #[test]
+fn implementation_context_covered_by_write_manifest_can_finalize() {
+    let f = Fixture::new();
+    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
+    manifest.repo_context = vec!["src/lib.rs".into()];
+    manifest.write_manifest = vec!["src".into()];
+    let prepared = f.preparer().prepare(&manifest).unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 22 }\n",
+    )
+    .unwrap();
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+
+    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert!(completion.cleaned);
+    let artifact = completion.artifact.unwrap();
+    assert_eq!(artifact.changed_paths, ["src/lib.rs"]);
+    let head = artifact.head_commit.as_deref().unwrap();
+    assert_eq!(git(&f.repository, &["cat-file", "-t", head]), "commit");
+    assert_eq!(
+        git(&f.repository, &["rev-list", "--parents", "-n", "1", head]),
+        format!("{head} {}", artifact.base_sha)
+    );
+    let patch = fs::read(prepared.artifact_root.join("changes.patch")).unwrap();
+    assert!(String::from_utf8_lossy(&patch).contains("value() -> u8 { 22 }"));
+}
+
+#[test]
+fn implementation_context_outside_write_manifest_remains_immutable() {
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("README.md"),
+        "changed non-writable context\n",
+    )
+    .unwrap();
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+
+    assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("PREPARED_CONTENT_INVALID")
+    );
+    assert!(completion.cleaned);
+}
+
+#[test]
 fn readonly_change_and_result_limit_become_result_invalid() {
     let f = Fixture::new();
     let prepared = f
@@ -717,6 +769,29 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
         Some("GITLINK_CHANGE_DENIED")
     );
     assert!(completion.cleaned);
+}
+
+#[test]
+fn ordinary_filename_containing_gitlink_mode_digits_is_allowed() {
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/160000_notes.txt"),
+        "ordinary blob\n",
+    )
+    .unwrap();
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+
+    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert!(completion.cleaned);
+    assert_eq!(
+        completion.artifact.unwrap().changed_paths,
+        ["src/160000_notes.txt"]
+    );
 }
 
 #[test]
