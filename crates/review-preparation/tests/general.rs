@@ -1,7 +1,7 @@
 use review_preparation::{
     AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactIntent,
-    GeneralArtifactKind, GeneralCompletionSubmission, GeneralFinalizer, GeneralProfile,
-    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PreparationError,
+    GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
+    GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PreparationError,
     GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
@@ -960,6 +960,41 @@ fn tampered_record_path_cleans_real_registration_without_touching_external_path(
 
     let retry = f.preparer().prepare(&manifest).unwrap();
     assert!(retry.worktree.path.exists());
+}
+
+#[test]
+fn retry_cleanup_with_corrupt_a_pointing_to_b_is_fail_closed_and_non_destructive() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let prepared_a = a
+        .preparer()
+        .prepare(&a.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    let prepared_b = b
+        .preparer()
+        .prepare(&b.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    let mut corrupt = prepared_a.clone();
+    corrupt.worktree = prepared_b.worktree.clone();
+    corrupt.scratch_root = prepared_b.scratch_root.clone();
+    corrupt.artifact_root = prepared_b.artifact_root.clone();
+    let persisted = GeneralCompletion {
+        outcome: CompletionOutcome::ResultInvalid,
+        reason_code: Some("TASK_ROOT_CLEANUP_FAILED".into()),
+        summary: "preserve".into(),
+        checks: vec!["check".into()],
+        residual_gaps: vec![],
+        artifacts: vec![],
+        artifact: None,
+        cleaned: false,
+    };
+    let retried = GeneralFinalizer::retry_cleanup(&corrupt, &persisted);
+    assert!(!retried.cleaned);
+    assert!(prepared_b.worktree.path.exists());
+    assert!(prepared_b.prompt_path.exists());
+    assert!(git(&b.repository, &["worktree", "list", "--porcelain"])
+        .contains(prepared_b.worktree.path.to_str().unwrap()));
+    assert_eq!(retried.summary, "preserve");
 }
 
 fn git(path: &Path, args: &[&str]) -> String {

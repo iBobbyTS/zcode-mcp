@@ -527,20 +527,7 @@ impl GeneralFinalizer {
         persisted: &GeneralCompletion,
     ) -> GeneralCompletion {
         let mut completion = persisted.clone();
-        completion.cleaned = if cleanup_if_trusted(prepared) {
-            true
-        } else {
-            let Ok(manager) = manager(prepared) else {
-                return completion;
-            };
-            let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
-                return completion;
-            };
-            manager
-                .verify_registration_absent(&prepared.worktree.path)
-                .is_ok()
-                && cleanup_job_root_path(job_root).is_ok()
-        };
+        completion.cleaned = cleanup_if_trusted(prepared);
         completion
     }
 
@@ -1536,9 +1523,6 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
             return false;
         }
     }
-    if manager.verify_worktree_absent(&prepared.worktree).is_err() {
-        return false;
-    }
     let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
         return false;
     };
@@ -1546,6 +1530,16 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
         return manager
             .verify_registration_absent(&prepared.worktree.path)
             .is_ok();
+    }
+    if !prepared.worktree.path.exists()
+        && manager
+            .verify_registration_absent(&prepared.worktree.path)
+            .is_ok()
+    {
+        return cleanup_job_root_path(job_root).is_ok();
+    }
+    if manager.verify_worktree_absent(&prepared.worktree).is_err() {
+        return false;
     }
     cleanup_job_root_path(job_root).is_ok()
 }
