@@ -126,7 +126,11 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
     };
     let projection = match WorkspaceDiagnosticProjection::from_result(result) {
         Ok(projection) => projection,
-        Err(_) => return failed("workspace/readState result shape is incompatible"),
+        Err(error) => {
+            return failed(&format!(
+                "workspace/readState result shape is incompatible: {error}"
+            ));
+        }
     };
     Preflight {
         runtime_path: None,
@@ -305,7 +309,7 @@ mod tests {
 read request
 printf '%s\n' '{"id":"server-1","method":"session/requestRuntimePreferences","params":{}}'
 read preferences
-printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"modelCatalog":{"available":[{"modelId":"glm-current"},{"modelId":"glm-other"}]}}}'
+printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"modelCatalog":{"available":[{"ref":{"modelId":"glm-current"}},{"ref":{"modelId":"glm-other"}}]}}}'
 sleep 10"#,
         );
         std::process::Command::new("chmod")
@@ -332,7 +336,7 @@ sleep 10"#,
         let paths = fixture(
             r#"#!/bin/sh
 read request
-printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"session":{"modelId":"glm-session"},"modelCatalog":{"available":[{"modelId":"glm-catalog"}]}}}'"#,
+printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"session":{"modelId":"glm-session"},"modelCatalog":{"available":[{"ref":{"modelId":"glm-catalog"}}]}}}'"#,
         );
         std::process::Command::new("chmod")
             .arg("+x")

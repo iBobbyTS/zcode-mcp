@@ -183,10 +183,13 @@ impl WorkspaceDiagnosticProjection {
                     let item = item
                         .as_object()
                         .ok_or(ProjectionError::Invalid("result.modelCatalog.available[]"))?;
+                    let reference = item.get("ref").and_then(Value::as_object).ok_or(
+                        ProjectionError::Invalid("result.modelCatalog.available[].ref"),
+                    )?;
                     available_models.push(
                         required_bounded_string(
-                            item.get("modelId"),
-                            "result.modelCatalog.available[].modelId",
+                            reference.get("modelId"),
+                            "result.modelCatalog.available[].ref.modelId",
                             128,
                         )?
                         .to_owned(),
@@ -749,9 +752,9 @@ mod tests {
         let projection = WorkspaceDiagnosticProjection::from_result(&serde_json::json!({
             "settings": {"model": {"current": {"modelId": "glm-current"}}},
             "modelCatalog": {"available": [
-                {"modelId": "glm-other"},
-                {"modelId": "glm-current"},
-                {"modelId": "glm-current"}
+                {"ref": {"modelId": "glm-other"}},
+                {"ref": {"modelId": "glm-current"}},
+                {"ref": {"modelId": "glm-current"}}
             ]}
         }))
         .unwrap();
@@ -764,6 +767,12 @@ mod tests {
         assert!(
             WorkspaceDiagnosticProjection::from_result(&serde_json::json!({
                 "settings": {"model": {"current": {"modelId": 7}}}
+            }))
+            .is_err()
+        );
+        assert!(
+            WorkspaceDiagnosticProjection::from_result(&serde_json::json!({
+                "modelCatalog": {"available": [{"modelId": "unobserved-direct"}]}
             }))
             .is_err()
         );

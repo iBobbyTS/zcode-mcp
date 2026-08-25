@@ -94,5 +94,5 @@ model values fail closed.
 
 `runtime_version` remains `unknown`. Current and available model IDs are
 emitted only from `settings.model.current.modelId` and
-`modelCatalog.available[].modelId`. The record includes Node `node_version` for
-provenance. The implementation and tests are Rust-only.
+`modelCatalog.available[].ref.modelId`. The record includes Node `node_version`
+for provenance. The implementation and tests are Rust-only.
