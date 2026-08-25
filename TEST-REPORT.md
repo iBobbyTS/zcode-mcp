@@ -2,12 +2,13 @@
 
 ## Evidence identity
 
-- Product/test head: `b8da3d250732b7788c6522dc36f5b723a1eed17d`
+- Product/test head: `e2fc9b0bc1bb9df617d808935428b206af79a3da`
 - Date: 2026-08-24
 - Host: macOS 26.5.1 (Darwin 25.5.0, arm64)
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
 - Cargo: `cargo 1.97.1 (c980f4866 2026-06-30)`
-- Runtime environment: `ZCODE_RUNTIME_PATH` absent
+- Runtime environment: official ZCode 3.8.1 entry supplied explicitly for the
+  real-runtime matrix
 
 ## Exact final gates
 
@@ -16,8 +17,8 @@
 | `cargo fmt --all -- --check` | PASS |
 | `cargo check --workspace --all-targets` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace --all-targets` | PASS, 151 tests, 0 failed |
-| `env -u ZCODE_RUNTIME_PATH cargo run -q -p runtime-preflight` | PASS, `compatibility_status=untested`, `reason=ZCODE_RUNTIME_PATH is unset` |
+| `cargo test --workspace --all-targets` | PASS, 155 tests, 0 failed |
+| official `runtime-preflight` | PASS, strict NDJSON `workspace/readState` tested |
 
 The workspace run exercised every target once at the exact product/test head.
 The long `review-ledger` aggregate overflow test completed successfully; no
@@ -52,22 +53,22 @@ The same full workspace run included these named fixtures:
 
 ## Coverage summary
 
-The 151 tests comprise: ledger 10, preparation 13, Store 16, runtime preflight
-7, shadow process/adapter 11, Driver 17, fake runtime 4, protocol 11, public MCP
-8, review daemon/RPC 54, for 151 total. Zero-test library/binary harnesses are
-not included in the count.
+The 155-test workspace gate includes three environment-gated official-runtime
+fixtures, which skip successfully when the explicit path is absent. The same
+fixtures were separately executed against the official runtime. That targeted
+matrix proved nested workspace state,
+runtime-preferences response, create/subscribe/send, stop and later send,
+offered-option permission denial, unsupported input, queue delivery,
+session-level ledger MCP, partial/final report integrity, and process-group
+reap. The final workspace count is recorded after the exact-head gate.
 
-The executed fake-runtime paths cover runtime spawn and process-group reap,
+The executed fake-runtime and official-runtime paths cover spawn and group reap,
 request/response correlation, session create/subscribe/send/stop, message FIFO,
 interrupt-and-continue, permission hard-deny override, unsupported user input,
 durable lifecycle/recovery, continuous report publication, and public MCP
-projection. They do not establish compatibility with an unavailable official
-runtime.
+projection.
 
 ## Exact-head rule
 
-The behavioral checks cover `b8da3d2` exactly. S09 changes only documentation
-and configuration examples, so the active workflow permits reuse of this
-evidence after the docs-only commit. Documentation consistency and CodeGraph
-are checked after that commit. Any later product or test change invalidates
-this reuse and requires bounded closure of that changed range.
+The final behavioral checks cover the compatibility-delta product/test head.
+Any later product or test change requires bounded closure of that changed range.

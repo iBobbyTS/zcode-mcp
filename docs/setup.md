@@ -31,8 +31,8 @@ canonical database. The socket is not published until migration and startup
 reconciliation finish.
 
 If the runtime is unavailable, omit `ZCODE_RUNTIME_PATH` only for facade/store
-inspection and deterministic fake-runtime development. Claimed jobs cannot
-start a real session and compatibility remains unverified.
+inspection and deterministic fake-runtime development. Official ZCode 3.8.1 is
+verified only for entry SHA-256 `9318f60f...e4274`.
 
 ## Configure Codex
 

@@ -2,19 +2,21 @@
 
 ## Official runtime status
 
-Status: `UNVERIFIED_NOT_AVAILABLE`.
+Status: `VERIFIED_ZCODE_3_8_1_GLM_5_3`.
 
-`ZCODE_RUNTIME_PATH` was unset. No unambiguous official executable was present
-in `PATH`, `/Applications`, or `/Users/ibobby/Applications`. No runtime was
-downloaded, extracted from a community project, vendored, patched, decompiled,
-or redistributed. The exact preflight result was:
+The signed official `/Applications/ZCode.app` is version 3.8.1, bundle
+`dev.zcode.app`, Team ID `8A5X4JJ39T`. Its embedded app-server entry SHA-256 is
+`9318f60fb8c2c3bc83ce62da10220ebcdc9a99786df0a9abb1a4435ba66e4274`.
+No runtime was downloaded, copied, patched, decompiled, or redistributed.
 
 ```json
-{"compatibility_status":"untested","reason":"ZCODE_RUNTIME_PATH is unset"}
+{"compatibility_status":"tested","observed_methods":["workspace/readState"]}
 ```
 
-Fake-runtime acceptance is mergeability evidence for this repository's typed
-seam; it is not real-runtime compatibility evidence.
+The product-owner matrix observed a real `sess_*` session using GLM-5.3, queue
+delivery, stop/later-send interruption behavior, offered-option policy
+responses, unsupported input, ledger checkpoints/validation/finalization,
+valid final report bytes/hash, and process-group reap.
 
 ## Pinned seam
 
@@ -64,7 +66,7 @@ OpenAI Codex configuration reference at
 | Environment | Status |
 |---|---|
 | macOS 26.5.1 arm64, fake runtime | verified |
-| Official local ZCode runtime | unverified, unavailable |
+| Official ZCode 3.8.1 / GLM-5.3 | verified |
 | Linux | unverified in this execution |
 | Windows named pipes | unsupported |
 | Remote/public daemon endpoint | unsupported |
@@ -78,17 +80,18 @@ the official runtime and do not create a redistribution claim.
 
 `Cargo.lock` pins the resolved Rust dependency graph, including `rmcp 3.1.4`,
 `rmcp-macros 3.1.4`, `rusqlite 0.32.1`, `tokio 1.53.1`, `serde 1.0.229`, and
-`sha2 0.10.9`. This repository currently has no top-level license and its local
-Cargo packages have no `license` metadata. A distribution/release decision must
-add project licensing and perform a complete dependency license audit; S09 does
-not infer one from build success.
+`sha2 0.10.9`. The repository has a top-level MIT `LICENSE` (SHA-256
+`896a6f2cea528ff8046c268b290f90d47907ecbaff081f4d140b104f7d17917b`).
+Local Cargo packages still have no `license` metadata and a complete dependency
+license audit remains outstanding.
 
 ## Real-runtime smoke matrix
 
-When an explicit official `ZCODE_RUNTIME_PATH` becomes available, execute and
-record separately: identity/hash and app-server start; workspace state;
-session create/subscribe/send; queue; interrupt-and-continue; permission allow
-and local hard-deny; unsupported input classification; ledger MCP injection;
-partial/final report integrity; stop; close; and process-group reap. A
-contradiction in any required core operation is a hard stop, not a documented
-compatibility exception.
+The executed matrix covered identity/hash and app-server start; nested workspace
+state; create with the three-false runtime-preference response; subscribe/send;
+queue; stop and later send; permission offered-option allow plus local hard
+deny; unsupported input; ledger MCP; partial/final report integrity; optional
+close; and process-group reap. GLM-5.3 was temporarily added to the existing
+authenticated provider catalog without reading or copying credentials. The
+original config SHA-256 was restored to
+`400b4836a700ca8eca974d3cb45dc06dbfd692058d34320543cb75d06882ffdf`.

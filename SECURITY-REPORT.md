@@ -87,14 +87,13 @@ back.
 
 ## Residual risks
 
-- Official ZCode runtime behavior is unverified because no explicit local
-  runtime was available.
+- Official ZCode 3.8.1 behavior was verified locally. Compatibility remains
+  hash/version-specific and does not imply future runtime compatibility.
 - Same-UID tampering, workstation compromise, and malicious replacement of
   configured binaries are outside the supported threat model.
 - Darwin network isolation is capability reporting, not enforcement.
 - Linux behavior was not executed; Windows is unsupported.
 - A runtime crash cannot resume the original live session; partial evidence is
   retained and runtime loss is classified.
-- The repository lacks a top-level distribution license and complete dependency
-  license report. This is a release/legal limitation, not a runtime security
-  finding.
+- The repository has a top-level MIT license, but Cargo package license metadata
+  and a complete dependency license report remain outstanding.

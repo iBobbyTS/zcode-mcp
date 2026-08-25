@@ -22,12 +22,14 @@ When the variable is absent, or the path is not a regular file, the result is
 gap, not a compatibility claim.
 
 When a regular file is supplied, the probe starts `node <runtime> app-server`,
-sends the smallest read-only `workspace/readState` request, and records only
+sends the current strict-NDJSON nested-workspace `workspace/readState` request,
+and records only
 observed response method/event names. It uses a bounded timeout and classifies
 startup, malformed output, timeout, and non-zero exit as `failed` or
 `incompatible`; payloads are never persisted. A successful exchange is marked
 `tested` only when a valid JSON response is observed.
 
 `runtime_version` is `unknown` unless the runtime itself exposes a version in a
-future explicit probe. The record includes the installed Node `node_version`
+future explicit probe. Current and available model IDs are emitted only when
+the workspace response exposes them. The record includes Node `node_version`
 for provenance. The implementation and tests are Rust-only.

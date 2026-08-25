@@ -61,3 +61,16 @@ cannot count as new independent evidence; DELTA is consultation only.
 Keep GPT and GLM RAW/admission/provenance artifacts separate. Main Codex alone
 admits findings and controls Clean counts, repair caps, recovery, sequencing,
 and acceptance.
+
+## Official ZCode 3.8.1 catalog
+
+The verified runtime entry SHA-256 is `9318f60f...e4274`. Its OAuth-generated
+CLI config may omit `zai/glm-5.3` even when the authenticated endpoint accepts
+it. The proven operator workaround adds only a `glm-5.3` model entry to the
+existing `zai` provider and selects `model.main = "zai/glm-5.3"`; it must not
+copy or replace provider credentials. Back up the exact config first and verify
+byte-for-byte restoration after a temporary compatibility run.
+
+The product reports the workspace model catalog it observes. A missing requested
+model is a configuration limitation, not permission to migrate desktop
+credentials or create a second config owner.

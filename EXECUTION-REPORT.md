@@ -5,14 +5,14 @@
 - Feature: `zcode-review-mcp`
 - Branch: `codex/zcode-review-mcp`
 - Feature base: `73c379e04a09015c29591214eb29093da7300e10`
-- Final product/test head: `b8da3d250732b7788c6522dc36f5b723a1eed17d`
+- Final product/test head: `e2fc9b0bc1bb9df617d808935428b206af79a3da`
 - Authoritative PLAN-FULL SHA-256:
   `3d12938489faf5629bde074cd277799b1d0de9352d9e273c00d85ed6397270f8`
 - S09 documentation is a later docs-only commit. Its exact Git identity is
   recorded in `.agent-work/sections/S09-HANDOFF.md` and the final audit record;
   a Git commit cannot contain its own hash.
 - Readiness: `mergeable` for the accepted fake-runtime contract.
-- Real official ZCode runtime: `UNVERIFIED_NOT_AVAILABLE`.
+- Real official ZCode runtime: `VERIFIED_ZCODE_3_8_1_GLM_5_3`.
 - Audit pack: finalized separately by the workflow orchestrator after S09
   acceptance; this report does not claim pack completion.
 
@@ -29,6 +29,7 @@
 | S06 | `af74e67a932be707677e7405f070098454b887fd` | internal orchestration accepted |
 | S07 | `20ee37c2f4c70c9acd98ba53b48aeba2199a8f14` | public MCP accepted |
 | S08 | `b8da3d250732b7788c6522dc36f5b723a1eed17d` | shadow integration accepted |
+| S09 compatibility delta | `e2fc9b0bc1bb9df617d808935428b206af79a3da` | official ZCode 3.8.1 candidate |
 
 The historical S02 supervisor commits remain visible in Git as unaccepted
 evidence. The accepted tree contains no `zcode-supervisor` product owner.
@@ -85,6 +86,7 @@ bb09e48ab5f75a8f6d39c8870777054a5604c225 fix(review): distinguish path entry ope
 af74e67a932be707677e7405f070098454b887fd fix(review): complete S06 internal composition
 20ee37c2f4c70c9acd98ba53b48aeba2199a8f14 test(mcp): prove claimed public review flow
 b8da3d250732b7788c6522dc36f5b723a1eed17d fix(shadow): require complete matching evidence
+e2fc9b0bc1bb9df617d808935428b206af79a3da fix(runtime): support official ZCode 3.8.1
 ```
 
 The full Git sequence, including intermediate repair commits and preserved
@@ -137,13 +139,14 @@ therefore not required by the active workflow.
 
 ## Limitations
 
-- No official local ZCode runtime was available, so real-runtime compatibility
-  is not verified.
+- Official ZCode 3.8.1 was verified through the current Driver, RuntimeOwner,
+  scheduler, ledger, and report owners. The local GLM-5.3 catalog entry remains
+  an operator workaround; the original config was restored byte-equivalently.
 - `interaction/requestUserInput` is visible as non-respondable and becomes
   `evidence_incomplete`; no response method is invented.
 - Same-turn live steering and session resume are unsupported.
 - Darwin is the executed platform. Linux-specific execution is unverified.
 - Network isolation and a hostile same-UID boundary are not claimed.
-- The project has no top-level distribution license or Cargo package license
-  metadata. Research references are pinned but not copied; dependency and
-  distribution licensing requires a separate release decision.
+- The project has a top-level MIT `LICENSE`, but Cargo package license metadata
+  and a complete dependency license audit are not present. Research references
+  are pinned but not copied.
