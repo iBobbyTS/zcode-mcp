@@ -140,6 +140,13 @@ pub struct PublicAttachment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedContext {
+    pub repository_relative: PathBuf,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedGeneralTask {
     pub schema: String,
     pub task_id: String,
@@ -148,12 +155,13 @@ pub struct PreparedGeneralTask {
     pub profile: GeneralProfile,
     pub prompt_path: PathBuf,
     pub prompt_sha256: String,
-    pub context_paths: Vec<PathBuf>,
+    pub context: Vec<PreparedContext>,
     pub attachments: Vec<PreparedAttachment>,
     pub write_manifest: Vec<PathBuf>,
     pub worktree: PreparedWorktree,
     pub scratch_root: PathBuf,
     pub artifact_root: PathBuf,
+    pub artifact_targets: BTreeMap<GeneralArtifactKind, PathBuf>,
     pub effective_budget: BudgetLimits,
     pub validation_commands: BTreeMap<String, PreparedCommand>,
     pub retain_partial: bool,
@@ -174,14 +182,36 @@ impl PreparedGeneralTask {
         }
         Ok(())
     }
+    pub fn validate_prepared_content(&self) -> PreparationResult<()> {
+        let job_root = self
+            .worktree
+            .scratch_worktrees_root
+            .parent()
+            .ok_or_else(|| PreparationError::Worktree("missing job root".into()))?;
+        verify_confined_file(job_root, &self.prompt_path, &self.prompt_sha256, None)?;
+        for attachment in &self.attachments {
+            verify_confined_file(
+                job_root,
+                &attachment.prepared_path,
+                &attachment.sha256,
+                Some(attachment.size_bytes),
+            )?;
+        }
+        for context in &self.context {
+            let path = reject_symlink_path(&self.worktree.path, &context.repository_relative)?;
+            verify_file(&path, &context.sha256, Some(context.size_bytes))?;
+        }
+        Ok(())
+    }
     pub fn launcher(&self) -> PreparationResult<PolicyLauncher> {
         self.validate_digest()?;
+        self.validate_prepared_content()?;
         let mut inputs = vec![self.prompt_path.clone()];
         inputs.extend(self.attachments.iter().map(|a| a.prepared_path.clone()));
         inputs.extend(
-            self.context_paths
+            self.context
                 .iter()
-                .map(|p| self.worktree.path.join(p)),
+                .map(|context| self.worktree.path.join(&context.repository_relative)),
         );
         let mode = match self.profile {
             GeneralProfile::AnalysisReadonly => PolicyMode::GeneralReadonly,
@@ -241,23 +271,6 @@ impl GeneralTaskPreparer {
             .iter()
             .map(|p| confined_relative(p))
             .collect::<PreparationResult<Vec<_>>>()?;
-        let mut context_bytes = manifest.prompt.len() as u64;
-        for path in &context_paths {
-            reject_protected(path)?;
-            let full = reject_symlink_path(&repository, path)?;
-            if !full.is_file() {
-                return Err(PreparationError::MissingInput(full));
-            }
-            if secret_type(&full) {
-                return Err(PreparationError::CredentialInput(full));
-            }
-            context_bytes = context_bytes.saturating_add(fs::metadata(full)?.len());
-        }
-        if context_bytes > effective_budget.max_context_bytes {
-            return Err(PreparationError::InvalidManifest(
-                "context byte limit exceeded".into(),
-            ));
-        }
         let write_manifest = manifest
             .write_manifest
             .iter()
@@ -311,6 +324,12 @@ impl GeneralTaskPreparer {
         let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
         let worktree = manager.create(&base_sha, &key)?;
         let built = (|| {
+            let (context, context_bytes) = prepare_context(
+                &worktree.path,
+                &context_paths,
+                manifest.prompt.len() as u64,
+                effective_budget.max_context_bytes,
+            )?;
             let private_root = create_dir(&job_root, "private-inputs")?;
             let prompt_path = private_root.join("prompt.txt");
             atomic_write(&prompt_path, manifest.prompt.as_bytes())?;
@@ -324,6 +343,20 @@ impl GeneralTaskPreparer {
                 &self.attachment_roots,
             )?;
             let scratch_root = create_dir(&job_root, "scratch")?;
+            let artifact_targets = BTreeMap::from([
+                (
+                    GeneralArtifactKind::ReportMarkdown,
+                    scratch_root.join("agent-artifacts/report.md"),
+                ),
+                (
+                    GeneralArtifactKind::CheckReport,
+                    scratch_root.join("agent-artifacts/check-report.json"),
+                ),
+                (
+                    GeneralArtifactKind::ChangesPatch,
+                    artifact_root.join("changes.patch"),
+                ),
+            ]);
             let validation_commands = manifest
                 .validation_commands
                 .iter()
@@ -348,12 +381,13 @@ impl GeneralTaskPreparer {
                 profile: manifest.profile,
                 prompt_path,
                 prompt_sha256: hash(manifest.prompt.as_bytes()),
-                context_paths,
+                context,
                 attachments,
                 write_manifest,
                 worktree: worktree.clone(),
                 scratch_root,
                 artifact_root,
+                artifact_targets,
                 effective_budget,
                 validation_commands,
                 retain_partial: manifest.retain_partial,
@@ -381,6 +415,7 @@ impl GeneralTaskPreparer {
                         "general preparation failed ({error}); cleanup failed ({cleanup})"
                     )));
                 }
+                cleanup_job_root_path(&job_root)?;
                 Err(error)
             }
         }
@@ -408,9 +443,13 @@ pub struct ArtifactMetadata {
     pub size_bytes: u64,
     pub partial: bool,
     pub head_commit: Option<String>,
+    pub base_sha: String,
+    pub changed_paths: Vec<String>,
+    pub diff_stat: Option<String>,
+    pub media_type: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeneralArtifactKind {
     ReportMarkdown,
@@ -419,9 +458,23 @@ pub enum GeneralArtifactKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneralArtifactIntent {
+    pub kind: GeneralArtifactKind,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralCompletion {
     pub outcome: CompletionOutcome,
     pub reason_code: Option<String>,
+    pub summary: String,
+    pub checks: Vec<String>,
+    pub residual_gaps: Vec<String>,
+    pub artifacts: Vec<ArtifactMetadata>,
     pub artifact: Option<ArtifactMetadata>,
     pub cleaned: bool,
 }
@@ -435,10 +488,21 @@ pub struct GeneralCompletionSubmission {
     pub checks: Vec<String>,
     #[serde(default)]
     pub residual_gaps: Vec<String>,
+    #[serde(default)]
+    pub artifact_intents: Vec<GeneralArtifactIntent>,
 }
 
 pub struct GeneralFinalizer;
 impl GeneralFinalizer {
+    pub fn retry_cleanup(
+        prepared: &PreparedGeneralTask,
+        persisted: &GeneralCompletion,
+    ) -> GeneralCompletion {
+        let mut completion = persisted.clone();
+        completion.cleaned = cleanup_if_trusted(prepared);
+        completion
+    }
+
     pub fn finalize_submission(
         prepared: &PreparedGeneralTask,
         submission: &GeneralCompletionSubmission,
@@ -449,35 +513,109 @@ impl GeneralFinalizer {
         ) {
             return invalid_completion(prepared, "COMPLETION_OUTCOME_NOT_REQUESTABLE");
         }
+        if submission.summary.trim().is_empty()
+            || submission.summary.contains('\0')
+            || submission.checks.len() > 128
+            || submission.residual_gaps.len() > 128
+            || submission
+                .checks
+                .iter()
+                .chain(&submission.residual_gaps)
+                .any(|value| value.contains('\0'))
+            || submission.artifact_intents.iter().any(|intent| {
+                intent.sha256.as_ref().is_some_and(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) || intent.size_bytes == Some(0)
+            })
+        {
+            return invalid_completion(prepared, "COMPLETION_METADATA_INVALID");
+        }
         let encoded = serde_json::to_vec(submission).unwrap_or_default();
         if encoded.len() as u64 > prepared.effective_budget.max_result_bytes {
             return invalid_completion(prepared, "RESULT_TOO_LARGE");
         }
-        Self::finalize(prepared, submission.requested_outcome)
+        Self::finish(
+            prepared,
+            submission.requested_outcome,
+            submission.summary.clone(),
+            submission.checks.clone(),
+            submission.residual_gaps.clone(),
+            &submission.artifact_intents,
+        )
     }
 
     pub fn finalize(
         prepared: &PreparedGeneralTask,
         requested: CompletionOutcome,
     ) -> GeneralCompletion {
-        match Self::try_finalize(prepared, requested) {
-            Ok(v) => v,
-            Err(code) => GeneralCompletion {
-                outcome: CompletionOutcome::ResultInvalid,
-                reason_code: Some(code),
-                artifact: None,
-                cleaned: cleanup_after_failure(prepared),
-            },
+        Self::finish(
+            prepared,
+            requested,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            &[],
+        )
+    }
+
+    fn finish(
+        prepared: &PreparedGeneralTask,
+        requested: CompletionOutcome,
+        summary: String,
+        checks: Vec<String>,
+        residual_gaps: Vec<String>,
+        intents: &[GeneralArtifactIntent],
+    ) -> GeneralCompletion {
+        match Self::try_finalize(
+            prepared,
+            requested,
+            summary.clone(),
+            checks.clone(),
+            residual_gaps.clone(),
+            intents,
+        ) {
+            Ok(mut completion) => {
+                completion.cleaned = cleanup_after_failure(prepared);
+                if !completion.cleaned {
+                    completion.outcome = CompletionOutcome::ResultInvalid;
+                    completion.reason_code = Some("TASK_ROOT_CLEANUP_FAILED".into());
+                }
+                completion
+            }
+            Err(code) => {
+                if code != "ARTIFACT_ROOT_NOT_EMPTY" {
+                    cleanup_failed_artifact_outputs(prepared);
+                }
+                GeneralCompletion {
+                    outcome: CompletionOutcome::ResultInvalid,
+                    reason_code: Some(code),
+                    summary,
+                    checks,
+                    residual_gaps,
+                    artifacts: Vec::new(),
+                    artifact: None,
+                    cleaned: cleanup_if_trusted(prepared),
+                }
+            }
         }
     }
     fn try_finalize(
         prepared: &PreparedGeneralTask,
         requested: CompletionOutcome,
+        summary: String,
+        checks: Vec<String>,
+        residual_gaps: Vec<String>,
+        intents: &[GeneralArtifactIntent],
     ) -> Result<GeneralCompletion, String> {
         prepared
             .validate_digest()
             .map_err(|_| "PREPARED_TASK_INVALID".to_owned())?;
+        prepared
+            .validate_prepared_content()
+            .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
         let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
+        prefinalization_integrity(prepared, &manager)?;
+        let mut artifacts = collect_declared_artifacts(prepared, intents)?;
         let mut artifact = None;
         match prepared.profile {
             GeneralProfile::AnalysisReadonly | GeneralProfile::TestRunner => {
@@ -502,8 +640,25 @@ impl GeneralFinalizer {
                     ));
                 if retain {
                     artifact = finalize_patch(prepared, requested != CompletionOutcome::Succeeded)?;
+                    if let Some(patch) = &artifact {
+                        validate_patch_intent(intents, patch)?;
+                        artifacts.push(patch.clone());
+                    } else if intents
+                        .iter()
+                        .any(|intent| intent.kind == GeneralArtifactKind::ChangesPatch)
+                    {
+                        return Err("DECLARED_ARTIFACT_MISSING".into());
+                    }
                 }
             }
+        }
+        if artifacts
+            .iter()
+            .map(|artifact| artifact.size_bytes)
+            .sum::<u64>()
+            > prepared.effective_budget.max_artifact_bytes
+        {
+            return Err("ARTIFACT_LIMIT_EXCEEDED".into());
         }
         let mut cleanup_worktree = prepared.worktree.clone();
         if let Some(a) = &artifact {
@@ -517,18 +672,16 @@ impl GeneralFinalizer {
         if !diagnostics.source_integrity_preserved() {
             return Err("SOURCE_INTEGRITY_FAILED".into());
         }
-        let record = manager
-            .persist_integrity(&cleanup_worktree, diagnostics)
-            .map_err(|_| "CLEANUP_RECORD_FAILED".to_owned())?;
-        manager
-            .cleanup_from_record(&record)
-            .map_err(|_| "WORKTREE_CLEANUP_FAILED".to_owned())?;
-        cleanup_scratch(prepared).map_err(|_| "SCRATCH_CLEANUP_FAILED".to_owned())?;
+        persist_artifact_inventory(prepared, &artifacts)?;
         Ok(GeneralCompletion {
             outcome: requested,
             reason_code: None,
+            summary,
+            checks,
+            residual_gaps,
+            artifacts,
             artifact,
-            cleaned: true,
+            cleaned: false,
         })
     }
 }
@@ -537,9 +690,250 @@ fn invalid_completion(prepared: &PreparedGeneralTask, code: &str) -> GeneralComp
     GeneralCompletion {
         outcome: CompletionOutcome::ResultInvalid,
         reason_code: Some(code.into()),
+        summary: String::new(),
+        checks: Vec::new(),
+        residual_gaps: Vec::new(),
+        artifacts: Vec::new(),
         artifact: None,
-        cleaned: cleanup_after_failure(prepared),
+        cleaned: cleanup_if_trusted(prepared),
     }
+}
+
+fn cleanup_failed_artifact_outputs(prepared: &PreparedGeneralTask) {
+    for name in [
+        "report.md",
+        "check-report.json",
+        "changes.patch",
+        "changes.manifest.json",
+        "artifacts.manifest.json",
+    ] {
+        let path = prepared.artifact_root.join(name);
+        if path.parent() == Some(prepared.artifact_root.as_path()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn prefinalization_integrity(
+    prepared: &PreparedGeneralTask,
+    manager: &WorktreeManager,
+) -> Result<(), String> {
+    let diagnostics = manager
+        .capture_integrity(&prepared.worktree)
+        .map_err(|_| "PREFINALIZATION_HEAD_INVALID".to_owned())?;
+    if !diagnostics.source_integrity_preserved()
+        || !diagnostics.detached_head_unchanged
+        || diagnostics.observed_head.as_deref() != Some(prepared.base_sha.as_str())
+        || prepared.worktree.head_sha != prepared.base_sha
+        || !diagnostics.staged_diff.is_empty()
+    {
+        return Err("PREFINALIZATION_HEAD_INVALID".into());
+    }
+    reject_unsafe_repository_config(&prepared.worktree.path)?;
+    Ok(())
+}
+
+fn reject_unsafe_repository_config(repository: &Path) -> Result<(), String> {
+    let output = safe_git_output(
+        repository,
+        &["config", "--local", "--get-regexp", "^(filter\\.|diff\\.)"],
+    )?;
+    if output.status.success() && !output.stdout.is_empty() {
+        return Err("UNSAFE_GIT_CONFIG".into());
+    }
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err("GIT_CONFIG_CHECK_FAILED".into());
+    }
+    Ok(())
+}
+
+fn collect_declared_artifacts(
+    prepared: &PreparedGeneralTask,
+    intents: &[GeneralArtifactIntent],
+) -> Result<Vec<ArtifactMetadata>, String> {
+    if intents.iter().enumerate().any(|(index, intent)| {
+        intents[..index]
+            .iter()
+            .any(|other| other.kind == intent.kind)
+    }) {
+        return Err("DUPLICATE_ARTIFACT_INTENT".into());
+    }
+    ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
+    let output_root = prepared
+        .artifact_targets
+        .get(&GeneralArtifactKind::ReportMarkdown)
+        .and_then(|path| path.parent())
+        .ok_or("ARTIFACT_TARGET_INVALID")?
+        .to_path_buf();
+    let expected_files = intents
+        .iter()
+        .filter_map(|intent| match intent.kind {
+            GeneralArtifactKind::ReportMarkdown => Some("report.md"),
+            GeneralArtifactKind::CheckReport => Some("check-report.json"),
+            GeneralArtifactKind::ChangesPatch => None,
+        })
+        .collect::<Vec<_>>();
+    if output_root.exists() {
+        let metadata =
+            fs::symlink_metadata(&output_root).map_err(|_| "ARTIFACT_INVENTORY_INVALID")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("ARTIFACT_INVENTORY_INVALID".into());
+        }
+        for entry in fs::read_dir(&output_root).map_err(|_| "ARTIFACT_INVENTORY_INVALID")? {
+            let entry = entry.map_err(|_| "ARTIFACT_INVENTORY_INVALID")?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or("ARTIFACT_INVENTORY_INVALID")?;
+            if !expected_files.contains(&name) {
+                return Err("UNDECLARED_ARTIFACT".into());
+            }
+        }
+    } else if !expected_files.is_empty() {
+        return Err("DECLARED_ARTIFACT_MISSING".into());
+    }
+
+    let mut artifacts = Vec::new();
+    for intent in intents {
+        let (source_name, destination_name) = match intent.kind {
+            GeneralArtifactKind::ReportMarkdown => ("report.md", "report.md"),
+            GeneralArtifactKind::CheckReport => ("check-report.json", "check-report.json"),
+            GeneralArtifactKind::ChangesPatch => {
+                if prepared.profile != GeneralProfile::ImplementationWorktree {
+                    return Err("CHANGES_PATCH_PROFILE_INVALID".into());
+                }
+                continue;
+            }
+        };
+        let expected_hash = intent.sha256.as_deref().ok_or("ARTIFACT_HASH_REQUIRED")?;
+        let expected_size = intent.size_bytes.ok_or("ARTIFACT_SIZE_REQUIRED")?;
+        let source = prepared
+            .artifact_targets
+            .get(&intent.kind)
+            .ok_or("ARTIFACT_TARGET_INVALID")?
+            .clone();
+        verify_file(&source, expected_hash, Some(expected_size))
+            .map_err(|_| "DECLARED_ARTIFACT_INVALID".to_owned())?;
+        let bytes = fs::read(&source).map_err(|_| "DECLARED_ARTIFACT_INVALID")?;
+        let destination = prepared.artifact_root.join(destination_name);
+        atomic_write(&destination, &bytes).map_err(|_| "ARTIFACT_WRITE_FAILED")?;
+        verify_file(&destination, expected_hash, Some(expected_size))
+            .map_err(|_| "AUTHORITATIVE_ARTIFACT_INVALID".to_owned())?;
+        artifacts.push(ArtifactMetadata {
+            artifact_id: hash(
+                format!("{}:{}:{expected_hash}", prepared.task_id, source_name).as_bytes(),
+            ),
+            kind: intent.kind,
+            sha256: expected_hash.into(),
+            size_bytes: expected_size,
+            partial: false,
+            head_commit: None,
+            base_sha: prepared.base_sha.clone(),
+            changed_paths: Vec::new(),
+            diff_stat: None,
+            media_type: match intent.kind {
+                GeneralArtifactKind::ReportMarkdown => "text/markdown; charset=utf-8",
+                GeneralArtifactKind::CheckReport => "application/json",
+                GeneralArtifactKind::ChangesPatch => unreachable!(),
+            }
+            .into(),
+        });
+    }
+    if artifacts
+        .iter()
+        .map(|artifact| artifact.size_bytes)
+        .sum::<u64>()
+        > prepared.effective_budget.max_artifact_bytes
+    {
+        return Err("ARTIFACT_LIMIT_EXCEEDED".into());
+    }
+    Ok(artifacts)
+}
+
+fn validate_patch_intent(
+    intents: &[GeneralArtifactIntent],
+    patch: &ArtifactMetadata,
+) -> Result<(), String> {
+    let Some(intent) = intents
+        .iter()
+        .find(|intent| intent.kind == GeneralArtifactKind::ChangesPatch)
+    else {
+        return Ok(());
+    };
+    if intent
+        .sha256
+        .as_deref()
+        .is_some_and(|value| value != patch.sha256)
+        || intent
+            .size_bytes
+            .is_some_and(|value| value != patch.size_bytes)
+    {
+        return Err("CHANGES_PATCH_INTENT_MISMATCH".into());
+    }
+    Ok(())
+}
+
+fn persist_artifact_inventory(
+    prepared: &PreparedGeneralTask,
+    artifacts: &[ArtifactMetadata],
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(artifacts)
+        .map_err(|_| "ARTIFACT_INVENTORY_INVALID".to_owned())?;
+    let path = prepared.artifact_root.join("artifacts.manifest.json");
+    atomic_write(&path, &bytes).map_err(|_| "ARTIFACT_INVENTORY_WRITE_FAILED".to_owned())?;
+    verify_file(&path, &hash(&bytes), Some(bytes.len() as u64))
+        .map_err(|_| "ARTIFACT_INVENTORY_INVALID".to_owned())
+}
+
+fn reject_gitlinks(repository: &Path) -> Result<(), String> {
+    let raw = git_bytes(
+        repository,
+        &[
+            "diff",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
+    )?;
+    if raw
+        .windows(b"160000".len())
+        .any(|window| window == b"160000")
+    {
+        return Err("GITLINK_CHANGE_DENIED".into());
+    }
+    Ok(())
+}
+
+fn validate_final_commit(repository: &Path, base: &str, head: &str) -> Result<(), String> {
+    let parents = String::from_utf8(git_bytes(
+        repository,
+        &["rev-list", "--parents", "-n", "1", head],
+    )?)
+    .map_err(|_| "FINAL_COMMIT_INVALID".to_owned())?;
+    let fields = parents.split_whitespace().collect::<Vec<_>>();
+    if fields != [head, base] {
+        return Err("FINAL_COMMIT_LINEAGE_INVALID".into());
+    }
+    let symbolic = safe_git_output(repository, &["symbolic-ref", "-q", "HEAD"])?;
+    if symbolic.status.success() || symbolic.status.code() != Some(1) {
+        return Err("FINAL_HEAD_NOT_DETACHED".into());
+    }
+    Ok(())
+}
+
+fn ensure_directory_empty(path: &Path, code: &'static str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| code.to_owned())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(code.into());
+    }
+    if fs::read_dir(path)
+        .map_err(|_| code.to_owned())?
+        .next()
+        .is_some()
+    {
+        return Err(code.into());
+    }
+    Ok(())
 }
 
 fn finalize_patch(
@@ -570,28 +964,31 @@ fn finalize_patch(
             return Err("CHANGED_PATH_NOT_ALLOWLISTED".into());
         }
     }
-    let mut add = Command::new("git");
-    add.current_dir(&prepared.worktree.path).args(["add", "--"]);
-    for p in &paths {
-        add.arg(p);
-    }
-    let out = add.output().map_err(|_| "GIT_STAGE_FAILED".to_owned())?;
+    let mut add_args = vec!["add", "--"];
+    add_args.extend(paths.iter().map(String::as_str));
+    let out = safe_git_output(&prepared.worktree.path, &add_args)
+        .map_err(|_| "GIT_STAGE_FAILED".to_owned())?;
     if !out.status.success() {
         return Err("GIT_STAGE_FAILED".into());
     }
-    let out = Command::new("git")
-        .current_dir(&prepared.worktree.path)
-        .args([
+    reject_gitlinks(&prepared.worktree.path)?;
+    let out = safe_git_output(
+        &prepared.worktree.path,
+        &[
             "-c",
             "user.name=zcode-reviewd",
             "-c",
             "user.email=zcode-reviewd@localhost",
+            "-c",
+            "commit.gpgSign=false",
             "commit",
+            "--no-verify",
+            "--no-gpg-sign",
             "-m",
             "chore(agent): finalize bounded task result",
-        ])
-        .output()
-        .map_err(|_| "GIT_COMMIT_FAILED".to_owned())?;
+        ],
+    )
+    .map_err(|_| "GIT_COMMIT_FAILED".to_owned())?;
     if !out.status.success() {
         return Err("GIT_COMMIT_FAILED".into());
     }
@@ -599,16 +996,55 @@ fn finalize_patch(
         .map_err(|_| "GIT_HEAD_INVALID".to_owned())?
         .trim()
         .to_owned();
+    validate_final_commit(&prepared.worktree.path, &prepared.base_sha, &head)?;
     let patch = git_bytes(
         &prepared.worktree.path,
-        &["diff", "--binary", &prepared.base_sha, &head],
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            &prepared.base_sha,
+            &head,
+        ],
     )?;
+    let repeated = git_bytes(
+        &prepared.worktree.path,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            &prepared.base_sha,
+            &head,
+        ],
+    )?;
+    if patch != repeated {
+        return Err("PATCH_NOT_DETERMINISTIC".into());
+    }
     if patch.len() as u64 > prepared.effective_budget.max_artifact_bytes {
         return Err("ARTIFACT_LIMIT_EXCEEDED".into());
     }
-    let path = prepared.artifact_root.join("changes.patch");
-    atomic_write(&path, &patch).map_err(|_| "ARTIFACT_WRITE_FAILED".to_owned())?;
+    let path = prepared
+        .artifact_targets
+        .get(&GeneralArtifactKind::ChangesPatch)
+        .ok_or("ARTIFACT_TARGET_INVALID")?;
+    atomic_write(path, &patch).map_err(|_| "ARTIFACT_WRITE_FAILED".to_owned())?;
     let digest = hash(&patch);
+    verify_file(path, &digest, Some(patch.len() as u64))
+        .map_err(|_| "AUTHORITATIVE_ARTIFACT_INVALID".to_owned())?;
+    let diff_stat = String::from_utf8(git_bytes(
+        &prepared.worktree.path,
+        &[
+            "diff",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            &prepared.base_sha,
+            &head,
+        ],
+    )?)
+    .map_err(|_| "DIFF_STAT_INVALID".to_owned())?;
     let metadata = ArtifactMetadata {
         artifact_id: hash(format!("{}:{}", prepared.task_id, digest).as_bytes()),
         kind: GeneralArtifactKind::ChangesPatch,
@@ -616,6 +1052,10 @@ fn finalize_patch(
         size_bytes: patch.len() as u64,
         partial,
         head_commit: Some(head),
+        base_sha: prepared.base_sha.clone(),
+        changed_paths: paths,
+        diff_stat: Some(diff_stat),
+        media_type: "application/vnd.git-diff".into(),
     };
     atomic_write(
         &prepared.artifact_root.join("changes.manifest.json"),
@@ -802,6 +1242,87 @@ fn create_dir(root: &Path, name: &str) -> PreparationResult<PathBuf> {
     fs::create_dir_all(&p)?;
     Ok(fs::canonicalize(p)?)
 }
+fn prepare_context(
+    worktree: &Path,
+    paths: &[PathBuf],
+    prompt_bytes: u64,
+    max_context_bytes: u64,
+) -> PreparationResult<(Vec<PreparedContext>, u64)> {
+    let mut total = prompt_bytes;
+    let context = paths
+        .iter()
+        .map(|relative| {
+            reject_protected(relative)?;
+            let path = reject_symlink_path(worktree, relative)?;
+            if !path.is_file() {
+                return Err(PreparationError::MissingInput(path));
+            }
+            if secret_type(&path) {
+                return Err(PreparationError::CredentialInput(path));
+            }
+            let bytes = fs::read(&path)?;
+            total = total.saturating_add(bytes.len() as u64);
+            if total > max_context_bytes {
+                return Err(PreparationError::InvalidManifest(
+                    "context byte limit exceeded".into(),
+                ));
+            }
+            Ok(PreparedContext {
+                repository_relative: relative.clone(),
+                sha256: hash(&bytes),
+                size_bytes: bytes.len() as u64,
+            })
+        })
+        .collect::<PreparationResult<Vec<_>>>()?;
+    Ok((context, total))
+}
+
+fn verify_file(
+    path: &Path,
+    expected_hash: &str,
+    expected_size: Option<u64>,
+) -> PreparationResult<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PreparationError::SymlinkInput(path.into()));
+    }
+    let bytes = fs::read(path)?;
+    if expected_size.is_some_and(|size| size != bytes.len() as u64) || hash(&bytes) != expected_hash
+    {
+        return Err(PreparationError::InvalidManifest(format!(
+            "prepared content integrity changed: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+fn verify_confined_file(
+    root: &Path,
+    path: &Path,
+    expected_hash: &str,
+    expected_size: Option<u64>,
+) -> PreparationResult<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| PreparationError::PathEscape {
+            path: path.into(),
+            root: root.into(),
+        })?;
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component);
+        if fs::symlink_metadata(&cursor)?.file_type().is_symlink() {
+            return Err(PreparationError::SymlinkInput(cursor));
+        }
+    }
+    if fs::canonicalize(path)? != path {
+        return Err(PreparationError::PathEscape {
+            path: path.into(),
+            root: root.into(),
+        });
+    }
+    verify_file(path, expected_hash, expected_size)
+}
 fn snapshot_attachments(
     inputs: &[AttachmentInput],
     root: &Path,
@@ -935,54 +1456,103 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
     let Ok(manager) = manager(prepared) else {
         return false;
     };
-    if !prepared.worktree.path.exists() {
-        return true;
+    if prepared.worktree.path.exists() {
+        let Ok(head) = git_bytes(&prepared.worktree.path, &["rev-parse", "HEAD"]) else {
+            return false;
+        };
+        let Ok(head) = String::from_utf8(head) else {
+            return false;
+        };
+        if safe_git_output(&prepared.worktree.path, &["symbolic-ref", "-q", "HEAD"])
+            .is_ok_and(|output| output.status.success())
+            && !safe_git_output(
+                &prepared.worktree.path,
+                &["checkout", "--detach", head.trim()],
+            )
+            .is_ok_and(|output| output.status.success())
+        {
+            return false;
+        }
+        let mut worktree = prepared.worktree.clone();
+        worktree.head_sha = head.trim().into();
+        let Ok(diagnostics) = manager.capture_integrity(&worktree) else {
+            return false;
+        };
+        let Ok(record) = manager.persist_integrity(&worktree, diagnostics) else {
+            return false;
+        };
+        if manager.cleanup_from_record(&record).is_err() {
+            return false;
+        }
     }
-    let Ok(head) = git_bytes(&prepared.worktree.path, &["rev-parse", "HEAD"]) else {
+    let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
         return false;
     };
-    let Ok(head) = String::from_utf8(head) else {
-        return false;
-    };
-    let mut worktree = prepared.worktree.clone();
-    worktree.head_sha = head.trim().into();
-    let Ok(diagnostics) = manager.capture_integrity(&worktree) else {
-        return false;
-    };
-    let Ok(record) = manager.persist_integrity(&worktree, diagnostics) else {
-        return false;
-    };
-    manager.cleanup_from_record(&record).is_ok() && cleanup_scratch(prepared).is_ok()
+    cleanup_job_root_path(job_root).is_ok()
 }
-fn cleanup_scratch(prepared: &PreparedGeneralTask) -> PreparationResult<()> {
-    if !prepared.scratch_root.exists() {
+fn cleanup_if_trusted(prepared: &PreparedGeneralTask) -> bool {
+    prepared.validate_digest().is_ok() && cleanup_after_failure(prepared)
+}
+fn cleanup_job_root_path(job_root: &Path) -> PreparationResult<()> {
+    if !job_root.exists() {
         return Ok(());
     }
-    let scratch = fs::canonicalize(&prepared.scratch_root)?;
-    let job_root = prepared
-        .worktree
-        .scratch_worktrees_root
+    let root = fs::canonicalize(job_root)?;
+    let parent = root
         .parent()
-        .ok_or_else(|| PreparationError::Worktree("missing job root".into()))?;
-    if scratch == job_root || !scratch.starts_with(job_root) || scratch.file_name().is_none() {
+        .map(Path::to_path_buf)
+        .ok_or_else(|| PreparationError::Worktree("job root has no parent".into()))?;
+    let repository = root
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .ok_or_else(|| PreparationError::Worktree("job root has no repository ancestor".into()))?;
+    let allowed = repository.join(".agent-work/scratch");
+    if root.file_name().is_none()
+        || root == parent
+        || !root.starts_with(&allowed)
+        || root
+            .components()
+            .any(|component| component.as_os_str() == ".git")
+    {
         return Err(PreparationError::PathEscape {
-            path: scratch,
-            root: job_root.into(),
+            path: root,
+            root: parent,
         });
     }
-    fs::remove_dir_all(scratch)?;
+    fs::remove_dir_all(&root)?;
+    if root.exists() {
+        return Err(PreparationError::Worktree(
+            "job root remains after cleanup".into(),
+        ));
+    }
     Ok(())
 }
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .map_err(|_| "GIT_COMMAND_FAILED".to_owned())?;
+    let out = safe_git_output(repo, args)?;
     if !out.status.success() {
         return Err("GIT_COMMAND_FAILED".into());
     }
     Ok(out.stdout)
+}
+fn safe_git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .current_dir(repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", "/var/empty")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .args(["-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat"])
+        .args(args)
+        .output()
+        .map_err(|_| "GIT_COMMAND_FAILED".to_owned())
 }
 fn parse_status_paths(bytes: &[u8]) -> Result<Vec<String>, String> {
     let fields = bytes

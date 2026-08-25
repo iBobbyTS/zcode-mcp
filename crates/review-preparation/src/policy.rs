@@ -529,6 +529,9 @@ impl PolicyLauncher {
                 _ => Some("tracked_writes_denied_for_profile"),
             };
         }
+        if !matches!(self.mode, PolicyMode::ReviewReadonly) && target.starts_with(report_root) {
+            return Some("daemon_artifact_root_denied");
+        }
         if target == self.scratch_root
             || target == report_root
             || (!target.starts_with(&self.scratch_root) && !target.starts_with(report_root))

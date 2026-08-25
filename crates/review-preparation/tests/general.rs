@@ -1,7 +1,8 @@
 use review_preparation::{
-    AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactKind,
-    GeneralCompletionSubmission, GeneralFinalizer, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PermissionRequest, PreparationError, GENERAL_TASK_SCHEMA,
+    AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactIntent,
+    GeneralArtifactKind, GeneralCompletionSubmission, GeneralFinalizer, GeneralProfile,
+    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PreparationError,
+    GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -191,6 +192,12 @@ fn failed_preparation_reaps_worktree_and_profile_set_is_closed() {
         git(&f.repository, &["worktree", "list", "--porcelain"]),
         before
     );
+    assert!(
+        fs::read_dir(f.repository.join(".agent-work/scratch/general"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert!(serde_json::from_str::<GeneralProfile>("\"review_readonly\"").is_err());
     assert_eq!(
         serde_json::to_string(&GeneralProfile::TestRunner).unwrap(),
@@ -231,6 +238,14 @@ fn profile_policy_allows_only_frozen_implementation_paths() {
         !policy
             .decide(
                 &PermissionRequest::Write(implementation.worktree.path.join("README.md")),
+                ExternalDecision::Allow
+            )
+            .allowed
+    );
+    assert!(
+        !policy
+            .decide(
+                &PermissionRequest::Write(implementation.artifact_root.join("leak.txt")),
                 ExternalDecision::Allow
             )
             .allowed
@@ -285,6 +300,7 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
             summary: "implemented".into(),
             checks: vec!["unit".into()],
             residual_gaps: vec![],
+            artifact_intents: vec![],
         },
     );
     assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
@@ -297,6 +313,26 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
     assert!(String::from_utf8_lossy(&patch).contains("value() -> u8 { 2 }"));
     assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(&patch)));
     assert_ne!(artifact.head_commit.as_deref(), Some(f.head.as_str()));
+    assert_eq!(artifact.base_sha, f.head);
+    assert_eq!(artifact.changed_paths, ["src/lib.rs"]);
+    assert!(artifact
+        .diff_stat
+        .as_deref()
+        .is_some_and(|stat| stat.contains("src/lib.rs")));
+    let expected_patch = Command::new("git")
+        .current_dir(&f.repository)
+        .args([
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            &artifact.base_sha,
+            artifact.head_commit.as_deref().unwrap(),
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(patch, expected_patch);
     assert_eq!(git(&f.repository, &["rev-parse", "HEAD"]), source_head);
     assert!(completion.cleaned);
     assert_eq!(
@@ -315,7 +351,11 @@ fn readonly_change_and_result_limit_become_result_invalid() {
         .preparer()
         .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
         .unwrap();
-    fs::write(prepared.worktree.path.join("README.md"), "changed\n").unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 8 }\n",
+    )
+    .unwrap();
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(
@@ -336,6 +376,7 @@ fn readonly_change_and_result_limit_become_result_invalid() {
             summary: "too long".into(),
             checks: vec![],
             residual_gaps: vec![],
+            artifact_intents: vec![],
         },
     );
     assert_eq!(completion.reason_code.as_deref(), Some("RESULT_TOO_LARGE"));
@@ -440,6 +481,328 @@ fn artifact_limit_failure_is_result_invalid_and_reaped() {
     );
     assert!(completion.cleaned);
     assert!(!prepared.worktree.path.exists());
+}
+
+#[test]
+fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
+    let mut f = Fixture::new();
+    fs::write(f.repository.join("README.md"), vec![b'x'; 4096]).unwrap();
+    git(&f.repository, &["add", "README.md"]);
+    git(&f.repository, &["commit", "-m", "large base context"]);
+    f.head = git(&f.repository, &["rev-parse", "HEAD"]);
+    fs::write(f.repository.join("README.md"), "small source drift\n").unwrap();
+    let mut manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+    budget.max_context_bytes = 512;
+    manifest.budget = Some(budget);
+    assert!(matches!(
+        f.preparer().prepare(&manifest),
+        Err(PreparationError::InvalidManifest(_))
+    ));
+
+    let f = Fixture::new();
+    fs::write(f.repository.join("README.md"), vec![b'y'; 4096]).unwrap();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    assert_eq!(prepared.context[0].size_bytes, b"fixture\n".len() as u64);
+    fs::write(&prepared.prompt_path, "mutated prepared prompt").unwrap();
+    assert!(prepared.launcher().is_err());
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("PREPARED_CONTENT_INVALID")
+    );
+    assert!(completion.cleaned);
+    assert!(!prepared.prompt_path.exists());
+
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    fs::write(&prepared.attachments[0].prepared_path, "replacement").unwrap();
+    assert!(prepared.launcher().is_err());
+    assert_eq!(
+        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded)
+            .reason_code
+            .as_deref(),
+        Some("PREPARED_CONTENT_INVALID")
+    );
+
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("README.md"),
+        "changed context\n",
+    )
+    .unwrap();
+    assert!(prepared.launcher().is_err());
+    assert_eq!(
+        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded)
+            .reason_code
+            .as_deref(),
+        Some("PREPARED_CONTENT_INVALID")
+    );
+
+    let mut f = Fixture::new();
+    fs::remove_file(f.repository.join("README.md")).unwrap();
+    symlink("src/lib.rs", f.repository.join("README.md")).unwrap();
+    git(&f.repository, &["add", "README.md"]);
+    git(&f.repository, &["commit", "-m", "symlink context"]);
+    f.head = git(&f.repository, &["rev-parse", "HEAD"]);
+    fs::remove_file(f.repository.join("README.md")).unwrap();
+    fs::write(f.repository.join("README.md"), "regular source drift\n").unwrap();
+    assert!(matches!(
+        f.preparer()
+            .prepare(&f.manifest(GeneralProfile::AnalysisReadonly)),
+        Err(PreparationError::SymlinkInput(_))
+    ));
+}
+
+#[test]
+fn precreated_history_and_attached_head_are_rejected() {
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 5 }\n",
+    )
+    .unwrap();
+    git(&prepared.worktree.path, &["add", "src/lib.rs"]);
+    git(
+        &prepared.worktree.path,
+        &[
+            "-c",
+            "user.name=attacker",
+            "-c",
+            "user.email=attacker@example.invalid",
+            "commit",
+            "-m",
+            "pre-created history",
+        ],
+    );
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("PREFINALIZATION_HEAD_INVALID")
+    );
+    assert!(completion.cleaned);
+
+    let f = Fixture::new();
+    git(&f.repository, &["branch", "spare", &f.head]);
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    git(&prepared.worktree.path, &["checkout", "spare"]);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("PREFINALIZATION_HEAD_INVALID")
+    );
+    assert!(completion.cleaned);
+}
+
+#[test]
+fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let canary = f._temp.path().join("hook-canary");
+    let hooks = f._temp.path().join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf hook > '{}'\n", canary.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &f.repository,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    git(&f.repository, &["config", "commit.gpgSign", "true"]);
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 6 }\n",
+    )
+    .unwrap();
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert!(!canary.exists());
+
+    let f = Fixture::new();
+    let diff_canary = f._temp.path().join("diff-canary");
+    let script = f._temp.path().join("external-diff");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf diff > '{}'\n", diff_canary.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &f.repository,
+        &["config", "diff.evil.command", script.to_str().unwrap()],
+    );
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 7 }\n",
+    )
+    .unwrap();
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(completion.reason_code.as_deref(), Some("UNSAFE_GIT_CONFIG"));
+    assert!(!diff_canary.exists());
+
+    let f = Fixture::new();
+    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
+    manifest.write_manifest = vec!["vendor".into()];
+    let prepared = f.preparer().prepare(&manifest).unwrap();
+    let nested = prepared.worktree.path.join("vendor/sub");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("data.txt"), "nested").unwrap();
+    git(&nested, &["init"]);
+    git(&nested, &["add", "data.txt"]);
+    git(
+        &nested,
+        &[
+            "-c",
+            "user.name=nested",
+            "-c",
+            "user.email=nested@example.invalid",
+            "commit",
+            "-m",
+            "nested",
+        ],
+    );
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("GITLINK_CHANGE_DENIED")
+    );
+    assert!(completion.cleaned);
+}
+
+#[test]
+fn result_metadata_and_declared_artifact_inventory_are_preserved() {
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    let output_root = prepared.scratch_root.join("agent-artifacts");
+    fs::create_dir_all(&output_root).unwrap();
+    let report = b"# Analysis\n\nBounded result.\n";
+    fs::write(output_root.join("report.md"), report).unwrap();
+    let report_hash = format!("{:x}", Sha256::digest(report));
+    let completion = GeneralFinalizer::finalize_submission(
+        &prepared,
+        &GeneralCompletionSubmission {
+            requested_outcome: CompletionOutcome::Succeeded,
+            summary: "bounded summary".into(),
+            checks: vec!["cargo check".into()],
+            residual_gaps: vec!["owner decision".into()],
+            artifact_intents: vec![GeneralArtifactIntent {
+                kind: GeneralArtifactKind::ReportMarkdown,
+                sha256: Some(report_hash.clone()),
+                size_bytes: Some(report.len() as u64),
+            }],
+        },
+    );
+    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert_eq!(completion.summary, "bounded summary");
+    assert_eq!(completion.checks, ["cargo check"]);
+    assert_eq!(completion.residual_gaps, ["owner decision"]);
+    assert_eq!(completion.artifacts.len(), 1);
+    assert_eq!(completion.artifacts[0].sha256, report_hash);
+    assert_eq!(
+        fs::read(prepared.artifact_root.join("report.md")).unwrap(),
+        report
+    );
+    assert!(prepared
+        .artifact_root
+        .join("artifacts.manifest.json")
+        .is_file());
+    assert!(!prepared.prompt_path.exists());
+    let job_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
+    assert!(!job_root.exists());
+
+    let replay = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    assert!(replay.worktree.path.exists());
+    let replay_completion = GeneralFinalizer::finalize(&replay, CompletionOutcome::Blocked);
+    assert_eq!(
+        replay_completion.reason_code.as_deref(),
+        Some("ARTIFACT_ROOT_NOT_EMPTY")
+    );
+    assert!(replay_completion.cleaned);
+
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::TestRunner))
+        .unwrap();
+    let output_root = prepared.scratch_root.join("agent-artifacts");
+    fs::create_dir_all(&output_root).unwrap();
+    fs::write(output_root.join("undeclared.txt"), "unexpected").unwrap();
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("UNDECLARED_ARTIFACT")
+    );
+    assert!(completion.cleaned);
+}
+
+#[test]
+fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    fs::write(
+        prepared.worktree.path.join("src/lib.rs"),
+        "pub fn value() -> u8 { 10 }\n",
+    )
+    .unwrap();
+    let job_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
+    let owner_root = job_root.parent().unwrap();
+    let original = fs::metadata(owner_root).unwrap().permissions();
+    fs::set_permissions(owner_root, fs::Permissions::from_mode(0o500)).unwrap();
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    fs::set_permissions(owner_root, original).unwrap();
+    assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("TASK_ROOT_CLEANUP_FAILED")
+    );
+    assert!(!completion.cleaned);
+    assert!(completion.artifact.is_some());
+    assert_eq!(completion.artifacts.len(), 1);
+    assert!(prepared.artifact_root.join("changes.patch").is_file());
+
+    let cleanup = GeneralFinalizer::retry_cleanup(&prepared, &completion);
+    assert!(cleanup.cleaned);
+    assert!(cleanup.artifact.is_some());
+    assert!(prepared.artifact_root.join("changes.patch").is_file());
 }
 
 fn git(path: &Path, args: &[&str]) -> String {
