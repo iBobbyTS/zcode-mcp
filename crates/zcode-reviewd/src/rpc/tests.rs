@@ -195,11 +195,16 @@ struct Fixture {
     socket: PathBuf,
     store: Arc<Store>,
     factory: Arc<FakeFactory>,
+    scheduler: Scheduler,
     service: Arc<RpcService>,
     server: RpcServer,
 }
 
 fn fixture() -> Fixture {
+    fixture_with_options(ServerOptions::default(), Duration::from_secs(1))
+}
+
+fn fixture_with_options(options: ServerOptions, control_timeout: Duration) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("review.sqlite3");
     let socket = directory.path().join("rpc").join("review.sock");
@@ -214,18 +219,20 @@ fn fixture() -> Fixture {
             global_max_agents: 4,
             per_workspace_max_agents: 4,
             stop_grace: Duration::from_millis(100),
-            command_timeout: Duration::from_secs(1),
+            bootstrap_timeout: Duration::from_secs(1),
+            control_timeout,
         },
     )
     .unwrap();
     let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
-    let server = RpcServer::bind(&socket, Arc::clone(&service), ServerOptions::default()).unwrap();
+    let server = RpcServer::bind(&socket, Arc::clone(&service), options).unwrap();
     Fixture {
         _directory: directory,
         database,
         socket,
         store,
         factory,
+        scheduler,
         service,
         server,
     }
@@ -312,6 +319,81 @@ fn enqueue_request(agent_id: &str, key: &str) -> RpcMethod {
             initial_prompt: "Begin review.".into(),
         },
     }
+}
+
+#[test]
+fn timed_out_control_releases_bounded_rpc_worker_capacity() {
+    let fixture = fixture_with_options(
+        ServerOptions {
+            max_connections: 1,
+            connection_timeout: Duration::from_millis(200),
+        },
+        Duration::from_millis(80),
+    );
+    fixture
+        .scheduler
+        .enqueue(&NewJob::new("worker-timeout", "/workspace"))
+        .unwrap();
+    fixture.scheduler.start_ready().unwrap();
+    let operation = fixture
+        .scheduler
+        .active_session("worker-timeout")
+        .unwrap()
+        .3;
+    let guard = operation.lock().unwrap();
+    let baseline_references = Arc::strong_count(&operation);
+    let first = {
+        let socket = fixture.socket.clone();
+        thread::spawn(move || {
+            client(&socket)
+                .call(&request(
+                    "blocked-control",
+                    RpcMethod::Message(MessageInput {
+                        agent_id: "worker-timeout".into(),
+                        message_id: "blocked-message".into(),
+                        mode: "queue".into(),
+                        content: "continue".into(),
+                    }),
+                ))
+                .unwrap()
+        })
+    };
+    let entered_deadline = Instant::now() + Duration::from_secs(1);
+    while Arc::strong_count(&operation) <= baseline_references {
+        assert!(
+            Instant::now() < entered_deadline,
+            "blocked RPC worker never entered scheduler control"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let busy = client(&fixture.socket)
+        .call(&request(
+            "while-busy",
+            RpcMethod::Status {
+                agent_id: "worker-timeout".into(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(error(busy).code, RpcErrorCode::Conflict);
+    assert_eq!(error(first.join().unwrap()).code, RpcErrorCode::Unavailable);
+    drop(guard);
+    thread::sleep(Duration::from_millis(10));
+
+    assert!(matches!(
+        success(
+            client(&fixture.socket)
+                .call(&request(
+                    "after-timeout",
+                    RpcMethod::Status {
+                        agent_id: "worker-timeout".into(),
+                    },
+                ))
+                .unwrap()
+        ),
+        RpcSuccess::Status { .. }
+    ));
+    fixture.scheduler.close_job("worker-timeout").unwrap();
 }
 
 fn raw_call(path: &Path, frame: &[u8]) -> RpcResponse {
@@ -1024,7 +1106,8 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
             global_max_agents: 1,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_millis(100),
-            command_timeout: Duration::from_secs(1),
+            bootstrap_timeout: Duration::from_secs(1),
+            control_timeout: Duration::from_secs(1),
         },
     )
     .unwrap();
@@ -1173,7 +1256,8 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
             global_max_agents: 1,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_millis(100),
-            command_timeout: Duration::from_secs(2),
+            bootstrap_timeout: Duration::from_secs(2),
+            control_timeout: Duration::from_secs(2),
         },
     )
     .unwrap();

@@ -24,7 +24,8 @@ struct Config {
     runtime: Option<PathBuf>,
 }
 
-const PRODUCTION_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
+const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ledger-mcp")) {
@@ -85,7 +86,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn production_scheduler_config() -> SchedulerConfig {
     SchedulerConfig {
-        command_timeout: PRODUCTION_COMMAND_TIMEOUT,
+        bootstrap_timeout: PRODUCTION_BOOTSTRAP_TIMEOUT,
+        control_timeout: PRODUCTION_CONTROL_TIMEOUT,
         ..SchedulerConfig::default()
     }
 }
@@ -250,7 +252,8 @@ mod tests {
         let defaults = SchedulerConfig::default();
         let production = production_scheduler_config();
 
-        assert_eq!(production.command_timeout, Duration::from_secs(90));
+        assert_eq!(production.bootstrap_timeout, Duration::from_secs(90));
+        assert_eq!(production.control_timeout, Duration::from_secs(5));
         assert_eq!(production.global_max_agents, defaults.global_max_agents);
         assert_eq!(
             production.per_workspace_max_agents,

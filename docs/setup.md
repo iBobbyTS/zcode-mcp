@@ -28,9 +28,11 @@ export ZCODE_RUNTIME_PATH=/absolute/official/zcode-runtime
 The daemon runs in the foreground, handles SIGINT/SIGTERM, owns the claim loop,
 and must be running before the facade is useful. Only one daemon may own a
 canonical database. The socket is not published until migration and startup
-reconciliation finish. Production runtime commands use the verified 90-second
-bootstrap window; public submission remains asynchronous and returns after
-durable enqueue rather than waiting for that window.
+reconciliation finish. Production runtime bootstrap uses the verified 90-second
+window; public submission remains asynchronous and returns after durable enqueue
+rather than waiting for that window. Synchronous message, interrupt, stop, and
+close controls each use one five-second internal budget, leaving one second for
+the facade's six-second daemon-call deadline and response framing.
 
 If the runtime is unavailable, omit `ZCODE_RUNTIME_PATH` only for facade/store
 inspection and deterministic fake-runtime development. Official ZCode 3.8.1 is

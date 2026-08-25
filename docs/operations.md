@@ -19,6 +19,14 @@ bytes. For complete evidence use the confined report artifact and verify its
 returned expected/observed SHA-256 and byte count; the preview is not the full
 report.
 
+Runtime bootstrap is asynchronous from public submission and may use its
+90-second production allowance. Each synchronous message, interrupt, stop, or
+close call instead has one five-second internal budget covering operation-lock
+wait and all runtime/event/stop/reap phases. A runtime command that times out
+after write is failed closed through terminal persistence and process stop/reap
+before the daemon returns; retry the same durable intent rather than changing
+its identifier.
+
 ## Public states
 
 Job states are `QUEUED`, `STARTING`, `RUNNING`, `STOPPING`, `COMPLETED`,

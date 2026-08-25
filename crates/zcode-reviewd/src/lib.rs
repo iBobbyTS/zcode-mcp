@@ -11,7 +11,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, MutexGuard, TryLockError,
     },
     thread,
     time::{Duration, Instant},
@@ -374,7 +374,8 @@ impl Publisher {
         terminal
     }
 
-    fn wait_for_exit_boundary(&self) -> Option<RuntimeTerminal> {
+    fn wait_for_exit_boundary(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+        let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().unwrap();
         loop {
             if state.exit_boundary_delivered {
@@ -383,7 +384,19 @@ impl Publisher {
             if let OwnerState::Terminal(terminal) = &state.owner {
                 return Some(terminal.clone());
             }
-            state = self.changed.wait(state).unwrap();
+            let now = Instant::now();
+            if now >= deadline {
+                return Some(RuntimeTerminal::FailedRuntimeLost(
+                    RuntimeLoss::EventStreamLost,
+                ));
+            }
+            let (next, wait) = self.changed.wait_timeout(state, deadline - now).unwrap();
+            state = next;
+            if wait.timed_out() && !state.exit_boundary_delivered {
+                return Some(RuntimeTerminal::FailedRuntimeLost(
+                    RuntimeLoss::EventStreamLost,
+                ));
+            }
         }
     }
 
@@ -570,6 +583,7 @@ impl RuntimeOwner {
         content: &str,
         timeout: Duration,
     ) -> Result<Option<String>, RuntimeCommandError> {
+        let deadline = Instant::now() + timeout;
         self.validate_session(session_id)?;
         let previous = self.turn_tracker.snapshot().generation;
         let params = serde_json::to_value(SendParams {
@@ -577,13 +591,16 @@ impl RuntimeOwner {
             content,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        let response = self.driver.request(SESSION_SEND, params, timeout)?;
+        let response =
+            self.driver
+                .request(SESSION_SEND, params, remaining_runtime_time(deadline)?)?;
         let turn_id = response
             .result
             .as_ref()
             .and_then(turn_id_from_result)
             .map(str::to_owned);
-        self.turn_tracker.wait_started_after(previous, timeout)?;
+        self.turn_tracker
+            .wait_started_after(previous, remaining_runtime_time(deadline)?)?;
         Ok(turn_id)
     }
 
@@ -592,6 +609,7 @@ impl RuntimeOwner {
         session_id: &str,
         timeout: Duration,
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
+        let deadline = Instant::now() + timeout;
         self.validate_session(session_id)?;
         let current = self.turn_tracker.snapshot();
         if !current.active {
@@ -599,10 +617,11 @@ impl RuntimeOwner {
         }
         let params = serde_json::to_value(SessionParams { session_id })
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        self.driver.request(SESSION_STOP, params, timeout)?;
+        self.driver
+            .request(SESSION_STOP, params, remaining_runtime_time(deadline)?)?;
         let boundary = self
             .turn_tracker
-            .wait_boundary_after(current.generation, timeout)?;
+            .wait_boundary_after(current.generation, remaining_runtime_time(deadline)?)?;
         self.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
     }
@@ -688,7 +707,7 @@ impl RuntimeOwner {
             return terminal;
         }
         let terminal = match self.driver.stop_and_reap(grace) {
-            Ok(outcome) => match self.publisher.wait_for_exit_boundary() {
+            Ok(outcome) => match self.publisher.wait_for_exit_boundary(grace) {
                 Some(terminal) => terminal,
                 None => match boundary {
                     Some(TurnBoundary::Completed) => RuntimeTerminal::Completed(outcome),
@@ -710,6 +729,21 @@ impl RuntimeOwner {
 
     pub fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
         self.publisher.wait_terminal(timeout)
+    }
+}
+
+fn remaining_runtime_time(deadline: Instant) -> Result<Duration, RuntimeCommandError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(RuntimeCommandError::Timeout)
+}
+
+fn control_failure_code(error: &RuntimeCommandError) -> &'static str {
+    if matches!(error, RuntimeCommandError::Timeout) {
+        "CONTROL_DEADLINE_EXCEEDED"
+    } else {
+        "CONTROL_RUNTIME_FAILED"
     }
 }
 
@@ -1119,7 +1153,8 @@ pub struct SchedulerConfig {
     pub global_max_agents: usize,
     pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
-    pub command_timeout: Duration,
+    pub bootstrap_timeout: Duration,
+    pub control_timeout: Duration,
 }
 
 impl Default for SchedulerConfig {
@@ -1128,8 +1163,45 @@ impl Default for SchedulerConfig {
             global_max_agents: 2,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_secs(1),
-            command_timeout: Duration::from_secs(2),
+            bootstrap_timeout: Duration::from_secs(2),
+            control_timeout: Duration::from_secs(2),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlDeadline {
+    expires_at: Instant,
+}
+
+impl ControlDeadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + budget,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn runtime_phase(self, stop_grace: Duration) -> Option<Duration> {
+        let remaining = self.remaining()?;
+        let maximum_cleanup = stop_grace
+            .checked_mul(3)
+            .unwrap_or(remaining)
+            .min(remaining / 2);
+        remaining
+            .checked_sub(maximum_cleanup)
+            .filter(|phase| !phase.is_zero())
+    }
+
+    fn cleanup_grace(self, configured: Duration) -> Duration {
+        self.remaining()
+            .map(|remaining| configured.min(remaining / 3))
+            .unwrap_or(Duration::ZERO)
     }
 }
 
@@ -1581,6 +1653,47 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
 }
 
 impl Scheduler {
+    fn control_deadline(&self) -> ControlDeadline {
+        ControlDeadline::new(self.inner.config.control_timeout)
+    }
+
+    fn control_timeout_error(agent_id: &str) -> SchedulerError {
+        SchedulerError::RuntimeCommand {
+            agent_id: agent_id.into(),
+            message: "control operation deadline elapsed".into(),
+        }
+    }
+
+    fn lock_operation<'a>(
+        &self,
+        agent_id: &str,
+        operation: &'a Mutex<()>,
+        deadline: ControlDeadline,
+    ) -> Result<MutexGuard<'a, ()>, SchedulerError> {
+        loop {
+            match operation.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    let Some(remaining) = deadline.remaining() else {
+                        return Err(Self::control_timeout_error(agent_id));
+                    };
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        }
+    }
+
+    fn runtime_phase_timeout(
+        &self,
+        agent_id: &str,
+        deadline: ControlDeadline,
+    ) -> Result<Duration, SchedulerError> {
+        deadline
+            .runtime_phase(self.inner.config.stop_grace)
+            .ok_or_else(|| Self::control_timeout_error(agent_id))
+    }
+
     pub fn new(
         owner_id: impl Into<String>,
         store: Arc<Store>,
@@ -1589,10 +1702,11 @@ impl Scheduler {
     ) -> Result<Self, SchedulerError> {
         if config.global_max_agents == 0
             || config.per_workspace_max_agents == 0
-            || config.command_timeout.is_zero()
+            || config.bootstrap_timeout.is_zero()
+            || config.control_timeout.is_zero()
         {
             return Err(SchedulerError::InvalidConfig(
-                "global and per-workspace limits must be positive".into(),
+                "scheduler limits and deadlines must be positive".into(),
             ));
         }
         Ok(Self {
@@ -1811,7 +1925,7 @@ impl Scheduler {
         let session = match runtime.bootstrap_session_with_mcp(
             &claim.job,
             &mcp_servers,
-            self.inner.config.command_timeout,
+            self.inner.config.bootstrap_timeout,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -2012,12 +2126,31 @@ impl Scheduler {
         sink: &Arc<StoreLifecycleSink>,
         failure: Option<(&str, String)>,
     ) -> Result<JobState, SchedulerError> {
+        self.cleanup_registered_runtime_with_grace(
+            agent_id,
+            owner_epoch,
+            runtime,
+            sink,
+            failure,
+            self.inner.config.stop_grace,
+        )
+    }
+
+    fn cleanup_registered_runtime_with_grace(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &Arc<StoreLifecycleSink>,
+        failure: Option<(&str, String)>,
+        stop_grace: Duration,
+    ) -> Result<JobState, SchedulerError> {
         let preclassified = failure.map(|(code, message)| {
             self.inner
                 .store
                 .fail_claim(agent_id, owner_epoch, code, &message)
         });
-        let terminal = runtime.stop(self.inner.config.stop_grace);
+        let terminal = runtime.stop(stop_grace);
         let terminal = self.review_terminal(agent_id, terminal, false);
         let finished = sink.finish(&terminal);
         self.release_active(agent_id, owner_epoch);
@@ -2049,6 +2182,36 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    fn fail_closed_control(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        deadline: ControlDeadline,
+        failure_code: &str,
+        message: String,
+    ) -> Result<(), SchedulerError> {
+        let sink = {
+            let state = self.inner.state.lock().unwrap();
+            state.active.get(agent_id).and_then(|active| {
+                (active.owner_epoch == owner_epoch).then(|| Arc::clone(&active.sink))
+            })
+        }
+        .ok_or_else(|| SchedulerError::RuntimeCommand {
+            agent_id: agent_id.into(),
+            message: "active runtime disappeared during fail-closed control cleanup".into(),
+        })?;
+        self.cleanup_registered_runtime_with_grace(
+            agent_id,
+            owner_epoch,
+            runtime,
+            &sink,
+            Some((failure_code, message)),
+            deadline.cleanup_grace(self.inner.config.stop_grace),
+        )?;
+        Ok(())
     }
 
     fn review_terminal(
@@ -2169,11 +2332,15 @@ impl Scheduler {
                         continue;
                     }
                     handled_generation = turn.generation;
-                    match scheduler.deliver_next_message(&agent_id, &session_id, &runtime) {
+                    let deadline = scheduler.control_deadline();
+                    match scheduler.deliver_next_message(&agent_id, &session_id, &runtime, deadline)
+                    {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            let terminal =
-                                runtime.finish_turn(boundary, scheduler.inner.config.stop_grace);
+                            let terminal = runtime.finish_turn(
+                                boundary,
+                                deadline.cleanup_grace(scheduler.inner.config.stop_grace),
+                            );
                             let terminal = scheduler.review_terminal(
                                 &agent_id,
                                 terminal,
@@ -2197,7 +2364,7 @@ impl Scheduler {
                             scheduler.record_failure(&agent_id, error.to_string());
                             let terminal = runtime.finish_turn(
                                 TurnBoundary::Failed,
-                                scheduler.inner.config.stop_grace,
+                                deadline.cleanup_grace(scheduler.inner.config.stop_grace),
                             );
                             let terminal = scheduler.review_terminal(&agent_id, terminal, false);
                             if let Err(finish_error) = scheduler.finish_terminal_or_fail(
@@ -2225,6 +2392,7 @@ impl Scheduler {
         agent_id: &str,
         session_id: &str,
         runtime: &Arc<dyn ManagedRuntime>,
+        deadline: ControlDeadline,
     ) -> Result<Option<StoredMessage>, SchedulerError> {
         let Some(message) = self.inner.store.claim_next_message(agent_id)? else {
             return Ok(None);
@@ -2232,7 +2400,7 @@ impl Scheduler {
         match runtime.send_turn(
             session_id,
             &message.content,
-            self.inner.config.command_timeout,
+            self.runtime_phase_timeout(agent_id, deadline)?,
         ) {
             Ok(turn_id) => {
                 if !self
@@ -2341,13 +2509,18 @@ impl Scheduler {
         mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
+        let deadline = self.control_deadline();
         let active = self.active_session(agent_id);
         let operation = active
             .as_ref()
             .map(|(_, _, _, operation)| Arc::clone(operation));
         let _operation = operation
             .as_ref()
-            .map(|operation| operation.lock().unwrap());
+            .map(|operation| self.lock_operation(agent_id, operation, deadline))
+            .transpose()?;
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
         let created = self
             .inner
             .store
@@ -2369,19 +2542,55 @@ impl Scheduler {
         if mode != "interrupt_and_continue" {
             return Ok(MessageDisposition::Queued);
         }
-        let Some((_epoch, runtime, session_id, _)) = active else {
+        let Some((owner_epoch, runtime, session_id, _)) = active else {
             return Ok(MessageDisposition::Queued);
         };
         let turn = runtime.turn_snapshot();
         if turn.active {
-            runtime
-                .stop_turn(&session_id, self.inner.config.command_timeout)
-                .map_err(|error| SchedulerError::RuntimeCommand {
+            let stop_timeout = match self.runtime_phase_timeout(agent_id, deadline) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    self.fail_closed_control(
+                        agent_id,
+                        owner_epoch,
+                        &runtime,
+                        deadline,
+                        "CONTROL_DEADLINE_EXCEEDED",
+                        error.to_string(),
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = runtime.stop_turn(&session_id, stop_timeout) {
+                let scheduler_error = SchedulerError::RuntimeCommand {
                     agent_id: agent_id.into(),
                     message: error.to_string(),
-                })?;
+                };
+                self.fail_closed_control(
+                    agent_id,
+                    owner_epoch,
+                    &runtime,
+                    deadline,
+                    control_failure_code(&error),
+                    error.to_string(),
+                )?;
+                return Err(scheduler_error);
+            }
         }
-        let delivered = self.deliver_next_message(agent_id, &session_id, &runtime)?;
+        let delivered = match self.deliver_next_message(agent_id, &session_id, &runtime, deadline) {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                self.fail_closed_control(
+                    agent_id,
+                    owner_epoch,
+                    &runtime,
+                    deadline,
+                    "CONTROL_DELIVERY_FAILED",
+                    error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
         Ok(match delivered {
             Some(message) if message.message_id == message_id => {
                 MessageDisposition::InterruptedThenDelivered
@@ -2544,17 +2753,18 @@ impl Scheduler {
     }
 
     pub fn stop_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
-        self.request_stop_or_close(agent_id, false)
+        self.request_stop_or_close(agent_id, false, self.control_deadline())
     }
 
     pub fn close_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
-        self.request_stop_or_close(agent_id, true)
+        self.request_stop_or_close(agent_id, true, self.control_deadline())
     }
 
     fn request_stop_or_close(
         &self,
         agent_id: &str,
         close_session: bool,
+        deadline: ControlDeadline,
     ) -> Result<JobState, SchedulerError> {
         let active = self.active_session(agent_id);
         let operation = active
@@ -2562,7 +2772,11 @@ impl Scheduler {
             .map(|(_, _, _, operation)| Arc::clone(operation));
         let _guard = operation
             .as_ref()
-            .map(|operation| operation.lock().unwrap());
+            .map(|operation| self.lock_operation(agent_id, operation, deadline))
+            .transpose()?;
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
         let decision = if close_session {
             self.inner.store.request_close(agent_id)?
         } else {
@@ -2589,17 +2803,29 @@ impl Scheduler {
             message: "active runtime disappeared".into(),
         })?;
         let _ = operation;
+        let mut control_error = None;
         if runtime.turn_snapshot().active {
-            let _ = runtime.stop_turn(&session_id, self.inner.config.command_timeout);
+            match self.runtime_phase_timeout(agent_id, deadline) {
+                Ok(timeout) => {
+                    if let Err(error) = runtime.stop_turn(&session_id, timeout) {
+                        control_error = Some(error.to_string());
+                    }
+                }
+                Err(error) => control_error = Some(error.to_string()),
+            }
         }
         let close_error = if close_session {
-            runtime
-                .close_session(&session_id, self.inner.config.command_timeout)
-                .err()
+            match self.runtime_phase_timeout(agent_id, deadline) {
+                Ok(timeout) => runtime
+                    .close_session(&session_id, timeout)
+                    .err()
+                    .map(|error| error.to_string()),
+                Err(error) => Some(error.to_string()),
+            }
         } else {
             None
         };
-        let terminal = runtime.stop(self.inner.config.stop_grace);
+        let terminal = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
         let terminal = self.review_terminal(agent_id, terminal, false);
         let result = if let Some(message) = sink.error() {
             let fallback = self.inner.store.fail_claim(
@@ -2644,7 +2870,10 @@ impl Scheduler {
         };
         self.release_active(agent_id, decision.owner_epoch);
         if let Some(error) = close_error {
-            self.record_failure(agent_id, error.to_string());
+            self.record_failure(agent_id, error);
+        }
+        if let Some(error) = control_error {
+            self.record_failure(agent_id, error);
         }
         result
     }
@@ -2662,10 +2891,14 @@ impl Scheduler {
     }
 
     pub fn reap_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
-        let state = self.close_job(agent_id)?;
+        let deadline = self.control_deadline();
+        let state = self.request_stop_or_close(agent_id, true, deadline)?;
         if !state.is_terminal() {
             return Ok(state);
         }
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
         Ok(self.inner.store.reap_job(agent_id)?)
     }
 
@@ -3064,7 +3297,10 @@ mod tests {
 
         let terminal_publisher = Arc::clone(&publisher);
         let terminal = thread::spawn(move || {
-            assert_eq!(terminal_publisher.wait_for_exit_boundary(), None);
+            assert_eq!(
+                terminal_publisher.wait_for_exit_boundary(Duration::from_secs(1)),
+                None
+            );
             terminal_publisher.publish_terminal(RuntimeTerminal::Stopped(
                 StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))),
             ))
@@ -3371,6 +3607,10 @@ mod tests {
         changed: Condvar,
         stop_calls: std::sync::atomic::AtomicUsize,
         turn: Mutex<TurnSnapshot>,
+        stop_turn_delay: Mutex<Duration>,
+        stop_turn_timeouts: Mutex<Vec<Duration>>,
+        send_timeouts: Mutex<Vec<Duration>>,
+        timeout_send_after_write: AtomicBool,
     }
 
     impl FakeRuntime {
@@ -3386,6 +3626,10 @@ mod tests {
                     active: false,
                     boundary: None,
                 }),
+                stop_turn_delay: Mutex::new(Duration::ZERO),
+                stop_turn_timeouts: Mutex::new(Vec::new()),
+                send_timeouts: Mutex::new(Vec::new()),
+                timeout_send_after_write: AtomicBool::new(false),
             }
         }
 
@@ -3419,6 +3663,14 @@ mod tests {
 
         fn stop_calls(&self) -> usize {
             self.stop_calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn delay_stop_turn(&self, delay: Duration) {
+            *self.stop_turn_delay.lock().unwrap() = delay;
+        }
+
+        fn timeout_send_after_write(&self) {
+            self.timeout_send_after_write.store(true, Ordering::Release);
         }
     }
 
@@ -3468,8 +3720,13 @@ mod tests {
             &self,
             _session_id: &str,
             _content: &str,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<Option<String>, RuntimeCommandError> {
+            self.send_timeouts.lock().unwrap().push(timeout);
+            if self.timeout_send_after_write.load(Ordering::Acquire) {
+                thread::sleep(timeout);
+                return Err(RuntimeCommandError::Timeout);
+            }
             let mut turn = self.turn.lock().unwrap();
             turn.generation = turn.generation.saturating_add(1);
             turn.active = true;
@@ -3480,8 +3737,10 @@ mod tests {
         fn stop_turn(
             &self,
             _session_id: &str,
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<TurnSnapshot, RuntimeCommandError> {
+            self.stop_turn_timeouts.lock().unwrap().push(timeout);
+            thread::sleep(*self.stop_turn_delay.lock().unwrap());
             let mut turn = self.turn.lock().unwrap();
             turn.active = false;
             turn.boundary = Some(TurnBoundary::Completed);
@@ -3553,6 +3812,20 @@ mod tests {
         global: usize,
         per_workspace: usize,
     ) -> (tempfile::TempDir, Arc<Store>, Arc<FakeFactory>, Scheduler) {
+        scheduler_fixture_with_deadlines(
+            global,
+            per_workspace,
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn scheduler_fixture_with_deadlines(
+        global: usize,
+        per_workspace: usize,
+        stop_grace: Duration,
+        control_timeout: Duration,
+    ) -> (tempfile::TempDir, Arc<Store>, Arc<FakeFactory>, Scheduler) {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
         let factory = Arc::new(FakeFactory::default());
@@ -3563,8 +3836,9 @@ mod tests {
             SchedulerConfig {
                 global_max_agents: global,
                 per_workspace_max_agents: per_workspace,
-                stop_grace: Duration::from_millis(25),
-                command_timeout: Duration::from_secs(1),
+                stop_grace,
+                bootstrap_timeout: Duration::from_secs(1),
+                control_timeout,
             },
         )
         .unwrap();
@@ -3584,6 +3858,134 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn interrupt_serial_phases_consume_one_control_deadline() {
+        let (_directory, _store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+        );
+        scheduler
+            .enqueue(&NewJob::new("serial-deadline", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime("serial-deadline");
+        runtime.delay_stop_turn(Duration::from_millis(40));
+
+        assert_eq!(
+            scheduler
+                .message_job(
+                    "serial-deadline",
+                    "serial-message",
+                    "interrupt_and_continue",
+                    "continue",
+                )
+                .unwrap(),
+            MessageDisposition::InterruptedThenDelivered
+        );
+        let stop_timeout = runtime.stop_turn_timeouts.lock().unwrap()[0];
+        let send_timeout = runtime.send_timeouts.lock().unwrap()[0];
+        assert!(stop_timeout <= Duration::from_millis(190));
+        assert!(send_timeout + Duration::from_millis(20) < stop_timeout);
+        scheduler.close_job("serial-deadline").unwrap();
+    }
+
+    #[test]
+    fn operation_lock_wait_is_bounded_and_releases_for_later_progress() {
+        let (_directory, _store, _factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(60),
+        );
+        scheduler
+            .enqueue(&NewJob::new("locked-control", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let operation = scheduler.active_session("locked-control").unwrap().3;
+        let guard = operation.lock().unwrap();
+        let caller = {
+            let scheduler = scheduler.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let result =
+                    scheduler.message_job("locked-control", "after-lock", "queue", "continue");
+                (started.elapsed(), result)
+            })
+        };
+        let (elapsed, result) = caller.join().unwrap();
+        assert!(matches!(result, Err(SchedulerError::RuntimeCommand { .. })));
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_millis(250));
+        drop(guard);
+
+        assert_eq!(
+            scheduler
+                .message_job("locked-control", "after-lock", "queue", "continue")
+                .unwrap(),
+            MessageDisposition::Queued
+        );
+        scheduler.close_job("locked-control").unwrap();
+    }
+
+    #[test]
+    fn timeout_after_runtime_write_fails_closed_and_retry_is_idempotent() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(120),
+        );
+        scheduler
+            .enqueue(&NewJob::new("timeout-write", "workspace"))
+            .unwrap();
+        scheduler
+            .enqueue(&NewJob::new("later-progress", "workspace"))
+            .unwrap();
+        assert_eq!(scheduler.start_ready().unwrap(), vec!["timeout-write"]);
+        let runtime = factory.runtime("timeout-write");
+        runtime.timeout_send_after_write();
+
+        let started = Instant::now();
+        assert!(matches!(
+            scheduler.message_job(
+                "timeout-write",
+                "timeout-message",
+                "interrupt_and_continue",
+                "continue",
+            ),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(300));
+        let job = store.get_job("timeout-write").unwrap().unwrap();
+        assert!(job.state.is_terminal());
+        assert!(scheduler.active_session("timeout-write").is_none());
+        assert_eq!(runtime.stop_calls(), 1);
+        assert!(runtime.wait_terminal(Duration::from_millis(20)).is_some());
+        assert_eq!(
+            store.message("timeout-message").unwrap().unwrap().state,
+            MessageState::Failed
+        );
+        assert_eq!(
+            scheduler
+                .message_job(
+                    "timeout-write",
+                    "timeout-message",
+                    "interrupt_and_continue",
+                    "continue",
+                )
+                .unwrap(),
+            MessageDisposition::Failed
+        );
+        factory.runtime("later-progress");
+        assert_eq!(
+            store.get_job("later-progress").unwrap().unwrap().state,
+            JobState::Running
+        );
+        scheduler.close_job("later-progress").unwrap();
     }
 
     #[test]

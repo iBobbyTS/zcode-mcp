@@ -185,7 +185,8 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
             global_max_agents: 1,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_secs(2),
-            command_timeout: Duration::from_secs(90),
+            bootstrap_timeout: Duration::from_secs(90),
+            control_timeout: Duration::from_secs(5),
         },
     )
     .unwrap()

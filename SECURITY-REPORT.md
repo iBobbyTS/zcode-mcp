@@ -36,8 +36,11 @@ in the accepted product tree.
   otherwise unverifiable. Unknown processes are not signalled.
 - The private daemon socket is local Unix IPC, published only after startup
   reconciliation. Database-keyed singleton locking prevents two durable owners.
-- Private RPC frames are capped at 128 KiB and connections use bounded total
-  deadlines. The public facade has a six-second total daemon call timeout.
+- Private RPC frames are capped at 128 KiB. Synchronous message, interrupt,
+  stop, and close controls use one five-second internal budget across lock wait,
+  runtime/event phases, and fail-closed stop/reap; the public facade retains a
+  six-second total daemon call timeout. Runtime bootstrap separately retains its
+  verified 90-second asynchronous allowance.
 - Public MCP stdout is reserved for valid rmcp framing; daemon/facade
   operational output does not share the public protocol stream.
 

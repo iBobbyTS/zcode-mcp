@@ -124,7 +124,8 @@ impl Fixture {
                 global_max_agents: 2,
                 per_workspace_max_agents: 2,
                 stop_grace: Duration::from_millis(100),
-                command_timeout: Duration::from_secs(2),
+                bootstrap_timeout: Duration::from_secs(2),
+                control_timeout: Duration::from_secs(2),
             },
         )
         .unwrap()
