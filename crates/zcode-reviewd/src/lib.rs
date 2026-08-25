@@ -519,7 +519,13 @@ impl RuntimeOwner {
         initial_prompt: &str,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.bootstrap_session_with_mcp(workspace_path, initial_prompt, &[], timeout)
+        self.bootstrap_session_with_mcp_for_requested_model(
+            workspace_path,
+            initial_prompt,
+            &[],
+            None,
+            timeout,
+        )
     }
 
     pub fn bootstrap_session_with_mcp(
@@ -527,6 +533,40 @@ impl RuntimeOwner {
         workspace_path: &str,
         initial_prompt: &str,
         mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        self.bootstrap_session_with_mcp_for_requested_model(
+            workspace_path,
+            initial_prompt,
+            mcp_servers,
+            None,
+            timeout,
+        )
+    }
+
+    fn bootstrap_prepared_session(
+        &self,
+        job: &Job,
+        mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        let requested_model =
+            requested_model_from_prepared_launch(job.prepared_launch_json.as_deref());
+        self.bootstrap_session_with_mcp_for_requested_model(
+            &job.workspace_path,
+            &job.initial_prompt,
+            mcp_servers,
+            requested_model.as_deref(),
+            timeout,
+        )
+    }
+
+    fn bootstrap_session_with_mcp_for_requested_model(
+        &self,
+        workspace_path: &str,
+        initial_prompt: &str,
+        mcp_servers: &[StdioMcpServer],
+        requested_model: Option<&str>,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
         let workspace = WorkspaceRef {
@@ -551,6 +591,8 @@ impl RuntimeOwner {
         })?;
         let session_id = projection.session_id;
         let observed_model = projection.requested_model;
+        validate_requested_model(requested_model, observed_model.as_deref())
+            .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
@@ -991,7 +1033,7 @@ impl ManagedRuntime for RuntimeOwner {
         job: &Job,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.bootstrap_session(&job.workspace_path, &job.initial_prompt, timeout)
+        self.bootstrap_prepared_session(job, &[], timeout)
     }
 
     fn bootstrap_session_with_mcp(
@@ -1000,12 +1042,7 @@ impl ManagedRuntime for RuntimeOwner {
         mcp_servers: &[StdioMcpServer],
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.bootstrap_session_with_mcp(
-            &job.workspace_path,
-            &job.initial_prompt,
-            mcp_servers,
-            timeout,
-        )
+        self.bootstrap_prepared_session(job, mcp_servers, timeout)
     }
 
     fn send_turn(
@@ -3123,6 +3160,75 @@ mod tests {
         );
     }
 
+    fn model_recording_runtime(
+        method_log: &std::path::Path,
+        observed_model: Option<&str>,
+    ) -> Command {
+        let create_response = match observed_model {
+            Some(observed_model) => serde_json::json!({
+                "id": 1,
+                "result": {
+                    "session": {
+                        "sessionId": "session-1",
+                        "model": {"modelId": observed_model}
+                    },
+                    "settings": {
+                        "model": {"current": {"modelId": observed_model}}
+                    }
+                }
+            }),
+            None => serde_json::json!({
+                "id": 1,
+                "result": {"session": {"sessionId": "session-1"}}
+            }),
+        };
+        let mut command = Command::new("sh");
+        command
+            .env("METHOD_LOG", method_log)
+            .env("CREATE_RESPONSE", create_response.to_string())
+            .args([
+                "-c",
+                r#"
+IFS= read -r create || exit 1
+printf '%s\n' "$create" >> "$METHOD_LOG"
+printf '%s\n' "$CREATE_RESPONSE"
+IFS= read -r subscribe || exit 1
+printf '%s\n' "$subscribe" >> "$METHOD_LOG"
+printf '%s\n' '{"id":2,"result":{}}'
+IFS= read -r send || exit 1
+printf '%s\n' "$send" >> "$METHOD_LOG"
+printf '%s\n' '{"id":3,"result":{"turnId":"turn-1"}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+sleep 10
+"#,
+            ]);
+        command
+    }
+
+    fn recorded_runtime_methods(method_log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(method_log)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn stored_model_job(
+        directory: &tempfile::TempDir,
+        agent_id: &str,
+        prepared_launch_json: &str,
+    ) -> Job {
+        let store = Store::open(directory.path().join("model.sqlite3")).unwrap();
+        let mut job = NewJob::new(agent_id, "/workspace");
+        job.prepared_launch_json = Some(prepared_launch_json.into());
+        job.prepared_launch_sha256 = Some("a".repeat(64));
+        store.enqueue_job(&job).unwrap()
+    }
+
     #[test]
     fn offered_permission_cache_is_bounded_retryable_and_evicts_whole_requests() {
         let valid = serde_json::json!({"options":[
@@ -3354,29 +3460,93 @@ mod tests {
     }
 
     #[test]
-    fn runtime_owner_bootstraps_with_session_create_as_the_first_request() {
+    fn runtime_owner_validates_matching_model_before_subscribe_and_send_in_exact_order() {
         let directory = tempfile::tempdir().unwrap();
-        let request_log = directory.path().join("first-request.json");
+        let method_log = directory.path().join("methods.jsonl");
+        let job = stored_model_job(&directory, "matching-model", r#"{"model":"zai/glm-5.3"}"#);
         let sink = Arc::new(MemorySink::default());
-        let mut command = Command::new("sh");
-        command.env("REQUEST_LOG", &request_log).args([
-            "-c",
-            "read create; printf '%s' \"$create\" > \"$REQUEST_LOG\"; printf '%s\\n' '{\"id\":\"server-1\",\"method\":\"session/requestRuntimePreferences\",\"params\":{}}'; read preferences; printf '%s\\n' '{\"id\":1,\"result\":{\"session\":{\"sessionId\":\"session-1\",\"model\":{\"modelId\":\"zai/glm-5.3\"}},\"projection\":{\"sessionId\":42},\"settings\":{\"model\":{\"current\":{\"modelId\":\"GLM-5.3\"}}}}}'; read subscribe; printf '%s\\n' '{\"id\":2,\"result\":{}}'; read send; printf '%s\\n' '{\"id\":3,\"result\":{\"turnId\":\"turn-1\"}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}'; sleep 10",
-        ]);
-        let owner = RuntimeOwner::spawn(command, sink).unwrap();
-        let ready = owner
-            .bootstrap_session("/workspace", "review", Duration::from_secs(3))
-            .unwrap();
+        let owner =
+            RuntimeOwner::spawn(model_recording_runtime(&method_log, Some("GLM-5.3")), sink)
+                .unwrap();
+        let ready = <RuntimeOwner as ManagedRuntime>::bootstrap_session_with_mcp(
+            &owner,
+            &job,
+            &[],
+            Duration::from_secs(3),
+        )
+        .unwrap();
         assert_eq!(ready.session_id, "session-1");
         assert_eq!(ready.observed_model.as_deref(), Some("GLM-5.3"));
-        let request: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&request_log).unwrap()).unwrap();
-        assert_eq!(request["method"], SESSION_CREATE);
-        assert!(!request.to_string().contains("workspace/readState"));
+        assert_eq!(
+            recorded_runtime_methods(&method_log),
+            vec![SESSION_CREATE, SESSION_SUBSCRIBE, SESSION_SEND]
+        );
         assert!(matches!(
             owner.stop(Duration::from_millis(100)),
             RuntimeTerminal::Stopped(_)
         ));
+    }
+
+    #[test]
+    fn runtime_owner_model_mismatch_stops_after_create_without_subscribe_or_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let method_log = directory.path().join("methods.jsonl");
+        let job = stored_model_job(&directory, "mismatched-model", r#"{"model":"zai/glm-5.3"}"#);
+        let owner = RuntimeOwner::spawn(
+            model_recording_runtime(&method_log, Some("GLM-5.1")),
+            Arc::new(MemorySink::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            <RuntimeOwner as ManagedRuntime>::bootstrap_session_with_mcp(
+                &owner,
+                &job,
+                &[],
+                Duration::from_secs(3),
+            ),
+            Err(RuntimeCommandError::InvalidSession("MODEL_MISMATCH".into()))
+        );
+        assert_eq!(recorded_runtime_methods(&method_log), vec![SESSION_CREATE]);
+        assert_eq!(*owner.session_id.lock().unwrap(), None);
+        assert!(!owner.turn_snapshot().active);
+        assert!(matches!(
+            owner.stop(Duration::from_millis(100)),
+            RuntimeTerminal::Stopped(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_owner_allows_absent_and_null_prepared_models() {
+        for (agent_id, prepared_launch_json) in [
+            ("absent-model", r#"{}"#),
+            ("null-model", r#"{"model":null}"#),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let method_log = directory.path().join("methods.jsonl");
+            let job = stored_model_job(&directory, agent_id, prepared_launch_json);
+            let owner = RuntimeOwner::spawn(
+                model_recording_runtime(&method_log, None),
+                Arc::new(MemorySink::default()),
+            )
+            .unwrap();
+
+            <RuntimeOwner as ManagedRuntime>::bootstrap_session_with_mcp(
+                &owner,
+                &job,
+                &[],
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            assert_eq!(
+                recorded_runtime_methods(&method_log),
+                vec![SESSION_CREATE, SESSION_SUBSCRIBE, SESSION_SEND]
+            );
+            assert!(matches!(
+                owner.stop(Duration::from_millis(100)),
+                RuntimeTerminal::Stopped(_)
+            ));
+        }
     }
 
     #[test]
