@@ -2,6 +2,7 @@
 name = "zcode-review-mcp"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 rmcp = { version = "=3.1.4", features = ["client", "server", "transport-io"] }

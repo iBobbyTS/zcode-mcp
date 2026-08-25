@@ -2,6 +2,7 @@
 name = "zcode-reviewd"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 zcode-driver = { path = "../zcode-driver" }
