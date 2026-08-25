@@ -3,16 +3,21 @@ use sha2::{Digest, Sha256};
 use std::{
     env,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use zcode_driver::{Driver, Inbound, RequestError};
+use zcode_protocol::{
+    RuntimePreferences, WireMessage, WorkspaceDiagnosticProjection, WorkspaceParams, WorkspaceRef,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, WORKSPACE_READ_STATE,
+};
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct Preflight {
@@ -88,119 +93,41 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         return untested("runtime unavailable");
     }
     let mut command = Command::new(node);
-    command
-        .arg(path)
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = match command.spawn() {
-        Ok(c) => c,
+    command.arg(path).arg("app-server");
+    let driver = match Driver::spawn(command) {
+        Ok(driver) => Arc::new(driver),
         Err(_) => return failed("unable to start node"),
     };
     let workspace = std::env::current_dir()
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
         .unwrap_or_else(|| PathBuf::from("/"));
-    let request = serde_json::json!({
-        "id":"preflight-1",
-        "method":"workspace/readState",
-        "params":{"workspace":{
-            "workspaceKey":workspace,
-            "workspacePath":workspace
-        }}
-    });
-    let request = format!("{request}\n");
-    let write_result = child
-        .stdin
-        .as_mut()
-        .ok_or(())
-        .and_then(|stdin| stdin.write_all(request.as_bytes()).map_err(|_| ()));
-    if write_result.is_err() {
-        terminate_process_group(&mut child);
-        let _ = child.wait();
-        return failed("unable to write probe");
-    }
-    drop(child.stdin.take());
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    let (stderr_tx, stderr_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = stdout_tx.send(read_bounded(stdout, 64 * 1024));
-    });
-    thread::spawn(move || {
-        let _ = stderr_tx.send(read_bounded(stderr, 64 * 1024));
-    });
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if child.try_wait().ok().flatten().is_none() {
-        timed_out = true;
-        terminate_process_group(&mut child);
-    }
-    let status = child.wait().ok();
-    // Descendants can inherit the pipes after the leader exits. Never join a
-    // reader indefinitely; process-group termination normally closes them.
-    let out = stdout_rx
-        .recv_timeout(Duration::from_millis(100))
-        .unwrap_or_default();
-    let _stderr = stderr_rx
-        .recv_timeout(Duration::from_millis(100))
-        .unwrap_or_default();
-    if timed_out {
-        return failed("probe timed out");
-    }
-    let Some(status) = status else {
-        return failed("unable to read probe");
+    let workspace = workspace.to_string_lossy();
+    let params = match serde_json::to_value(WorkspaceParams {
+        workspace: WorkspaceRef {
+            workspace_key: &workspace,
+            workspace_path: &workspace,
+        },
+    }) {
+        Ok(params) => params,
+        Err(_) => return failed("unable to serialize workspace probe"),
     };
-    if !status.success() {
-        return failed("app-server exited non-zero");
+    let response = request_with_runtime_preferences(&driver, params, timeout);
+    let cleanup_grace = timeout.min(Duration::from_millis(250));
+    if driver.stop_and_reap(cleanup_grace).is_err() {
+        return failed("unable to reap app-server process group");
     }
-    let Some(value) = parse_response(&out) else {
-        return failed(if out.contains(&b'{') {
-            "malformed NDJSON response"
-        } else {
-            "non-JSON app-server output"
-        });
+    let response = match response {
+        Ok(response) => response,
+        Err(reason) => return failed(reason),
     };
-    if value.get("jsonrpc").is_some() {
-        return failed("unexpected jsonrpc member");
-    }
-    if value.get("id") != Some(&serde_json::Value::String("preflight-1".into())) {
-        return failed("NDJSON id mismatch");
-    }
-    if value.get("result").is_none() {
-        return failed("NDJSON result missing");
-    }
-    let methods = vec!["workspace/readState".to_owned()];
-    let result = value.get("result").expect("checked above");
-    let current_model = result
-        .pointer("/settings/model/current/modelId")
-        .or_else(|| result.pointer("/settings/model/current/id"))
-        .or_else(|| result.pointer("/settings/model/current"))
-        .or_else(|| result.pointer("/settings/model/value/modelId"))
-        .or_else(|| result.pointer("/settings/model/value"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    let mut available_models = Vec::new();
-    collect_model_ids(result.get("modelCatalog"), &mut available_models);
-    available_models.sort();
-    available_models.dedup();
+    let Some(result) = response.result.as_ref() else {
+        return failed("workspace/readState result missing");
+    };
+    let projection = match WorkspaceDiagnosticProjection::from_result(result) {
+        Ok(projection) => projection,
+        Err(_) => return failed("workspace/readState result shape is incompatible"),
+    };
     Preflight {
         runtime_path: None,
         runtime_size: None,
@@ -209,73 +136,77 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         node_version: None,
         compatibility_status: "tested".into(),
         reason: None,
-        observed_methods: Some(methods),
-        current_model,
-        available_models: Some(available_models),
+        observed_methods: Some(vec![WORKSPACE_READ_STATE.to_owned()]),
+        current_model: projection.current_model,
+        available_models: Some(projection.available_models),
     }
 }
 
-fn collect_model_ids(value: Option<&serde_json::Value>, output: &mut Vec<String>) {
-    let Some(value) = value else { return };
-    match value {
-        serde_json::Value::Object(object) => {
-            if let Some(model) = object.get("modelId").and_then(serde_json::Value::as_str) {
-                if model.len() <= 128 && !model.contains('\0') {
-                    output.push(model.to_owned());
+fn request_with_runtime_preferences(
+    driver: &Arc<Driver>,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<zcode_protocol::ResponseEnvelope, &'static str> {
+    let events = driver.subscribe();
+    let done = Arc::new(AtomicBool::new(false));
+    let handler_error = Arc::new(Mutex::new(None));
+    let request = thread::scope(|scope| {
+        let handler_done = Arc::clone(&done);
+        let handler_error = Arc::clone(&handler_error);
+        scope.spawn(move || {
+            while !handler_done.load(Ordering::Acquire) {
+                match events.recv_timeout(Duration::from_millis(10)) {
+                    Ok(Inbound::Message(WireMessage::Request(request)))
+                        if request.method == SESSION_REQUEST_RUNTIME_PREFERENCES =>
+                    {
+                        let preferences = serde_json::to_value(RuntimePreferences::default())
+                            .expect("runtime preferences serialization cannot fail");
+                        if driver.respond(request.id, preferences).is_err() {
+                            *handler_error.lock().unwrap() =
+                                Some("unable to answer runtime preferences request");
+                            return;
+                        }
+                    }
+                    Ok(Inbound::Message(WireMessage::Request(request))) => {
+                        let _ = driver.respond_error(
+                            request.id,
+                            serde_json::json!({
+                                "code": -32601,
+                                "message": "unsupported preflight server request"
+                            }),
+                        );
+                        *handler_error.lock().unwrap() =
+                            Some("unsupported app-server request during preflight");
+                        return;
+                    }
+                    Ok(Inbound::Malformed(_)) => {
+                        *handler_error.lock().unwrap() = Some("malformed NDJSON response");
+                        return;
+                    }
+                    Ok(Inbound::OversizedLine { .. }) => {
+                        *handler_error.lock().unwrap() = Some("oversized NDJSON response");
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
-            for value in object.values() {
-                collect_model_ids(Some(value), output);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_model_ids(Some(value), output);
-            }
-        }
-        _ => {}
+        });
+        let response = driver.request(WORKSPACE_READ_STATE, params, timeout);
+        done.store(true, Ordering::Release);
+        response
+    });
+    if let Some(error) = *handler_error.lock().unwrap() {
+        return Err(error);
     }
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn setsid() -> i32;
-    fn killpg(pgrp: i32, sig: i32) -> i32;
-}
-
-fn terminate_process_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    unsafe {
-        let _ = killpg(child.id() as i32, 9);
-    }
-    let _ = child.kill();
-}
-
-fn read_bounded(mut reader: impl Read, limit: usize) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let mut buf = [0u8; 4096];
-    while bytes.len() < limit {
-        let chunk = (limit - bytes.len()).min(buf.len());
-        match reader.read(&mut buf[..chunk]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => bytes.extend_from_slice(&buf[..n]),
-        }
-    }
-    bytes
-}
-
-fn parse_response(output: &[u8]) -> Option<serde_json::Value> {
-    for line in String::from_utf8_lossy(output)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-    {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            if value.is_object() {
-                return Some(value);
-            }
-        }
-    }
-    None
+    request.map_err(|error| match error {
+        RequestError::Timeout => "probe timed out",
+        RequestError::Remote(_) => "workspace/readState returned an error",
+        RequestError::ChildExited(_) => "app-server exited before probe response",
+        RequestError::WriteFailed(_) => "unable to write probe",
+        RequestError::Cancelled | RequestError::StreamClosed => "unable to read probe response",
+    })
 }
 
 fn untested(reason: &str) -> Preflight {
@@ -325,6 +256,7 @@ pub fn run_from_env(timeout: Duration) -> io::Result<Preflight> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Instant;
     #[test]
     fn missing_is_untested() {
         assert_eq!(identity(None).unwrap().compatibility_status, "untested");
@@ -367,16 +299,27 @@ mod tests {
     }
 
     #[test]
-    fn probe_accepts_noise_and_valid_response() {
-        let paths = fixture("#!/bin/sh\nprintf 'noise\\n{\\\"id\\\":\\\"preflight-1\\\",\\\"result\\\":{\\\"settings\\\":{\\\"model\\\":{\\\"current\\\":{\\\"modelId\\\":\\\"glm-current\\\"}}},\\\"modelCatalog\\\":{\\\"items\\\":[{\\\"modelId\\\":\\\"glm-current\\\"},{\\\"modelId\\\":\\\"glm-other\\\"}]}}}\\n'");
+    fn probe_uses_driver_correlation_and_handles_runtime_preferences() {
+        let paths = fixture(
+            r#"#!/bin/sh
+read request
+printf '%s\n' '{"id":"server-1","method":"session/requestRuntimePreferences","params":{}}'
+read preferences
+printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"modelCatalog":{"available":[{"modelId":"glm-current"},{"modelId":"glm-other"}]}}}'
+sleep 10"#,
+        );
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
             .status()
             .unwrap();
         let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1));
-        assert_eq!(result.compatibility_status, "tested");
-        assert_eq!(result.current_model.as_deref(), Some("glm-current"));
+        assert_eq!(result.compatibility_status, "tested", "{result:?}");
+        assert_eq!(
+            result.current_model.as_deref(),
+            Some("glm-current"),
+            "{result:?}"
+        );
         assert_eq!(
             result.available_models.unwrap(),
             vec!["glm-current", "glm-other"]
@@ -386,7 +329,11 @@ mod tests {
 
     #[test]
     fn preflight_catalog_does_not_collect_current_or_session_models() {
-        let paths = fixture("#!/bin/sh\nprintf '{\\\"id\\\":\\\"preflight-1\\\",\\\"result\\\":{\\\"settings\\\":{\\\"model\\\":{\\\"current\\\":{\\\"modelId\\\":\\\"glm-current\\\"}}},\\\"session\\\":{\\\"modelId\\\":\\\"glm-session\\\"},\\\"modelCatalog\\\":{\\\"items\\\":[{\\\"modelId\\\":\\\"glm-catalog\\\"}]}}}\\n'");
+        let paths = fixture(
+            r#"#!/bin/sh
+read request
+printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"modelId":"glm-current"}}},"session":{"modelId":"glm-session"},"modelCatalog":{"available":[{"modelId":"glm-catalog"}]}}}'"#,
+        );
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
@@ -400,7 +347,12 @@ mod tests {
 
     #[test]
     fn probe_rejects_bad_id_and_nonzero() {
-        let paths = fixture("#!/bin/sh\nprintf '{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":\\\"wrong\\\",\\\"result\\\":{}}\\n'; exit 3");
+        let paths = fixture(
+            r#"#!/bin/sh
+read request
+printf '%s\n' '{"id":99,"result":{}}'
+exit 3"#,
+        );
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
@@ -408,13 +360,19 @@ mod tests {
             .unwrap();
         let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1));
         assert_eq!(result.compatibility_status, "failed");
-        assert!(result.reason.unwrap().contains("non-zero"));
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("exited")),
+            "{result:?}"
+        );
         cleanup(paths);
     }
 
     #[test]
     fn probe_rejects_malformed_json_rpc() {
-        let paths = fixture("#!/bin/sh\nprintf '{not-json}\\n'");
+        let paths = fixture("#!/bin/sh\nread request\nprintf '{not-json}\\n'");
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
@@ -428,7 +386,7 @@ mod tests {
 
     #[test]
     fn probe_times_out_and_redacts_identity() {
-        let paths = fixture("#!/bin/sh\nsleep 2 & wait");
+        let paths = fixture("#!/bin/sh\nread request\nsleep 2 & wait");
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)

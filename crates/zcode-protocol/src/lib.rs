@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 pub const WORKSPACE_READ_STATE: &str = "workspace/readState";
 pub const SESSION_CREATE: &str = "session/create";
@@ -82,13 +83,217 @@ impl ResponseEnvelope {
     }
 }
 
-pub fn session_id_from_result(result: &Value) -> Option<&str> {
-    result.get("sessionId").and_then(Value::as_str).or_else(|| {
-        result
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionError {
+    Missing(&'static str),
+    Invalid(&'static str),
+    UnobservedAlternate(&'static str),
+    ModelConflict,
+}
+
+impl fmt::Display for ProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(path) => write!(formatter, "missing authoritative field {path}"),
+            Self::Invalid(path) => write!(formatter, "invalid pinned field {path}"),
+            Self::UnobservedAlternate(path) => {
+                write!(formatter, "unobserved alternate field {path} is present")
+            }
+            Self::ModelConflict => write!(formatter, "requested and observed model conflict"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCreateProjection {
+    pub session_id: String,
+    pub requested_model: Option<String>,
+}
+
+impl SessionCreateProjection {
+    pub fn from_result(result: &Value) -> Result<Self, ProjectionError> {
+        let root = result
+            .as_object()
+            .ok_or(ProjectionError::Invalid("result"))?;
+        reject_alternate(root, "sessionId", "result.sessionId")?;
+        reject_alternate(root, "session_id", "result.session_id")?;
+        reject_alternate(root, "modelId", "result.modelId")?;
+        reject_alternate(root, "model", "result.model")?;
+
+        let session = root
             .get("session")
-            .and_then(|session| session.get("sessionId"))
-            .and_then(Value::as_str)
-    })
+            .ok_or(ProjectionError::Missing("result.session.sessionId"))?
+            .as_object()
+            .ok_or(ProjectionError::Invalid("result.session"))?;
+        reject_alternate(session, "id", "result.session.id")?;
+        reject_alternate(session, "session_id", "result.session.session_id")?;
+        reject_alternate(session, "modelId", "result.session.modelId")?;
+        reject_alternate(session, "settings", "result.session.settings")?;
+
+        let session_id =
+            required_bounded_string(session.get("sessionId"), "result.session.sessionId", 512)?
+                .to_owned();
+        // result.projection.sessionId is an independent identifier in pinned
+        // 3.8.1. It is intentionally not inspected or used as provenance.
+
+        let requested_model = settings_current_model(root)?;
+        let consistency_model = session_consistency_model(session)?;
+        match (&requested_model, &consistency_model) {
+            (Some(requested), Some(observed))
+                if normalized_zai_model(requested) != normalized_zai_model(observed) =>
+            {
+                return Err(ProjectionError::ModelConflict);
+            }
+            (None, Some(_)) => {
+                return Err(ProjectionError::Missing(
+                    "result.settings.model.current.modelId",
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            session_id,
+            requested_model,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDiagnosticProjection {
+    pub current_model: Option<String>,
+    pub available_models: Vec<String>,
+}
+
+impl WorkspaceDiagnosticProjection {
+    pub fn from_result(result: &Value) -> Result<Self, ProjectionError> {
+        let root = result
+            .as_object()
+            .ok_or(ProjectionError::Invalid("result"))?;
+        let current_model = settings_current_model(root)?;
+        let mut available_models = Vec::new();
+        if let Some(catalog) = optional_object(root, "modelCatalog", "result.modelCatalog")? {
+            if let Some(available) = catalog.get("available") {
+                let available = available
+                    .as_array()
+                    .ok_or(ProjectionError::Invalid("result.modelCatalog.available"))?;
+                for item in available {
+                    let item = item
+                        .as_object()
+                        .ok_or(ProjectionError::Invalid("result.modelCatalog.available[]"))?;
+                    available_models.push(
+                        required_bounded_string(
+                            item.get("modelId"),
+                            "result.modelCatalog.available[].modelId",
+                            128,
+                        )?
+                        .to_owned(),
+                    );
+                }
+            }
+        }
+        available_models.sort();
+        available_models.dedup();
+        Ok(Self {
+            current_model,
+            available_models,
+        })
+    }
+}
+
+pub fn normalized_zai_model(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        return None;
+    }
+    let model = match value.split_once('/') {
+        Some(("zai", model)) => model,
+        Some(_) => return None,
+        None => value,
+    };
+    if model.is_empty() || model.contains('/') {
+        return None;
+    }
+    Some(model.to_ascii_lowercase())
+}
+
+fn reject_alternate(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    path: &'static str,
+) -> Result<(), ProjectionError> {
+    if object.contains_key(key) {
+        Err(ProjectionError::UnobservedAlternate(path))
+    } else {
+        Ok(())
+    }
+}
+
+fn optional_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    path: &'static str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, ProjectionError> {
+    object
+        .get(key)
+        .map(|value| value.as_object().ok_or(ProjectionError::Invalid(path)))
+        .transpose()
+}
+
+fn settings_current_model(
+    root: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, ProjectionError> {
+    let Some(settings) = optional_object(root, "settings", "result.settings")? else {
+        return Ok(None);
+    };
+    let Some(model) = optional_object(settings, "model", "result.settings.model")? else {
+        return Ok(None);
+    };
+    reject_alternate(model, "value", "result.settings.model.value")?;
+    let Some(current) = optional_object(model, "current", "result.settings.model.current")? else {
+        return Ok(None);
+    };
+    reject_alternate(current, "id", "result.settings.model.current.id")?;
+    let Some(value) = current.get("modelId") else {
+        return Ok(None);
+    };
+    let value = required_bounded_string(Some(value), "result.settings.model.current.modelId", 128)?;
+    if normalized_zai_model(value).is_none() {
+        return Err(ProjectionError::Invalid(
+            "result.settings.model.current.modelId",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn session_consistency_model(
+    session: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, ProjectionError> {
+    let Some(model) = optional_object(session, "model", "result.session.model")? else {
+        return Ok(None);
+    };
+    let Some(value) = model.get("modelId") else {
+        return Ok(None);
+    };
+    let value = required_bounded_string(Some(value), "result.session.model.modelId", 128)?;
+    if normalized_zai_model(value).is_none() {
+        return Err(ProjectionError::Invalid("result.session.model.modelId"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn required_bounded_string<'a>(
+    value: Option<&'a Value>,
+    path: &'static str,
+    max_len: usize,
+) -> Result<&'a str, ProjectionError> {
+    let value = value.ok_or(ProjectionError::Missing(path))?;
+    let value = value.as_str().ok_or(ProjectionError::Invalid(path))?;
+    if value.is_empty() || value.len() > max_len || value.contains('\0') {
+        return Err(ProjectionError::Invalid(path));
+    }
+    Ok(value)
 }
 
 pub fn turn_id_from_result(result: &Value) -> Option<&str> {
@@ -395,17 +600,172 @@ mod tests {
     }
 
     #[test]
-    fn session_and_turn_ids_accept_observed_result_shapes() {
+    fn session_projection_requires_the_authoritative_nested_id() {
         let nested = serde_json::json!({"session": {"sessionId": "s1"}, "turnId": "t1"});
-        assert_eq!(session_id_from_result(&nested), Some("s1"));
-        assert_eq!(turn_id_from_result(&nested), Some("t1"));
         assert_eq!(
-            session_id_from_result(&serde_json::json!({"sessionId": "s2"})),
-            Some("s2")
+            SessionCreateProjection::from_result(&nested).unwrap(),
+            SessionCreateProjection {
+                session_id: "s1".into(),
+                requested_model: None,
+            }
         );
+        assert_eq!(turn_id_from_result(&nested), Some("t1"));
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"session": null}),
+            serde_json::json!({"session": {}}),
+            serde_json::json!({"session": {"sessionId": null}}),
+            serde_json::json!({"session": {"sessionId": ""}}),
+            serde_json::json!({"session": {"sessionId": 7}}),
+        ] {
+            assert!(SessionCreateProjection::from_result(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn projection_identifier_is_always_ignored_for_session_provenance() {
+        for projection in [
+            None,
+            Some(serde_json::json!({"sessionId": "different-projection"})),
+            Some(serde_json::json!({"sessionId": null})),
+            Some(serde_json::json!({"sessionId": 42})),
+        ] {
+            let mut result = serde_json::json!({"session": {"sessionId": "authoritative"}});
+            if let Some(projection) = projection {
+                result["projection"] = projection;
+            }
+            assert_eq!(
+                SessionCreateProjection::from_result(&result)
+                    .unwrap()
+                    .session_id,
+                "authoritative"
+            );
+        }
+    }
+
+    #[test]
+    fn unobserved_session_fallbacks_fail_closed_even_when_they_coexist() {
+        for invalid in [
+            serde_json::json!({"sessionId": "fallback", "session": {}}),
+            serde_json::json!({
+                "sessionId": "authoritative",
+                "session": {"sessionId": "authoritative"}
+            }),
+        ] {
+            assert!(SessionCreateProjection::from_result(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn model_projection_uses_settings_current_with_optional_session_consistency() {
+        let base = serde_json::json!({
+            "session": {"sessionId": "session"},
+            "settings": {"model": {"current": {"modelId": "GLM-5.3"}}}
+        });
         assert_eq!(
-            session_id_from_result(&serde_json::json!({"session": {"id": "legacy"}})),
+            SessionCreateProjection::from_result(&base)
+                .unwrap()
+                .requested_model
+                .as_deref(),
+            Some("GLM-5.3")
+        );
+
+        let equal = serde_json::json!({
+            "session": {
+                "sessionId": "session",
+                "model": {"modelId": "zai/glm-5.3"}
+            },
+            "settings": {"model": {"current": {"modelId": "GLM-5.3"}}}
+        });
+        assert!(SessionCreateProjection::from_result(&equal).is_ok());
+
+        for consistency in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!("glm-5.1"),
+        ] {
+            let mut invalid = base.clone();
+            invalid["session"]["model"] = serde_json::json!({"modelId": consistency});
+            assert!(SessionCreateProjection::from_result(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn model_projection_preserves_absence_and_rejects_fallbacks_or_alternates() {
+        let absent = serde_json::json!({"session": {"sessionId": "session"}});
+        assert_eq!(
+            SessionCreateProjection::from_result(&absent)
+                .unwrap()
+                .requested_model,
             None
+        );
+
+        let consistency_only = serde_json::json!({
+            "session": {
+                "sessionId": "session",
+                "model": {"modelId": "glm-5.3"}
+            }
+        });
+        assert!(SessionCreateProjection::from_result(&consistency_only).is_err());
+
+        for invalid in [
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"model": {"current": {"modelId": null}}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"model": {"current": {"modelId": ""}}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"model": {"current": {"modelId": 7}}}
+            }),
+            serde_json::json!({
+                "modelId": "glm-5.3",
+                "session": {"sessionId": "session"},
+                "settings": {"model": {"current": {"modelId": "glm-5.3"}}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session", "modelId": "glm-5.3"},
+                "settings": {"model": {"current": {"modelId": "glm-5.3"}}}
+            }),
+            serde_json::json!({
+                "session": {
+                    "sessionId": "session",
+                    "settings": {"model": {"current": {"modelId": "glm-5.3"}}}
+                },
+                "settings": {"model": {"current": {"modelId": "glm-5.3"}}}
+            }),
+        ] {
+            assert!(SessionCreateProjection::from_result(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_diagnostic_projection_uses_only_observed_catalog_paths() {
+        let projection = WorkspaceDiagnosticProjection::from_result(&serde_json::json!({
+            "settings": {"model": {"current": {"modelId": "glm-current"}}},
+            "modelCatalog": {"available": [
+                {"modelId": "glm-other"},
+                {"modelId": "glm-current"},
+                {"modelId": "glm-current"}
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(projection.current_model.as_deref(), Some("glm-current"));
+        assert_eq!(
+            projection.available_models,
+            vec!["glm-current", "glm-other"]
+        );
+
+        assert!(
+            WorkspaceDiagnosticProjection::from_result(&serde_json::json!({
+                "settings": {"model": {"current": {"modelId": 7}}}
+            }))
+            .is_err()
         );
     }
 

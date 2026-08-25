@@ -30,9 +30,20 @@ the next active turn. `Clean A` is satisfied; fresh `Clean B` remains pending.
 The typed request/event seam follows the observed research reference
 `jpalmae/zcode-acp@42fe149d4b501469343c01f23ba3801832306d53`:
 strict non-JSON-RPC envelopes, integer/string wire IDs, camelCase session
-parameters, `workspace/readState`, `session/create`, `session/subscribe`,
-`session/send`, `session/stop`, the supported close path, `session/event`
-lifecycle events, and `interaction/requestPermission` responses.
+parameters, optional diagnostic `workspace/readState`, `session/create`,
+`session/subscribe`, `session/send`, `session/stop`, the supported close path,
+`session/event` lifecycle events, and `interaction/requestPermission` responses.
+
+The bounded official 3.8.1 gate proved that `session/create` succeeds without a
+preceding read-state call, so production bootstrap no longer makes that unused
+diagnostic a hard prerequisite. Runtime preflight now consumes the same
+Driver/protocol request, strict-NDJSON, and process cleanup owner. Session
+provenance accepts only `result.session.sessionId`; the independently observed
+`result.projection.sessionId` is ignored and never used as a fallback. Model
+provenance accepts only `result.settings.model.current.modelId`, with
+`result.session.model.modelId` as optional equal-only consistency evidence.
+Malformed authoritative values, conflicts, and unobserved direct/top-level
+fallbacks fail closed.
 
 `interaction/requestUserInput` is retained as an unsupported, non-respondable
 pending request. It causes shadow evidence to be incomplete. The implementation

@@ -21,12 +21,11 @@ use zcode_driver::{
     RequestError, StopOutcome,
 };
 use zcode_protocol::{
-    event_type, offered_permission_response, session_id_from_result, turn_id_from_result,
-    CreateSessionParams, LifecycleOrder, RuntimePreferences, SendParams, SessionParams,
-    StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceParams, WorkspaceRef,
+    event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
+    CreateSessionParams, LifecycleOrder, RuntimePreferences, SendParams, SessionCreateProjection,
+    SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
     INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
     SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE,
-    WORKSPACE_READ_STATE,
 };
 
 pub mod ledger_mcp;
@@ -534,14 +533,6 @@ impl RuntimeOwner {
             workspace_key: workspace_path,
             workspace_path,
         };
-        self.driver.request(
-            WORKSPACE_READ_STATE,
-            serde_json::to_value(WorkspaceParams {
-                workspace: workspace.clone(),
-            })
-            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?,
-            timeout,
-        )?;
         let create_params = serde_json::to_value(CreateSessionParams {
             workspace,
             mcp_servers,
@@ -553,13 +544,13 @@ impl RuntimeOwner {
         let result = created.result.as_ref().ok_or_else(|| {
             RuntimeCommandError::InvalidSession("session/create result is missing".into())
         })?;
-        let session_id = session_id_from_result(result)
-            .filter(|value| !value.is_empty() && value.len() <= 512 && !value.contains('\0'))
-            .ok_or_else(|| {
-                RuntimeCommandError::InvalidSession("session/create returned no session id".into())
-            })?
-            .to_owned();
-        let observed_model = observed_model_from_result(result).map(str::to_owned);
+        let projection = SessionCreateProjection::from_result(result).map_err(|error| {
+            RuntimeCommandError::InvalidSession(format!(
+                "session/create projection is invalid: {error}"
+            ))
+        })?;
+        let session_id = projection.session_id;
+        let observed_model = projection.requested_model;
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
@@ -747,43 +738,6 @@ fn control_failure_code(error: &RuntimeCommandError) -> &'static str {
     }
 }
 
-fn observed_model_from_result(result: &serde_json::Value) -> Option<&str> {
-    fn current(root: &serde_json::Value) -> Option<&str> {
-        root.get("settings")?
-            .get("model")?
-            .get("current")?
-            .get("modelId")?
-            .as_str()
-    }
-    let direct = result
-        .get("modelId")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            result
-                .get("session")
-                .and_then(|session| session.get("modelId"))
-                .and_then(serde_json::Value::as_str)
-        });
-    direct
-        .or_else(|| current(result))
-        .or_else(|| result.get("session").and_then(current))
-}
-
-fn normalized_zai_model(value: &str) -> Option<String> {
-    if value.is_empty() || value.len() > 128 || value.contains('\0') {
-        return None;
-    }
-    let model = match value.split_once('/') {
-        Some(("zai", model)) => model,
-        Some(_) => return None,
-        None => value,
-    };
-    if model.is_empty() || model.contains('/') {
-        return None;
-    }
-    Some(model.to_ascii_lowercase())
-}
-
 fn validate_requested_model(
     requested: Option<&str>,
     observed: Option<&str>,
@@ -801,6 +755,17 @@ fn validate_requested_model(
         return Err("MODEL_MISMATCH");
     }
     Ok(())
+}
+
+fn requested_model_from_prepared_launch(prepared_launch_json: Option<&str>) -> Option<String> {
+    prepared_launch_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|prepared| {
+            prepared
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 impl Drop for RuntimeOwner {
@@ -1945,17 +1910,8 @@ impl Scheduler {
                 });
             }
         };
-        let requested_model = claim
-            .job
-            .prepared_launch_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .and_then(|prepared| {
-                prepared
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            });
+        let requested_model =
+            requested_model_from_prepared_launch(claim.job.prepared_launch_json.as_deref());
         if let Err(code) = validate_requested_model(
             requested_model.as_deref(),
             session.observed_model.as_deref(),
@@ -3155,6 +3111,19 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_preserves_absent_and_explicit_null_model_as_none() {
+        assert_eq!(requested_model_from_prepared_launch(Some(r#"{}"#)), None);
+        assert_eq!(
+            requested_model_from_prepared_launch(Some(r#"{"model":null}"#)),
+            None
+        );
+        assert_eq!(
+            requested_model_from_prepared_launch(Some(r#"{"model":"zai/glm-5.3"}"#)),
+            Some("zai/glm-5.3".into())
+        );
+    }
+
+    #[test]
     fn offered_permission_cache_is_bounded_retryable_and_evicts_whole_requests() {
         let valid = serde_json::json!({"options":[
             {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
@@ -3382,6 +3351,32 @@ mod tests {
         ));
         sink.release_through(5);
         assert!(matches!(stop.join().unwrap(), RuntimeTerminal::Stopped(_)));
+    }
+
+    #[test]
+    fn runtime_owner_bootstraps_with_session_create_as_the_first_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let request_log = directory.path().join("first-request.json");
+        let sink = Arc::new(MemorySink::default());
+        let mut command = Command::new("sh");
+        command.env("REQUEST_LOG", &request_log).args([
+            "-c",
+            "read create; printf '%s' \"$create\" > \"$REQUEST_LOG\"; printf '%s\\n' '{\"id\":\"server-1\",\"method\":\"session/requestRuntimePreferences\",\"params\":{}}'; read preferences; printf '%s\\n' '{\"id\":1,\"result\":{\"session\":{\"sessionId\":\"session-1\",\"model\":{\"modelId\":\"zai/glm-5.3\"}},\"projection\":{\"sessionId\":42},\"settings\":{\"model\":{\"current\":{\"modelId\":\"GLM-5.3\"}}}}}'; read subscribe; printf '%s\\n' '{\"id\":2,\"result\":{}}'; read send; printf '%s\\n' '{\"id\":3,\"result\":{\"turnId\":\"turn-1\"}}' '{\"method\":\"session/event\",\"params\":{\"type\":\"turn.started\"}}'; sleep 10",
+        ]);
+        let owner = RuntimeOwner::spawn(command, sink).unwrap();
+        let ready = owner
+            .bootstrap_session("/workspace", "review", Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(ready.session_id, "session-1");
+        assert_eq!(ready.observed_model.as_deref(), Some("GLM-5.3"));
+        let request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&request_log).unwrap()).unwrap();
+        assert_eq!(request["method"], SESSION_CREATE);
+        assert!(!request.to_string().contains("workspace/readState"));
+        assert!(matches!(
+            owner.stop(Duration::from_millis(100)),
+            RuntimeTerminal::Stopped(_)
+        ));
     }
 
     #[test]

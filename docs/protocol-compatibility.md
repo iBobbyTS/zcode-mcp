@@ -13,8 +13,8 @@ project.
 cargo run -p runtime-preflight
 ```
 
-The command reads `ZCODE_RUNTIME_PATH` only. It emits JSON with a redacted
-redacted path token, byte size, SHA-256, Node version, and an app-server probe result.
+The command reads `ZCODE_RUNTIME_PATH` only. It emits JSON with a redacted path
+token, byte size, SHA-256, Node version, and an app-server probe result.
 Authentication tokens and provider secrets are not read or emitted.
 
 ## Pinned 3.8.1 event and request shapes
@@ -68,14 +68,31 @@ When the variable is absent, or the path is not a regular file, the result is
 gap, not a compatibility claim.
 
 When a regular file is supplied, the probe starts `node <runtime> app-server`,
-sends the current strict-NDJSON nested-workspace `workspace/readState` request,
-and records only
-observed response method/event names. It uses a bounded timeout and classifies
-startup, malformed output, timeout, and non-zero exit as `failed` or
-`incompatible`; payloads are never persisted. A successful exchange is marked
-`tested` only when a valid JSON response is observed.
+sends the current typed nested-workspace `workspace/readState` diagnostic
+request through `zcode-driver`, and records only observed response method names
+and the typed model-catalog projection. Driver remains the single owner of
+strict NDJSON parsing, request correlation, stderr draining, process identity,
+and bounded TERM/KILL/reap. Startup, malformed output, timeout, remote error,
+unsupported server requests, and cleanup failure are classified as `failed`;
+payloads are never persisted. A successful exchange is marked `tested` only
+when the correlated Driver response matches the pinned read-state projection.
 
-`runtime_version` is `unknown` unless the runtime itself exposes a version in a
-future explicit probe. Current and available model IDs are emitted only when
-the workspace response exposes them. The record includes Node `node_version`
-for provenance. The implementation and tests are Rust-only.
+Production session bootstrap does not require this diagnostic. The pinned
+3.8.1 create-without-readState gate succeeded, including the three-false
+`session/requestRuntimePreferences` response and complete process-group reap,
+so the core path begins with `session/create`.
+
+For `session/create`, session provenance is only
+`result.session.sessionId`. `result.projection.sessionId` is an independent
+projection identifier and is ignored even when it differs or is malformed; it
+is never a fallback. The requested runtime model is only
+`result.settings.model.current.modelId`; optional
+`result.session.model.modelId` is consistency-only and must normalize equal
+when present. Direct/top-level legacy alternates, missing or malformed
+authoritative session data, consistency-only model fallback, and conflicting
+model values fail closed.
+
+`runtime_version` remains `unknown`. Current and available model IDs are
+emitted only from `settings.model.current.modelId` and
+`modelCatalog.available[].modelId`. The record includes Node `node_version` for
+provenance. The implementation and tests are Rust-only.

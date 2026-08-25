@@ -285,8 +285,8 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
                     .respond_job(&agent_id, &request.request_id, "allow", None)
                     .unwrap();
                 eprintln!(
-                    "official permission request={} effective={} overrode={}",
-                    request.request_id, outcome.effective_decision, outcome.policy_overrode
+                    "official permission effective={} overrode={}",
+                    outcome.effective_decision, outcome.policy_overrode
                 );
             }
         }
@@ -296,7 +296,9 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "official review timed out: {job:?}"
+            "official review timed out: state={:?} failure_code={:?}",
+            job.state,
+            job.failure_code
         );
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -339,9 +341,7 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         .unwrap()
         .is_some_and(|job| job.reaped_at.is_some()));
     eprintln!(
-        "official full review agent={} session={:?} permissions={} checkpoints={} finalized=true reaped=true",
-        agent_id,
-        terminal.zcode_session_id,
+        "official full review permissions={} checkpoints={} finalized=true reaped=true",
         responded.len(),
         snapshot.checkpoints.len()
     );
@@ -423,8 +423,7 @@ fn official_runtime_current_driver_session_seam() {
     assert!(observe_process_group(identity.pgid).unwrap().is_empty());
     assert!(!records.0.lock().unwrap().is_empty());
     eprintln!(
-        "official runtime session={} model={:?} records={} close={close_result:?} terminal={terminal:?}",
-        ready.session_id,
+        "official runtime session_present=true model={:?} records={} close={close_result:?} terminal={terminal:?}",
         ready.observed_model,
         records.0.lock().unwrap().len()
     );

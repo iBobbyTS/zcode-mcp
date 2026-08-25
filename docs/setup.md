@@ -32,7 +32,9 @@ reconciliation finish. Production runtime bootstrap uses the verified 90-second
 window; public submission remains asynchronous and returns after durable enqueue
 rather than waiting for that window. Synchronous message, interrupt, stop, and
 close controls each use one five-second internal budget, leaving one second for
-the facade's six-second daemon-call deadline and response framing.
+the facade's six-second daemon-call deadline and response framing. Core session
+bootstrap starts with `session/create`; `workspace/readState` is an optional
+`runtime-preflight` model-catalog diagnostic and is not a production prerequisite.
 
 If the runtime is unavailable, omit `ZCODE_RUNTIME_PATH` only for facade/store
 inspection and deterministic fake-runtime development. Official ZCode 3.8.1 is

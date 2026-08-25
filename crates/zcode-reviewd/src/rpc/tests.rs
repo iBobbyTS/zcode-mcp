@@ -1093,7 +1093,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
         let mut command = Command::new("sh");
         command.args([
             "-c",
-            "read one; printf '%s\\n' '{\"id\":1,\"result\":{}}'; read two; printf '%s\\n' '{\"id\":2,\"result\":{\"session\":{\"sessionId\":\"real-fake-session\"}}}'; read three; printf '%s\\n' '{\"id\":3,\"result\":{}}'; read four; printf '%s\\n' '{\"id\":4,\"result\":{\"accepted\":true}}' '{\"method\":\"session/event\",\"params\":{\"sessionId\":\"real-fake-session\",\"type\":\"turn.started\",\"turnId\":\"turn-1\"}}'; trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
+            "read one; printf '%s\\n' '{\"id\":1,\"result\":{\"session\":{\"sessionId\":\"real-fake-session\"}}}'; read two; printf '%s\\n' '{\"id\":2,\"result\":{}}'; read three; printf '%s\\n' '{\"id\":3,\"result\":{\"accepted\":true}}' '{\"method\":\"session/event\",\"params\":{\"sessionId\":\"real-fake-session\",\"type\":\"turn.started\",\"turnId\":\"turn-1\"}}'; trap '' TERM; sleep 30 & descendant=$!; wait $descendant",
         ]);
         Ok(command)
     }));
