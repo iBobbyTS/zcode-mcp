@@ -74,6 +74,14 @@ pub enum ExternalDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyMode {
+    ReviewReadonly,
+    GeneralReadonly,
+    GeneralTest,
+    GeneralImplementation { tracked_write_roots: Vec<PathBuf> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionRequest {
     Read(PathBuf),
     Write(PathBuf),
@@ -125,6 +133,7 @@ pub struct PolicyLauncher {
     commands: BTreeMap<String, PreparedCommand>,
     network_allowed: bool,
     capabilities: PolicyCapabilities,
+    mode: PolicyMode,
 }
 
 impl PolicyLauncher {
@@ -161,7 +170,43 @@ impl PolicyLauncher {
             commands,
             network_allowed,
             capabilities,
+            mode: PolicyMode::ReviewReadonly,
         })
+    }
+
+    pub fn for_general(
+        worktree: PathBuf,
+        scratch_root: PathBuf,
+        artifact_target: PathBuf,
+        readable_inputs: Vec<PathBuf>,
+        commands: BTreeMap<String, PreparedCommand>,
+        capabilities: PolicyCapabilities,
+        mode: PolicyMode,
+    ) -> PreparationResult<Self> {
+        let mut launcher = Self::new(
+            worktree,
+            scratch_root,
+            artifact_target,
+            readable_inputs,
+            commands,
+            false,
+            capabilities,
+        )?;
+        launcher.mode = mode;
+        if let PolicyMode::GeneralImplementation {
+            tracked_write_roots,
+        } = &mut launcher.mode
+        {
+            for root in tracked_write_roots.iter_mut() {
+                *root = lexical_confined_path(&launcher.worktree, root)?;
+                if protected_worktree_path(&launcher.worktree, root) {
+                    return Err(PreparationError::Policy(
+                        "tracked write root targets protected metadata".into(),
+                    ));
+                }
+            }
+        }
+        Ok(launcher)
     }
 
     pub fn capabilities(&self) -> &PolicyCapabilities {
@@ -314,7 +359,10 @@ impl PolicyLauncher {
             PermissionRequest::Network(_) => None,
             PermissionRequest::GitRefMutation => Some("git_ref_mutation_denied"),
             PermissionRequest::CredentialRead(_) => Some("credential_read_denied"),
-            PermissionRequest::InternalReviewLedger => None,
+            PermissionRequest::InternalReviewLedger => match self.mode {
+                PolicyMode::ReviewReadonly => None,
+                _ => Some("review_ledger_unavailable_for_general_task"),
+            },
             PermissionRequest::Read(path) => {
                 if is_credential_path(path) {
                     return Some("credential_read_denied");
@@ -464,8 +512,24 @@ impl PolicyLauncher {
         let Some(report_root) = self.report_target.parent() else {
             return Some("write_path_unverifiable");
         };
-        if target.starts_with(&self.worktree)
-            || target == self.scratch_root
+        if target.starts_with(&self.worktree) {
+            if protected_worktree_path(&self.worktree, target) {
+                return Some("protected_worktree_metadata_denied");
+            }
+            return match &self.mode {
+                PolicyMode::GeneralImplementation {
+                    tracked_write_roots,
+                } if tracked_write_roots
+                    .iter()
+                    .any(|root| target.starts_with(root)) =>
+                {
+                    None
+                }
+                PolicyMode::GeneralImplementation { .. } => Some("tracked_path_not_allowlisted"),
+                _ => Some("tracked_writes_denied_for_profile"),
+            };
+        }
+        if target == self.scratch_root
             || target == report_root
             || (!target.starts_with(&self.scratch_root) && !target.starts_with(report_root))
         {
@@ -474,6 +538,31 @@ impl PolicyLauncher {
             None
         }
     }
+}
+
+fn lexical_confined_path(root: &Path, value: &Path) -> PreparationResult<PathBuf> {
+    if value.is_absolute()
+        || value
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(PreparationError::InvalidPath {
+            path: value.to_path_buf(),
+            reason: "path must be repository-relative and confined".into(),
+        });
+    }
+    Ok(root.join(value))
+}
+
+fn protected_worktree_path(worktree: &Path, target: &Path) -> bool {
+    let Ok(relative) = target.strip_prefix(worktree) else {
+        return false;
+    };
+    relative.components().any(|component| {
+        component.as_os_str() == ".git"
+            || component.as_os_str() == ".agent-work"
+            || component.as_os_str() == ".gitmodules"
+    })
 }
 
 pub(crate) fn prepare_command(

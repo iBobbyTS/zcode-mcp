@@ -1,6 +1,9 @@
 use crate::{prompts::build_review_prompt, ReviewFailure, Scheduler, SchedulerError};
 use review_ledger::{ArtifactIntegrity, LedgerManager};
-use review_preparation::{PreparedLaunchSpec, ReviewManifest, ReviewPreparer, WorktreeManager};
+use review_preparation::{
+    CompletionOutcome, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
+    PreparedGeneralTask, PreparedLaunchSpec, ReviewManifest, ReviewPreparer, WorktreeManager,
+};
 use review_store::{Job, StoreError};
 use std::{
     fmt,
@@ -13,6 +16,26 @@ pub struct SpawnedReview {
     pub job: Job,
     pub prompt_sha256: String,
     pub resumed_existing: bool,
+}
+
+/// Daemon-owned typed boundary for general-task completion. Runtime ingress is
+/// added in S03; callers cannot supply a worktree or Git command here.
+pub struct GeneralCompletionGate;
+
+impl GeneralCompletionGate {
+    pub fn complete(
+        prepared: &PreparedGeneralTask,
+        submission: &GeneralCompletionSubmission,
+    ) -> GeneralCompletion {
+        GeneralFinalizer::finalize_submission(prepared, submission)
+    }
+
+    pub fn terminalize(
+        prepared: &PreparedGeneralTask,
+        outcome: CompletionOutcome,
+    ) -> GeneralCompletion {
+        GeneralFinalizer::finalize(prepared, outcome)
+    }
 }
 
 #[derive(Debug)]

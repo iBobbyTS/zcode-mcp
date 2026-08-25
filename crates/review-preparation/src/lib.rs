@@ -1,6 +1,14 @@
+mod general;
 mod manifest;
 mod policy;
 mod worktree;
+
+pub use general::{
+    ArtifactMetadata, AttachmentInput, BudgetLimits, CompletionOutcome, GeneralArtifactKind,
+    GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer, GeneralProfile,
+    GeneralTaskManifest, GeneralTaskPreparer, PreparedAttachment, PreparedGeneralTask,
+    PublicAttachment, GENERAL_TASK_SCHEMA,
+};
 
 pub use manifest::{
     InputArtifact, NetworkPolicy, PreparedLaunchSpec, PreparedScopePath, ReviewKind,
@@ -8,7 +16,7 @@ pub use manifest::{
 };
 pub use policy::{
     ExternalDecision, PermissionDecision, PermissionRequest, PolicyCapabilities, PolicyLauncher,
-    PreparedCommand, SandboxEnforcement, ValidationOutput,
+    PolicyMode, PreparedCommand, SandboxEnforcement, ValidationOutput,
 };
 pub use worktree::{CleanupRecord, IntegrityDiagnostics, PreparedWorktree, WorktreeManager};
 
