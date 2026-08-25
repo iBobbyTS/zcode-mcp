@@ -428,7 +428,51 @@ pub struct RuntimeOwner {
     shutdown_pump: Arc<AtomicBool>,
     turn_tracker: Arc<TurnTracker>,
     session_id: Mutex<Option<String>>,
-    permission_responses: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    permission_responses: Arc<Mutex<OfferedPermissionCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct PermissionResponses {
+    allow: serde_json::Value,
+    deny: serde_json::Value,
+}
+
+const MAX_PENDING_PERMISSION_RESPONSES: usize = 128;
+
+#[derive(Debug, Default)]
+struct OfferedPermissionCache {
+    requests: HashMap<String, PermissionResponses>,
+}
+
+impl OfferedPermissionCache {
+    fn observe(&mut self, key: String, params: &serde_json::Value) {
+        let reused = self.requests.remove(&key).is_some();
+        let offered = offered_permission_response(params, "allow")
+            .zip(offered_permission_response(params, "deny"))
+            .map(|(allow, deny)| PermissionResponses { allow, deny });
+        if !reused && self.requests.len() < MAX_PENDING_PERMISSION_RESPONSES {
+            if let Some(offered) = offered {
+                self.requests.insert(key, offered);
+            }
+        }
+    }
+
+    fn response(&self, key: &str, decision: &str) -> Option<serde_json::Value> {
+        let offered = self.requests.get(key)?;
+        match decision {
+            "allow" => Some(offered.allow.clone()),
+            "deny" => Some(offered.deny.clone()),
+            _ => None,
+        }
+    }
+
+    fn complete(&mut self, key: &str) {
+        self.requests.remove(key);
+    }
+
+    fn clear(&mut self) {
+        self.requests.clear();
+    }
 }
 
 impl RuntimeOwner {
@@ -437,7 +481,7 @@ impl RuntimeOwner {
         let publisher = Arc::new(Publisher::new(sink));
         let shutdown_pump = Arc::new(AtomicBool::new(false));
         let turn_tracker = Arc::new(TurnTracker::new());
-        let permission_responses = Arc::new(Mutex::new(HashMap::new()));
+        let permission_responses = Arc::new(Mutex::new(OfferedPermissionCache::default()));
         spawn_event_pump(
             Arc::clone(&driver),
             Arc::clone(&publisher),
@@ -572,20 +616,23 @@ impl RuntimeOwner {
         }
         let key = serde_json::to_string(&id)
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        let result = self
-            .permission_responses
-            .lock()
-            .unwrap()
-            .remove(&format!("{key}:{decision}"))
-            .ok_or_else(|| {
-                RuntimeCommandError::InvalidSession(
-                    "runtime offered no matching permission response".into(),
-                )
-            })?;
+        let result = {
+            self.permission_responses
+                .lock()
+                .unwrap()
+                .response(&key, decision)
+                .ok_or_else(|| {
+                    RuntimeCommandError::InvalidSession(
+                        "runtime offered no matching permission response".into(),
+                    )
+                })?
+        };
         let _ = content;
         self.driver
             .respond(id, result)
-            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))
+            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.permission_responses.lock().unwrap().complete(&key);
+        Ok(())
     }
 
     pub fn close_session(
@@ -644,6 +691,7 @@ impl RuntimeOwner {
                 RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed(error.to_string()))
             }
         };
+        self.permission_responses.lock().unwrap().clear();
         self.publisher.publish_terminal(terminal)
     }
 
@@ -678,6 +726,40 @@ fn observed_model_from_result(result: &serde_json::Value) -> Option<&str> {
         .or_else(|| result.get("session").and_then(current))
 }
 
+fn normalized_zai_model(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        return None;
+    }
+    let model = match value.split_once('/') {
+        Some(("zai", model)) => model,
+        Some(_) => return None,
+        None => value,
+    };
+    if model.is_empty() || model.contains('/') {
+        return None;
+    }
+    Some(model.to_ascii_lowercase())
+}
+
+fn validate_requested_model(
+    requested: Option<&str>,
+    observed: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let Some(requested) = normalized_zai_model(requested) else {
+        return Err("MODEL_REQUEST_INVALID");
+    };
+    let Some(observed) = observed.and_then(normalized_zai_model) else {
+        return Err("MODEL_NOT_OBSERVED");
+    };
+    if requested != observed {
+        return Err("MODEL_MISMATCH");
+    }
+    Ok(())
+}
+
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
         let _ = self.stop(Duration::from_secs(1));
@@ -690,7 +772,7 @@ fn spawn_event_pump(
     publisher: Arc<Publisher>,
     shutdown: Arc<AtomicBool>,
     turn_tracker: Arc<TurnTracker>,
-    permission_responses: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    permission_responses: Arc<Mutex<OfferedPermissionCache>>,
 ) {
     thread::spawn(move || loop {
         if shutdown.load(Ordering::Acquire) {
@@ -710,14 +792,10 @@ fn spawn_event_pump(
                         }
                     } else if request.method == INTERACTION_REQUEST_PERMISSION {
                         if let Ok(key) = serde_json::to_string(&request.id) {
-                            let mut cached = permission_responses.lock().unwrap();
-                            for decision in ["allow", "deny"] {
-                                if let Some(response) =
-                                    offered_permission_response(&request.params, decision)
-                                {
-                                    cached.insert(format!("{key}:{decision}"), response);
-                                }
-                            }
+                            permission_responses
+                                .lock()
+                                .unwrap()
+                                .observe(key, &request.params);
                         }
                     }
                 }
@@ -752,11 +830,13 @@ fn spawn_event_pump(
                 };
                 publisher.emit_driver(event, terminal);
                 if is_exit_boundary {
+                    permission_responses.lock().unwrap().clear();
                     return;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                permission_responses.lock().unwrap().clear();
                 publisher.publish_terminal(RuntimeTerminal::FailedRuntimeLost(
                     RuntimeLoss::EventStreamLost,
                 ));
@@ -1735,6 +1815,35 @@ impl Scheduler {
                 });
             }
         };
+        let requested_model = claim
+            .job
+            .prepared_launch_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|prepared| {
+                prepared
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        if let Err(code) = validate_requested_model(
+            requested_model.as_deref(),
+            session.observed_model.as_deref(),
+        ) {
+            let message = "runtime model did not match the prepared request";
+            if let Err(error) =
+                self.inner
+                    .store
+                    .fail_claim(&claim.job.agent_id, claim.owner_epoch, code, message)
+            {
+                self.record_failure(&claim.job.agent_id, error.to_string());
+            }
+            let _ = runtime.stop(self.inner.config.stop_grace);
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: claim.job.agent_id,
+                message: message.into(),
+            });
+        }
         let identity = runtime.identity().map(|identity| StoredProcessIdentity {
             pid: identity.pid,
             process_group_id: identity.pgid,
@@ -2774,6 +2883,58 @@ mod tests {
     use std::sync::Barrier;
     use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
 
+    #[test]
+    fn requested_model_normalization_is_narrow_and_fail_closed() {
+        assert_eq!(normalized_zai_model("zai/glm-5.3"), Some("glm-5.3".into()));
+        assert_eq!(normalized_zai_model("GLM-5.3"), Some("glm-5.3".into()));
+        assert!(normalized_zai_model("builtin:zai-coding-plan/glm-5.3").is_none());
+        assert!(normalized_zai_model("other/glm-5.3").is_none());
+        assert!(validate_requested_model(Some("zai/glm-5.3"), Some("glm-5.3")).is_ok());
+        assert_eq!(
+            validate_requested_model(Some("zai/glm-5.3"), None),
+            Err("MODEL_NOT_OBSERVED")
+        );
+        assert_eq!(
+            validate_requested_model(Some("zai/glm-5.3"), Some("glm-5.1")),
+            Err("MODEL_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn offered_permission_cache_is_bounded_retryable_and_evicts_whole_requests() {
+        let valid = serde_json::json!({"options":[
+            {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
+            {"kind":"deny","response":{"decision":"deny","reason":"denied"}}
+        ]});
+        let mut cache = OfferedPermissionCache::default();
+        cache.observe("request-1".into(), &valid);
+        let first = cache.response("request-1", "deny").unwrap();
+        assert_eq!(first["decision"], "deny");
+        assert_eq!(cache.response("request-1", "deny"), Some(first));
+        cache.complete("request-1");
+        assert!(cache.response("request-1", "allow").is_none());
+        assert!(cache.response("request-1", "deny").is_none());
+
+        cache.observe("reused".into(), &valid);
+        cache.observe("reused".into(), &valid);
+        assert!(cache.response("reused", "deny").is_none());
+        cache.observe(
+            "malformed".into(),
+            &serde_json::json!({"options":[
+                {"kind":"allow_once","response":{"decision":"allow"}},
+                {"kind":"deny","response":{"decision":"allow"}}
+            ]}),
+        );
+        assert!(cache.response("malformed", "deny").is_none());
+
+        for index in 0..MAX_PENDING_PERMISSION_RESPONSES + 1 {
+            cache.observe(format!("bounded-{index}"), &valid);
+        }
+        assert_eq!(cache.requests.len(), MAX_PENDING_PERMISSION_RESPONSES);
+        cache.clear();
+        assert!(cache.requests.is_empty());
+    }
+
     #[derive(Default)]
     struct MemorySink {
         records: Mutex<Vec<LifecycleRecord>>,
@@ -3402,6 +3563,27 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn requested_model_must_be_observed_before_running_and_runtime_is_stopped() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let mut job = NewJob::new("model-mismatch", "workspace-model");
+        job.prepared_launch_json = Some(r#"{"model":"zai/glm-5.3"}"#.into());
+        job.prepared_launch_sha256 = Some("a".repeat(64));
+        scheduler.enqueue(&job).unwrap();
+        assert!(matches!(
+            scheduler.start_ready(),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        let failed = store.get_job("model-mismatch").unwrap().unwrap();
+        assert_eq!(failed.state, JobState::FailedRuntimeLost);
+        assert_eq!(failed.failure_code.as_deref(), Some("MODEL_NOT_OBSERVED"));
+        assert_eq!(scheduler.active_count(), 0);
+        assert!(factory
+            .runtime("model-mismatch")
+            .wait_terminal(Duration::from_secs(1))
+            .is_some());
     }
 
     #[test]

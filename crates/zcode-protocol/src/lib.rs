@@ -177,14 +177,18 @@ pub fn offered_permission_response(params: &Value, decision: &str) -> Option<Val
         "deny" => "deny",
         _ => return None,
     };
-    params
+    let matches = params
         .get("options")?
         .as_array()?
         .iter()
-        .find(|option| option.get("kind").and_then(Value::as_str) == Some(expected_kind))?
-        .get("response")
-        .cloned()
-        .filter(Value::is_object)
+        .filter(|option| option.get("kind").and_then(Value::as_str) == Some(expected_kind))
+        .collect::<Vec<_>>();
+    let [option] = matches.as_slice() else {
+        return None;
+    };
+    let response = option.get("response")?.as_object()?;
+    (response.get("decision").and_then(Value::as_str) == Some(decision))
+        .then(|| Value::Object(response.clone()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,5 +472,14 @@ mod tests {
             Some(serde_json::json!({"decision":"deny","reason":"bounded"}))
         );
         assert!(offered_permission_response(&params, "other").is_none());
+        let mismatched = serde_json::json!({"options":[
+            {"kind":"deny","response":{"decision":"allow"}}
+        ]});
+        assert!(offered_permission_response(&mismatched, "deny").is_none());
+        let duplicate = serde_json::json!({"options":[
+            {"kind":"deny","response":{"decision":"deny"}},
+            {"kind":"deny","response":{"decision":"deny"}}
+        ]});
+        assert!(offered_permission_response(&duplicate, "deny").is_none());
     }
 }

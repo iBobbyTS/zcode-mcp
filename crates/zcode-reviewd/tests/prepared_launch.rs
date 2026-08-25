@@ -158,7 +158,7 @@ impl ManagedRuntime for CapturingRuntime {
         Ok(SessionReady {
             session_id: "real-session-id".into(),
             initial_turn_id: Some("turn-1".into()),
-            observed_model: Some("observed-model".into()),
+            observed_model: Some("requested-model".into()),
         })
     }
 
@@ -337,7 +337,7 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
     assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
     let final_report = fs::read_to_string(&prepared.report_target).unwrap();
     assert!(final_report.contains("real\\-session\\-id"));
-    assert!(final_report.contains("observed\\-model"));
+    assert!(final_report.contains("requested\\-model"));
     assert!(final_report.contains("FINALIZED: true"));
 }
 

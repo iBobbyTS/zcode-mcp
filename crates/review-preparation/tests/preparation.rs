@@ -527,6 +527,17 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
     let arbitrary = launcher.decide_zcode_permission(&arbitrary_mcp, ExternalDecision::Allow);
     assert!(!arbitrary.allowed);
     assert_eq!(arbitrary.reason, "permission_request_unrecognized");
+    for variant in [
+        "MCP__REVIEW-LEDGER__REVIEW_FINALIZE",
+        "mcp__review-ledger__Review_Finalize",
+    ] {
+        let decision = launcher.decide_zcode_permission(
+            &serde_json::json!({"toolName":variant,"input":{}}),
+            ExternalDecision::Allow,
+        );
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "permission_request_unrecognized");
+    }
 
     let mut network_allowed = fixture.manifest();
     network_allowed.idempotency_key = "feature:S04:network-allow".into();

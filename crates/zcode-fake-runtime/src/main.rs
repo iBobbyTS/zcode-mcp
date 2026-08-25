@@ -510,7 +510,13 @@ fn main() {
                 }
                 let _ = write_value(
                     &mut out,
-                    response(id, json!({"session": {"sessionId": &session_id}})),
+                    response(
+                        id,
+                        json!({
+                            "session": {"sessionId": &session_id},
+                            "settings":{"model":{"current":{"modelId":"fixture-model"}}}
+                        }),
+                    ),
                 );
             }
             "session/subscribe" => {

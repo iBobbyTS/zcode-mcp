@@ -198,7 +198,7 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let mut available_models = Vec::new();
-    collect_model_ids(Some(result), &mut available_models);
+    collect_model_ids(result.get("modelCatalog"), &mut available_models);
     available_models.sort();
     available_models.dedup();
     Preflight {
@@ -381,6 +381,20 @@ mod tests {
             result.available_models.unwrap(),
             vec!["glm-current", "glm-other"]
         );
+        cleanup(paths);
+    }
+
+    #[test]
+    fn preflight_catalog_does_not_collect_current_or_session_models() {
+        let paths = fixture("#!/bin/sh\nprintf '{\\\"id\\\":\\\"preflight-1\\\",\\\"result\\\":{\\\"settings\\\":{\\\"model\\\":{\\\"current\\\":{\\\"modelId\\\":\\\"glm-current\\\"}}},\\\"session\\\":{\\\"modelId\\\":\\\"glm-session\\\"},\\\"modelCatalog\\\":{\\\"items\\\":[{\\\"modelId\\\":\\\"glm-catalog\\\"}]}}}\\n'");
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&paths.0)
+            .status()
+            .unwrap();
+        let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1));
+        assert_eq!(result.current_model.as_deref(), Some("glm-current"));
+        assert_eq!(result.available_models.unwrap(), vec!["glm-catalog"]);
         cleanup(paths);
     }
 

@@ -224,15 +224,18 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         .unwrap()
         .contains("FINALIZED: false"));
 
-    let queued = scheduler
+    let interrupted = scheduler
         .message_job(
             &agent_id,
-            "official-queue",
-            "queue",
-            "After the review turn ends, reply with one word and do not call any tools.",
+            "official-interrupt",
+            "interrupt_and_continue",
+            "Continue the bounded review, call the required ledger tools exactly once, and finalize.",
         )
         .unwrap();
-    assert!(matches!(queued, zcode_reviewd::MessageDisposition::Queued));
+    assert_eq!(
+        interrupted,
+        zcode_reviewd::MessageDisposition::InterruptedThenDelivered
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(240);
     let mut responded = std::collections::HashSet::new();
@@ -294,7 +297,7 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         terminal.failure_message
     );
     assert_eq!(
-        store.message("official-queue").unwrap().unwrap().state,
+        store.message("official-interrupt").unwrap().unwrap().state,
         MessageState::Delivered
     );
     let snapshot = store.review_snapshot(&agent_id).unwrap().unwrap();
@@ -302,6 +305,10 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
     assert!(!snapshot.checkpoints.is_empty());
     assert!(!snapshot.validations.is_empty());
     assert!(snapshot.finalization.is_some());
+    assert_eq!(
+        snapshot.provenance.observed_model.as_deref(),
+        Some("glm-5.3")
+    );
     let artifact = scheduler
         .verify_review_artifact(&agent_id, 256)
         .unwrap()
