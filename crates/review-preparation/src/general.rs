@@ -322,7 +322,20 @@ impl GeneralTaskPreparer {
             return Ok(existing);
         }
         let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
-        let worktree = manager.create(&base_sha, &key)?;
+        let expected_worktree_path = job_root.join("worktrees").join(&key);
+        let worktree = match manager.create(&base_sha, &key) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                let cleanup =
+                    bounded_cleanup_unregistered(&manager, &expected_worktree_path, &job_root);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(PreparationError::Worktree(format!(
+                        "general worktree creation failed ({error}); cleanup unresolved ({cleanup})"
+                    ))),
+                };
+            }
+        };
         let built = (|| {
             let (context, context_bytes) = prepare_context(
                 &worktree.path,
@@ -406,16 +419,12 @@ impl GeneralTaskPreparer {
         match built {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
-                let cleanup = manager
-                    .capture_integrity(&worktree)
-                    .and_then(|diagnostics| manager.persist_integrity(&worktree, diagnostics))
-                    .and_then(|record| manager.cleanup_from_record(&record).map(|_| ()));
+                let cleanup = bounded_cleanup_worktree(&manager, &worktree, &job_root);
                 if let Err(cleanup) = cleanup {
                     return Err(PreparationError::Worktree(format!(
                         "general preparation failed ({error}); cleanup failed ({cleanup})"
                     )));
                 }
-                cleanup_job_root_path(&job_root)?;
                 Err(error)
             }
         }
@@ -499,7 +508,20 @@ impl GeneralFinalizer {
         persisted: &GeneralCompletion,
     ) -> GeneralCompletion {
         let mut completion = persisted.clone();
-        completion.cleaned = cleanup_if_trusted(prepared);
+        completion.cleaned = if cleanup_if_trusted(prepared) {
+            true
+        } else {
+            let Ok(manager) = manager(prepared) else {
+                return completion;
+            };
+            let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
+                return completion;
+            };
+            manager
+                .verify_registration_absent(&prepared.worktree.path)
+                .is_ok()
+                && cleanup_job_root_path(job_root).is_ok()
+        };
         completion
     }
 
@@ -1485,10 +1507,57 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
             return false;
         }
     }
+    if manager.verify_worktree_absent(&prepared.worktree).is_err() {
+        return false;
+    }
     let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
         return false;
     };
+    if !job_root.exists() {
+        return manager
+            .verify_registration_absent(&prepared.worktree.path)
+            .is_ok();
+    }
     cleanup_job_root_path(job_root).is_ok()
+}
+
+fn bounded_cleanup_worktree(
+    manager: &WorktreeManager,
+    worktree: &PreparedWorktree,
+    job_root: &Path,
+) -> PreparationResult<()> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match manager
+            .capture_integrity(worktree)
+            .and_then(|diagnostics| manager.persist_integrity(worktree, diagnostics))
+            .and_then(|record| manager.cleanup_from_record(&record).map(|_| ()))
+            .and_then(|_| manager.verify_worktree_absent(worktree))
+            .and_then(|_| cleanup_job_root_path(job_root))
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| PreparationError::Worktree("cleanup retry exhausted".into())))
+}
+
+fn bounded_cleanup_unregistered(
+    manager: &WorktreeManager,
+    worktree_path: &Path,
+    job_root: &Path,
+) -> PreparationResult<()> {
+    let mut last_error = None;
+    for _ in 0..3 {
+        match manager
+            .verify_path_absent(worktree_path)
+            .and_then(|_| cleanup_job_root_path(job_root))
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| PreparationError::Worktree("cleanup retry exhausted".into())))
 }
 fn cleanup_if_trusted(prepared: &PreparedGeneralTask) -> bool {
     prepared.validate_digest().is_ok() && cleanup_after_failure(prepared)

@@ -350,6 +350,56 @@ impl WorktreeManager {
         Ok(record)
     }
 
+    /// Verify that a prepared worktree has converged to both filesystem and
+    /// Git-registration absence before its private job root is removed.
+    pub fn verify_worktree_absent(&self, worktree: &PreparedWorktree) -> PreparationResult<()> {
+        let (worktrees_root, diagnostic_root) = self.expected_roots()?;
+        let path = fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
+        if worktree.repository != self.repository
+            || worktree.scratch_worktrees_root != worktrees_root
+            || worktree.diagnostic_root != diagnostic_root
+            || path.parent() != Some(worktrees_root.as_path())
+        {
+            return Err(PreparationError::Worktree(
+                "absent-worktree proof is not bound to this manager".into(),
+            ));
+        }
+        if worktree.path.exists()
+            || registered_worktree(&self.repository, &worktree.path)?.is_some()
+        {
+            return Err(PreparationError::Worktree(
+                "worktree filesystem or Git registration remains".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_path_absent(&self, path: &Path) -> PreparationResult<()> {
+        let (worktrees_root, _) = self.expected_roots()?;
+        let path = path.to_path_buf();
+        if path.parent() != Some(worktrees_root.as_path()) {
+            return Err(PreparationError::PathEscape {
+                path,
+                root: worktrees_root,
+            });
+        }
+        if path.exists() || registered_worktree(&self.repository, &path)?.is_some() {
+            return Err(PreparationError::Worktree(
+                "worktree filesystem or Git registration remains".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_registration_absent(&self, path: &Path) -> PreparationResult<()> {
+        if registered_worktree(&self.repository, path)?.is_some() {
+            return Err(PreparationError::Worktree(
+                "Git registration remains after filesystem cleanup".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn expected_roots(&self) -> PreparationResult<(PathBuf, PathBuf)> {
         Ok((
             fs::canonicalize(self.scratch_root.join("worktrees"))?,

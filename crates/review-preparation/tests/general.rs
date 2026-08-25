@@ -805,6 +805,53 @@ fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
     assert!(prepared.artifact_root.join("changes.patch").is_file());
 }
 
+#[test]
+fn missing_worktree_with_stale_git_registration_is_not_cleaned() {
+    let f = Fixture::new();
+    let prepared = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .unwrap();
+    fs::remove_dir_all(&prepared.worktree.path).unwrap();
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
+    assert!(!completion.cleaned);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("PREPARED_CONTENT_INVALID")
+    );
+    assert!(git(&f.repository, &["worktree", "list", "--porcelain"]).contains("worktree"));
+}
+
+#[test]
+fn preparation_failure_retries_cleanup_and_leaves_truthful_residue() {
+    let f = Fixture::new();
+    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    manifest.validation_commands.insert(
+        "missing".into(),
+        review_preparation::ValidationCommand {
+            program: "/definitely/missing".into(),
+            args: vec![],
+            cwd: ".".into(),
+            timeout_ms: 100,
+            max_output_bytes: 100,
+        },
+    );
+    assert!(f.preparer().prepare(&manifest).is_err());
+    let scratch = f.repository.join(".agent-work/scratch/general");
+    assert!(fs::read_dir(&scratch).unwrap().next().is_none());
+
+    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    manifest.scratch_root = ".agent-work/scratch/general/symlink-root".into();
+    let linked = f
+        .repository
+        .join(".agent-work/scratch/general/symlink-root");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    symlink(f.repository.join("outside"), &linked).unwrap();
+    assert!(f.preparer().prepare(&manifest).is_err());
+    assert!(linked.is_symlink());
+}
+
 fn git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(path)
