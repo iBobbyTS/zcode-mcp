@@ -68,6 +68,14 @@ effective decisions, `policy_overrode`, and a bounded reason code. Duplicate
 responses return the persisted effective decision. Unsupported user input is
 never fabricated into a permission response.
 
+Official-runtime permission options are cached per wire request with a fixed
+bound. A response must contain exactly one matching allow and deny option with
+an effective-decision-consistent response object. Cache entries survive a
+failed Driver write for retry, are removed as a whole after successful write,
+are invalidated on wire-ID reuse, and are cleared at terminal/disconnect.
+Requested model provenance is checked before durable `RUNNING`; missing or
+mismatched observations fail and reap the runtime.
+
 The example Codex configuration defaults tools to `prompt`, auto-approves only
 the five read-only projection tools, and keeps spawn/message/respond/stop/close
 at `prompt`. The exact ten-tool allowlist prevents accidental exposure of
@@ -86,6 +94,10 @@ is atomic; an unrenderable oversized candidate rolls its database transaction
 back.
 
 ## Residual risks
+
+- `Clean A` is satisfied at product/test head `9c5276e8...`; independent
+  `Clean B` final review remains pending, so final S09 acceptance is not yet
+  claimed.
 
 - Official ZCode 3.8.1 behavior was verified locally. Compatibility remains
   hash/version-specific and does not imply future runtime compatibility.

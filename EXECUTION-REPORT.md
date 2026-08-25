@@ -5,13 +5,15 @@
 - Feature: `zcode-review-mcp`
 - Branch: `codex/zcode-review-mcp`
 - Feature base: `73c379e04a09015c29591214eb29093da7300e10`
-- Final product/test head: `e2fc9b0d9010a7652b6022cfa220764af8ae5c62`
+- Final product/test head: `9c5276e8acbece92dc9f8272a426de767b504466`
 - Authoritative PLAN-FULL SHA-256:
   `3d12938489faf5629bde074cd277799b1d0de9352d9e273c00d85ed6397270f8`
 - S09 documentation is a later docs-only commit. Its exact Git identity is
   recorded in `.agent-work/sections/S09-HANDOFF.md` and the final audit record;
   a Git commit cannot contain its own hash.
-- Readiness: `mergeable` for the accepted fake-runtime contract.
+- Assurance: `Clean A` closure evidence satisfied; fresh `Clean B`
+  `FINAL_BOUNDED` remains pending.
+- Readiness: `pending Clean B`; this report does not claim final S09 acceptance.
 - Real official ZCode runtime: `VERIFIED_ZCODE_3_8_1_GLM_5_3`.
 - Audit pack: finalized separately by the workflow orchestrator after S09
   acceptance; this report does not claim pack completion.
@@ -29,7 +31,7 @@
 | S06 | `af74e67a932be707677e7405f070098454b887fd` | internal orchestration accepted |
 | S07 | `20ee37c2f4c70c9acd98ba53b48aeba2199a8f14` | public MCP accepted |
 | S08 | `b8da3d250732b7788c6522dc36f5b723a1eed17d` | shadow integration accepted |
-| S09 compatibility delta | `e2fc9b0d9010a7652b6022cfa220764af8ae5c62` | official ZCode 3.8.1 candidate |
+| S09 compatibility delta | `9c5276e8acbece92dc9f8272a426de767b504466` | Clean A, Clean B pending |
 
 The historical S02 supervisor commits remain visible in Git as unaccepted
 evidence. The accepted tree contains no `zcode-supervisor` product owner.
@@ -69,7 +71,7 @@ product/test head:
 
 ```text
 git log --reverse --format='%H%x09%s' \
-  73c379e04a09015c29591214eb29093da7300e10..b8da3d250732b7788c6522dc36f5b723a1eed17d
+  73c379e04a09015c29591214eb29093da7300e10..9c5276e8acbece92dc9f8272a426de767b504466
 ```
 
 The section-closing commits, in dependency order, are:
@@ -87,6 +89,8 @@ af74e67a932be707677e7405f070098454b887fd fix(review): complete S06 internal comp
 20ee37c2f4c70c9acd98ba53b48aeba2199a8f14 test(mcp): prove claimed public review flow
 b8da3d250732b7788c6522dc36f5b723a1eed17d fix(shadow): require complete matching evidence
 e2fc9b0d9010a7652b6022cfa220764af8ae5c62 fix(runtime): support official ZCode 3.8.1
+58cea86cbee31daae08c77dff1bdba9dc2819fe6 fix(runtime): enforce compatibility provenance
+9c5276e8acbece92dc9f8272a426de767b504466 test(runtime): prove official interrupt boundary
 ```
 
 The full Git sequence, including intermediate repair commits and preserved
@@ -130,12 +134,20 @@ owner.
 
 ## Final composition
 
-`unproven_composition = []` for the accepted fake-runtime scope. The exact-head
+`unproven_composition = []` for the current fake/official-runtime scope. The exact-head
 workspace suite includes the complete internal fake review, official-rmcp
 public facade process flow, daemon restart/lifecycle fixtures, manifest and
 worktree integrity, report hash revalidation, sectioned shadow process flow,
 and deterministic consumer patch replay. A redundant integration reviewer is
 therefore not required by the active workflow.
+
+The official scheduler interrupt closure ran for 192.92 seconds. Immediately
+before `interrupt_and_continue` the turn was active; the observed stop-boundary
+counter increased exactly once; the same runtime entered the delivered next
+active turn; the single message was durable `DELIVERED`; the report finalized
+with GLM-5.3 provenance; and the process group was reaped. The temporary model
+catalog was restored to config SHA-256
+`400b4836a700ca8eca974d3cb45dc06dbfd692058d34320543cb75d06882ffdf`.
 
 ## Limitations
 

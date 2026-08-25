@@ -2,7 +2,7 @@
 
 ## Evidence identity
 
-- Product/test head: `e2fc9b0d9010a7652b6022cfa220764af8ae5c62`
+- Product/test head: `9c5276e8acbece92dc9f8272a426de767b504466`
 - Date: 2026-08-24
 - Host: macOS 26.5.1 (Darwin 25.5.0, arm64)
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
@@ -17,7 +17,7 @@
 | `cargo fmt --all -- --check` | PASS |
 | `cargo check --workspace --all-targets` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace --all-targets` | PASS, 155 tests, 0 failed |
+| `cargo test --workspace --all-targets` | PASS, 158 tests, 0 failed |
 | official `runtime-preflight` | PASS, strict NDJSON `workspace/readState` tested |
 
 The workspace run exercised every target once at the exact product/test head.
@@ -53,14 +53,21 @@ The same full workspace run included these named fixtures:
 
 ## Coverage summary
 
-The 155-test workspace gate includes three environment-gated official-runtime
+The 158-test workspace gate includes three environment-gated official-runtime
 fixtures, which skip successfully when the explicit path is absent. The same
 fixtures were separately executed against the official runtime. That targeted
 matrix proved nested workspace state,
 runtime-preferences response, create/subscribe/send, stop and later send,
 offered-option permission denial, unsupported input, queue delivery,
 session-level ledger MCP, partial/final report integrity, and process-group
-reap. The final workspace count is recorded after the exact-head gate.
+reap.
+
+The fresh real scheduler interrupt oracle passed in 192.92 seconds. It proved
+active-before-interrupt, exactly one observed stop boundary, exactly one next
+turn delivery, `InterruptedThenDelivered`, final report/provenance integrity,
+terminal state, and process-group reap. The temporary catalog config was
+restored to SHA-256
+`400b4836a700ca8eca974d3cb45dc06dbfd692058d34320543cb75d06882ffdf`.
 
 The executed fake-runtime and official-runtime paths cover spawn and group reap,
 request/response correlation, session create/subscribe/send/stop, message FIFO,
@@ -72,3 +79,4 @@ projection.
 
 The final behavioral checks cover the compatibility-delta product/test head.
 Any later product or test change requires bounded closure of that changed range.
+`Clean A` is satisfied at this head; `Clean B` is not yet claimed.

@@ -18,6 +18,13 @@ delivery, stop/later-send interruption behavior, offered-option policy
 responses, unsupported input, ledger checkpoints/validation/finalization,
 valid final report bytes/hash, and process-group reap.
 
+The exact final product/test head is
+`9c5276e8acbece92dc9f8272a426de767b504466`. Its fresh real
+`interrupt_and_continue` oracle passed in 192.92 seconds and distinguished a
+real stop-current-turn boundary from natural completion by observing an active
+turn immediately before the call and one exact stop-boundary increment before
+the next active turn. `Clean A` is satisfied; fresh `Clean B` remains pending.
+
 ## Pinned seam
 
 The typed request/event seam follows the observed research reference
