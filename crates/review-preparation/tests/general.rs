@@ -899,11 +899,7 @@ fn stale_prepared_record_never_returns_dangling_task_and_retries_deterministical
     assert!(retry.worktree.path.exists());
 
     fs::remove_dir_all(&retry.worktree.path).unwrap();
-    let error = f.preparer().prepare(&manifest).unwrap_err();
-    assert!(matches!(
-        error,
-        PreparationError::Worktree(_) | PreparationError::InvalidManifest(_)
-    ));
+    assert!(f.preparer().prepare(&manifest).is_err());
     assert!(!retry.worktree.path.exists());
 }
 
@@ -929,6 +925,40 @@ fn malformed_prepared_record_cleans_registered_worktree_before_private_root() {
 
     let retry = f.preparer().prepare(&manifest).unwrap();
     retry.validate_digest().unwrap();
+    assert!(retry.worktree.path.exists());
+}
+
+#[test]
+fn tampered_record_path_cleans_real_registration_without_touching_external_path() {
+    let f = Fixture::new();
+    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let prepared = f.preparer().prepare(&manifest).unwrap();
+    let job_root = prepared
+        .worktree
+        .scratch_worktrees_root
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let record = job_root.join("prepared-general.json");
+    let external = f._temp.path().join("must-survive");
+    fs::create_dir_all(&external).unwrap();
+    fs::write(external.join("sentinel"), "preserve").unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    value["worktree"]["path"] = serde_json::Value::String(external.to_string_lossy().into_owned());
+    value["worktree"]["scratch_worktrees_root"] =
+        serde_json::Value::String(external.to_string_lossy().into_owned());
+    fs::write(&record, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    assert!(f.preparer().prepare(&manifest).is_err());
+    assert_eq!(
+        fs::read_to_string(external.join("sentinel")).unwrap(),
+        "preserve"
+    );
+    assert!(!job_root.exists());
+    assert!(!git(&f.repository, &["worktree", "list", "--porcelain"])
+        .contains(prepared.worktree.path.to_str().unwrap()));
+
+    let retry = f.preparer().prepare(&manifest).unwrap();
     assert!(retry.worktree.path.exists());
 }
 

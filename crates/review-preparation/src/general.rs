@@ -1621,15 +1621,11 @@ fn validate_reusable_prepared(
 fn cleanup_stale_record(
     manager: &WorktreeManager,
     job_root: &Path,
-    record_bytes: &[u8],
+    _record_bytes: &[u8],
 ) -> PreparationResult<()> {
-    if let Ok(prepared) = serde_json::from_slice::<PreparedGeneralTask>(record_bytes) {
-        if !prepared.worktree.path.exists() {
-            manager.verify_registration_absent(&prepared.worktree.path)?;
-            return cleanup_job_root_path(job_root);
-        }
-        return bounded_cleanup_worktree(manager, &prepared.worktree, job_root);
-    }
+    // A record that already failed digest/content/owner validation is never
+    // authority for deletion, even when its JSON shape remains parseable.
+    // Enumerate only manager-bound registrations under the canonical job root.
     manager.cleanup_registered_under_job_root(job_root)?;
     cleanup_job_root_path(job_root)
 }
