@@ -37,7 +37,6 @@ CREATE TABLE IF NOT EXISTS agents (
     closed_at INTEGER,
     reaped_at INTEGER
 );
-
 CREATE INDEX IF NOT EXISTS agents_queue_idx
     ON agents(state, created_at, agent_id);
 CREATE INDEX IF NOT EXISTS agents_workspace_state_idx
@@ -130,4 +129,3 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     checkpoint_number INTEGER,
     created_at INTEGER NOT NULL
 );
-

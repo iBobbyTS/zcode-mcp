@@ -1194,7 +1194,7 @@ impl Store {
             TaskOutcome::Blocked => ("COMPLETED", Some("BLOCKED")),
             TaskOutcome::Cancelled => ("CANCELLED", Some("CANCELLED")),
             TaskOutcome::RuntimeLost => ("FAILED_RUNTIME_LOST", Some("RUNTIME_LOST")),
-            TaskOutcome::TimedOut => ("FAILED", Some("TIMED_OUT")),
+            TaskOutcome::TimedOut => ("FAILED", Some("TIMEOUT")),
             TaskOutcome::BudgetExhausted => ("FAILED", Some("BUDGET_EXHAUSTED")),
             TaskOutcome::ResultInvalid => ("FAILED", Some("RESULT_INVALID")),
             TaskOutcome::Failed => ("FAILED", Some("FAILED")),
@@ -4262,7 +4262,7 @@ mod tests {
                 5,
                 TaskOutcome::TimedOut,
                 JobState::Failed,
-                Some("TIMED_OUT"),
+                Some("TIMEOUT"),
             ),
             (
                 6,
