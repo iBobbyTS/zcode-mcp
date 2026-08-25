@@ -5,7 +5,7 @@
 - Feature: `zcode-review-mcp`
 - Branch: `codex/zcode-review-mcp`
 - Feature base: `73c379e04a09015c29591214eb29093da7300e10`
-- Final product/test head: `e2fc9b0bc1bb9df617d808935428b206af79a3da`
+- Final product/test head: `e2fc9b0d9010a7652b6022cfa220764af8ae5c62`
 - Authoritative PLAN-FULL SHA-256:
   `3d12938489faf5629bde074cd277799b1d0de9352d9e273c00d85ed6397270f8`
 - S09 documentation is a later docs-only commit. Its exact Git identity is
@@ -29,7 +29,7 @@
 | S06 | `af74e67a932be707677e7405f070098454b887fd` | internal orchestration accepted |
 | S07 | `20ee37c2f4c70c9acd98ba53b48aeba2199a8f14` | public MCP accepted |
 | S08 | `b8da3d250732b7788c6522dc36f5b723a1eed17d` | shadow integration accepted |
-| S09 compatibility delta | `e2fc9b0bc1bb9df617d808935428b206af79a3da` | official ZCode 3.8.1 candidate |
+| S09 compatibility delta | `e2fc9b0d9010a7652b6022cfa220764af8ae5c62` | official ZCode 3.8.1 candidate |
 
 The historical S02 supervisor commits remain visible in Git as unaccepted
 evidence. The accepted tree contains no `zcode-supervisor` product owner.
@@ -86,7 +86,7 @@ bb09e48ab5f75a8f6d39c8870777054a5604c225 fix(review): distinguish path entry ope
 af74e67a932be707677e7405f070098454b887fd fix(review): complete S06 internal composition
 20ee37c2f4c70c9acd98ba53b48aeba2199a8f14 test(mcp): prove claimed public review flow
 b8da3d250732b7788c6522dc36f5b723a1eed17d fix(shadow): require complete matching evidence
-e2fc9b0bc1bb9df617d808935428b206af79a3da fix(runtime): support official ZCode 3.8.1
+e2fc9b0d9010a7652b6022cfa220764af8ae5c62 fix(runtime): support official ZCode 3.8.1
 ```
 
 The full Git sequence, including intermediate repair commits and preserved

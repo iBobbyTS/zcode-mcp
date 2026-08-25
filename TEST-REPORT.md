@@ -2,7 +2,7 @@
 
 ## Evidence identity
 
-- Product/test head: `e2fc9b0bc1bb9df617d808935428b206af79a3da`
+- Product/test head: `e2fc9b0d9010a7652b6022cfa220764af8ae5c62`
 - Date: 2026-08-24
 - Host: macOS 26.5.1 (Darwin 25.5.0, arm64)
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
