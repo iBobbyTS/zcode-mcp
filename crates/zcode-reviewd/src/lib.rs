@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -429,6 +429,7 @@ pub struct RuntimeOwner {
     turn_tracker: Arc<TurnTracker>,
     session_id: Mutex<Option<String>>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
+    stop_boundaries: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +497,7 @@ impl RuntimeOwner {
             turn_tracker,
             session_id: Mutex::new(None),
             permission_responses,
+            stop_boundaries: AtomicU64::new(0),
         })
     }
 
@@ -598,8 +600,11 @@ impl RuntimeOwner {
         let params = serde_json::to_value(SessionParams { session_id })
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         self.driver.request(SESSION_STOP, params, timeout)?;
-        self.turn_tracker
-            .wait_boundary_after(current.generation, timeout)
+        let boundary = self
+            .turn_tracker
+            .wait_boundary_after(current.generation, timeout)?;
+        self.stop_boundaries.fetch_add(1, Ordering::AcqRel);
+        Ok(boundary)
     }
 
     pub fn respond_request(
@@ -650,6 +655,10 @@ impl RuntimeOwner {
 
     pub fn turn_snapshot(&self) -> TurnSnapshot {
         self.turn_tracker.snapshot()
+    }
+
+    pub fn stop_boundary_count(&self) -> u64 {
+        self.stop_boundaries.load(Ordering::Acquire)
     }
 
     fn validate_session(&self, session_id: &str) -> Result<(), RuntimeCommandError> {
@@ -956,6 +965,9 @@ pub trait ManagedRuntime: Send + Sync + 'static {
             boundary: None,
         }
     }
+    fn stop_boundary_count(&self) -> u64 {
+        0
+    }
     fn finish_turn(&self, boundary: TurnBoundary, grace: Duration) -> RuntimeTerminal {
         let _ = boundary;
         self.stop(grace)
@@ -1033,6 +1045,10 @@ impl ManagedRuntime for RuntimeOwner {
 
     fn turn_snapshot(&self) -> TurnSnapshot {
         self.turn_snapshot()
+    }
+
+    fn stop_boundary_count(&self) -> u64 {
+        self.stop_boundary_count()
     }
 
     fn finish_turn(&self, boundary: TurnBoundary, grace: Duration) -> RuntimeTerminal {
@@ -2655,6 +2671,11 @@ impl Scheduler {
 
     pub fn active_count(&self) -> usize {
         self.inner.state.lock().unwrap().active.len()
+    }
+
+    pub fn active_turn_observation(&self, agent_id: &str) -> Option<(TurnSnapshot, u64)> {
+        self.active_session(agent_id)
+            .map(|(_, runtime, _, _)| (runtime.turn_snapshot(), runtime.stop_boundary_count()))
     }
 
     pub fn last_error(&self, agent_id: &str) -> Option<String> {

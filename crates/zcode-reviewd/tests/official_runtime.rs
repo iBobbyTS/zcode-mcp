@@ -224,6 +224,11 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         .unwrap()
         .contains("FINALIZED: false"));
 
+    let (before_interrupt, stop_boundaries_before) = scheduler
+        .active_turn_observation(&agent_id)
+        .expect("official runtime must be active before interrupt");
+    assert!(before_interrupt.active);
+
     let interrupted = scheduler
         .message_job(
             &agent_id,
@@ -236,6 +241,11 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
         interrupted,
         zcode_reviewd::MessageDisposition::InterruptedThenDelivered
     );
+    let (after_interrupt, stop_boundaries_after) = scheduler
+        .active_turn_observation(&agent_id)
+        .expect("official runtime must remain active for the delivered next turn");
+    assert!(after_interrupt.active);
+    assert_eq!(stop_boundaries_after, stop_boundaries_before + 1);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(240);
     let mut responded = std::collections::HashSet::new();
