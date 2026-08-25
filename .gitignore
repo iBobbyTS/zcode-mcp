@@ -22,5 +22,11 @@ target
 
 # Agent
 .agent-work
-*.DS_Store
 .codegraph
+
+# User
+/*.zip
+
+# OS Junk
+*.DS_Store
+desktop.ini

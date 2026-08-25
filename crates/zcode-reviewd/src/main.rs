@@ -4,14 +4,15 @@ use sha2::{Digest, Sha256};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
     env, fs,
-    io::{self, BufReader, Read, Write},
-    os::unix::net::UnixStream,
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
     sync::{atomic::AtomicBool, Arc},
     thread,
     time::Duration,
 };
+#[cfg(debug_assertions)]
+use std::{io::Write, os::unix::net::UnixStream};
 use zcode_reviewd::{
     ledger_mcp, rpc::ServerOptions, CommandRuntimeFactory, Daemon, InternalLedgerMcpConfig,
     RuntimeFactory, Scheduler, SchedulerConfig,
@@ -22,6 +23,8 @@ struct Config {
     socket: PathBuf,
     runtime: Option<PathBuf>,
 }
+
+const PRODUCTION_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ledger-mcp")) {
@@ -47,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("reviewd-{}", std::process::id()),
         store,
         runtime_factory,
-        SchedulerConfig::default(),
+        production_scheduler_config(),
     )?
     .with_ledger(
         ledger,
@@ -78,6 +81,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     daemon.shutdown();
     Ok(())
+}
+
+fn production_scheduler_config() -> SchedulerConfig {
+    SchedulerConfig {
+        command_timeout: PRODUCTION_COMMAND_TIMEOUT,
+        ..SchedulerConfig::default()
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -228,5 +238,24 @@ fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {
         Ok(command)
     } else {
         Ok(Command::new(runtime))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_scheduler_allows_the_verified_official_runtime_bootstrap_window() {
+        let defaults = SchedulerConfig::default();
+        let production = production_scheduler_config();
+
+        assert_eq!(production.command_timeout, Duration::from_secs(90));
+        assert_eq!(production.global_max_agents, defaults.global_max_agents);
+        assert_eq!(
+            production.per_workspace_max_agents,
+            defaults.per_workspace_max_agents
+        );
+        assert_eq!(production.stop_grace, defaults.stop_grace);
     }
 }
