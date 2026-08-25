@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS events (
     turn_id TEXT,
     payload_json TEXT NOT NULL,
     redaction_level TEXT NOT NULL,
+    attempt_sequence INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (agent_id, runtime_agent_id, seq),
     UNIQUE (agent_id, runtime_agent_id, source_seq)
 );
@@ -236,9 +237,46 @@ CREATE TABLE IF NOT EXISTS review_report_events (
     PRIMARY KEY (agent_id, revision)
 );
 
+CREATE TABLE IF NOT EXISTS task_attempts (
+    execution_agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    public_agent_id TEXT NOT NULL,
+    task_kind TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'QUEUED',
+    review_id TEXT,
+    review_kind TEXT,
+    continuation_of TEXT REFERENCES task_attempts(execution_agent_id),
+    attempt_sequence INTEGER NOT NULL,
+    repository TEXT NOT NULL,
+    feature_id TEXT NOT NULL,
+    ownership_token TEXT NOT NULL,
+    semantic_fingerprint TEXT NOT NULL,
+    effective_budget_json TEXT NOT NULL,
+    independent_evidence INTEGER NOT NULL,
+    UNIQUE(public_agent_id, attempt_sequence)
+);
+CREATE INDEX IF NOT EXISTS task_attempts_scope_idx
+    ON task_attempts(repository, feature_id, ownership_token, task_kind);
+
+CREATE TABLE IF NOT EXISTS task_results (
+    execution_agent_id TEXT PRIMARY KEY REFERENCES task_attempts(execution_agent_id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    partial INTEGER NOT NULL,
+    retained INTEGER NOT NULL,
+    base_commit TEXT,
+    head_commit TEXT,
+    changed_files_json TEXT NOT NULL,
+    diff_stat TEXT,
+    checks_json TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    residual_gaps_json TEXT NOT NULL,
+    artifacts_json TEXT NOT NULL,
+    completed_at INTEGER NOT NULL
+);
+
 "#;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -287,6 +325,164 @@ pub enum JobListScope {
     Recent,
     All,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    General,
+    Review,
+    ReviewContinuation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    Queued,
+    Preparing,
+    Running,
+    WaitingInput,
+    Cancelling,
+    Terminal,
+}
+impl TaskPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Preparing => "PREPARING",
+            Self::Running => "RUNNING",
+            Self::WaitingInput => "WAITING_INPUT",
+            Self::Cancelling => "CANCELLING",
+            Self::Terminal => "TERMINAL",
+        }
+    }
+    fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "QUEUED" => Ok(Self::Queued),
+            "PREPARING" => Ok(Self::Preparing),
+            "RUNNING" => Ok(Self::Running),
+            "WAITING_INPUT" => Ok(Self::WaitingInput),
+            "CANCELLING" => Ok(Self::Cancelling),
+            "TERMINAL" => Ok(Self::Terminal),
+            other => Err(StoreError::InvalidState(format!(
+                "unknown task phase {other}"
+            ))),
+        }
+    }
+}
+impl TaskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "GENERAL",
+            Self::Review => "REVIEW",
+            Self::ReviewContinuation => "REVIEW_CONTINUATION",
+        }
+    }
+    fn parse(value: &str) -> StoreResult<Self> {
+        match value {
+            "GENERAL" => Ok(Self::General),
+            "REVIEW" => Ok(Self::Review),
+            "REVIEW_CONTINUATION" => Ok(Self::ReviewContinuation),
+            other => Err(StoreError::InvalidState(format!(
+                "unknown task kind {other}"
+            ))),
+        }
+    }
+    pub fn is_legacy_review(self) -> bool {
+        self == Self::Review
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveBudget {
+    pub wall_time_ms: u64,
+    pub max_turns: u64,
+    pub max_tool_calls: u64,
+    pub max_context_bytes: u64,
+    pub max_result_bytes: u64,
+    pub max_artifact_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetRequest {
+    Omitted,
+    Null,
+    Limits(EffectiveBudget),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTask {
+    pub job: NewJob,
+    pub public_agent_id: String,
+    pub task_kind: TaskKind,
+    pub review_id: Option<String>,
+    pub continuation_of: Option<String>,
+    pub repository: String,
+    pub feature_id: String,
+    pub ownership_token: String,
+    pub budget: BudgetRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRecord {
+    pub execution_agent_id: String,
+    pub public_agent_id: String,
+    pub task_kind: TaskKind,
+    pub phase: TaskPhase,
+    pub review_id: Option<String>,
+    pub review_kind: Option<String>,
+    pub continuation_of: Option<String>,
+    pub attempt_sequence: u64,
+    pub repository: String,
+    pub feature_id: String,
+    pub ownership_token: String,
+    pub effective_budget: EffectiveBudget,
+    pub independent_evidence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResultArtifact {
+    pub kind: String,
+    pub artifact_id: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskResult {
+    pub outcome: String,
+    pub summary: String,
+    pub partial: bool,
+    pub retain_partial: bool,
+    pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
+    pub changed_files: Vec<String>,
+    pub diff_stat: Option<String>,
+    pub checks: Vec<String>,
+    pub result_sha256: String,
+    pub residual_gaps: Vec<String>,
+    pub artifacts: Vec<ResultArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskQueryScope<'a> {
+    pub repository: &'a str,
+    pub feature_id: &'a str,
+    pub ownership_token: &'a str,
+}
+
+const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
+    wall_time_ms: 3_600_000,
+    max_turns: 32,
+    max_tool_calls: 128,
+    max_context_bytes: 1_048_576,
+    max_result_bytes: 1_048_576,
+    max_artifact_bytes: 16_777_216,
+};
+const MAX_BUDGET: EffectiveBudget = EffectiveBudget {
+    wall_time_ms: 86_400_000,
+    max_turns: 1024,
+    max_tool_calls: 4096,
+    max_context_bytes: 16_777_216,
+    max_result_bytes: 16_777_216,
+    max_artifact_bytes: 268_435_456,
+};
 
 impl JobState {
     pub fn is_terminal(self) -> bool {
@@ -468,6 +664,7 @@ pub struct StoredEvent {
     pub event_type: String,
     pub payload_json: String,
     pub redaction_level: String,
+    pub attempt_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -649,7 +846,6 @@ impl Store {
         let mut connection = Connection::open(path.as_ref())?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.execute_batch(SCHEMA)?;
         migrate_to_v4(&mut connection)?;
         let database_path = std::fs::canonicalize(path.as_ref()).map_err(|error| {
             StoreError::InvalidState(format!("database path cannot be canonicalized: {error}"))
@@ -744,6 +940,220 @@ impl Store {
             .ok_or_else(|| StoreError::InvalidState("inserted job could not be read".into()))?;
         transaction.commit()?;
         Ok(stored)
+    }
+
+    pub fn enqueue_task(&self, task: &NewTask) -> StoreResult<(Job, TaskRecord)> {
+        validate_task(task)?;
+        let effective = effective_budget(&task.budget)?;
+        let fingerprint = task_fingerprint(task, &effective);
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(key) = &task.job.idempotency_key {
+            let existing = transaction.query_row(
+                "SELECT a.agent_id, t.semantic_fingerprint FROM agents a JOIN task_attempts t ON t.execution_agent_id=a.agent_id WHERE a.idempotency_key=?1",
+                [key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?;
+            if let Some((execution_id, stored_fingerprint)) = existing {
+                if stored_fingerprint != fingerprint {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} names a semantically different task"
+                    )));
+                }
+                let job = query_job(&transaction, &execution_id)?
+                    .ok_or_else(|| StoreError::InvalidState("task job disappeared".into()))?;
+                let record = query_task_record(&transaction, &execution_id)?
+                    .ok_or_else(|| StoreError::InvalidState("task metadata disappeared".into()))?;
+                transaction.commit()?;
+                return Ok((job, record));
+            }
+        }
+        if query_job(&transaction, &task.job.agent_id)?.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "agent id {} already exists",
+                task.job.agent_id
+            )));
+        }
+        let (attempt_sequence, independent_evidence) = continuation_identity(&transaction, task)?;
+        let created_at = now_millis();
+        transaction.execute(
+            "INSERT INTO agents (agent_id,idempotency_key,parent_agent_id,review_kind,feature_id,section_id,round_kind,state,workspace_path,report_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,initial_prompt,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'QUEUED',?8,?9,?10,?11,?12,?13,?14)",
+            params![task.job.agent_id,task.job.idempotency_key,task.job.parent_agent_id,task.job.review_kind,task.job.feature_id,task.job.section_id,task.job.round_kind,task.job.workspace_path,task.job.report_path,task.job.runtime_hash,task.job.prepared_launch_json,task.job.prepared_launch_sha256,task.job.initial_prompt,created_at])?;
+        insert_ledger(
+            &transaction,
+            &task.job.agent_id,
+            0,
+            None,
+            JobState::Queued,
+            None,
+        )?;
+        transaction.execute(
+            "INSERT INTO task_attempts (execution_agent_id,public_agent_id,task_kind,phase,review_id,review_kind,continuation_of,attempt_sequence,repository,feature_id,ownership_token,semantic_fingerprint,effective_budget_json,independent_evidence) VALUES (?1,?2,?3,'QUEUED',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![task.job.agent_id,task.public_agent_id,task.task_kind.as_str(),task.review_id,task.job.review_kind,task.continuation_of,u64_to_i64(attempt_sequence)?,task.repository,task.feature_id,task.ownership_token,fingerprint,serde_json::to_string(&effective).map_err(|e| StoreError::InvalidState(e.to_string()))?,independent_evidence])?;
+        let job = query_job(&transaction, &task.job.agent_id)?.unwrap();
+        let record = query_task_record(&transaction, &task.job.agent_id)?.unwrap();
+        transaction.commit()?;
+        Ok((job, record))
+    }
+
+    pub fn get_task_scoped(
+        &self,
+        execution_agent_id: &str,
+        scope: TaskQueryScope<'_>,
+    ) -> StoreResult<Option<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        query_task_record_scoped(&connection, execution_agent_id, scope)
+    }
+
+    pub fn list_tasks_scoped(
+        &self,
+        scope: TaskQueryScope<'_>,
+        kind: Option<TaskKind>,
+        legacy_compatible_review_only: bool,
+        limit: usize,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let kind_filter = if legacy_compatible_review_only {
+            Some(TaskKind::Review)
+        } else {
+            kind
+        };
+        let mut statement = connection.prepare("SELECT execution_agent_id FROM task_attempts WHERE repository=?1 AND feature_id=?2 AND ownership_token=?3 AND (?4 IS NULL OR task_kind=?4) ORDER BY rowid DESC LIMIT ?5")?;
+        let ids = statement
+            .query_map(
+                params![
+                    scope.repository,
+                    scope.feature_id,
+                    scope.ownership_token,
+                    kind_filter.map(TaskKind::as_str),
+                    usize_to_i64(limit)?
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                query_task_record(&connection, &id)?
+                    .ok_or_else(|| StoreError::InvalidState("task disappeared".into()))
+            })
+            .collect()
+    }
+
+    pub fn store_task_result(
+        &self,
+        execution_agent_id: &str,
+        result: &TaskResult,
+    ) -> StoreResult<()> {
+        validate_result(result)?;
+        let connection = self.connection.lock().unwrap();
+        if query_task_record(&connection, execution_agent_id)?.is_none() {
+            return Err(StoreError::InvalidState(format!(
+                "unknown task {execution_agent_id}"
+            )));
+        }
+        if let Some(existing) = connection
+            .query_row(
+                "SELECT result_sha256 FROM task_results WHERE execution_agent_id=?1",
+                [execution_agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return if existing == result.result_sha256 {
+                Ok(())
+            } else {
+                Err(StoreError::Conflict(format!(
+                    "task {execution_agent_id} already has a different immutable completion"
+                )))
+            };
+        }
+        let retained = !result.partial || result.retain_partial;
+        let changed = connection.execute("INSERT INTO task_results (execution_agent_id,outcome,summary,partial,retained,base_commit,head_commit,changed_files_json,diff_stat,checks_json,result_sha256,residual_gaps_json,artifacts_json,completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)", params![execution_agent_id,result.outcome,result.summary,result.partial,retained,result.base_commit,result.head_commit,serde_json::to_string(&result.changed_files).unwrap(),result.diff_stat,serde_json::to_string(&result.checks).unwrap(),result.result_sha256,serde_json::to_string(&result.residual_gaps).unwrap(),serde_json::to_string(&result.artifacts).unwrap(),now_millis()])?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {execution_agent_id} already has immutable completion"
+            )));
+        }
+        connection.execute(
+            "UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id=?1",
+            [execution_agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_task_phase(&self, execution_agent_id: &str, next: TaskPhase) -> StoreResult<()> {
+        let connection = self.connection.lock().unwrap();
+        let current = connection
+            .query_row(
+                "SELECT phase FROM task_attempts WHERE execution_agent_id=?1",
+                [execution_agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("unknown task {execution_agent_id}"))
+            })?;
+        let current = TaskPhase::parse(&current)?;
+        let allowed = matches!(
+            (current, next),
+            (TaskPhase::Queued, TaskPhase::Preparing)
+                | (TaskPhase::Preparing, TaskPhase::Running)
+                | (TaskPhase::Running, TaskPhase::WaitingInput)
+                | (TaskPhase::WaitingInput, TaskPhase::Running)
+                | (_, TaskPhase::Cancelling)
+                | (TaskPhase::Cancelling, TaskPhase::Terminal)
+        );
+        if !allowed || current == TaskPhase::Terminal {
+            return Err(StoreError::Conflict(format!(
+                "invalid task phase transition {current:?} -> {next:?}"
+            )));
+        }
+        connection.execute(
+            "UPDATE task_attempts SET phase=?1 WHERE execution_agent_id=?2",
+            params![next.as_str(), execution_agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn task_events_after(
+        &self,
+        public_agent_id: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredEvent>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare("SELECT e.runtime_agent_id,e.seq,e.source_seq,e.event_type,e.payload_json,e.redaction_level,e.attempt_sequence FROM events e JOIN task_attempts t ON t.execution_agent_id=e.agent_id WHERE t.public_agent_id=?1 AND e.seq>?2 ORDER BY e.seq LIMIT ?3")?;
+        let rows = statement
+            .query_map(
+                params![
+                    public_agent_id,
+                    u64_to_i64(after_sequence)?,
+                    usize_to_i64(limit)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(StoredEvent {
+                    runtime_agent_id: r.0,
+                    sequence: i64_to_u64(r.1)?,
+                    source_sequence: i64_to_u64(r.2)?,
+                    event_type: r.3,
+                    payload_json: r.4,
+                    redaction_level: r.5,
+                    attempt_sequence: i64_to_u64(r.6)?,
+                })
+            })
+            .collect()
     }
 
     pub fn get_job(&self, agent_id: &str) -> StoreResult<Option<Job>> {
@@ -1005,23 +1415,19 @@ impl Store {
                 write.agent_id, write.owner_epoch
             )));
         }
-        let last_seq: i64 = transaction
-            .query_row(
-                "SELECT last_seq FROM agent_cursors
-                 WHERE agent_id = ?1 AND runtime_agent_id = ?2",
-                params![write.agent_id, write.runtime_agent_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
+        let last_seq: i64 = transaction.query_row(
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM task_attempts WHERE execution_agent_id=?1)
+             THEN COALESCE((SELECT MAX(e.seq) FROM events e JOIN task_attempts t ON t.execution_agent_id=e.agent_id WHERE t.public_agent_id=(SELECT public_agent_id FROM task_attempts WHERE execution_agent_id=?1)),0)
+             ELSE (SELECT last_event_seq FROM agents WHERE agent_id=?1) END",
+            [&write.agent_id], |row| row.get(0))?;
         let sequence = last_seq
             .checked_add(1)
             .ok_or_else(|| StoreError::InvalidState("event sequence overflow".into()))?;
         transaction.execute(
             "INSERT INTO events (
                 agent_id, runtime_agent_id, seq, source_seq, timestamp,
-                event_type, turn_id, payload_json, redaction_level
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                event_type, turn_id, payload_json, redaction_level, attempt_sequence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE((SELECT attempt_sequence FROM task_attempts WHERE execution_agent_id=?1),1))",
             params![
                 write.agent_id,
                 write.runtime_agent_id,
@@ -2613,6 +3019,202 @@ fn advance_review_revision(connection: &Connection, agent_id: &str) -> StoreResu
     review_current_revision(connection, agent_id)
 }
 
+fn validate_task(task: &NewTask) -> StoreResult<()> {
+    if task.public_agent_id.is_empty()
+        || task.repository.is_empty()
+        || task.feature_id.is_empty()
+        || task.ownership_token.is_empty()
+    {
+        return Err(StoreError::InvalidState(
+            "task identity and query scope must be non-empty".into(),
+        ));
+    }
+    match task.task_kind {
+        TaskKind::General
+            if task.review_id.is_some()
+                || task.job.review_kind.is_some()
+                || task.continuation_of.is_some() =>
+        {
+            Err(StoreError::InvalidState(
+                "general task cannot carry review identity".into(),
+            ))
+        }
+        TaskKind::Review
+            if task.review_id.is_none()
+                || task.job.review_kind.is_none()
+                || task.continuation_of.is_some() =>
+        {
+            Err(StoreError::InvalidState(
+                "fresh review requires review_id/review_kind and no continuation".into(),
+            ))
+        }
+        TaskKind::ReviewContinuation
+            if task.review_id.is_none()
+                || task.job.review_kind.is_none()
+                || task.continuation_of.is_none() =>
+        {
+            Err(StoreError::InvalidState(
+                "review continuation requires review_id and parent".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn effective_budget(request: &BudgetRequest) -> StoreResult<EffectiveBudget> {
+    let value = match request {
+        BudgetRequest::Omitted => DEFAULT_BUDGET,
+        BudgetRequest::Null => {
+            return Err(StoreError::InvalidState(
+                "budget null is not omission".into(),
+            ))
+        }
+        BudgetRequest::Limits(value) => value.clone(),
+    };
+    let pairs = [
+        (value.wall_time_ms, MAX_BUDGET.wall_time_ms),
+        (value.max_turns, MAX_BUDGET.max_turns),
+        (value.max_tool_calls, MAX_BUDGET.max_tool_calls),
+        (value.max_context_bytes, MAX_BUDGET.max_context_bytes),
+        (value.max_result_bytes, MAX_BUDGET.max_result_bytes),
+        (value.max_artifact_bytes, MAX_BUDGET.max_artifact_bytes),
+    ];
+    if pairs.iter().any(|(value, cap)| *value == 0 || value > cap) {
+        return Err(StoreError::InvalidState(
+            "budget limit is zero or above hard cap".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = format!(
+        "{:?}|{}|{}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}",
+        task.task_kind,
+        task.public_agent_id,
+        task.job.workspace_path,
+        task.review_id,
+        task.job.review_kind,
+        task.continuation_of,
+        task.repository,
+        task.feature_id,
+        task.ownership_token,
+        task.job.initial_prompt,
+        budget
+    );
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+fn continuation_identity(connection: &Connection, task: &NewTask) -> StoreResult<(u64, bool)> {
+    if task.task_kind != TaskKind::ReviewContinuation {
+        return Ok((1, task.task_kind == TaskKind::Review));
+    }
+    let parent_id = task.continuation_of.as_deref().unwrap();
+    let parent = query_task_record(connection, parent_id)?.ok_or_else(|| {
+        StoreError::InvalidState(format!("unknown continuation parent {parent_id}"))
+    })?;
+    if parent.public_agent_id != task.public_agent_id
+        || parent.review_id != task.review_id
+        || parent.review_kind != task.job.review_kind
+        || !matches!(
+            parent.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        )
+    {
+        return Err(StoreError::Conflict(
+            "continuation identity or kind is incompatible".into(),
+        ));
+    }
+    let state = query_job(connection, parent_id)?
+        .ok_or_else(|| StoreError::InvalidState("continuation parent job missing".into()))?
+        .state;
+    if !matches!(
+        state,
+        JobState::Completed
+            | JobState::Failed
+            | JobState::FailedRuntimeLost
+            | JobState::Orphaned
+            | JobState::Cancelled
+    ) {
+        return Err(StoreError::Conflict(
+            "continuation parent is active or ineligible".into(),
+        ));
+    }
+    let latest: i64 = connection
+        .query_row(
+            "SELECT MAX(attempt_sequence) FROM task_attempts WHERE public_agent_id=?1",
+            [&task.public_agent_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .unwrap_or(0);
+    if i64_to_u64(latest)? != parent.attempt_sequence {
+        return Err(StoreError::Conflict(
+            "continuation parent is not latest attempt".into(),
+        ));
+    }
+    Ok((
+        parent
+            .attempt_sequence
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidState("attempt sequence overflow".into()))?,
+        false,
+    ))
+}
+
+fn validate_result(result: &TaskResult) -> StoreResult<()> {
+    const OUTCOMES: &[&str] = &[
+        "SUCCEEDED",
+        "BLOCKED",
+        "FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+        "BUDGET_EXHAUSTED",
+        "RUNTIME_LOST",
+        "RESULT_INVALID",
+    ];
+    if !OUTCOMES.contains(&result.outcome.as_str())
+        || result.summary.is_empty()
+        || result.result_sha256.is_empty()
+    {
+        return Err(StoreError::InvalidState("invalid task completion".into()));
+    }
+    if result.partial && result.outcome == "SUCCEEDED" {
+        return Err(StoreError::InvalidState(
+            "partial result cannot be successful".into(),
+        ));
+    }
+    for artifact in &result.artifacts {
+        if !matches!(
+            artifact.kind.as_str(),
+            "report_markdown" | "changes_patch" | "check_report"
+        ) {
+            return Err(StoreError::InvalidState(format!(
+                "unsupported artifact kind {}",
+                artifact.kind
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn query_task_record(connection: &Connection, id: &str) -> StoreResult<Option<TaskRecord>> {
+    connection.query_row("SELECT execution_agent_id,public_agent_id,task_kind,phase,review_id,review_kind,continuation_of,attempt_sequence,repository,feature_id,ownership_token,effective_budget_json,independent_evidence FROM task_attempts WHERE execution_agent_id=?1",[id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,i64>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,String>(11)?,row.get::<_,i64>(12)?))).optional()?.map(|r| Ok(TaskRecord { execution_agent_id:r.0,public_agent_id:r.1,task_kind:TaskKind::parse(&r.2)?,phase:TaskPhase::parse(&r.3)?,review_id:r.4,review_kind:r.5,continuation_of:r.6,attempt_sequence:i64_to_u64(r.7)?,repository:r.8,feature_id:r.9,ownership_token:r.10,effective_budget:serde_json::from_str(&r.11).map_err(|e| StoreError::InvalidState(format!("invalid effective budget: {e}")))?,independent_evidence:r.12 != 0 })).transpose()
+}
+
+fn query_task_record_scoped(
+    connection: &Connection,
+    id: &str,
+    scope: TaskQueryScope<'_>,
+) -> StoreResult<Option<TaskRecord>> {
+    let allowed: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM task_attempts WHERE execution_agent_id=?1 AND repository=?2 AND feature_id=?3 AND ownership_token=?4)",params![id,scope.repository,scope.feature_id,scope.ownership_token],|row| row.get(0))?;
+    if allowed {
+        query_task_record(connection, id)
+    } else {
+        Ok(None)
+    }
+}
+
 fn migrate_to_v4(connection: &mut Connection) -> StoreResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -2621,11 +3223,17 @@ fn migrate_to_v4(connection: &mut Connection) -> StoreResult<()> {
         )));
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(SCHEMA)?;
     for (table, column, definition) in [
         (
             "agents",
             "initial_prompt",
             "initial_prompt TEXT NOT NULL DEFAULT 'Begin review.'",
+        ),
+        (
+            "events",
+            "attempt_sequence",
+            "attempt_sequence INTEGER NOT NULL DEFAULT 1",
         ),
         (
             "agents",
@@ -2792,7 +3400,7 @@ fn query_events_after(
     limit: i64,
 ) -> StoreResult<Vec<StoredEvent>> {
     let mut statement = connection.prepare(
-        "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level
+        "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level, attempt_sequence
          FROM events WHERE agent_id = ?1 AND runtime_agent_id = ?2 AND seq > ?3
          ORDER BY seq LIMIT ?4",
     )?;
@@ -2805,6 +3413,7 @@ fn query_events_after(
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2818,6 +3427,7 @@ fn query_events_after(
                 event_type,
                 payload_json,
                 redaction_level,
+                attempt_sequence,
             )| {
                 Ok(StoredEvent {
                     runtime_agent_id,
@@ -2826,6 +3436,7 @@ fn query_events_after(
                     event_type,
                     payload_json,
                     redaction_level,
+                    attempt_sequence: i64_to_u64(attempt_sequence)?,
                 })
             },
         )
@@ -3689,7 +4300,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_v3_job_rows_migrate_to_empty_v4_review_tables() {
+    fn accepted_v3_job_rows_migrate_to_current_review_and_task_tables() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v3.sqlite3");
         let connection = Connection::open(&path).unwrap();
@@ -3718,7 +4329,53 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn accepted_v4_rows_migrate_without_losing_review_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v4.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_results; DROP TABLE task_attempts; PRAGMA user_version=4;",
+            )
+            .unwrap();
+        connection.execute("INSERT INTO agents (agent_id,state,workspace_path,created_at) VALUES ('v4-job','COMPLETED','/v4',1)",[]).unwrap();
+        connection.execute("INSERT INTO review_reports (agent_id,expected_path,report_root,created_at,updated_at) VALUES ('v4-job','report.md','/v4',1,1)",[]).unwrap();
+        drop(connection);
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            store.get_job("v4-job").unwrap().unwrap().state,
+            JobState::Completed
+        );
+        assert!(store.review_report_state("v4-job").unwrap().is_some());
+    }
+
+    #[test]
+    fn forward_unknown_schema_fails_before_creating_current_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("future.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE future_only(value TEXT); PRAGMA user_version=99;")
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::InvalidState(_))
+        ));
+        let connection = Connection::open(path).unwrap();
+        let agents: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agents, 0);
     }
 
     #[test]
@@ -3848,5 +4505,277 @@ mod tests {
         let message = store.message("never-send").unwrap().unwrap();
         assert_eq!(message.state, MessageState::Failed);
         assert_eq!(message.failure_code.as_deref(), Some("STOP_REQUESTED"));
+    }
+
+    fn general_task(execution: &str, public: &str, key: &str) -> NewTask {
+        let mut job = NewJob::new(execution, "/workspace");
+        job.idempotency_key = Some(key.into());
+        NewTask {
+            job,
+            public_agent_id: public.into(),
+            task_kind: TaskKind::General,
+            review_id: None,
+            continuation_of: None,
+            repository: "repo".into(),
+            feature_id: "feature".into(),
+            ownership_token: "owner".into(),
+            budget: BudgetRequest::Omitted,
+        }
+    }
+
+    #[test]
+    fn task_identity_idempotency_scope_and_budget_are_durable() {
+        let (_directory, path, store) = file_store();
+        let task = general_task("execution-1", "public-1", "key-1");
+        let (_, first) = store.enqueue_task(&task).unwrap();
+        assert_eq!(first.task_kind, TaskKind::General);
+        assert_eq!(first.effective_budget, DEFAULT_BUDGET);
+        assert_eq!(store.enqueue_task(&task).unwrap().1, first);
+        let mut conflict = task.clone();
+        conflict.repository = "other".into();
+        assert!(matches!(
+            store.enqueue_task(&conflict),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(store
+            .get_task_scoped(
+                "execution-1",
+                TaskQueryScope {
+                    repository: "repo",
+                    feature_id: "feature",
+                    ownership_token: "owner"
+                }
+            )
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_task_scoped(
+                "execution-1",
+                TaskQueryScope {
+                    repository: "repo",
+                    feature_id: "feature",
+                    ownership_token: "wrong"
+                }
+            )
+            .unwrap()
+            .is_none());
+        drop(store);
+        let reopened = Store::open(path).unwrap();
+        assert_eq!(
+            reopened
+                .get_task_scoped(
+                    "execution-1",
+                    TaskQueryScope {
+                        repository: "repo",
+                        feature_id: "feature",
+                        ownership_token: "owner"
+                    }
+                )
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        reopened
+            .set_task_phase("execution-1", TaskPhase::Preparing)
+            .unwrap();
+        reopened
+            .set_task_phase("execution-1", TaskPhase::Running)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_task_scoped(
+                    "execution-1",
+                    TaskQueryScope {
+                        repository: "repo",
+                        feature_id: "feature",
+                        ownership_token: "owner"
+                    }
+                )
+                .unwrap()
+                .unwrap()
+                .phase,
+            TaskPhase::Running
+        );
+    }
+
+    #[test]
+    fn budget_null_zero_and_above_cap_fail_before_enqueue() {
+        let (_directory, _path, store) = file_store();
+        let mut task = general_task("bad-budget", "public", "budget-key");
+        task.budget = BudgetRequest::Null;
+        assert!(matches!(
+            store.enqueue_task(&task),
+            Err(StoreError::InvalidState(_))
+        ));
+        task.budget = BudgetRequest::Limits(EffectiveBudget {
+            wall_time_ms: 0,
+            ..DEFAULT_BUDGET
+        });
+        assert!(matches!(
+            store.enqueue_task(&task),
+            Err(StoreError::InvalidState(_))
+        ));
+        task.budget = BudgetRequest::Limits(EffectiveBudget {
+            max_turns: MAX_BUDGET.max_turns + 1,
+            ..DEFAULT_BUDGET
+        });
+        assert!(matches!(
+            store.enqueue_task(&task),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(store.get_job("bad-budget").unwrap().is_none());
+    }
+
+    #[test]
+    fn review_continuation_preserves_public_identity_and_is_not_independent() {
+        let (_directory, _path, store) = file_store();
+        let mut fresh = general_task("review-attempt-1", "stable-agent", "review-key-1");
+        fresh.task_kind = TaskKind::Review;
+        fresh.job.review_kind = Some("initial".into());
+        fresh.review_id = Some("review-1".into());
+        let (_, first) = store.enqueue_task(&fresh).unwrap();
+        assert!(first.independent_evidence);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agents SET state='COMPLETED' WHERE agent_id='review-attempt-1'",
+                [],
+            )
+            .unwrap();
+        let mut continuation = general_task("review-attempt-2", "stable-agent", "review-key-2");
+        continuation.task_kind = TaskKind::ReviewContinuation;
+        continuation.job.review_kind = Some("initial".into());
+        continuation.review_id = Some("review-1".into());
+        continuation.continuation_of = Some("review-attempt-1".into());
+        let (_, second) = store.enqueue_task(&continuation).unwrap();
+        assert_eq!(second.attempt_sequence, 2);
+        assert!(!second.independent_evidence);
+        assert_eq!(second.public_agent_id, first.public_agent_id);
+        assert!(store
+            .list_tasks_scoped(
+                TaskQueryScope {
+                    repository: "repo",
+                    feature_id: "feature",
+                    ownership_token: "owner"
+                },
+                None,
+                true,
+                10
+            )
+            .unwrap()
+            .iter()
+            .all(|task| task.task_kind == TaskKind::Review));
+    }
+
+    #[test]
+    fn public_event_sequence_does_not_reset_across_review_attempts() {
+        let (_directory, _path, store) = file_store();
+        let mut first = general_task("seq-attempt-1", "seq-agent", "seq-key-1");
+        first.task_kind = TaskKind::Review;
+        first.job.review_kind = Some("initial".into());
+        first.review_id = Some("seq-review".into());
+        store.enqueue_task(&first).unwrap();
+        let first_claim = claim(&store, "seq-attempt-1");
+        store
+            .mark_running("seq-attempt-1", first_claim.owner_epoch, "runtime-1", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .append_lifecycle(&LifecycleWrite {
+                    agent_id: "seq-attempt-1".into(),
+                    runtime_agent_id: "runtime-1".into(),
+                    owner_epoch: first_claim.owner_epoch,
+                    source_sequence: 1,
+                    event_type: "complete".into(),
+                    turn_id: None,
+                    payload_json: "{}".into(),
+                    redaction_level: "public".into(),
+                    terminal: Some(TerminalUpdate {
+                        state: JobState::Completed,
+                        failure_code: None,
+                        failure_message: None
+                    }),
+                    turn_state: None
+                })
+                .unwrap(),
+            1
+        );
+        let mut second = general_task("seq-attempt-2", "seq-agent", "seq-key-2");
+        second.task_kind = TaskKind::ReviewContinuation;
+        second.job.review_kind = Some("initial".into());
+        second.review_id = Some("seq-review".into());
+        second.continuation_of = Some("seq-attempt-1".into());
+        store.enqueue_task(&second).unwrap();
+        let second_claim = claim(&store, "seq-attempt-2");
+        store
+            .mark_running("seq-attempt-2", second_claim.owner_epoch, "runtime-2", None)
+            .unwrap();
+        assert_eq!(
+            store
+                .append_lifecycle(&LifecycleWrite {
+                    agent_id: "seq-attempt-2".into(),
+                    runtime_agent_id: "runtime-2".into(),
+                    owner_epoch: second_claim.owner_epoch,
+                    source_sequence: 1,
+                    event_type: "started".into(),
+                    turn_id: None,
+                    payload_json: "{}".into(),
+                    redaction_level: "public".into(),
+                    terminal: None,
+                    turn_state: None
+                })
+                .unwrap(),
+            2
+        );
+        let events = store.task_events_after("seq-agent", 0, 10).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.sequence, e.attempt_sequence))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn completion_is_immutable_and_artifact_kinds_are_closed() {
+        let (_directory, _path, store) = file_store();
+        store
+            .enqueue_task(&general_task("result-task", "public", "result-key"))
+            .unwrap();
+        let result = TaskResult {
+            outcome: "BLOCKED".into(),
+            summary: "bounded result".into(),
+            partial: true,
+            retain_partial: true,
+            base_commit: Some("base".into()),
+            head_commit: Some("head".into()),
+            changed_files: vec!["src/lib.rs".into()],
+            diff_stat: Some("1 file".into()),
+            checks: vec!["cargo test".into()],
+            result_sha256: "abc".into(),
+            residual_gaps: vec!["auth unavailable".into()],
+            artifacts: vec![ResultArtifact {
+                kind: "report_markdown".into(),
+                artifact_id: "artifact-1".into(),
+                sha256: "def".into(),
+            }],
+        };
+        store.store_task_result("result-task", &result).unwrap();
+        store.store_task_result("result-task", &result).unwrap();
+        let mut conflicting = result.clone();
+        conflicting.result_sha256 = "different".into();
+        assert!(matches!(
+            store.store_task_result("result-task", &conflicting),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut invalid = result.clone();
+        invalid.artifacts[0].kind = "raw_prompt".into();
+        assert!(matches!(
+            store.store_task_result("result-task", &invalid),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 }
