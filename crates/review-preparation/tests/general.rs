@@ -421,10 +421,7 @@ fn null_budget_and_idempotency_conflicts_are_rejected() {
         preparer.prepare(&changed),
         Err(PreparationError::IdempotencyConflict(_))
     ));
-    assert_eq!(
-        fs::read_to_string(first.prompt_path).unwrap(),
-        "Inspect and produce the bounded result."
-    );
+    assert!(!first.prompt_path.exists());
 }
 
 #[test]
@@ -630,6 +627,23 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
     );
     git(&f.repository, &["config", "commit.gpgSign", "true"]);
+    let fsmonitor_canary = f._temp.path().join("fsmonitor-canary");
+    let fsmonitor = f._temp.path().join("fsmonitor");
+    fs::write(
+        &fsmonitor,
+        format!(
+            "#!/bin/sh\nprintf fsmonitor > '{}'\n",
+            fsmonitor_canary.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &f.repository,
+        &["config", "core.fsmonitor", fsmonitor.to_str().unwrap()],
+    );
+    let _ = fs::remove_file(&fsmonitor_canary);
+    assert!(!fsmonitor_canary.exists());
     let prepared = f
         .preparer()
         .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
@@ -640,8 +654,10 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
     )
     .unwrap();
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
-    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
+    assert_eq!(completion.reason_code.as_deref(), Some("UNSAFE_GIT_CONFIG"));
     assert!(!canary.exists());
+    assert!(!fsmonitor_canary.exists());
 
     let f = Fixture::new();
     let diff_canary = f._temp.path().join("diff-canary");
@@ -850,6 +866,40 @@ fn preparation_failure_retries_cleanup_and_leaves_truthful_residue() {
     symlink(f.repository.join("outside"), &linked).unwrap();
     assert!(f.preparer().prepare(&manifest).is_err());
     assert!(linked.is_symlink());
+}
+
+#[test]
+fn stale_prepared_record_never_returns_dangling_task_and_retries_deterministically() {
+    let f = Fixture::new();
+    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let prepared = f.preparer().prepare(&manifest).unwrap();
+    let record = prepared
+        .worktree
+        .scratch_worktrees_root
+        .parent()
+        .unwrap()
+        .join("prepared-general.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    value["prompt_sha256"] = serde_json::Value::String("0".repeat(64));
+    fs::write(&record, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let error = f.preparer().prepare(&manifest).unwrap_err();
+    assert!(matches!(
+        error,
+        PreparationError::InvalidManifest(_) | PreparationError::Worktree(_)
+    ));
+    assert!(!record.exists());
+    assert!(!prepared.worktree.path.exists());
+    let retry = f.preparer().prepare(&manifest).unwrap();
+    retry.validate_digest().unwrap();
+    assert!(retry.worktree.path.exists());
+
+    fs::remove_dir_all(&retry.worktree.path).unwrap();
+    let error = f.preparer().prepare(&manifest).unwrap_err();
+    assert!(matches!(
+        error,
+        PreparationError::Worktree(_) | PreparationError::InvalidManifest(_)
+    ));
+    assert!(!retry.worktree.path.exists());
 }
 
 fn git(path: &Path, args: &[&str]) -> String {

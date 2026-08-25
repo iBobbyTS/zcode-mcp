@@ -312,14 +312,32 @@ impl GeneralTaskPreparer {
         let job_root = fs::canonicalize(job_root)?;
         let prepared_path = job_root.join("prepared-general.json");
         if prepared_path.is_file() {
-            let existing: PreparedGeneralTask = serde_json::from_slice(&fs::read(prepared_path)?)?;
-            existing.validate_digest()?;
-            if existing.manifest_sha256 != manifest_sha256 {
-                return Err(PreparationError::IdempotencyConflict(
-                    "key already owns a different immutable general task".into(),
-                ));
-            }
-            return Ok(existing);
+            let existing_bytes = fs::read(&prepared_path)?;
+            let existing = serde_json::from_slice::<PreparedGeneralTask>(&existing_bytes)
+                .map_err(PreparationError::from);
+            let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
+            let reusable = existing.and_then(|existing| {
+                validate_reusable_prepared(
+                    &existing,
+                    &manifest_sha256,
+                    &repository,
+                    &base_sha,
+                    &manager,
+                )
+                .map(|()| existing)
+            });
+            return match reusable {
+                Ok(existing) => Ok(existing),
+                Err(error) => {
+                    let cleanup = cleanup_stale_record(&manager, &job_root, &existing_bytes);
+                    match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(PreparationError::Worktree(format!(
+                            "stale prepared record rejected ({error}); cleanup unresolved ({cleanup})"
+                        ))),
+                    }
+                }
+            };
         }
         let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
         let expected_worktree_path = job_root.join("worktrees").join(&key);
@@ -740,6 +758,7 @@ fn prefinalization_integrity(
     prepared: &PreparedGeneralTask,
     manager: &WorktreeManager,
 ) -> Result<(), String> {
+    reject_unsafe_repository_config(&prepared.worktree.path)?;
     let diagnostics = manager
         .capture_integrity(&prepared.worktree)
         .map_err(|_| "PREFINALIZATION_HEAD_INVALID".to_owned())?;
@@ -751,7 +770,6 @@ fn prefinalization_integrity(
     {
         return Err("PREFINALIZATION_HEAD_INVALID".into());
     }
-    reject_unsafe_repository_config(&prepared.worktree.path)?;
     Ok(())
 }
 
@@ -764,6 +782,16 @@ fn reject_unsafe_repository_config(repository: &Path) -> Result<(), String> {
         return Err("UNSAFE_GIT_CONFIG".into());
     }
     if !output.status.success() && output.status.code() != Some(1) {
+        return Err("GIT_CONFIG_CHECK_FAILED".into());
+    }
+    let fsmonitor = safe_git_output(
+        repository,
+        &["config", "--local", "--get", "core.fsmonitor"],
+    )?;
+    if fsmonitor.status.success() && !fsmonitor.stdout.is_empty() {
+        return Err("UNSAFE_GIT_CONFIG".into());
+    }
+    if !fsmonitor.status.success() && fsmonitor.status.code() != Some(1) {
         return Err("GIT_CONFIG_CHECK_FAILED".into());
     }
     Ok(())
@@ -1558,6 +1586,63 @@ fn bounded_cleanup_unregistered(
         }
     }
     Err(last_error.unwrap_or_else(|| PreparationError::Worktree("cleanup retry exhausted".into())))
+}
+
+fn validate_reusable_prepared(
+    prepared: &PreparedGeneralTask,
+    manifest_sha256: &str,
+    repository: &Path,
+    base_sha: &str,
+    manager: &WorktreeManager,
+) -> PreparationResult<()> {
+    prepared.validate_digest()?;
+    if prepared.manifest_sha256 != manifest_sha256
+        || prepared.repository != repository
+        || prepared.base_sha != base_sha
+    {
+        return Err(PreparationError::IdempotencyConflict(
+            "key already owns a different immutable general task".into(),
+        ));
+    }
+    prepared.validate_prepared_content()?;
+    let diagnostics = manager.capture_integrity(&prepared.worktree)?;
+    if diagnostics.has_policy_violation()
+        || diagnostics.observed_head.as_deref() != Some(base_sha)
+        || !diagnostics.detached_head_unchanged
+    {
+        return Err(PreparationError::Worktree(
+            "prepared record worktree is stale or no longer detached at base".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_record(
+    manager: &WorktreeManager,
+    job_root: &Path,
+    record_bytes: &[u8],
+) -> PreparationResult<()> {
+    if let Ok(prepared) = serde_json::from_slice::<PreparedGeneralTask>(record_bytes) {
+        if !prepared.worktree.path.exists() {
+            manager.verify_registration_absent(&prepared.worktree.path)?;
+            return cleanup_job_root_path(job_root);
+        }
+        return bounded_cleanup_worktree(manager, &prepared.worktree, job_root);
+    }
+    let worktree_path = job_root.join("worktrees");
+    if worktree_path.exists() {
+        let mut last_error = None;
+        for _ in 0..3 {
+            match cleanup_job_root_path(job_root) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        return Err(last_error.unwrap_or_else(|| {
+            PreparationError::Worktree("malformed prepared record cleanup exhausted".into())
+        }));
+    }
+    cleanup_job_root_path(job_root)
 }
 fn cleanup_if_trusted(prepared: &PreparedGeneralTask) -> bool {
     prepared.validate_digest().is_ok() && cleanup_after_failure(prepared)
