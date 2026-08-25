@@ -1456,8 +1456,5 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
         )
         .unwrap();
     assert!(events.iter().any(|event| event.event_type == "raw.unknown"));
-    assert!(events.iter().any(|event| {
-        event.event_type == "driver.message" && event.payload_json.contains("permission.responded")
-    }));
     server.shutdown();
 }

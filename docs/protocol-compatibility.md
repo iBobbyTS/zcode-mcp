@@ -19,19 +19,49 @@ Authentication tokens and provider secrets are not read or emitted.
 
 ## Pinned 3.8.1 event and request shapes
 
-The retained black-box inventory in
-`.agent-work/probes/zcode-3.8.1/{EVENT-INVENTORY.md,REQUEST-SHAPES.redacted.json}`
-is the source for the deterministic fake. It observed `permission.requested`
-and `permission.resolved`; no separate acknowledgement event is synthesized or
-classified as known. Permission decisions use the exact response object offered by
-`interaction/requestPermission`; completion is established by the terminal turn
-lifecycle rather than an invented acknowledgement event. Events without typed
-product semantics continue through the bounded, redacted `raw.unknown` path.
+This tracked section is the source for the deterministic fake. The evidence
+snapshot is content-addressed as follows:
 
-For requests emitted by this project, `session/subscribe` accepts exactly
-`sessionId`, `deliveryKind`, and `includeSnapshot`; `session/send` accepts
-exactly `sessionId` and `content`. The fake rejects the unobserved `afterSeq`,
-`inputId`, and `queryId` fields.
+- Official ZCode 3.8.1 runtime SHA-256:
+  `9318f60fb8c2c3bc83ce62da10220ebcdc9a99786df0a9abb1a4435ba66e4274`.
+- Event inventory SHA-256:
+  `3bfb920a01630830bbfb59491da8abd6225177db50f6ec087a03bb479ab04dc7`.
+- Request-shape locator `zcode-3.8.1-black-box-request-shapes/v1`, SHA-256:
+  `aaff1addb4d95f9b9ff443519da2c3f9cccbab264ebb9cf2c40c4aec003651b1`.
+- Response-shape locator `zcode-3.8.1-black-box-response-shapes/v1`, SHA-256:
+  `99df5e616bfb10e562861f7b5a00e45bf2197c352bb01dd568d4f356dc34f5ba`.
+
+The ignored files under `.agent-work/probes/zcode-3.8.1/` are local supporting
+evidence for this checkout, not source material available in a fresh clone.
+The stable locators, hashes, and observed shapes recorded here are the tracked
+compatibility source.
+
+The observed event inventory includes `state.updated`, `session.titleUpdated`,
+`session.updated`, `turn.started`, `model.streaming`, `tool.updated`,
+`permission.requested`, `permission.resolved`, `streamRecovery.updated`,
+`turn.completed`, and `v4/telemetry/event`. No separate permission
+acknowledgement event is synthesized or classified as known. Permission
+decisions return the exact response object from the selected option offered by
+`interaction/requestPermission`, whose observed parameter keys are `input`,
+`options`, `reason`, `requestId`, `riskLevel`, `sessionId`, `toolCallId`,
+`toolName`, and `turnId`. Completion is established by the terminal turn
+lifecycle. Events without typed product semantics continue through the bounded,
+redacted `raw.unknown` path.
+
+Observed client request parameters are:
+
+- `workspace/readState`: exactly `workspace`, containing exactly string
+  `workspaceKey` and `workspacePath`.
+- `session/create`: `workspace` with the same nested shape, plus the observed
+  optional `mcpServers` variant whose entries contain exactly `name`, `command`,
+  `args`, and `env`.
+- `session/subscribe`: exactly `sessionId`, `deliveryKind`, and
+  `includeSnapshot`.
+- `session/send`: exactly `sessionId` and `content`.
+- `session/stop`: exactly `sessionId`.
+
+The fake rejects unobserved extra keys, including `afterSeq`, `inputId`, and
+`queryId`.
 
 When the variable is absent, or the path is not a regular file, the result is
 `compatibility_status: "untested"` with a reason. This is an explicit evidence

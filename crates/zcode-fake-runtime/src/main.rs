@@ -72,14 +72,17 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
         return false;
     };
     match method {
-        "workspace/readState" => params
-            .get("workspace")
-            .and_then(Value::as_object)
-            .is_some_and(|workspace| {
-                exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
-                    && workspace.get("workspaceKey").is_some_and(Value::is_string)
-                    && workspace.get("workspacePath").is_some_and(Value::is_string)
-            }),
+        "workspace/readState" => {
+            exact_keys(params, &["workspace"], &[])
+                && params
+                    .get("workspace")
+                    .and_then(Value::as_object)
+                    .is_some_and(|workspace| {
+                        exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
+                            && workspace.get("workspaceKey").is_some_and(Value::is_string)
+                            && workspace.get("workspacePath").is_some_and(Value::is_string)
+                    })
+        }
         "session/create" => {
             if !exact_keys(params, &["workspace"], &["mcpServers"]) {
                 return false;
@@ -644,6 +647,27 @@ mod tests {
 
     #[test]
     fn pinned_request_keys_accept_observed_and_reject_unobserved_fields() {
+        assert!(valid_params(
+            "workspace/readState",
+            &json!({
+                "workspace": {
+                    "workspaceKey": "workspace-key",
+                    "workspacePath": "/workspace"
+                }
+            }),
+            "fake-session-7f3a",
+        ));
+        assert!(!valid_params(
+            "workspace/readState",
+            &json!({
+                "workspace": {
+                    "workspaceKey": "workspace-key",
+                    "workspacePath": "/workspace"
+                },
+                "invented": true
+            }),
+            "fake-session-7f3a",
+        ));
         assert!(!valid_params(
             "session/send",
             &json!({"session_id":"fake-session-7f3a","message":"review"}),
