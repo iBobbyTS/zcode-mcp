@@ -503,6 +503,30 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
             .decide_zcode_permission(&unknown, ExternalDecision::Allow)
             .allowed
     );
+    for tool in [
+        "mcp__review-ledger__review_checkpoint",
+        "mcp__review-ledger__review_finding_upsert",
+        "mcp__review-ledger__review_validation_record",
+        "mcp__review-ledger__review_finalize",
+    ] {
+        let request = serde_json::json!({"toolName":tool,"input":{}});
+        assert!(
+            launcher
+                .decide_zcode_permission(&request, ExternalDecision::Allow)
+                .allowed
+        );
+        assert!(
+            !launcher
+                .decide_zcode_permission(&request, ExternalDecision::Deny)
+                .allowed
+        );
+    }
+    let arbitrary_mcp = serde_json::json!({
+        "toolName":"mcp__review-ledger__unapproved_tool","input":{}
+    });
+    let arbitrary = launcher.decide_zcode_permission(&arbitrary_mcp, ExternalDecision::Allow);
+    assert!(!arbitrary.allowed);
+    assert_eq!(arbitrary.reason, "permission_request_unrecognized");
 
     let mut network_allowed = fixture.manifest();
     network_allowed.idempotency_key = "feature:S04:network-allow".into();

@@ -31,6 +31,10 @@ pub struct Preflight {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_methods: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<Vec<String>>,
 }
 
 pub fn identity(path: Option<&Path>) -> io::Result<Preflight> {
@@ -67,6 +71,8 @@ pub fn identity(path: Option<&Path>) -> io::Result<Preflight> {
         compatibility_status: "untested".into(),
         reason: None,
         observed_methods: None,
+        current_model: None,
+        available_models: None,
     })
 }
 
@@ -101,8 +107,19 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
         Ok(c) => c,
         Err(_) => return failed("unable to start node"),
     };
-    let request = r#"{"jsonrpc":"2.0","id":"preflight-1","method":"workspace/readState","params":{}}
-"#;
+    let workspace = std::env::current_dir()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let request = serde_json::json!({
+        "id":"preflight-1",
+        "method":"workspace/readState",
+        "params":{"workspace":{
+            "workspaceKey":workspace,
+            "workspacePath":workspace
+        }}
+    });
+    let request = format!("{request}\n");
     let write_result = child
         .stdin
         .as_mut()
@@ -156,34 +173,67 @@ pub fn probe_with_node(path: Option<&Path>, node: &Path, timeout: Duration) -> P
     }
     let Some(value) = parse_response(&out) else {
         return failed(if out.contains(&b'{') {
-            "malformed JSON-RPC response"
+            "malformed NDJSON response"
         } else {
             "non-JSON app-server output"
         });
     };
-    if value.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-        return failed("invalid JSON-RPC version");
+    if value.get("jsonrpc").is_some() {
+        return failed("unexpected jsonrpc member");
     }
     if value.get("id") != Some(&serde_json::Value::String("preflight-1".into())) {
-        return failed("JSON-RPC id mismatch");
+        return failed("NDJSON id mismatch");
     }
     if value.get("result").is_none() {
-        return failed("JSON-RPC result missing");
+        return failed("NDJSON result missing");
     }
-    let mut methods = Vec::new();
-    if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
-        methods.push(method.to_string());
-    }
-    let status = "tested";
+    let methods = vec!["workspace/readState".to_owned()];
+    let result = value.get("result").expect("checked above");
+    let current_model = result
+        .pointer("/settings/model/current/modelId")
+        .or_else(|| result.pointer("/settings/model/current/id"))
+        .or_else(|| result.pointer("/settings/model/current"))
+        .or_else(|| result.pointer("/settings/model/value/modelId"))
+        .or_else(|| result.pointer("/settings/model/value"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let mut available_models = Vec::new();
+    collect_model_ids(Some(result), &mut available_models);
+    available_models.sort();
+    available_models.dedup();
     Preflight {
         runtime_path: None,
         runtime_size: None,
         runtime_sha256: None,
         runtime_version: None,
         node_version: None,
-        compatibility_status: status.into(),
+        compatibility_status: "tested".into(),
         reason: None,
         observed_methods: Some(methods),
+        current_model,
+        available_models: Some(available_models),
+    }
+}
+
+fn collect_model_ids(value: Option<&serde_json::Value>, output: &mut Vec<String>) {
+    let Some(value) = value else { return };
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(model) = object.get("modelId").and_then(serde_json::Value::as_str) {
+                if model.len() <= 128 && !model.contains('\0') {
+                    output.push(model.to_owned());
+                }
+            }
+            for value in object.values() {
+                collect_model_ids(Some(value), output);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_model_ids(Some(value), output);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -238,6 +288,8 @@ fn untested(reason: &str) -> Preflight {
         compatibility_status: "untested".into(),
         reason: Some(reason.into()),
         observed_methods: None,
+        current_model: None,
+        available_models: None,
     }
 }
 fn failed(reason: &str) -> Preflight {
@@ -250,6 +302,8 @@ fn failed(reason: &str) -> Preflight {
         runtime_version: None,
         node_version: None,
         observed_methods: None,
+        current_model: None,
+        available_models: None,
     }
 }
 
@@ -261,6 +315,8 @@ pub fn run_from_env(timeout: Duration) -> io::Result<Preflight> {
         result.compatibility_status = smoke.compatibility_status;
         result.reason = smoke.reason;
         result.observed_methods = smoke.observed_methods;
+        result.current_model = smoke.current_model;
+        result.available_models = smoke.available_models;
     }
     Ok(result)
 }
@@ -312,15 +368,18 @@ mod tests {
 
     #[test]
     fn probe_accepts_noise_and_valid_response() {
-        let paths = fixture("#!/bin/sh\nprintf 'noise\\n{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":\\\"preflight-1\\\",\\\"result\\\":{}}\\n'");
+        let paths = fixture("#!/bin/sh\nprintf 'noise\\n{\\\"id\\\":\\\"preflight-1\\\",\\\"result\\\":{\\\"settings\\\":{\\\"model\\\":{\\\"current\\\":{\\\"modelId\\\":\\\"glm-current\\\"}}},\\\"modelCatalog\\\":{\\\"items\\\":[{\\\"modelId\\\":\\\"glm-current\\\"},{\\\"modelId\\\":\\\"glm-other\\\"}]}}}\\n'");
         std::process::Command::new("chmod")
             .arg("+x")
             .arg(&paths.0)
             .status()
             .unwrap();
+        let result = probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1));
+        assert_eq!(result.compatibility_status, "tested");
+        assert_eq!(result.current_model.as_deref(), Some("glm-current"));
         assert_eq!(
-            probe_with_node(Some(&paths.1), &paths.0, Duration::from_secs(1)).compatibility_status,
-            "tested"
+            result.available_models.unwrap(),
+            vec!["glm-current", "glm-other"]
         );
         cleanup(paths);
     }

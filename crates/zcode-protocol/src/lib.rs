@@ -8,6 +8,7 @@ pub const SESSION_SEND: &str = "session/send";
 pub const SESSION_STOP: &str = "session/stop";
 pub const SESSION_CLOSE: &str = "session/close";
 pub const SESSION_EVENT: &str = "session/event";
+pub const SESSION_REQUEST_RUNTIME_PREFERENCES: &str = "session/requestRuntimePreferences";
 pub const INTERACTION_REQUEST_PERMISSION: &str = "interaction/requestPermission";
 pub const INTERACTION_REQUEST_USER_INPUT: &str = "interaction/requestUserInput";
 
@@ -109,6 +110,12 @@ pub struct WorkspaceRef<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkspaceParams<'a> {
+    pub workspace: WorkspaceRef<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateSessionParams<'a> {
     pub workspace: WorkspaceRef<'a>,
     #[serde(skip_serializing_if = "is_empty_mcp_servers")]
@@ -154,6 +161,30 @@ pub struct SendParams<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct SessionParams<'a> {
     pub session_id: &'a str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePreferences {
+    pub native_search_enhancements_enabled: bool,
+    pub memory_enabled: bool,
+    pub ask_user_question_auto_resolution_enabled: bool,
+}
+
+pub fn offered_permission_response(params: &Value, decision: &str) -> Option<Value> {
+    let expected_kind = match decision {
+        "allow" => "allow_once",
+        "deny" => "deny",
+        _ => return None,
+    };
+    params
+        .get("options")?
+        .as_array()?
+        .iter()
+        .find(|option| option.get("kind").and_then(Value::as_str) == Some(expected_kind))?
+        .get("response")
+        .cloned()
+        .filter(Value::is_object)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,5 +437,36 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn official_workspace_preferences_and_permission_shapes_are_exact() {
+        assert_eq!(
+            serde_json::to_value(WorkspaceParams {
+                workspace: WorkspaceRef {
+                    workspace_key: "/work",
+                    workspace_path: "/work",
+                },
+            })
+            .unwrap(),
+            serde_json::json!({"workspace":{"workspaceKey":"/work","workspacePath":"/work"}})
+        );
+        assert_eq!(
+            serde_json::to_value(RuntimePreferences::default()).unwrap(),
+            serde_json::json!({
+                "nativeSearchEnhancementsEnabled":false,
+                "memoryEnabled":false,
+                "askUserQuestionAutoResolutionEnabled":false
+            })
+        );
+        let params = serde_json::json!({"options":[
+            {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
+            {"kind":"deny","response":{"decision":"deny","reason":"bounded"}}
+        ]});
+        assert_eq!(
+            offered_permission_response(&params, "deny"),
+            Some(serde_json::json!({"decision":"deny","reason":"bounded"}))
+        );
+        assert!(offered_permission_response(&params, "other").is_none());
     }
 }

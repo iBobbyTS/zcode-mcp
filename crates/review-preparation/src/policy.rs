@@ -91,6 +91,7 @@ pub enum PermissionRequest {
     Network(String),
     GitRefMutation,
     CredentialRead(PathBuf),
+    InternalReviewLedger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +242,12 @@ impl PolicyLauncher {
                 .and_then(serde_json::Value::as_str)
                 .map(|target| PermissionRequest::Network(target.into())),
             "git_ref_mutation" => Some(PermissionRequest::GitRefMutation),
+            "mcp__review-ledger__review_checkpoint"
+            | "mcp__review-ledger__review_finding_upsert"
+            | "mcp__review-ledger__review_validation_record"
+            | "mcp__review-ledger__review_finalize" => {
+                Some(PermissionRequest::InternalReviewLedger)
+            }
             "execute" | "terminal" => {
                 let program = input
                     .get("program")
@@ -303,6 +310,7 @@ impl PolicyLauncher {
             PermissionRequest::Network(_) => None,
             PermissionRequest::GitRefMutation => Some("git_ref_mutation_denied"),
             PermissionRequest::CredentialRead(_) => Some("credential_read_denied"),
+            PermissionRequest::InternalReviewLedger => None,
             PermissionRequest::Read(path) => {
                 if is_credential_path(path) {
                     return Some("credential_read_denied");

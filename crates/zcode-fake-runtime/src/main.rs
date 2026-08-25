@@ -72,7 +72,14 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
         return false;
     };
     match method {
-        "workspace/readState" => params.is_empty(),
+        "workspace/readState" => params
+            .get("workspace")
+            .and_then(Value::as_object)
+            .is_some_and(|workspace| {
+                exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
+                    && workspace.get("workspaceKey").is_some_and(Value::is_string)
+                    && workspace.get("workspacePath").is_some_and(Value::is_string)
+            }),
         "session/create" => {
             if !exact_keys(params, &["workspace"], &["mcpServers"]) {
                 return false;
@@ -105,8 +112,8 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
                 &["sessionId", "deliveryKind", "includeSnapshot"],
                 &["afterSeq"],
             ) && params.get("sessionId").and_then(Value::as_str) == Some(session_id)
-                && params.get("deliveryKind").is_some_and(Value::is_string)
-                && params.get("includeSnapshot").is_some_and(Value::is_boolean)
+                && params.get("deliveryKind").and_then(Value::as_str) == Some("desktop-continuous")
+                && params.get("includeSnapshot") == Some(&Value::Bool(true))
         }
         "session/send" => {
             exact_keys(params, &["sessionId", "content"], &["inputId", "queryId"])
@@ -354,7 +361,8 @@ fn main() {
         None
     };
 
-    for line in stdin.lock().lines() {
+    let mut lines = stdin.lock().lines();
+    while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -476,6 +484,30 @@ fn main() {
                         })
                     })
                     .cloned();
+                let preference_id = Value::String("runtime-preferences-1".into());
+                let _ = write_value(
+                    &mut out,
+                    json!({
+                        "id": preference_id,
+                        "method": "session/requestRuntimePreferences",
+                        "params": {"scope":"session","sessionId":&session_id}
+                    }),
+                );
+                let preference_response = lines
+                    .next()
+                    .and_then(Result::ok)
+                    .and_then(|line| serde_json::from_str::<Value>(&line).ok());
+                if preference_response.as_ref().is_none_or(|response| {
+                    response.get("id") != Some(&preference_id)
+                        || response.get("result")
+                            != Some(&json!({
+                                "nativeSearchEnhancementsEnabled":false,
+                                "memoryEnabled":false,
+                                "askUserQuestionAutoResolutionEnabled":false
+                            }))
+                }) {
+                    std::process::exit(24);
+                }
                 let _ = write_value(
                     &mut out,
                     response(id, json!({"session": {"sessionId": &session_id}})),
@@ -536,8 +568,8 @@ fn main() {
                                 "reason": "fixture permission",
                                 "input": if hard_deny { json!({}) } else { json!({"path": "fixture.txt"}) },
                                 "options": [
-                                    {"optionId": "allow-once", "kind": "allow", "name": "Allow once", "response": {"decision": "allow"}},
-                                    {"optionId": "deny-once", "kind": "deny", "name": "Deny", "response": {"decision": "deny"}}
+                                    {"id": "allow_once", "kind": "allow_once", "label": "Allow once", "response": {"decision": "allow", "reason": "allowed once"}},
+                                    {"id": "deny", "kind": "deny", "label": "Deny", "response": {"decision": "deny", "reason": "denied"}}
                                 ]
                             }
                         }),

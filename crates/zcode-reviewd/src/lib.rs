@@ -21,10 +21,12 @@ use zcode_driver::{
     RequestError, StopOutcome,
 };
 use zcode_protocol::{
-    event_type, session_id_from_result, turn_id_from_result, CreateSessionParams, LifecycleOrder,
-    SendParams, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
-    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_SEND,
-    SESSION_STOP, SESSION_SUBSCRIBE, WORKSPACE_READ_STATE,
+    event_type, offered_permission_response, session_id_from_result, turn_id_from_result,
+    CreateSessionParams, LifecycleOrder, RuntimePreferences, SendParams, SessionParams,
+    StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceParams, WorkspaceRef,
+    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE,
+    WORKSPACE_READ_STATE,
 };
 
 pub mod ledger_mcp;
@@ -426,6 +428,7 @@ pub struct RuntimeOwner {
     shutdown_pump: Arc<AtomicBool>,
     turn_tracker: Arc<TurnTracker>,
     session_id: Mutex<Option<String>>,
+    permission_responses: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 impl RuntimeOwner {
@@ -434,11 +437,13 @@ impl RuntimeOwner {
         let publisher = Arc::new(Publisher::new(sink));
         let shutdown_pump = Arc::new(AtomicBool::new(false));
         let turn_tracker = Arc::new(TurnTracker::new());
+        let permission_responses = Arc::new(Mutex::new(HashMap::new()));
         spawn_event_pump(
             Arc::clone(&driver),
             Arc::clone(&publisher),
             Arc::clone(&shutdown_pump),
             Arc::clone(&turn_tracker),
+            Arc::clone(&permission_responses),
         );
         Ok(Self {
             driver,
@@ -446,6 +451,7 @@ impl RuntimeOwner {
             shutdown_pump,
             turn_tracker,
             session_id: Mutex::new(None),
+            permission_responses,
         })
     }
 
@@ -465,13 +471,20 @@ impl RuntimeOwner {
         mcp_servers: &[StdioMcpServer],
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.driver
-            .request(WORKSPACE_READ_STATE, serde_json::json!({}), timeout)?;
+        let workspace = WorkspaceRef {
+            workspace_key: workspace_path,
+            workspace_path,
+        };
+        self.driver.request(
+            WORKSPACE_READ_STATE,
+            serde_json::to_value(WorkspaceParams {
+                workspace: workspace.clone(),
+            })
+            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?,
+            timeout,
+        )?;
         let create_params = serde_json::to_value(CreateSessionParams {
-            workspace: WorkspaceRef {
-                workspace_key: workspace_path,
-                workspace_path,
-            },
+            workspace,
             mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
@@ -491,7 +504,7 @@ impl RuntimeOwner {
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
-            include_snapshot: false,
+            include_snapshot: true,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         self.driver
@@ -557,13 +570,19 @@ impl RuntimeOwner {
         if !matches!(decision, "allow" | "deny") {
             return Err(RuntimeCommandError::Unsupported);
         }
-        let mut result = serde_json::json!({"decision": decision});
-        if let Some(reason) = content {
-            result
-                .as_object_mut()
-                .expect("permission result is an object")
-                .insert("reason".into(), reason.into());
-        }
+        let key = serde_json::to_string(&id)
+            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        let result = self
+            .permission_responses
+            .lock()
+            .unwrap()
+            .remove(&format!("{key}:{decision}"))
+            .ok_or_else(|| {
+                RuntimeCommandError::InvalidSession(
+                    "runtime offered no matching permission response".into(),
+                )
+            })?;
+        let _ = content;
         self.driver
             .respond(id, result)
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))
@@ -638,7 +657,14 @@ impl RuntimeOwner {
 }
 
 fn observed_model_from_result(result: &serde_json::Value) -> Option<&str> {
-    result
+    fn current(root: &serde_json::Value) -> Option<&str> {
+        root.get("settings")?
+            .get("model")?
+            .get("current")?
+            .get("modelId")?
+            .as_str()
+    }
+    let direct = result
         .get("modelId")
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
@@ -646,7 +672,10 @@ fn observed_model_from_result(result: &serde_json::Value) -> Option<&str> {
                 .get("session")
                 .and_then(|session| session.get("modelId"))
                 .and_then(serde_json::Value::as_str)
-        })
+        });
+    direct
+        .or_else(|| current(result))
+        .or_else(|| result.get("session").and_then(current))
 }
 
 impl Drop for RuntimeOwner {
@@ -661,6 +690,7 @@ fn spawn_event_pump(
     publisher: Arc<Publisher>,
     shutdown: Arc<AtomicBool>,
     turn_tracker: Arc<TurnTracker>,
+    permission_responses: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 ) {
     thread::spawn(move || loop {
         if shutdown.load(Ordering::Acquire) {
@@ -668,6 +698,29 @@ fn spawn_event_pump(
         }
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
+                if let Inbound::Message(WireMessage::Request(request)) = &event {
+                    if request.method == SESSION_REQUEST_RUNTIME_PREFERENCES {
+                        let result = serde_json::to_value(RuntimePreferences::default())
+                            .expect("runtime preferences serialize");
+                        if driver.respond(request.id.clone(), result).is_err() {
+                            publisher.publish_terminal(RuntimeTerminal::FailedRuntimeLost(
+                                RuntimeLoss::EventStreamLost,
+                            ));
+                            return;
+                        }
+                    } else if request.method == INTERACTION_REQUEST_PERMISSION {
+                        if let Ok(key) = serde_json::to_string(&request.id) {
+                            let mut cached = permission_responses.lock().unwrap();
+                            for decision in ["allow", "deny"] {
+                                if let Some(response) =
+                                    offered_permission_response(&request.params, decision)
+                                {
+                                    cached.insert(format!("{key}:{decision}"), response);
+                                }
+                            }
+                        }
+                    }
+                }
                 turn_tracker.observe(&event);
                 let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
                 let terminal = match &event {
