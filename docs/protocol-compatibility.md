@@ -17,6 +17,22 @@ The command reads `ZCODE_RUNTIME_PATH` only. It emits JSON with a redacted
 redacted path token, byte size, SHA-256, Node version, and an app-server probe result.
 Authentication tokens and provider secrets are not read or emitted.
 
+## Pinned 3.8.1 event and request shapes
+
+The retained black-box inventory in
+`.agent-work/probes/zcode-3.8.1/{EVENT-INVENTORY.md,REQUEST-SHAPES.redacted.json}`
+is the source for the deterministic fake. It observed `permission.requested`
+and `permission.resolved`; no separate acknowledgement event is synthesized or
+classified as known. Permission decisions use the exact response object offered by
+`interaction/requestPermission`; completion is established by the terminal turn
+lifecycle rather than an invented acknowledgement event. Events without typed
+product semantics continue through the bounded, redacted `raw.unknown` path.
+
+For requests emitted by this project, `session/subscribe` accepts exactly
+`sessionId`, `deliveryKind`, and `includeSnapshot`; `session/send` accepts
+exactly `sessionId` and `content`. The fake rejects the unobserved `afterSeq`,
+`inputId`, and `queryId` fields.
+
 When the variable is absent, or the path is not a regular file, the result is
 `compatibility_status: "untested"` with a reason. This is an explicit evidence
 gap, not a compatibility claim.

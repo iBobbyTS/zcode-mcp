@@ -238,10 +238,7 @@ pub fn parse_line(line: &str) -> Result<WireMessage, ParseError> {
                 .and_then(|params| params.get("type"))
                 .and_then(Value::as_str)
                 .is_some_and(|kind| {
-                    matches!(
-                        kind,
-                        "turn.started" | "turn.completed" | "turn.failed" | "permission.responded"
-                    )
+                    matches!(kind, "turn.started" | "turn.completed" | "turn.failed")
                 });
         return if known {
             serde_json::from_value(value)
@@ -306,6 +303,15 @@ mod tests {
     #[test]
     fn unknown_preserved() {
         let msg = parse_line(r#"{"method":"new/event","params":{"a":2}}"#).unwrap();
+        assert!(matches!(msg, WireMessage::UnknownEvent { .. }));
+    }
+
+    #[test]
+    fn observed_permission_resolution_remains_bounded_without_typed_semantics() {
+        let msg = parse_line(
+            r#"{"method":"session/event","params":{"sessionId":"s1","type":"permission.resolved","payload":{"future":"shape"}}}"#,
+        )
+        .unwrap();
         assert!(matches!(msg, WireMessage::UnknownEvent { .. }));
     }
     #[test]

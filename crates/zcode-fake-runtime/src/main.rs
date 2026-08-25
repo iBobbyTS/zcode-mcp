@@ -110,13 +110,13 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
             exact_keys(
                 params,
                 &["sessionId", "deliveryKind", "includeSnapshot"],
-                &["afterSeq"],
+                &[],
             ) && params.get("sessionId").and_then(Value::as_str) == Some(session_id)
                 && params.get("deliveryKind").and_then(Value::as_str) == Some("desktop-continuous")
                 && params.get("includeSnapshot") == Some(&Value::Bool(true))
         }
         "session/send" => {
-            exact_keys(params, &["sessionId", "content"], &["inputId", "queryId"])
+            exact_keys(params, &["sessionId", "content"], &[])
                 && params.get("sessionId").and_then(Value::as_str) == Some(session_id)
                 && params.get("content").is_some_and(Value::is_string)
         }
@@ -410,17 +410,12 @@ fn main() {
                 && object.get("error").is_none()
                 && object.get("result").is_some_and(valid_permission_response)
             {
-                let decision = object
-                    .get("result")
-                    .and_then(|result| result.get("decision"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("invalid");
-                let expected_decision = if is_review_flow(&mode) {
-                    "deny"
+                let expected_response = if is_review_flow(&mode) {
+                    json!({"decision": "deny", "reason": "denied"})
                 } else {
-                    "allow"
+                    json!({"decision": "allow", "reason": "allowed once"})
                 };
-                if decision != expected_decision {
+                if object.get("result") != Some(&expected_response) {
                     continue;
                 }
                 if is_review_flow(&mode) && mode != "review-flow-no-ledger" && !ledger_completed {
@@ -433,15 +428,6 @@ fn main() {
                     ledger_completed = true;
                 }
                 pending_permission = None;
-                let _ = write_value(
-                    &mut out,
-                    event(
-                        &mut sequence,
-                        &session_id,
-                        "permission.responded",
-                        json!({"accepted": true}),
-                    ),
-                );
                 if is_review_flow(&mode) && active_turn {
                     active_turn = false;
                     let _ = write_value(
@@ -657,7 +643,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strict_params_reject_legacy_session_and_message_fields() {
+    fn pinned_request_keys_accept_observed_and_reject_unobserved_fields() {
         assert!(!valid_params(
             "session/send",
             &json!({"session_id":"fake-session-7f3a","message":"review"}),
@@ -668,6 +654,36 @@ mod tests {
             &json!({"sessionId":"fake-session-7f3a","content":"review"}),
             "fake-session-7f3a",
         ));
+        assert!(valid_params(
+            "session/subscribe",
+            &json!({
+                "sessionId":"fake-session-7f3a",
+                "deliveryKind":"desktop-continuous",
+                "includeSnapshot":true
+            }),
+            "fake-session-7f3a",
+        ));
+        assert!(!valid_params(
+            "session/subscribe",
+            &json!({
+                "sessionId":"fake-session-7f3a",
+                "deliveryKind":"desktop-continuous",
+                "includeSnapshot":true,
+                "afterSeq":0
+            }),
+            "fake-session-7f3a",
+        ));
+        for key in ["inputId", "queryId"] {
+            let mut params = json!({
+                "sessionId":"fake-session-7f3a",
+                "content":"review"
+            });
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), json!("invented"));
+            assert!(!valid_params("session/send", &params, "fake-session-7f3a",));
+        }
     }
 
     #[test]

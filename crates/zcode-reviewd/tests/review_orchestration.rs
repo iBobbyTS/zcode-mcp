@@ -292,20 +292,25 @@ impl Fixture {
             }))
     }
 
-    fn respond_permission(&self, agent_id: &str) {
+    fn respond_permission(&self, agent_id: &str) -> zcode_reviewd::rpc::ResponseOutcomeView {
         let pending = self.wait_pending(agent_id);
         let permission = pending
             .iter()
             .find(|request| request.request_type == "permission")
             .unwrap();
-        self.service
+        match self
+            .service
             .dispatch(RpcMethod::Respond(RespondInput {
                 agent_id: agent_id.into(),
                 request_id: permission.request_id.clone(),
                 decision: ResponseDecision::Allow,
                 content: None,
             }))
-            .unwrap();
+            .unwrap()
+        {
+            RpcSuccess::Respond { outcome } => outcome,
+            other => panic!("unexpected permission response: {other:?}"),
+        }
     }
 
     fn fail_terminal_event_writes(&self) {
@@ -466,7 +471,15 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(resumed);
     assert!(!independent);
 
-    fixture.respond_permission(&first);
+    let permission_outcome = fixture.respond_permission(&first);
+    assert_eq!(
+        permission_outcome.disposition,
+        zcode_reviewd::rpc::ResponseDispositionView::Responded
+    );
+    assert_eq!(permission_outcome.requested_decision, "allow");
+    assert_eq!(permission_outcome.effective_decision, "deny");
+    assert!(permission_outcome.policy_overrode);
+    assert!(permission_outcome.policy_reason_code.is_some());
     let first_done = fixture.wait_terminal(&first);
     assert_eq!(first_done.state, JobState::Completed);
     assert_eq!(
@@ -568,9 +581,16 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(first_events
         .iter()
         .any(|event| event.event_type == "runtime.completed"));
-    assert!(first_events
+    let unknown = first_events
         .iter()
-        .any(|event| event.event_type == "raw.unknown"));
+        .find(|event| event.event_type == "raw.unknown")
+        .expect("unknown non-critical notification must remain visible");
+    assert_eq!(unknown.redaction_level, "redacted");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&unknown.payload_json).unwrap(),
+        serde_json::json!({"kind":"unknown_event","raw":"[REDACTED]"})
+    );
+    assert!(!unknown.payload_json.contains("secret"));
     let unsupported = fixture
         .store
         .pending_requests(&first)
@@ -608,17 +628,6 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
             }
         } if requested_decision == "allow" && effective_decision == "deny"
     ));
-    assert_eq!(
-        first_events
-            .iter()
-            .filter(|event| {
-                event.event_type == "driver.message"
-                    && serde_json::from_str::<serde_json::Value>(&event.payload_json)
-                        .is_ok_and(|payload| payload["type"] == "permission.responded")
-            })
-            .count(),
-        1
-    );
     assert_eq!(
         fixture
             .store
