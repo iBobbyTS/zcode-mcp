@@ -4258,12 +4258,7 @@ mod tests {
                 JobState::Cancelled,
                 Some("CANCELLED"),
             ),
-            (
-                5,
-                TaskOutcome::TimedOut,
-                JobState::Failed,
-                Some("TIMEOUT"),
-            ),
+            (5, TaskOutcome::TimedOut, JobState::Failed, Some("TIMEOUT")),
             (
                 6,
                 TaskOutcome::BudgetExhausted,
