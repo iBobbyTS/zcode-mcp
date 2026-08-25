@@ -1077,6 +1077,7 @@ impl Store {
         review_id: &str,
         scope: TaskQueryScope<'_>,
     ) -> StoreResult<Option<TaskRecord>> {
+        validate_scope(&scope)?;
         let connection = self.connection.lock().unwrap();
         let public_id = connection
             .query_row(
@@ -1188,12 +1189,20 @@ impl Store {
             "UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id=?1",
             [execution_agent_id],
         )?;
-        let legacy_state = match result.outcome.as_str() {
-            "SUCCEEDED" => "COMPLETED",
-            "CANCELLED" => "CANCELLED",
-            _ => "FAILED",
+        let (legacy_state, failure_code) = match result.outcome {
+            TaskOutcome::Succeeded => ("COMPLETED", None),
+            TaskOutcome::Blocked => ("COMPLETED", Some("BLOCKED")),
+            TaskOutcome::Cancelled => ("CANCELLED", Some("CANCELLED")),
+            TaskOutcome::RuntimeLost => ("FAILED_RUNTIME_LOST", Some("RUNTIME_LOST")),
+            TaskOutcome::TimedOut => ("FAILED", Some("TIMED_OUT")),
+            TaskOutcome::BudgetExhausted => ("FAILED", Some("BUDGET_EXHAUSTED")),
+            TaskOutcome::ResultInvalid => ("FAILED", Some("RESULT_INVALID")),
+            TaskOutcome::Failed => ("FAILED", Some("FAILED")),
         };
-        transaction.execute("UPDATE agents SET state=?1,completed_at=?2,failure_code=CASE WHEN ?1='COMPLETED' THEN NULL ELSE ?3 END WHERE agent_id=?4",params![legacy_state,now_millis(),result.outcome.as_str(),execution_agent_id])?;
+        transaction.execute(
+            "UPDATE agents SET state=?1,completed_at=?2,failure_code=?3 WHERE agent_id=?4",
+            params![legacy_state, now_millis(), failure_code, execution_agent_id],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -4174,6 +4183,137 @@ mod tests {
             store.enqueue_job(&incomplete),
             Err(StoreError::InvalidState(_))
         ));
+        assert!(matches!(
+            store.get_task_scoped(
+                "missing-public",
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: None,
+                    ownership_token: None
+                }
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(matches!(
+            store.get_review_scoped(
+                "missing-review",
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: None,
+                    ownership_token: None
+                }
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        let mut review = general_task(
+            "scope-review-exec",
+            "scope-review-public",
+            "scope-review-key",
+        );
+        review.task_kind = TaskKind::Review;
+        review.review_id = Some("scope-review".into());
+        review.job.review_kind = Some("initial".into());
+        review.repository = "r1".into();
+        review.feature_id = "f1".into();
+        review.ownership_token = "o1".into();
+        store.enqueue_task(&review).unwrap();
+        assert!(matches!(
+            store.get_review_scoped(
+                "scope-review",
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: None,
+                    ownership_token: None
+                }
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(store
+            .get_review_scoped(
+                "scope-review",
+                TaskQueryScope {
+                    repository: Some("r1"),
+                    feature_id: Some("f1"),
+                    ownership_token: None
+                }
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn every_task_outcome_has_exact_legacy_projection() {
+        for (index, outcome, state, code) in [
+            (1, TaskOutcome::Succeeded, JobState::Completed, None),
+            (
+                2,
+                TaskOutcome::Blocked,
+                JobState::Completed,
+                Some("BLOCKED"),
+            ),
+            (3, TaskOutcome::Failed, JobState::Failed, Some("FAILED")),
+            (
+                4,
+                TaskOutcome::Cancelled,
+                JobState::Cancelled,
+                Some("CANCELLED"),
+            ),
+            (
+                5,
+                TaskOutcome::TimedOut,
+                JobState::Failed,
+                Some("TIMED_OUT"),
+            ),
+            (
+                6,
+                TaskOutcome::BudgetExhausted,
+                JobState::Failed,
+                Some("BUDGET_EXHAUSTED"),
+            ),
+            (
+                7,
+                TaskOutcome::RuntimeLost,
+                JobState::FailedRuntimeLost,
+                Some("RUNTIME_LOST"),
+            ),
+            (
+                8,
+                TaskOutcome::ResultInvalid,
+                JobState::Failed,
+                Some("RESULT_INVALID"),
+            ),
+        ] {
+            let (_directory, _path, store) = file_store();
+            let id = format!("projection-{index}");
+            let task = general_task(
+                &id,
+                &format!("projection-public-{index}"),
+                &format!("projection-key-{index}"),
+            );
+            store.enqueue_task(&task).unwrap();
+            store.set_task_phase(&id, TaskPhase::Preparing).unwrap();
+            store.set_task_phase(&id, TaskPhase::Running).unwrap();
+            store
+                .store_task_result(
+                    &id,
+                    &TaskResult {
+                        outcome,
+                        summary: "done".into(),
+                        partial: false,
+                        base_commit: None,
+                        head_commit: None,
+                        changed_files: vec![],
+                        diff_stat: None,
+                        checks: vec![],
+                        residual_gaps: vec![],
+                        artifacts: vec![],
+                    },
+                )
+                .unwrap();
+            let job = store.get_job(&id).unwrap().unwrap();
+            assert_eq!(job.state, state);
+            assert_eq!(job.failure_code.as_deref(), code);
+        }
     }
 
     #[test]
@@ -4559,22 +4699,56 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    fn seed_historical_common(connection: &Connection, prefix: &str) {
+        let agent = format!("{prefix}-job");
+        let runtime = format!("{prefix}-runtime");
+        connection.execute("INSERT INTO agents (agent_id,state,workspace_path,initial_prompt,turn_state,runtime_agent_id,created_at,last_event_seq) VALUES (?1,'COMPLETED',?2,'preserved','IDLE',?3,1,1)",params![agent,format!("/{prefix}"),runtime]).unwrap();
+        connection.execute("INSERT INTO events (agent_id,runtime_agent_id,seq,source_seq,timestamp,event_type,turn_id,payload_json,redaction_level) VALUES (?1,?2,1,7,1,'historical.event',NULL,?3,'allowlisted')",params![agent,runtime,format!("{{\"version\":\"{prefix}\"}}")]).unwrap();
+        connection.execute("INSERT INTO messages (message_id,agent_id,mode,content,state,created_at,delivered_at,target_turn_id,failure_code,failure_message) VALUES (?1,?2,'queue',?3,'DELIVERED',1,2,NULL,NULL,NULL)",params![format!("{prefix}-message"),agent,format!("{prefix} message")]).unwrap();
+        connection.execute("INSERT INTO pending_requests (request_id,agent_id,correlation_id,request_type,payload_json,state,created_at,responded_at,response_decision,response_content) VALUES (?1,?2,?3,'permission','{}','RESPONDED',1,2,'allow',NULL)",params![format!("{prefix}-request"),agent,format!("{prefix}-correlation")]).unwrap();
+        connection.execute("INSERT INTO artifacts (artifact_id,agent_id,artifact_type,path,sha256,bytes,checkpoint_number,created_at) VALUES (?1,?2,'report',?3,?4,9,1,2)",params![format!("{prefix}-artifact"),agent,format!("/{prefix}/report.md"),format!("{prefix}-hash")]).unwrap();
+    }
+
+    fn assert_historical_common(store: &Store, prefix: &str) {
+        let agent = format!("{prefix}-job");
+        let runtime = format!("{prefix}-runtime");
+        assert_eq!(
+            store.events_after(&agent, &runtime, 0, 10).unwrap()[0].payload_json,
+            format!("{{\"version\":\"{prefix}\"}}")
+        );
+        assert_eq!(
+            store
+                .message(&format!("{prefix}-message"))
+                .unwrap()
+                .unwrap()
+                .content,
+            format!("{prefix} message")
+        );
+        assert_eq!(
+            store
+                .pending_request(&agent, &format!("{prefix}-request"))
+                .unwrap()
+                .unwrap()
+                .response_decision
+                .as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            store.artifacts(&agent, 10).unwrap()[0].sha256,
+            format!("{prefix}-hash")
+        );
+    }
+
     #[test]
     fn accepted_v3_job_rows_migrate_to_current_review_and_task_tables() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v3.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(SCHEMA).unwrap();
-        connection.execute_batch("DROP TABLE task_results; DROP TABLE task_attempts; DROP TABLE task_identities; DROP TABLE review_report_events; DROP TABLE review_finalizations; DROP TABLE review_validations; DROP TABLE review_finding_history; DROP TABLE review_findings; DROP TABLE review_checkpoints; DROP TABLE review_provenance; DROP TABLE review_reports; ALTER TABLE events DROP COLUMN attempt_sequence;").unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
         connection
-            .execute(
-                "INSERT INTO agents (
-                    agent_id, state, workspace_path, initial_prompt, turn_state, created_at
-                 ) VALUES ('v3-job', 'QUEUED', '/v3', 'preserved', 'IDLE', 1)",
-                [],
-            )
+            .execute_batch(include_str!("../tests/fixtures/schema-v3.sql"))
             .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        seed_historical_common(&connection, "v3");
         drop(connection);
 
         let store = Store::open(&path).unwrap();
@@ -4582,6 +4756,7 @@ mod tests {
             store.get_job("v3-job").unwrap().unwrap().initial_prompt,
             "preserved"
         );
+        assert_historical_common(&store, "v3");
         assert!(store.review_report_state("v3-job").unwrap().is_none());
         assert!(store.review_report_agent_ids().unwrap().is_empty());
         let version: i64 = store
@@ -4598,13 +4773,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("v4.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(SCHEMA).unwrap();
         connection
-            .execute_batch(
-                "DROP TABLE task_results; DROP TABLE task_attempts; DROP TABLE task_identities; ALTER TABLE events DROP COLUMN attempt_sequence; PRAGMA user_version=4;",
-            )
+            .execute_batch(include_str!("../tests/fixtures/schema-v4.sql"))
             .unwrap();
-        connection.execute("INSERT INTO agents (agent_id,state,workspace_path,created_at) VALUES ('v4-job','COMPLETED','/v4',1)",[]).unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        seed_historical_common(&connection, "v4");
         connection.execute_batch(r#"INSERT INTO review_reports (agent_id,expected_path,report_root,current_revision,published_revision,sha256,bytes,finalized,final_signal,created_at,updated_at) VALUES ('v4-job','report.md','/v4',4,4,'report-hash',10,1,'findings_present',1,2);
           INSERT INTO review_provenance (agent_id,manifest_sha256,prepared_sha256,base_sha,head_sha,runtime_sha256,zcode_session_id,requested_model,observed_model) VALUES ('v4-job','manifest','prepared','base','head','runtime','session','requested','observed');
           INSERT INTO review_checkpoints VALUES ('v4-job','checkpoint','{"v":1}','checkpoint-hash',1,1);
@@ -4620,6 +4793,7 @@ mod tests {
             JobState::Completed
         );
         assert!(store.review_report_state("v4-job").unwrap().is_some());
+        assert_historical_common(&store, "v4");
         let snapshot = store.review_snapshot("v4-job").unwrap().unwrap();
         assert_eq!(snapshot.provenance.manifest_sha256, "manifest");
         assert_eq!(snapshot.checkpoints[0].payload_json, "{\"v\":1}");
