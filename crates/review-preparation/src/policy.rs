@@ -100,6 +100,7 @@ pub enum PermissionRequest {
     GitRefMutation,
     CredentialRead(PathBuf),
     InternalReviewLedger,
+    InternalGeneralCompletion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +249,9 @@ impl PolicyLauncher {
             };
         };
         let input = params.get("input").unwrap_or(&serde_json::Value::Null);
-        let request = if matches!(
+        let request = if tool_name == "mcp__general-completion__zcode_general_complete" {
+            Some(PermissionRequest::InternalGeneralCompletion)
+        } else if matches!(
             tool_name,
             "mcp__review-ledger__review_checkpoint"
                 | "mcp__review-ledger__review_finding_upsert"
@@ -362,6 +365,14 @@ impl PolicyLauncher {
             PermissionRequest::InternalReviewLedger => match self.mode {
                 PolicyMode::ReviewReadonly => None,
                 _ => Some("review_ledger_unavailable_for_general_task"),
+            },
+            PermissionRequest::InternalGeneralCompletion => match self.mode {
+                PolicyMode::ReviewReadonly => {
+                    Some("general_completion_unavailable_for_review_task")
+                }
+                PolicyMode::GeneralReadonly
+                | PolicyMode::GeneralTest
+                | PolicyMode::GeneralImplementation { .. } => None,
             },
             PermissionRequest::Read(path) => {
                 if is_credential_path(path) {

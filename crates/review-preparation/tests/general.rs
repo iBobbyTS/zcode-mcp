@@ -277,6 +277,103 @@ fn profile_policy_allows_only_frozen_implementation_paths() {
 }
 
 #[test]
+fn internal_general_completion_permission_is_exact_and_general_profile_scoped() {
+    const TOOL: &str = "mcp__general-completion__zcode_general_complete";
+    let f = Fixture::new();
+    for (profile, tracked_write_allowed) in [
+        (GeneralProfile::AnalysisReadonly, false),
+        (GeneralProfile::TestRunner, false),
+        (GeneralProfile::ImplementationWorktree, true),
+    ] {
+        let prepared = f.preparer().prepare(&f.manifest(profile)).unwrap();
+        let launcher = prepared.launcher().unwrap();
+        let request = serde_json::json!({"toolName":TOOL,"input":{}});
+
+        let allowed = launcher.decide_zcode_permission(&request, ExternalDecision::Allow);
+        assert!(allowed.allowed, "{profile:?}: {allowed:?}");
+        assert_eq!(allowed.reason, "allowed_by_bounded_policy");
+        assert!(
+            launcher
+                .decide(
+                    &PermissionRequest::InternalGeneralCompletion,
+                    ExternalDecision::Allow,
+                )
+                .allowed
+        );
+        let denied = launcher.decide_zcode_permission(&request, ExternalDecision::Deny);
+        assert!(!denied.allowed);
+        assert_eq!(denied.reason, "external_policy_denied");
+
+        for near_miss in [
+            "MCP__GENERAL-COMPLETION__ZCODE_GENERAL_COMPLETE",
+            "mcp__general-completion__ZCode_general_complete",
+            "mcp__general-completion__zcode_general_complete_extra",
+            "prefix_mcp__general-completion__zcode_general_complete",
+        ] {
+            let decision = launcher.decide_zcode_permission(
+                &serde_json::json!({"toolName":near_miss,"input":{}}),
+                ExternalDecision::Allow,
+            );
+            assert!(!decision.allowed, "{profile:?}: {near_miss}");
+            assert_eq!(decision.reason, "permission_request_unrecognized");
+        }
+
+        let review_ledger = launcher.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName":"mcp__review-ledger__review_finalize",
+                "input":{}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert!(!review_ledger.allowed);
+        assert_eq!(
+            review_ledger.reason,
+            "review_ledger_unavailable_for_general_task"
+        );
+        for unchanged_unknown in ["Bash", "mcp__other__zcode_general_complete"] {
+            let decision = launcher.decide_zcode_permission(
+                &serde_json::json!({"toolName":unchanged_unknown,"input":{}}),
+                ExternalDecision::Allow,
+            );
+            assert!(!decision.allowed);
+            assert_eq!(decision.reason, "permission_request_unrecognized");
+        }
+        let write = launcher.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName":"write",
+                "input":{"path":prepared.worktree.path.join("src/lib.rs")}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert_eq!(write.allowed, tracked_write_allowed, "{profile:?}");
+        let git = launcher.decide_zcode_permission(
+            &serde_json::json!({"toolName":"git_ref_mutation","input":{}}),
+            ExternalDecision::Allow,
+        );
+        assert!(!git.allowed);
+        assert_eq!(git.reason, "git_ref_mutation_denied");
+        let network = launcher.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName":"network",
+                "input":{"target":"https://example.invalid"}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert!(!network.allowed);
+        assert_eq!(network.reason, "network_not_enforced_and_request_denied");
+        let execute = launcher.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName":"execute",
+                "input":{"program":"/bin/sh","args":[],"cwd":prepared.worktree.path}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert!(!execute.allowed);
+        assert_eq!(execute.reason, "command_not_allowlisted");
+    }
+}
+
+#[test]
 fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
     let f = Fixture::new();
     let source_head = git(&f.repository, &["rev-parse", "HEAD"]);

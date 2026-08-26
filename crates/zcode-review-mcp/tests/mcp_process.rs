@@ -1660,7 +1660,27 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
             "official runtime requested the injected general completion tool but policy hard-denied it as unrecognized: {completion_permission}"
         );
     }
-    assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
+    assert_eq!(
+        completion_permission["policy_preview"], "externally_decidable",
+        "{completion_permission}"
+    );
+    assert_eq!(
+        completion_permission["effective_decision"], "allow",
+        "{completion_permission}"
+    );
+    assert_eq!(
+        completion_permission["policy_overrode"], false,
+        "{completion_permission}"
+    );
+    assert_eq!(
+        completion_permission["policy_reason_code"],
+        serde_json::Value::Null,
+        "{completion_permission}"
+    );
+    assert_eq!(
+        result["result"]["outcome"], "SUCCEEDED",
+        "result={result}; public_permission_evidence={permission_evidence:?}"
+    );
     assert_eq!(
         result["result"]["summary"],
         "official runtime called the private general completion ingress"
