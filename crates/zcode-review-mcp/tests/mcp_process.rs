@@ -1360,6 +1360,8 @@ fn official_public_v2_configured_readiness_is_truthful_bounded_and_reaped() {
 
 #[test]
 fn official_public_v2_general_permission_completion_and_result_are_bounded() {
+    const GENERAL_COMPLETION_TOOL: &str = "mcp__general-completion__zcode_general_complete";
+    const MAX_PERMISSION_EVIDENCE: usize = 8;
     let Some(runtime_path) = official_runtime_path() else {
         eprintln!("skipped: ZCODE_RUNTIME_PATH is unset");
         return;
@@ -1485,6 +1487,8 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     let terminal_deadline = std::time::Instant::now() + Duration::from_secs(150);
     let mut responded = std::collections::HashSet::new();
     let mut denied_bash = false;
+    let mut permission_evidence = Vec::new();
+    let mut permission_evidence_overflow = false;
     let terminal = loop {
         let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
         for request in status["pending_requests"].as_array().unwrap() {
@@ -1506,7 +1510,19 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
                     "reason":"bounded official runtime general ingress verification"
                 }),
             );
-            assert_eq!(response["disposition"], "responded");
+            if permission_evidence.len() < MAX_PERMISSION_EVIDENCE {
+                permission_evidence.push(json!({
+                    "tool_name":request["tool_name"],
+                    "policy_preview":request["policy_preview"],
+                    "disposition":response["disposition"],
+                    "requested_decision":response["requested_decision"],
+                    "effective_decision":response["effective_decision"],
+                    "policy_overrode":response["policy_overrode"],
+                    "policy_reason_code":response["policy_reason_code"]
+                }));
+            } else {
+                permission_evidence_overflow = true;
+            }
             if deny {
                 denied_bash |= response["effective_decision"] == "deny";
             }
@@ -1548,6 +1564,102 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     assert_eq!(terminal["task"]["attempt_sequence"], 1);
     assert_eq!(terminal["task"]["effective_budget"]["max_turns"], 2);
     assert_eq!(terminal["task"]["effective_budget"]["max_tool_calls"], 6);
+    assert_eq!(
+        terminal["result"]["result_sha256"],
+        result["result"]["result_sha256"]
+    );
+    assert_eq!(
+        result["result"]["result_sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(closed["task"]["resources_reaped"], true);
+    assert!(!prepared.worktree.path.exists());
+    assert_eq!(
+        git(&manifest.repository, &["rev-parse", "HEAD"]),
+        initial_head
+    );
+    assert_eq!(
+        git(&manifest.repository, &["status", "--porcelain"]),
+        initial_status
+    );
+    assert!(
+        !permission_evidence_overflow,
+        "official runtime exceeded the bounded public permission evidence envelope"
+    );
+    for evidence in &permission_evidence {
+        let tool_name = evidence["tool_name"]
+            .as_str()
+            .expect("public pending tool_name must be bounded text");
+        let policy_preview = evidence["policy_preview"]
+            .as_str()
+            .expect("public pending policy_preview must be bounded text");
+        let disposition = evidence["disposition"]
+            .as_str()
+            .expect("public response disposition must be bounded text");
+        let requested_decision = evidence["requested_decision"]
+            .as_str()
+            .expect("public requested_decision must be bounded text");
+        let effective_decision = evidence["effective_decision"]
+            .as_str()
+            .expect("public effective_decision must be bounded text");
+        assert!(tool_name.len() <= 256, "unbounded tool_name: {evidence}");
+        assert!(
+            matches!(
+                policy_preview,
+                "externally_decidable" | "hard_deny" | "unknown"
+            ),
+            "invalid policy_preview: {evidence}"
+        );
+        assert_eq!(disposition, "responded", "{evidence}");
+        assert!(
+            matches!(requested_decision, "allow" | "deny"),
+            "invalid requested_decision: {evidence}"
+        );
+        assert!(
+            matches!(effective_decision, "allow" | "deny"),
+            "invalid effective_decision: {evidence}"
+        );
+        assert!(
+            evidence["policy_overrode"].is_boolean(),
+            "invalid policy_overrode: {evidence}"
+        );
+        assert!(
+            evidence["policy_reason_code"]
+                .as_str()
+                .is_none_or(|reason| reason.len() <= 128),
+            "unbounded policy_reason_code: {evidence}"
+        );
+    }
+    let completion_permission = permission_evidence
+        .iter()
+        .find(|evidence| evidence["tool_name"] == GENERAL_COMPLETION_TOOL)
+        .unwrap_or_else(|| {
+            panic!(
+                "official runtime did not request the injected general completion tool; public_permission_evidence={}",
+                serde_json::to_string(&permission_evidence).unwrap()
+            )
+        });
+    assert_eq!(
+        completion_permission["requested_decision"], "allow",
+        "{completion_permission}"
+    );
+    if completion_permission["policy_preview"] == "hard_deny" {
+        assert_eq!(
+            completion_permission["effective_decision"], "deny",
+            "{completion_permission}"
+        );
+        assert_eq!(
+            completion_permission["policy_overrode"], true,
+            "{completion_permission}"
+        );
+        assert_eq!(
+            completion_permission["policy_reason_code"], "permission_request_unrecognized",
+            "{completion_permission}"
+        );
+        panic!(
+            "official runtime requested the injected general completion tool but policy hard-denied it as unrecognized: {completion_permission}"
+        );
+    }
     assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
     assert_eq!(
         result["result"]["summary"],
@@ -1560,14 +1672,6 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
             "official runtime wrote the report artifact"
         ])
     );
-    assert_eq!(
-        terminal["result"]["result_sha256"],
-        result["result"]["result_sha256"]
-    );
-    assert_eq!(
-        result["result"]["result_sha256"].as_str().unwrap().len(),
-        64
-    );
     let artifact = artifact.expect("official completion did not publish its report artifact");
     assert_eq!(artifact["sha256"], report_sha256);
     let chunk = chunk.unwrap();
@@ -1578,16 +1682,6 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
         report
     );
     assert_eq!(chunk["artifact_chunk"]["eof"], true);
-    assert_eq!(closed["task"]["resources_reaped"], true);
-    assert!(!prepared.worktree.path.exists());
-    assert_eq!(
-        git(&manifest.repository, &["rev-parse", "HEAD"]),
-        initial_head
-    );
-    assert_eq!(
-        git(&manifest.repository, &["status", "--porcelain"]),
-        initial_status
-    );
 }
 
 #[test]
