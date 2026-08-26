@@ -396,12 +396,7 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
         .get("provenance")
         .ok_or_else(|| ShadowError::Protocol("review spawn omitted provenance".into()))?;
     let prompt_sha256 = string_field(spawn_provenance, "prompt_sha256")?.to_owned();
-    let counts_as_independent = spawn
-        .get("counts_as_independent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut last_sequence = 0_u64;
-    let mut checkpoint_count = 0_u64;
     let mut unsupported = false;
     let mut terminal = None;
     for _ in 0..config.max_waits {
@@ -465,12 +460,6 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
                 );
             }
         };
-        if let Some(events) = waited.get("events").and_then(Value::as_array) {
-            checkpoint_count += events
-                .iter()
-                .filter(|event| event["event_type"] == "report.checkpoint")
-                .count() as u64;
-        }
         last_sequence = waited
             .get("next_sequence")
             .and_then(Value::as_u64)
@@ -508,6 +497,10 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
         .get("fresh_session_observed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let counts_as_independent = task
+        .get("counts_as_independent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let result = match client
         .call("zcode_agent_result", json!({"agent_id": agent_id}))
         .await
@@ -535,11 +528,10 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
     let report = read_v2_verified_report(client, &agent_id, &result)
         .await
         .ok();
-    let report_valid = report.as_ref().is_some_and(|(_, _, bytes)| {
-        std::str::from_utf8(bytes)
-            .ok()
-            .is_some_and(|text| text.contains("FINALIZED: true"))
-    });
+    let checkpoint_count = report
+        .as_ref()
+        .and_then(|(_, _, bytes)| finalized_checkpoint_count(bytes));
+    let report_valid = checkpoint_count.is_some();
     let close_reaped = client
         .call("zcode_agent_close", json!({"agent_id": agent_id}))
         .await
@@ -598,7 +590,7 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
         report_sha256,
         report_bytes,
         report_schema_compliant: report_valid,
-        checkpoint_count,
+        checkpoint_count: checkpoint_count.unwrap_or(0),
         unsupported_input_observed: unsupported,
         runtime_failure_observed: !terminal_success || !close_reaped,
         wall_time_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -619,6 +611,26 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
     })
 }
 
+fn finalized_checkpoint_count(bytes: &[u8]) -> Option<u64> {
+    let report = std::str::from_utf8(bytes).ok()?;
+    if !report.contains("FINALIZED: true") {
+        return None;
+    }
+    let checkpoints = report
+        .split_once("\n## Checkpoints\n\n")?
+        .1
+        .split_once("\n## Findings\n\n")?
+        .0;
+    Some(
+        checkpoints
+            .lines()
+            .filter(|line| line.starts_with("### "))
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )
+}
+
 fn public_path(repository: &Path, path: &Path) -> String {
     path.strip_prefix(repository)
         .unwrap_or(path)
@@ -633,7 +645,7 @@ fn v2_spawn_arguments(manifest: &ReviewManifest) -> Value {
         RoundKind::RepairDelta => "repair_delta",
         RoundKind::FinalBounded => "final_bounded",
     };
-    json!({
+    let mut arguments = json!({
         "review_kind": review_kind,
         "repository": manifest.repository,
         "base_ref": manifest.base_ref,
@@ -646,9 +658,12 @@ fn v2_spawn_arguments(manifest: &ReviewManifest) -> Value {
         "ownership_token": format!("sectioned-shadow:{}:{}", manifest.feature_id, manifest.section_id),
         "idempotency_key": manifest.idempotency_key,
         "read_only": true,
-        "attachments": manifest.context_paths.iter().map(|path| public_path(&manifest.repository, path)).collect::<Vec<_>>(),
-        "model": manifest.model
-    })
+        "attachments": manifest.context_paths.iter().map(|path| public_path(&manifest.repository, path)).collect::<Vec<_>>()
+    });
+    if let Some(model) = &manifest.model {
+        arguments["model"] = Value::String(model.clone());
+    }
+    arguments
 }
 
 async fn read_v2_verified_report<C: PublicMcpClient>(

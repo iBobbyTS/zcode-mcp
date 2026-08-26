@@ -1231,8 +1231,21 @@ pub trait RuntimeFactory: Send + Sync + 'static {
         &self,
         job: &Job,
         sink: Arc<dyn LifecycleSink>,
+        deadline: Instant,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        ensure_readiness_deadline(deadline)?;
         self.spawn(job, sink)
+    }
+}
+
+fn ensure_readiness_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "readiness spawn deadline elapsed",
+        ))
     }
 }
 
@@ -1296,8 +1309,11 @@ where
         &self,
         job: &Job,
         sink: Arc<dyn LifecycleSink>,
+        deadline: Instant,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        ensure_readiness_deadline(deadline)?;
         let command = (self.command)(job)?;
+        ensure_readiness_deadline(deadline)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
 }
@@ -1353,6 +1369,17 @@ impl ControlDeadline {
             .checked_mul(3)
             .unwrap_or(remaining)
             .min(remaining / 2);
+        self.expires_at
+            .checked_sub(maximum_cleanup)
+            .filter(|deadline| *deadline > Instant::now())
+    }
+
+    fn readiness_probe_deadline(self, stop_grace: Duration) -> Option<Instant> {
+        let remaining = self.remaining()?;
+        let maximum_cleanup = stop_grace
+            .checked_mul(3)
+            .unwrap_or(remaining)
+            .min(remaining / 4);
         self.expires_at
             .checked_sub(maximum_cleanup)
             .filter(|deadline| *deadline > Instant::now())
@@ -1520,7 +1547,9 @@ fn readiness_job(workspace: &Path) -> Job {
         idempotency_key: None,
         state: JobState::Starting,
         workspace_path: workspace.to_string_lossy().into_owned(),
-        initial_prompt: "Runtime readiness preflight. Do not modify files.".into(),
+        initial_prompt:
+            "Runtime readiness preflight. Reply with a short acknowledgement; do not use tools or modify files."
+                .into(),
         prepared_launch_json: None,
         prepared_launch_sha256: None,
         owner_id: None,
@@ -1537,6 +1566,24 @@ fn readiness_job(workspace: &Path) -> Job {
         closed_at: None,
         reaped_at: None,
         created_at: 0,
+    }
+}
+
+fn wait_for_probe_success(runtime: &dyn ManagedRuntime, deadline: Instant) -> Option<bool> {
+    loop {
+        let turn = runtime.turn_snapshot();
+        if !turn.active {
+            match turn.boundary {
+                Some(TurnBoundary::Completed) => return Some(true),
+                Some(TurnBoundary::Failed) => return Some(false),
+                None => {}
+            }
+        }
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(5)));
     }
 }
 
@@ -2404,6 +2451,16 @@ impl Scheduler {
                 reaped: true,
             };
         }
+        let deadline = ControlDeadline::new(timeout);
+        let Some(probe_deadline) = deadline.readiness_probe_deadline(self.inner.config.stop_grace)
+        else {
+            return RuntimePreflight {
+                driver_ready: false,
+                runtime_ready: false,
+                model_auth_ready: false,
+                reaped: true,
+            };
+        };
         let workspace = match tempfile::Builder::new()
             .prefix("zcode-reviewd-readiness-")
             .tempdir()
@@ -2420,7 +2477,11 @@ impl Scheduler {
         };
         let job = readiness_job(workspace.path());
         let sink: Arc<dyn LifecycleSink> = Arc::new(ReadinessSink);
-        let runtime = match self.inner.factory.spawn_readiness(&job, sink) {
+        let runtime = match self
+            .inner
+            .factory
+            .spawn_readiness(&job, sink, probe_deadline)
+        {
             Ok(runtime) => runtime,
             Err(_) => {
                 return RuntimePreflight {
@@ -2431,13 +2492,12 @@ impl Scheduler {
                 }
             }
         };
-        let cleanup_grace = self.inner.config.stop_grace.min(timeout / 3);
-        let bootstrap_timeout = timeout
-            .checked_sub(cleanup_grace)
-            .filter(|remaining| !remaining.is_zero())
-            .unwrap_or(Duration::from_millis(1));
-        let bootstrapped = runtime.bootstrap_session(&job, bootstrap_timeout).is_ok();
-        let terminal = runtime.stop(cleanup_grace);
+        let bootstrapped = remaining_runtime_time(probe_deadline)
+            .and_then(|remaining| runtime.bootstrap_session(&job, remaining))
+            .is_ok();
+        let model_auth_ready = bootstrapped
+            && wait_for_probe_success(runtime.as_ref(), probe_deadline).unwrap_or(false);
+        let terminal = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
         let reaped = matches!(
             terminal,
             RuntimeTerminal::Stopped(_)
@@ -2448,7 +2508,7 @@ impl Scheduler {
         RuntimePreflight {
             driver_ready: true,
             runtime_ready: bootstrapped,
-            model_auth_ready: bootstrapped,
+            model_auth_ready,
             reaped,
         }
     }

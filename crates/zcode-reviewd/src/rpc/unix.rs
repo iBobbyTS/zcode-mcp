@@ -199,10 +199,11 @@ fn read_limited_frame_until(
     limit: usize,
     deadline: Instant,
 ) -> io::Result<Vec<u8>> {
+    stream.set_nonblocking(true)?;
     let mut frame = Vec::new();
     let mut buffer = [0u8; 4096];
     loop {
-        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        let read_remaining = remaining(deadline)?;
         let read = match stream.read(&mut buffer) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -212,6 +213,10 @@ fn read_limited_frame_until(
             }
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(read_remaining.min(Duration::from_millis(1)));
+                continue;
+            }
             Err(error) => return Err(error),
         };
         if let Some(newline) = buffer[..read].iter().position(|byte| *byte == b'\n') {

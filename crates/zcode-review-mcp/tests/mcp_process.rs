@@ -1,8 +1,20 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use review_ledger::{LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_VALIDATION_RECORD};
-use review_preparation::{NetworkPolicy, ReviewKind, ReviewManifest, RoundKind, ScratchPolicy};
+use review_preparation::{
+    CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletionSubmission,
+    NetworkPolicy, PreparedGeneralTask, PreparedLaunchSpec, ReviewKind, ReviewManifest, RoundKind,
+    ScratchPolicy,
+};
 use review_store::Store;
+use sectioned_shadow::{
+    run_shadow_v2, EvidenceClassification, RmcpFacadeClient, ShadowConfig, ShadowMode,
+    SHADOW_SCHEMA,
+};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
+    env, io,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -17,10 +29,13 @@ use zcode_driver::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use zcode_protocol::{RequestEnvelope, WireId, WireMessage};
 use zcode_reviewd::rpc::{RpcServer, RpcService, ServerOptions};
 use zcode_reviewd::{
-    InternalLedgerMcpConfig, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeCommandError,
-    RuntimeEvent, RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig, SessionReady,
-    TurnBoundary, TurnSnapshot,
+    CommandRuntimeFactory, InternalLedgerMcpConfig, LifecycleRecord, LifecycleSink, ManagedRuntime,
+    RuntimeCommandError, RuntimeEvent, RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig,
+    SessionReady, TurnBoundary, TurnSnapshot,
 };
+
+const OFFICIAL_RUNTIME_SHA256: &str =
+    "9318f60fb8c2c3bc83ce62da10220ebcdc9a99786df0a9abb1a4435ba66e4274";
 
 fn discover(protocol_version: &str) -> Vec<Value> {
     discover_mode(protocol_version, None)
@@ -132,7 +147,7 @@ impl FacadeProcess {
 
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         let response = self.request("tools/call", json!({"name":name,"arguments":arguments}));
-        assert!(response.get("error").is_none(), "{response}");
+        assert!(response.get("error").is_none(), "{name}: {response}");
         assert!(
             response["result"]["content"]
                 .as_array()
@@ -140,12 +155,12 @@ impl FacadeProcess {
                     item["type"] == "text"
                         && item["text"].as_str().is_some_and(|text| !text.is_empty())
                 })),
-            "missing text fallback: {response}"
+            "{name} missing text fallback: {response}"
         );
         let structured = response["result"]["structuredContent"].clone();
         assert!(
             !structured.is_null(),
-            "missing structured content: {response}"
+            "{name} missing structured content: {response}"
         );
         structured
     }
@@ -180,6 +195,64 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().into()
+}
+
+fn official_runtime_path() -> Option<PathBuf> {
+    env::var_os("ZCODE_RUNTIME_PATH").map(PathBuf::from)
+}
+
+fn verify_official_runtime(path: &Path) {
+    assert!(path.is_file(), "ZCODE_RUNTIME_PATH must be a regular file");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(std::fs::read(path).unwrap())),
+        OFFICIAL_RUNTIME_SHA256
+    );
+}
+
+fn official_runtime_command(path: &Path) -> io::Result<Command> {
+    let mut command = Command::new("node");
+    command.arg(path).arg("app-server");
+    Ok(command)
+}
+
+fn wait_official_public_review(
+    facade: &mut FacadeProcess,
+    agent_id: &str,
+    attempt_sequence: u64,
+    timeout: Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut responded = std::collections::HashSet::new();
+    loop {
+        let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+        for request in status["pending_requests"].as_array().unwrap() {
+            if request["kind"] == "permission" {
+                let request_id = request["request_id"].as_str().unwrap();
+                if responded.insert(request_id.to_owned()) {
+                    let response = facade.tool(
+                        "zcode_agent_respond",
+                        json!({
+                            "agent_id":agent_id,
+                            "request_id":request_id,
+                            "decision":"allow",
+                            "reason":"bounded official structured review"
+                        }),
+                    );
+                    assert_eq!(response["disposition"], "responded");
+                }
+            }
+        }
+        if status["task"]["phase"] == "TERMINAL"
+            && status["task"]["attempt_sequence"] == attempt_sequence
+        {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "official public review did not terminalize: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn manifest_fixture(root: &Path) -> PathBuf {
@@ -233,6 +306,7 @@ struct PublicFakeRuntime {
     bootstrap_entered: Arc<Barrier>,
     bootstrap_release: Arc<Barrier>,
     readiness: bool,
+    emit_unsupported: bool,
 }
 
 impl PublicFakeRuntime {
@@ -242,6 +316,17 @@ impl PublicFakeRuntime {
             event,
         });
     }
+
+    fn finish(&self, terminal: RuntimeTerminal) -> RuntimeTerminal {
+        let mut current = self.terminal.lock().unwrap();
+        if let Some(current) = current.as_ref() {
+            return current.clone();
+        }
+        *current = Some(terminal.clone());
+        drop(current);
+        self.emit(RuntimeEvent::Terminal(terminal.clone()));
+        terminal
+    }
 }
 
 impl ManagedRuntime for PublicFakeRuntime {
@@ -249,11 +334,9 @@ impl ManagedRuntime for PublicFakeRuntime {
         None
     }
     fn stop(&self, _grace: Duration) -> RuntimeTerminal {
-        let terminal =
-            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))));
-        *self.terminal.lock().unwrap() = Some(terminal.clone());
-        self.emit(RuntimeEvent::Terminal(terminal.clone()));
-        terminal
+        self.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )))
     }
     fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
         self.terminal.lock().unwrap().clone()
@@ -269,8 +352,8 @@ impl ManagedRuntime for PublicFakeRuntime {
         }
         *self.turn.lock().unwrap() = TurnSnapshot {
             generation: 1,
-            active: true,
-            boundary: None,
+            active: !self.readiness,
+            boundary: self.readiness.then_some(TurnBoundary::Completed),
         };
         if !self.readiness {
             self.emit(RuntimeEvent::Driver(Inbound::Message(
@@ -280,13 +363,15 @@ impl ManagedRuntime for PublicFakeRuntime {
                     json!({"toolCallId":"tool-1","toolName":"git_ref_mutation","input":{}}),
                 )),
             )));
-            self.emit(RuntimeEvent::Driver(Inbound::Message(
-                WireMessage::Request(RequestEnvelope::new(
-                    WireId::String("input-wire".into()),
-                    "interaction/requestUserInput",
-                    json!({"question":"private unsupported payload"}),
-                )),
-            )));
+            if self.emit_unsupported {
+                self.emit(RuntimeEvent::Driver(Inbound::Message(
+                    WireMessage::Request(RequestEnvelope::new(
+                        WireId::String("input-wire".into()),
+                        "interaction/requestUserInput",
+                        json!({"question":"private unsupported payload"}),
+                    )),
+                )));
+            }
         }
         Ok(SessionReady {
             session_id: format!("session-{}", job.agent_id),
@@ -329,9 +414,15 @@ impl ManagedRuntime for PublicFakeRuntime {
 struct PublicFakeFactory {
     bootstrap_entered: Arc<Barrier>,
     bootstrap_release: Arc<Barrier>,
+    runtimes: Mutex<HashMap<String, Arc<PublicFakeRuntime>>>,
+    emit_unsupported: bool,
 }
 impl PublicFakeFactory {
-    fn runtime(&self, sink: Arc<dyn LifecycleSink>, readiness: bool) -> Arc<dyn ManagedRuntime> {
+    fn create_runtime(
+        &self,
+        sink: Arc<dyn LifecycleSink>,
+        readiness: bool,
+    ) -> Arc<PublicFakeRuntime> {
         Arc::new(PublicFakeRuntime {
             sink,
             sequence: AtomicU64::new(1),
@@ -344,24 +435,156 @@ impl PublicFakeFactory {
             bootstrap_entered: Arc::clone(&self.bootstrap_entered),
             bootstrap_release: Arc::clone(&self.bootstrap_release),
             readiness,
+            emit_unsupported: self.emit_unsupported,
         })
+    }
+
+    fn runtime(&self, agent_id: &str) -> Arc<PublicFakeRuntime> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(runtime) = self.runtimes.lock().unwrap().get(agent_id).cloned() {
+                return runtime;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "public fake runtime was not spawned"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 impl RuntimeFactory for PublicFakeFactory {
     fn spawn(
         &self,
-        _job: &review_store::Job,
+        job: &review_store::Job,
         sink: Arc<dyn LifecycleSink>,
     ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
-        Ok(self.runtime(sink, false))
+        let runtime = self.create_runtime(sink, false);
+        self.runtimes
+            .lock()
+            .unwrap()
+            .insert(job.agent_id.clone(), Arc::clone(&runtime));
+        Ok(runtime)
     }
 
     fn spawn_readiness(
         &self,
         _job: &review_store::Job,
         sink: Arc<dyn LifecycleSink>,
+        deadline: std::time::Instant,
     ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
-        Ok(self.runtime(sink, true))
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "readiness spawn deadline elapsed",
+            ));
+        }
+        Ok(self.create_runtime(sink, true))
+    }
+}
+
+fn completed_runtime_terminal() -> RuntimeTerminal {
+    RuntimeTerminal::Completed(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+}
+
+fn complete_next_review_attempt(
+    store: &Store,
+    scheduler: &Scheduler,
+    factory: &PublicFakeFactory,
+    ledger: &LedgerManager,
+    checkpoint_id: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let execution_id = loop {
+        let started = scheduler.start_ready().unwrap();
+        if let Some(execution_id) = started.into_iter().next() {
+            break execution_id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "review attempt was not submitted"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    ledger
+        .call_tool(
+            &execution_id,
+            REVIEW_CHECKPOINT,
+            json!({
+                "checkpoint_id":checkpoint_id,
+                "stage":"inspection",
+                "summary":"public composition inspected",
+                "inspected":[{"path":"src/lib.rs","line_ranges":["1"]}],
+                "commands":[],
+                "open_questions":[],
+                "remaining_scope":[]
+            }),
+        )
+        .unwrap();
+    ledger
+        .call_tool(
+            &execution_id,
+            REVIEW_VALIDATION_RECORD,
+            json!({
+                "validation_id":format!("{checkpoint_id}-validation"),
+                "command":"cargo test",
+                "cwd":"public-composition",
+                "exit_code":0,
+                "duration_ms":1,
+                "stdout_summary":"passed",
+                "stderr_summary":"",
+                "related_findings":[]
+            }),
+        )
+        .unwrap();
+    ledger
+        .call_tool(
+            &execution_id,
+            REVIEW_FINALIZE,
+            json!({
+                "signal":"no_findings_observed",
+                "summary":"public composition finalized",
+                "coverage":{"covered":["public facade"],"not_covered":[]},
+                "uncertainties":[],
+                "recommended_next_actions":[]
+            }),
+        )
+        .unwrap();
+    factory
+        .runtime(&execution_id)
+        .finish(completed_runtime_terminal());
+    let terminal_deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if store.task_result(&execution_id).unwrap().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < terminal_deadline,
+            "review attempt did not terminalize"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    execution_id
+}
+
+fn wait_public_terminal(
+    facade: &mut FacadeProcess,
+    agent_id: &str,
+    attempt_sequence: u64,
+) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+        if status["task"]["phase"] == "TERMINAL"
+            && status["task"]["attempt_sequence"] == attempt_sequence
+        {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "public task did not terminalize"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -559,6 +782,8 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
     let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
         bootstrap_entered: Arc::new(Barrier::new(2)),
         bootstrap_release: Arc::new(Barrier::new(2)),
+        runtimes: Mutex::new(HashMap::new()),
+        emit_unsupported: true,
     });
     let scheduler = Scheduler::new(
         "s05-v2-general",
@@ -639,6 +864,938 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
     assert_eq!(closed["task"]["resources_reaped"], true);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let factory = Arc::new(PublicFakeFactory {
+        bootstrap_entered: Arc::new(Barrier::new(1)),
+        bootstrap_release: Arc::new(Barrier::new(1)),
+        runtimes: Mutex::new(HashMap::new()),
+        emit_unsupported: false,
+    });
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
+    let runtime_factory: Arc<dyn RuntimeFactory> = factory.clone();
+    let scheduler = Scheduler::new(
+        "s05-v2-composition-first",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        Arc::clone(&ledger),
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join("first-ledger.sock"),
+            runtime_sha256: None,
+        },
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc/review.sock");
+    let server = RpcServer::bind(&socket, Arc::clone(&service), ServerOptions::default()).unwrap();
+    let manifest_path = manifest_fixture(directory.path());
+    let manifest: ReviewManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let initial_head = git(&manifest.repository, &["rev-parse", "HEAD"]);
+    let initial_status = git(&manifest.repository, &["status", "--porcelain"]);
+    let shadow = ShadowConfig {
+        schema: SHADOW_SCHEMA.into(),
+        manifest_path: manifest_path.clone(),
+        artifact_directory: directory.path().join("shadow-artifacts"),
+        artifact_stem: "s05-real-public-shadow".into(),
+        mode: ShadowMode::Full,
+        wait_timeout_ms: 500,
+        max_waits: 6,
+    };
+    let shadow_store = Arc::clone(&store);
+    let shadow_scheduler = scheduler.clone();
+    let shadow_factory = Arc::clone(&factory);
+    let shadow_ledger = Arc::clone(&ledger);
+    let review_worker = thread::spawn(move || {
+        complete_next_review_attempt(
+            &shadow_store,
+            &shadow_scheduler,
+            &shadow_factory,
+            &shadow_ledger,
+            "fresh-public-checkpoint",
+        )
+    });
+    let facade =
+        RmcpFacadeClient::spawn(Path::new(env!("CARGO_BIN_EXE_zcode-review-mcp")), &socket)
+            .await
+            .unwrap();
+    let shadow_run = run_shadow_v2(&facade, &shadow).await.unwrap();
+    facade.shutdown().await.unwrap();
+    let shadow_execution = review_worker.join().unwrap();
+    assert_eq!(
+        shadow_run.provenance.classification,
+        EvidenceClassification::IndependentEvidence
+    );
+    assert!(shadow_run.provenance.fresh_session_observed);
+    assert_eq!(shadow_run.provenance.checkpoint_count, 1);
+    let shadow_report = std::fs::read(&shadow_run.artifacts.glm_raw).unwrap();
+    let shadow_report_sha256 = format!("{:x}", Sha256::digest(&shadow_report));
+    assert_eq!(
+        shadow_run.provenance.report_sha256.as_deref(),
+        Some(shadow_report_sha256.as_str())
+    );
+    let shadow_prepared: PreparedLaunchSpec = serde_json::from_str(
+        store
+            .get_job(&shadow_execution)
+            .unwrap()
+            .unwrap()
+            .prepared_launch_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!shadow_prepared.worktree.path.exists());
+
+    let shadow_agent_id = shadow_run.provenance.agent_id.clone();
+    let mut before_restart = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let shadow_status = before_restart.tool("zcode_agent_get", json!({"agent_id":shadow_agent_id}));
+    assert_eq!(shadow_status["task"]["attempt_sequence"], 1);
+    assert_eq!(shadow_status["task"]["counts_as_independent"], true);
+    assert_eq!(shadow_status["task"]["resources_reaped"], true);
+    let shadow_events = before_restart.tool(
+        "zcode_agent_events",
+        json!({"agent_id":shadow_agent_id,"after_sequence":0,"limit":100}),
+    );
+    assert!(shadow_events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["attempt_sequence"] == 1));
+    drop(before_restart);
+    server.shutdown();
+    drop(service);
+    drop(scheduler);
+
+    let restarted_factory: Arc<dyn RuntimeFactory> = factory.clone();
+    let restarted_scheduler = Scheduler::new(
+        "s05-v2-composition-restarted",
+        Arc::clone(&store),
+        restarted_factory,
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        Arc::clone(&ledger),
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join("restarted-ledger.sock"),
+            runtime_sha256: None,
+        },
+    )
+    .unwrap();
+    restarted_scheduler.reconcile_startup().unwrap();
+    let restarted_service =
+        Arc::new(RpcService::new(restarted_scheduler.clone(), Arc::clone(&store)).unwrap());
+    let _restarted_server =
+        RpcServer::bind(&socket, restarted_service, ServerOptions::default()).unwrap();
+    let mut v2 = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    assert_eq!(
+        v2.tool("zcode_agent_get", json!({"agent_id":shadow_agent_id}))["task"]["resources_reaped"],
+        true
+    );
+
+    let mut continuation_parent_manifest = manifest.clone();
+    continuation_parent_manifest.idempotency_key = "s05-public-continuation-parent".into();
+    continuation_parent_manifest.report_target =
+        ".agent-work/reviews/s07/continuation-parent.md".into();
+    let continuation_parent = v2.tool(
+        "zcode_review_spawn",
+        json!({
+            "review_kind":"initial_bounded",
+            "repository":continuation_parent_manifest.repository,
+            "base_ref":continuation_parent_manifest.base_ref,
+            "head_ref":continuation_parent_manifest.head_ref,
+            "scope_manifest":continuation_parent_manifest.scope_paths,
+            "requirements_path":continuation_parent_manifest.plan_path,
+            "report_path":continuation_parent_manifest.report_target,
+            "feature_id":continuation_parent_manifest.feature_id,
+            "section_id":continuation_parent_manifest.section_id,
+            "ownership_token":"s05-public-continuation-parent-owner",
+            "idempotency_key":continuation_parent_manifest.idempotency_key,
+            "read_only":true,
+            "attachments":[]
+        }),
+    );
+    let public_agent_id = continuation_parent["agent_id"].as_str().unwrap().to_owned();
+    let review_id = continuation_parent["review_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(continuation_parent["counts_as_independent"], false);
+    let first_execution = complete_next_review_attempt(
+        &store,
+        &restarted_scheduler,
+        &factory,
+        &ledger,
+        "continuation-parent-checkpoint",
+    );
+    let first_status = wait_public_terminal(&mut v2, &public_agent_id, 1);
+    assert_eq!(first_status["task"]["counts_as_independent"], true);
+    assert_eq!(first_status["task"]["fresh_session_observed"], true);
+    let first_prepared: PreparedLaunchSpec = serde_json::from_str(
+        store
+            .get_job(&first_execution)
+            .unwrap()
+            .unwrap()
+            .prepared_launch_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    let first_report = std::fs::read(&first_prepared.report_target).unwrap();
+    let first_report_sha256 = format!("{:x}", Sha256::digest(&first_report));
+    assert!(!first_prepared.worktree.path.exists());
+    let first_events = v2.tool(
+        "zcode_agent_events",
+        json!({"agent_id":public_agent_id,"after_sequence":0,"limit":100}),
+    );
+    let first_cursor = first_events["next_sequence"].as_u64().unwrap();
+    assert!(first_events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["attempt_sequence"] == 1));
+
+    let continuation = v2.tool(
+        "zcode_review_continue",
+        json!({
+            "agent_id":public_agent_id,
+            "review_id":review_id,
+            "base_ref":manifest.base_ref,
+            "head_ref":manifest.head_ref,
+            "frozen_finding_ids":[],
+            "idempotency_key":"s05-public-continuation",
+            "attachments":[],
+            "budget":{
+                "wall_time_ms":7000,
+                "max_turns":12,
+                "max_tool_calls":48,
+                "max_context_bytes":1048576,
+                "max_result_bytes":262144,
+                "max_artifact_bytes":2097152
+            }
+        }),
+    );
+    assert_eq!(continuation["agent_id"], public_agent_id);
+    assert_eq!(continuation["review_id"], review_id);
+    assert_eq!(continuation["attempt_sequence"], 2);
+    assert_eq!(continuation["counts_as_independent"], false);
+    assert_eq!(continuation["effective_budget"]["max_turns"], 12);
+    let second_execution = complete_next_review_attempt(
+        &store,
+        &restarted_scheduler,
+        &factory,
+        &ledger,
+        "continuation-public-checkpoint",
+    );
+    let second_status = wait_public_terminal(&mut v2, &public_agent_id, 2);
+    assert_eq!(second_status["task"]["counts_as_independent"], false);
+    assert_eq!(second_status["task"]["fresh_session_observed"], true);
+    let second_prepared: PreparedLaunchSpec = serde_json::from_str(
+        store
+            .get_job(&second_execution)
+            .unwrap()
+            .unwrap()
+            .prepared_launch_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!second_prepared.worktree.path.exists());
+    let continuation_events = v2.tool(
+        "zcode_agent_events",
+        json!({"agent_id":public_agent_id,"after_sequence":first_cursor,"limit":100}),
+    );
+    let continuation_rows = continuation_events["events"].as_array().unwrap();
+    assert!(!continuation_rows.is_empty());
+    assert!(continuation_rows
+        .iter()
+        .all(|event| event["sequence"].as_u64().unwrap() > first_cursor));
+    assert!(continuation_rows
+        .iter()
+        .all(|event| event["attempt_sequence"] == 2));
+
+    let selected_first = v2.tool(
+        "zcode_agent_result",
+        json!({"agent_id":public_agent_id,"attempt_sequence":1}),
+    );
+    assert_eq!(selected_first["task"]["attempt_sequence"], 1);
+    assert_eq!(selected_first["result"]["outcome"], "SUCCEEDED");
+    let first_artifact = selected_first["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "report_markdown")
+        .unwrap();
+    assert_eq!(first_artifact["sha256"], first_report_sha256);
+    let selected_chunk = v2.tool(
+        "zcode_agent_result",
+        json!({
+            "agent_id":public_agent_id,
+            "attempt_sequence":1,
+            "artifact_id":first_artifact["artifact_id"],
+            "offset_bytes":0,
+            "limit_bytes":first_report.len()
+        }),
+    );
+    let selected_bytes = BASE64
+        .decode(
+            selected_chunk["artifact_chunk"]["bytes_base64"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(selected_bytes, first_report);
+    assert_eq!(selected_chunk["artifact_chunk"]["eof"], true);
+    let continuation_closed = v2.tool("zcode_agent_close", json!({"agent_id":public_agent_id}));
+    assert_eq!(continuation_closed["task"]["resources_reaped"], true);
+
+    let general_spawn = v2.tool(
+        "zcode_agent_spawn",
+        json!({
+            "repository":manifest.repository,
+            "base_ref":manifest.base_ref,
+            "profile":"analysis_readonly",
+            "prompt":"inspect the repository without modifying it",
+            "feature_id":"s05-public-composition",
+            "ownership_token":"s05-public-owner",
+            "idempotency_key":"s05-public-general-completion",
+            "write_manifest":[],
+            "repo_context":["src/lib.rs"],
+            "attachments":[],
+            "retain_partial":false
+        }),
+    );
+    let general_agent_id = general_spawn["agent_id"].as_str().unwrap().to_owned();
+    let general_execution = store
+        .get_task(&general_agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        restarted_scheduler.start_ready().unwrap(),
+        vec![general_execution.clone()]
+    );
+    let general_pending = v2.tool("zcode_agent_get", json!({"agent_id":general_agent_id}));
+    let permission_id = general_pending["pending_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["kind"] == "permission")
+        .unwrap()["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let responded = v2.tool(
+        "zcode_agent_respond",
+        json!({
+            "agent_id":general_agent_id,
+            "request_id":permission_id,
+            "decision":"allow",
+            "reason":"public composition response"
+        }),
+    );
+    assert_eq!(responded["disposition"], "responded");
+    assert_eq!(responded["effective_decision"], "deny");
+    assert_eq!(responded["policy_overrode"], true);
+    let message = v2.tool(
+        "zcode_agent_message",
+        json!({
+            "agent_id":general_agent_id,
+            "message_id":"s05-public-message",
+            "mode":"queue",
+            "content":"record the bounded public composition"
+        }),
+    );
+    assert_eq!(message["disposition"], "queued");
+    let general_job = store.get_job(&general_execution).unwrap().unwrap();
+    let general_prepared: PreparedGeneralTask =
+        serde_json::from_str(general_job.prepared_launch_json.as_deref().unwrap()).unwrap();
+    let general_report = b"# General public composition\n\nverified result chunk\n";
+    let general_report_path = general_prepared
+        .artifact_targets
+        .get(&GeneralArtifactKind::ReportMarkdown)
+        .unwrap();
+    std::fs::create_dir_all(general_report_path.parent().unwrap()).unwrap();
+    std::fs::write(general_report_path, general_report).unwrap();
+    let general_sha256 = format!("{:x}", Sha256::digest(general_report));
+    restarted_scheduler
+        .submit_general_completion(
+            &general_execution,
+            GeneralCompletionSubmission {
+                requested_outcome: CompletionOutcome::Succeeded,
+                summary: "public general completion succeeded".into(),
+                checks: vec!["public composition".into()],
+                residual_gaps: Vec::new(),
+                artifact_intents: vec![GeneralArtifactIntent {
+                    kind: GeneralArtifactKind::ReportMarkdown,
+                    sha256: Some(general_sha256.clone()),
+                    size_bytes: Some(general_report.len() as u64),
+                }],
+            },
+        )
+        .unwrap();
+    factory
+        .runtime(&general_execution)
+        .finish(completed_runtime_terminal());
+    let general_terminal = wait_public_terminal(&mut v2, &general_agent_id, 1);
+    assert_eq!(general_terminal["task"]["resources_reaped"], false);
+    let general_result = v2.tool("zcode_agent_result", json!({"agent_id":general_agent_id}));
+    assert_eq!(general_result["result"]["outcome"], "SUCCEEDED");
+    let general_artifact = general_result["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "report_markdown")
+        .unwrap();
+    assert_eq!(general_artifact["sha256"], general_sha256);
+    let general_chunk = v2.tool(
+        "zcode_agent_result",
+        json!({
+            "agent_id":general_agent_id,
+            "artifact_id":general_artifact["artifact_id"],
+            "offset_bytes":0,
+            "limit_bytes":general_report.len()
+        }),
+    );
+    assert_eq!(
+        BASE64
+            .decode(
+                general_chunk["artifact_chunk"]["bytes_base64"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+        general_report
+    );
+    assert_eq!(general_chunk["artifact_chunk"]["eof"], true);
+    assert_eq!(
+        v2.tool("zcode_agent_close", json!({"agent_id":general_agent_id}))["task"]
+            ["resources_reaped"],
+        true
+    );
+    assert!(!general_prepared.worktree.path.exists());
+
+    let mut legacy = FacadeProcess::start_mode(&socket, Some("legacy_review_v1"));
+    assert!(
+        legacy.tool("zcode_review_list", json!({"scope":"all","limit":1}))["jobs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for agent_id in [&public_agent_id, &general_agent_id] {
+        assert!(legacy
+            .tool_error("zcode_review_status", json!({"agent_id":agent_id}))
+            .starts_with("not_found:"));
+    }
+    assert_eq!(
+        v2.tool("zcode_agent_get", json!({"agent_id":general_agent_id}))["task"]
+            ["resources_reaped"],
+        true
+    );
+    assert_eq!(
+        git(&manifest.repository, &["rev-parse", "HEAD"]),
+        initial_head
+    );
+    assert_eq!(
+        git(&manifest.repository, &["status", "--porcelain"]),
+        initial_status
+    );
+}
+
+#[test]
+fn official_public_v2_configured_readiness_is_truthful_bounded_and_reaped() {
+    let Some(runtime_path) = official_runtime_path() else {
+        eprintln!("skipped: ZCODE_RUNTIME_PATH is unset");
+        return;
+    };
+    verify_official_runtime(&runtime_path);
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("readiness.sqlite3")).unwrap());
+    let factory_path = runtime_path.clone();
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(CommandRuntimeFactory::new(
+        move |_job: &review_store::Job| official_runtime_command(&factory_path),
+    ));
+    let scheduler = Scheduler::new(
+        "s05-official-public-readiness",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig {
+            global_max_agents: 1,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_secs(1),
+            bootstrap_timeout: Duration::from_secs(5),
+            control_timeout: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc/review.sock");
+    let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let started = std::time::Instant::now();
+    let readiness = facade.tool("zcode_system_ensure_ready", json!({"timeout_ms":5000}));
+    assert_eq!(readiness["status"]["components"]["driver"], "READY");
+    assert_eq!(readiness["status"]["components"]["runtime"], "READY");
+    if readiness["ready"] == true {
+        assert_eq!(readiness["reason_code"], Value::Null);
+        assert_eq!(readiness["status"]["components"]["model_auth"], "READY");
+    } else {
+        assert_eq!(readiness["reason_code"], "LOWER_LAYER_NOT_READY");
+        assert_eq!(
+            readiness["status"]["components"]["model_auth"],
+            "UNAVAILABLE"
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert!(store.list_jobs(10).unwrap().is_empty());
+}
+
+#[test]
+fn official_public_v2_general_permission_completion_and_result_are_bounded() {
+    let Some(runtime_path) = official_runtime_path() else {
+        eprintln!("skipped: ZCODE_RUNTIME_PATH is unset");
+        return;
+    };
+    verify_official_runtime(&runtime_path);
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("general.sqlite3")).unwrap());
+    let factory_path = runtime_path.clone();
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(CommandRuntimeFactory::new_prepared(
+        move |_job: &review_store::Job| official_runtime_command(&factory_path),
+    ));
+    let scheduler = Scheduler::new(
+        "s05-official-public-general",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig {
+            global_max_agents: 1,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_secs(2),
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc/review.sock");
+    let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let manifest_path = manifest_fixture(directory.path());
+    let manifest: ReviewManifest =
+        serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+    let initial_head = git(&manifest.repository, &["rev-parse", "HEAD"]);
+    let initial_status = git(&manifest.repository, &["status", "--porcelain"]);
+    let denied_target = directory.path().join("must-not-exist.txt");
+    let prompt = format!(
+        "Use the Bash tool to create {} and wait for permission. Do not use any other tool.",
+        denied_target.display()
+    );
+    let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let spawned = facade.tool(
+        "zcode_agent_spawn",
+        json!({
+            "repository":manifest.repository,
+            "base_ref":manifest.base_ref,
+            "profile":"analysis_readonly",
+            "prompt":prompt,
+            "feature_id":"s05-official-public-general",
+            "ownership_token":"s05-official-public-general-owner",
+            "idempotency_key":"s05-official-public-general",
+            "write_manifest":[],
+            "repo_context":["src/lib.rs"],
+            "attachments":[],
+            "retain_partial":false,
+            "budget":{
+                "wall_time_ms":90000,
+                "max_turns":1,
+                "max_tool_calls":1,
+                "max_context_bytes":1048576,
+                "max_result_bytes":262144,
+                "max_artifact_bytes":2097152
+            }
+        }),
+    );
+    assert_eq!(spawned["effective_budget"]["max_turns"], 1);
+    assert_eq!(spawned["effective_budget"]["max_tool_calls"], 1);
+    let agent_id = spawned["agent_id"].as_str().unwrap().to_owned();
+    let execution_id = store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(scheduler.start_ready().unwrap(), vec![execution_id.clone()]);
+
+    let general_job = store.get_job(&execution_id).unwrap().unwrap();
+    let prepared: PreparedGeneralTask =
+        serde_json::from_str(general_job.prepared_launch_json.as_deref().unwrap()).unwrap();
+    let report = b"# Official public general result\n\nverified runtime composition\n";
+    let report_path = prepared
+        .artifact_targets
+        .get(&GeneralArtifactKind::ReportMarkdown)
+        .unwrap();
+    std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+    std::fs::write(report_path, report).unwrap();
+    let report_sha256 = format!("{:x}", Sha256::digest(report));
+    assert!(scheduler
+        .submit_general_completion(
+            &execution_id,
+            GeneralCompletionSubmission {
+                requested_outcome: CompletionOutcome::Succeeded,
+                summary: "official public general completion succeeded".into(),
+                checks: vec!["typed permission handled".into()],
+                residual_gaps: Vec::new(),
+                artifact_intents: vec![GeneralArtifactIntent {
+                    kind: GeneralArtifactKind::ReportMarkdown,
+                    sha256: Some(report_sha256.clone()),
+                    size_bytes: Some(report.len() as u64),
+                }],
+            },
+        )
+        .unwrap());
+
+    let permission_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let permission_id = loop {
+        let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+        if let Some(request_id) = status["pending_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["kind"] == "permission")
+            .and_then(|request| request["request_id"].as_str())
+        {
+            break request_id.to_owned();
+        }
+        assert!(status["task"]["phase"] != "TERMINAL", "{status}");
+        assert!(
+            std::time::Instant::now() < permission_deadline,
+            "official runtime did not emit a typed permission request"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let responded = facade.tool(
+        "zcode_agent_respond",
+        json!({
+            "agent_id":agent_id,
+            "request_id":permission_id,
+            "decision":"deny",
+            "reason":"bounded official runtime verification"
+        }),
+    );
+    assert_eq!(responded["disposition"], "responded");
+    assert_eq!(responded["effective_decision"], "deny");
+    assert!(!denied_target.exists());
+
+    let terminal_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let terminal = loop {
+        let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+        if status["task"]["phase"] == "TERMINAL" {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < terminal_deadline,
+            "official general task did not terminalize"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(terminal["task"]["attempt_sequence"], 1);
+    assert_eq!(terminal["task"]["effective_budget"]["max_turns"], 1);
+    assert_eq!(terminal["task"]["effective_budget"]["max_tool_calls"], 1);
+    let result = facade.tool("zcode_agent_result", json!({"agent_id":agent_id}));
+    assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
+    let artifact = result["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["kind"] == "report_markdown")
+        .unwrap();
+    assert_eq!(artifact["sha256"], report_sha256);
+    let chunk = facade.tool(
+        "zcode_agent_result",
+        json!({
+            "agent_id":agent_id,
+            "artifact_id":artifact["artifact_id"],
+            "offset_bytes":0,
+            "limit_bytes":report.len()
+        }),
+    );
+    assert_eq!(
+        BASE64
+            .decode(chunk["artifact_chunk"]["bytes_base64"].as_str().unwrap())
+            .unwrap(),
+        report
+    );
+    assert_eq!(chunk["artifact_chunk"]["eof"], true);
+    let closed = facade.tool("zcode_agent_close", json!({"agent_id":agent_id}));
+    assert_eq!(closed["task"]["resources_reaped"], true);
+    assert!(!prepared.worktree.path.exists());
+    assert_eq!(
+        git(&manifest.repository, &["rev-parse", "HEAD"]),
+        initial_head
+    );
+    assert_eq!(
+        git(&manifest.repository, &["status", "--porcelain"]),
+        initial_status
+    );
+}
+
+#[test]
+fn official_public_v2_structured_fresh_and_continuation_finalize_and_reap() {
+    let Some(runtime_path) = official_runtime_path() else {
+        eprintln!("skipped: ZCODE_RUNTIME_PATH is unset");
+        return;
+    };
+    let Some(daemon_program) = env::var_os("ZCODE_REVIEWD_BIN").map(PathBuf::from) else {
+        eprintln!("skipped: ZCODE_REVIEWD_BIN is unset");
+        return;
+    };
+    verify_official_runtime(&runtime_path);
+    assert!(daemon_program.is_file());
+    let directory = tempfile::tempdir().unwrap();
+    let manifest_path = manifest_fixture(directory.path());
+    let manifest: ReviewManifest =
+        serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+    std::fs::write(
+        manifest.repository.join(".git/info/exclude"),
+        ".agent-work/\n",
+    )
+    .unwrap();
+    let initial_head = git(&manifest.repository, &["rev-parse", "HEAD"]);
+    let initial_status = git(&manifest.repository, &["status", "--porcelain"]);
+    let store = Arc::new(Store::open(directory.path().join("structured.sqlite3")).unwrap());
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
+    let factory_path = runtime_path.clone();
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(CommandRuntimeFactory::new_prepared(
+        move |_job: &review_store::Job| official_runtime_command(&factory_path),
+    ));
+    let socket = directory.path().join("rpc/review.sock");
+    let scheduler = Scheduler::new(
+        "s05-official-public-structured",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig {
+            global_max_agents: 1,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_secs(2),
+            bootstrap_timeout: Duration::from_secs(90),
+            control_timeout: Duration::from_secs(5),
+        },
+    )
+    .unwrap()
+    .with_ledger(
+        Arc::clone(&ledger),
+        InternalLedgerMcpConfig {
+            command: std::fs::canonicalize(daemon_program).unwrap(),
+            socket: socket.clone(),
+            runtime_sha256: Some(OFFICIAL_RUNTIME_SHA256.into()),
+        },
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+    let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let fresh = facade.tool(
+        "zcode_review_spawn",
+        json!({
+            "review_kind":"initial_bounded",
+            "repository":manifest.repository,
+            "base_ref":manifest.base_ref,
+            "head_ref":manifest.head_ref,
+            "scope_manifest":["src/lib.rs"],
+            "requirements_path":".agent-work/PLAN.md",
+            "report_path":".agent-work/reviews/official-public-fresh.md",
+            "feature_id":"s05-official-public-structured",
+            "section_id":"S05",
+            "ownership_token":"s05-official-public-structured-owner",
+            "idempotency_key":"s05-official-public-structured-fresh",
+            "read_only":true,
+            "attachments":[],
+            "model":"zai/glm-5.3",
+            "budget":{
+                "wall_time_ms":240000,
+                "max_turns":4,
+                "max_tool_calls":24,
+                "max_context_bytes":1048576,
+                "max_result_bytes":262144,
+                "max_artifact_bytes":2097152
+            }
+        }),
+    );
+    assert_eq!(fresh["counts_as_independent"], false);
+    assert_eq!(fresh["effective_budget"]["max_turns"], 4);
+    assert_eq!(fresh["effective_budget"]["max_tool_calls"], 24);
+    let agent_id = fresh["agent_id"].as_str().unwrap().to_owned();
+    let review_id = fresh["review_id"].as_str().unwrap().to_owned();
+    let fresh_execution = store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        scheduler.start_ready().unwrap(),
+        vec![fresh_execution.clone()]
+    );
+    let delivered = facade.tool(
+        "zcode_agent_message",
+        json!({
+            "agent_id":agent_id,
+            "message_id":"s05-official-public-structured-finalize",
+            "mode":"interrupt_and_continue",
+            "content":"Continue the bounded review, call each required ledger tool, record validation, and finalize the report."
+        }),
+    );
+    assert_eq!(delivered["disposition"], "interrupted_then_delivered");
+    let fresh_terminal =
+        wait_official_public_review(&mut facade, &agent_id, 1, Duration::from_secs(240));
+    assert_eq!(fresh_terminal["task"]["counts_as_independent"], true);
+    assert_eq!(fresh_terminal["task"]["fresh_session_observed"], true);
+    assert_eq!(fresh_terminal["task"]["effective_budget"]["max_turns"], 4);
+    assert_eq!(
+        fresh_terminal["task"]["effective_budget"]["max_tool_calls"],
+        24
+    );
+    let fresh_snapshot = store.review_snapshot(&fresh_execution).unwrap().unwrap();
+    assert!(fresh_snapshot.report.finalized);
+    assert!(!fresh_snapshot.checkpoints.is_empty());
+    assert!(!fresh_snapshot.validations.is_empty());
+    let fresh_prepared: PreparedLaunchSpec = serde_json::from_str(
+        store
+            .get_job(&fresh_execution)
+            .unwrap()
+            .unwrap()
+            .prepared_launch_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!fresh_prepared.worktree.path.exists());
+
+    let continuation = facade.tool(
+        "zcode_review_continue",
+        json!({
+            "agent_id":agent_id,
+            "review_id":review_id,
+            "base_ref":manifest.base_ref,
+            "head_ref":manifest.head_ref,
+            "frozen_finding_ids":[],
+            "idempotency_key":"s05-official-public-structured-continuation",
+            "attachments":[],
+            "budget":{
+                "wall_time_ms":240000,
+                "max_turns":3,
+                "max_tool_calls":16,
+                "max_context_bytes":1048576,
+                "max_result_bytes":262144,
+                "max_artifact_bytes":2097152
+            }
+        }),
+    );
+    assert_eq!(continuation["agent_id"], agent_id);
+    assert_eq!(continuation["review_id"], review_id);
+    assert_eq!(continuation["attempt_sequence"], 2);
+    assert_eq!(continuation["counts_as_independent"], false);
+    assert_eq!(continuation["effective_budget"]["max_turns"], 3);
+    assert_eq!(continuation["effective_budget"]["max_tool_calls"], 16);
+    let continuation_execution = store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_ne!(continuation_execution, fresh_execution);
+    assert_eq!(
+        scheduler.start_ready().unwrap(),
+        vec![continuation_execution.clone()]
+    );
+    let continuation_terminal =
+        wait_official_public_review(&mut facade, &agent_id, 2, Duration::from_secs(240));
+    assert_eq!(
+        continuation_terminal["task"]["counts_as_independent"],
+        false
+    );
+    assert_eq!(
+        continuation_terminal["task"]["fresh_session_observed"],
+        true
+    );
+    assert_eq!(
+        continuation_terminal["task"]["effective_budget"]["max_turns"],
+        3
+    );
+    assert_eq!(
+        continuation_terminal["task"]["effective_budget"]["max_tool_calls"],
+        16
+    );
+    let continuation_snapshot = store
+        .review_snapshot(&continuation_execution)
+        .unwrap()
+        .unwrap();
+    assert!(continuation_snapshot.report.finalized);
+    assert!(!continuation_snapshot.checkpoints.is_empty());
+    assert!(!continuation_snapshot.validations.is_empty());
+    let continuation_prepared: PreparedLaunchSpec = serde_json::from_str(
+        store
+            .get_job(&continuation_execution)
+            .unwrap()
+            .unwrap()
+            .prepared_launch_json
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!continuation_prepared.worktree.path.exists());
+
+    store.reap_job(&fresh_execution).unwrap();
+    for attempt_sequence in [1_u64, 2] {
+        let result = facade.tool(
+            "zcode_agent_result",
+            json!({"agent_id":agent_id,"attempt_sequence":attempt_sequence}),
+        );
+        assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
+        assert_eq!(result["task"]["attempt_sequence"], attempt_sequence);
+        if attempt_sequence == 1 {
+            assert_eq!(result["task"]["resources_reaped"], true);
+        }
+        let artifact = result["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|artifact| artifact["kind"] == "report_markdown")
+            .unwrap();
+        let chunk = facade.tool(
+            "zcode_agent_result",
+            json!({
+                "agent_id":agent_id,
+                "attempt_sequence":attempt_sequence,
+                "artifact_id":artifact["artifact_id"],
+                "offset_bytes":0,
+                "limit_bytes":artifact["size_bytes"]
+            }),
+        );
+        let bytes = BASE64
+            .decode(chunk["artifact_chunk"]["bytes_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), artifact["sha256"]);
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .contains("FINALIZED: true"));
+    }
+    let closed = facade.tool("zcode_agent_close", json!({"agent_id":agent_id}));
+    assert_eq!(closed["task"]["resources_reaped"], true);
+    assert_eq!(
+        git(&manifest.repository, &["rev-parse", "HEAD"]),
+        initial_head
+    );
+    assert_eq!(
+        git(&manifest.repository, &["status", "--porcelain"]),
+        initial_status
+    );
+}
+
 #[test]
 fn concurrent_v2_facades_use_canonical_identity_and_authoritative_disposition() {
     let directory = tempfile::tempdir().unwrap();
@@ -646,6 +1803,8 @@ fn concurrent_v2_facades_use_canonical_identity_and_authoritative_disposition() 
     let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
         bootstrap_entered: Arc::new(Barrier::new(2)),
         bootstrap_release: Arc::new(Barrier::new(2)),
+        runtimes: Mutex::new(HashMap::new()),
+        emit_unsupported: true,
     });
     let scheduler = Scheduler::new(
         "s05-v2-canonical",
@@ -743,6 +1902,8 @@ fn public_stdio_submit_returns_before_claim_and_survives_facade_restart() {
     let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
         bootstrap_entered: Arc::clone(&bootstrap_entered),
         bootstrap_release: Arc::clone(&bootstrap_release),
+        runtimes: Mutex::new(HashMap::new()),
+        emit_unsupported: true,
     });
     let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let scheduler = Scheduler::new(

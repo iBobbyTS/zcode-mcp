@@ -30,10 +30,15 @@ struct FakeRuntime {
     terminal: Mutex<Option<RuntimeTerminal>>,
     changed: Condvar,
     turn: Mutex<TurnSnapshot>,
+    probe_boundary: Option<TurnBoundary>,
 }
 
 impl FakeRuntime {
     fn new(sink: Arc<dyn LifecycleSink>) -> Self {
+        Self::new_with_probe(sink, None)
+    }
+
+    fn new_with_probe(sink: Arc<dyn LifecycleSink>, probe_boundary: Option<TurnBoundary>) -> Self {
         Self {
             sink,
             next_sequence: AtomicU64::new(1),
@@ -44,6 +49,7 @@ impl FakeRuntime {
                 active: false,
                 boundary: None,
             }),
+            probe_boundary,
         }
     }
 
@@ -94,8 +100,8 @@ impl ManagedRuntime for FakeRuntime {
     ) -> Result<SessionReady, RuntimeCommandError> {
         *self.turn.lock().unwrap() = TurnSnapshot {
             generation: 1,
-            active: true,
-            boundary: None,
+            active: self.probe_boundary.is_none(),
+            boundary: self.probe_boundary,
         };
         Ok(SessionReady {
             session_id: format!("session-{}", job.agent_id),
@@ -147,6 +153,7 @@ impl ManagedRuntime for FakeRuntime {
 struct FakeFactory {
     runtimes: Mutex<HashMap<String, Arc<FakeRuntime>>>,
     fail_for: Mutex<Vec<String>>,
+    readiness_boundary: Mutex<Option<TurnBoundary>>,
 }
 
 impl FakeFactory {
@@ -163,6 +170,14 @@ impl FakeFactory {
             assert!(Instant::now() < deadline, "runtime was not spawned");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn readiness_fails_turn(&self) {
+        *self.readiness_boundary.lock().unwrap() = Some(TurnBoundary::Failed);
+    }
+
+    fn readiness_succeeds_turn(&self) {
+        *self.readiness_boundary.lock().unwrap() = None;
     }
 }
 
@@ -185,6 +200,31 @@ impl RuntimeFactory for FakeFactory {
         runtime.emit(RuntimeEvent::Driver(Inbound::Malformed(
             "sensitive runtime text".into(),
         )));
+        self.runtimes
+            .lock()
+            .unwrap()
+            .insert(job.agent_id.clone(), Arc::clone(&runtime));
+        Ok(runtime)
+    }
+
+    fn spawn_readiness(
+        &self,
+        job: &Job,
+        sink: Arc<dyn LifecycleSink>,
+        deadline: Instant,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "readiness spawn deadline elapsed",
+            ));
+        }
+        let boundary = self
+            .readiness_boundary
+            .lock()
+            .unwrap()
+            .unwrap_or(TurnBoundary::Completed);
+        let runtime = Arc::new(FakeRuntime::new_with_probe(sink, Some(boundary)));
         self.runtimes
             .lock()
             .unwrap()
@@ -645,6 +685,44 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
         .filter(|(agent_id, _)| agent_id.starts_with("readiness-"))
         .all(|(_, runtime)| runtime.terminal.lock().unwrap().is_some()));
 
+    fixture.factory.readiness_fails_turn();
+    match fixture
+        .service
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 100 })
+        .unwrap()
+    {
+        RpcSuccess::SystemReadiness {
+            ready,
+            status,
+            reason_code,
+        } => {
+            assert!(!ready);
+            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(
+                status.components.get("driver"),
+                Some(&ComponentStateView::Ready)
+            );
+            assert_eq!(
+                status.components.get("runtime"),
+                Some(&ComponentStateView::Ready)
+            );
+            assert_eq!(
+                status.components.get("model_auth"),
+                Some(&ComponentStateView::Unavailable)
+            );
+        }
+        other => panic!("unexpected failed-turn readiness: {other:?}"),
+    }
+    assert!(fixture
+        .factory
+        .runtimes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(agent_id, _)| agent_id.starts_with("readiness-"))
+        .all(|(_, runtime)| runtime.terminal.lock().unwrap().is_some()));
+    fixture.factory.readiness_succeeds_turn();
+
     struct InvalidReadinessFactory;
     impl RuntimeFactory for InvalidReadinessFactory {
         fn spawn(
@@ -787,6 +865,67 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
             .code,
         RpcErrorCode::ResultInvalid
     );
+}
+
+#[test]
+fn s05_readiness_absolute_deadline_reaps_term_resistant_process_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("readiness.pid");
+    let factory_pid_file = pid_file.clone();
+    let factory = Arc::new(CommandRuntimeFactory::new(move |_job: &Job| {
+        thread::sleep(Duration::from_millis(30));
+        let mut command = Command::new("sh");
+        command.env("READINESS_PID_FILE", &factory_pid_file).args([
+            "-c",
+            "printf '%s' \"$$\" > \"$READINESS_PID_FILE\"; trap '' TERM; sleep 0.03; read one; printf '%s\\n' '{\"id\":1,\"result\":{\"session\":{\"sessionId\":\"readiness-session\"}}}'; sleep 0.03; read two; printf '%s\\n' '{\"id\":2,\"result\":{}}'; sleep 0.03; read three; printf '%s\\n' '{\"id\":3,\"result\":{\"accepted\":true}}' '{\"method\":\"session/event\",\"params\":{\"sessionId\":\"readiness-session\",\"type\":\"turn.started\",\"turnId\":\"turn-1\"}}'; sh -c 'trap \"\" TERM; sleep 30' & descendant=$!; wait $descendant",
+        ]);
+        Ok(command)
+    }));
+    let store = Arc::new(Store::open(directory.path().join("deadline.sqlite3")).unwrap());
+    let scheduler = Scheduler::new(
+        "readiness-deadline",
+        Arc::clone(&store),
+        factory,
+        SchedulerConfig {
+            global_max_agents: 1,
+            per_workspace_max_agents: 1,
+            stop_grace: Duration::from_millis(100),
+            bootstrap_timeout: Duration::from_secs(1),
+            control_timeout: Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    let service = RpcService::new(scheduler, Arc::clone(&store)).unwrap();
+    let started = Instant::now();
+    match service
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 300 })
+        .unwrap()
+    {
+        RpcSuccess::SystemReadiness {
+            ready,
+            status,
+            reason_code,
+        } => {
+            assert!(!ready);
+            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(
+                status.components.get("model_auth"),
+                Some(&ComponentStateView::Unavailable)
+            );
+        }
+        other => panic!("unexpected delayed readiness: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "readiness exceeded its bounded cleanup envelope: {:?}",
+        started.elapsed()
+    );
+    let process_group_id = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert!(observe_process_group(process_group_id).unwrap().is_empty());
+    assert!(store.list_jobs(10).unwrap().is_empty());
 }
 
 #[test]

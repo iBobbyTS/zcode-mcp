@@ -136,7 +136,7 @@ impl FixtureMcp {
         let agent_id = format!("fixture-{}", input.review_kind);
         let report = Arc::new(
             format!(
-                "# ZCode Review Report\n\nREVIEW_KIND: {}\nFINALIZED: true\n\nFixture shadow evidence.\n",
+                "# ZCode Review Report\n\nREVIEW_KIND: {}\nFINALIZED: true\nREPORT_REVISION: 2\n\n## Provenance\n\nFixture shadow evidence.\n\n## Checkpoints\n\n### fixture-checkpoint (revision 1)\n\n- Stage: `Inspection`\n\n## Findings\n\nNo findings recorded.\n\n## Finalization\n\n- Signal: `no_findings_observed`\n",
                 input.review_kind
             )
             .into_bytes(),
@@ -161,7 +161,7 @@ impl FixtureMcp {
             "phase":"QUEUED",
             "attempt_sequence":1,
             "effective_budget":budget(),
-            "counts_as_independent":true,
+            "counts_as_independent":false,
             "provenance":{
                 "review_kind":state.review_kind,
                 "manifest_sha256":manifest_sha256,
@@ -170,7 +170,7 @@ impl FixtureMcp {
                 "base_sha":state.base_ref,
                 "head_sha":state.head_ref,
                 "requested_model":Value::Null,
-                "fresh_session_observed":true
+                "fresh_session_observed":false
             }
         })))
     }
@@ -204,7 +204,7 @@ impl FixtureMcp {
         }
         Ok(Json(json!({
             "task":task(&state,"ACTIVE",false),
-            "events":[{"sequence":input.after_sequence + 1,"attempt_sequence":1,"event_type":"report.checkpoint","redaction_level":"allowlisted","pending_request_id":Value::Null}],
+            "events":[{"sequence":input.after_sequence + 1,"attempt_sequence":1,"event_type":"lifecycle","redaction_level":"allowlisted","pending_request_id":Value::Null}],
             "next_sequence":input.after_sequence + 1,
             "has_more":false,
             "timed_out":false
@@ -271,7 +271,7 @@ fn task(state: &FixtureState, phase: &str, reaped: bool) -> Value {
         "phase":phase,
         "attempt_sequence":1,
         "effective_budget":budget(),
-        "counts_as_independent":true,
+        "counts_as_independent":phase == "TERMINAL",
         "fresh_session_observed":true,
         "cancel_requested":false,
         "close_requested":reaped,

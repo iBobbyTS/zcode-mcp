@@ -19,6 +19,7 @@ review-store = { path = "../review-store" }
 
 [dev-dependencies]
 review-ledger = { path = "../review-ledger" }
+sectioned-shadow = { path = "../sectioned-shadow" }
 zcode-driver = { path = "../zcode-driver" }
 zcode-protocol = { path = "../zcode-protocol" }
 tempfile = "3"
