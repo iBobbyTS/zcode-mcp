@@ -1364,13 +1364,20 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
         eprintln!("skipped: ZCODE_RUNTIME_PATH is unset");
         return;
     };
+    let Some(daemon_program) = env::var_os("ZCODE_REVIEWD_BIN").map(PathBuf::from) else {
+        eprintln!("skipped: ZCODE_REVIEWD_BIN is unset");
+        return;
+    };
     verify_official_runtime(&runtime_path);
+    assert!(daemon_program.is_file());
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(directory.path().join("general.sqlite3")).unwrap());
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let factory_path = runtime_path.clone();
     let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(CommandRuntimeFactory::new_prepared(
         move |_job: &review_store::Job| official_runtime_command(&factory_path),
     ));
+    let socket = directory.path().join("rpc/review.sock");
     let scheduler = Scheduler::new(
         "s05-official-public-general",
         Arc::clone(&store),
@@ -1383,9 +1390,17 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
             control_timeout: Duration::from_secs(5),
         },
     )
+    .unwrap()
+    .with_ledger(
+        ledger,
+        InternalLedgerMcpConfig {
+            command: std::fs::canonicalize(daemon_program).unwrap(),
+            socket: socket.clone(),
+            runtime_sha256: Some(OFFICIAL_RUNTIME_SHA256.into()),
+        },
+    )
     .unwrap();
     let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
-    let socket = directory.path().join("rpc/review.sock");
     let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
     let manifest_path = manifest_fixture(directory.path());
     let manifest: ReviewManifest =
@@ -1393,9 +1408,34 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     let initial_head = git(&manifest.repository, &["rev-parse", "HEAD"]);
     let initial_status = git(&manifest.repository, &["status", "--porcelain"]);
     let denied_target = directory.path().join("must-not-exist.txt");
+    let idempotency_key = "s05-official-public-general";
+    let preparation_key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{idempotency_key}", manifest.repository.display()).as_bytes())
+    );
+    let report_path = manifest
+        .repository
+        .join(".agent-work/scratch/general")
+        .join(preparation_key)
+        .join("scratch/agent-artifacts/report.md");
+    let report = b"# Official ZCode general completion";
+    let report_sha256 = format!("{:x}", Sha256::digest(report));
+    let completion = json!({
+        "requested_outcome":"SUCCEEDED",
+        "summary":"official runtime called the private general completion ingress",
+        "checks":["typed permission denied","official runtime wrote the report artifact"],
+        "residual_gaps":[],
+        "artifact_intents":[{
+            "kind":"report_markdown",
+            "sha256":report_sha256,
+            "size_bytes":report.len()
+        }]
+    });
     let prompt = format!(
-        "Use the Bash tool to create {} and wait for permission. Do not use any other tool.",
-        denied_target.display()
+        "Complete this bounded task in order. First use the Bash tool to try to create {} and wait for permission; it will be denied, so continue without retrying it. Second use the Write tool to write exactly the UTF-8 content '# Official ZCode general completion' (with no trailing newline) to {} and wait for permission. Finally call the injected zcode_general_complete MCP tool exactly once with these arguments: {}. Do not use any other tool and do not stop after a prose answer; completion is valid only after zcode_general_complete returns accepted.",
+        denied_target.display(),
+        report_path.display(),
+        completion
     );
     let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
     let spawned = facade.tool(
@@ -1407,23 +1447,23 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
             "prompt":prompt,
             "feature_id":"s05-official-public-general",
             "ownership_token":"s05-official-public-general-owner",
-            "idempotency_key":"s05-official-public-general",
+            "idempotency_key":idempotency_key,
             "write_manifest":[],
             "repo_context":["src/lib.rs"],
             "attachments":[],
             "retain_partial":false,
             "budget":{
-                "wall_time_ms":90000,
-                "max_turns":1,
-                "max_tool_calls":1,
+                "wall_time_ms":120000,
+                "max_turns":2,
+                "max_tool_calls":6,
                 "max_context_bytes":1048576,
                 "max_result_bytes":262144,
                 "max_artifact_bytes":2097152
             }
         }),
     );
-    assert_eq!(spawned["effective_budget"]["max_turns"], 1);
-    assert_eq!(spawned["effective_budget"]["max_tool_calls"], 1);
+    assert_eq!(spawned["effective_budget"]["max_turns"], 2);
+    assert_eq!(spawned["effective_budget"]["max_tool_calls"], 6);
     let agent_id = spawned["agent_id"].as_str().unwrap().to_owned();
     let execution_id = store
         .get_task(&agent_id)
@@ -1435,96 +1475,102 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     let general_job = store.get_job(&execution_id).unwrap().unwrap();
     let prepared: PreparedGeneralTask =
         serde_json::from_str(general_job.prepared_launch_json.as_deref().unwrap()).unwrap();
-    let report = b"# Official public general result\n\nverified runtime composition\n";
-    let report_path = prepared
-        .artifact_targets
-        .get(&GeneralArtifactKind::ReportMarkdown)
-        .unwrap();
-    std::fs::create_dir_all(report_path.parent().unwrap()).unwrap();
-    std::fs::write(report_path, report).unwrap();
-    let report_sha256 = format!("{:x}", Sha256::digest(report));
-    assert!(scheduler
-        .submit_general_completion(
-            &execution_id,
-            GeneralCompletionSubmission {
-                requested_outcome: CompletionOutcome::Succeeded,
-                summary: "official public general completion succeeded".into(),
-                checks: vec!["typed permission handled".into()],
-                residual_gaps: Vec::new(),
-                artifact_intents: vec![GeneralArtifactIntent {
-                    kind: GeneralArtifactKind::ReportMarkdown,
-                    sha256: Some(report_sha256.clone()),
-                    size_bytes: Some(report.len() as u64),
-                }],
-            },
-        )
-        .unwrap());
-
-    let permission_deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let permission_id = loop {
-        let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
-        if let Some(request_id) = status["pending_requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|request| request["kind"] == "permission")
-            .and_then(|request| request["request_id"].as_str())
-        {
-            break request_id.to_owned();
-        }
-        assert!(status["task"]["phase"] != "TERMINAL", "{status}");
-        assert!(
-            std::time::Instant::now() < permission_deadline,
-            "official runtime did not emit a typed permission request"
-        );
-        thread::sleep(Duration::from_millis(20));
-    };
-    let responded = facade.tool(
-        "zcode_agent_respond",
-        json!({
-            "agent_id":agent_id,
-            "request_id":permission_id,
-            "decision":"deny",
-            "reason":"bounded official runtime verification"
-        }),
+    assert_eq!(
+        prepared
+            .artifact_targets
+            .get(&GeneralArtifactKind::ReportMarkdown),
+        Some(&report_path)
     );
-    assert_eq!(responded["disposition"], "responded");
-    assert_eq!(responded["effective_decision"], "deny");
-    assert!(!denied_target.exists());
 
-    let terminal_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let terminal_deadline = std::time::Instant::now() + Duration::from_secs(150);
+    let mut responded = std::collections::HashSet::new();
+    let mut denied_bash = false;
     let terminal = loop {
         let status = facade.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+        for request in status["pending_requests"].as_array().unwrap() {
+            if request["kind"] != "permission" {
+                continue;
+            }
+            let request_id = request["request_id"].as_str().unwrap();
+            if !responded.insert(request_id.to_owned()) {
+                continue;
+            }
+            let tool_name = request["tool_name"].as_str().unwrap_or_default();
+            let deny = tool_name.eq_ignore_ascii_case("bash");
+            let response = facade.tool(
+                "zcode_agent_respond",
+                json!({
+                    "agent_id":agent_id,
+                    "request_id":request_id,
+                    "decision":if deny { "deny" } else { "allow" },
+                    "reason":"bounded official runtime general ingress verification"
+                }),
+            );
+            assert_eq!(response["disposition"], "responded");
+            if deny {
+                denied_bash |= response["effective_decision"] == "deny";
+            }
+        }
         if status["task"]["phase"] == "TERMINAL" {
             break status;
         }
         assert!(
             std::time::Instant::now() < terminal_deadline,
-            "official general task did not terminalize"
+            "official general task did not terminalize: {status}"
         );
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(terminal["task"]["attempt_sequence"], 1);
-    assert_eq!(terminal["task"]["effective_budget"]["max_turns"], 1);
-    assert_eq!(terminal["task"]["effective_budget"]["max_tool_calls"], 1);
     let result = facade.tool("zcode_agent_result", json!({"agent_id":agent_id}));
-    assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
     let artifact = result["artifacts"]
         .as_array()
         .unwrap()
         .iter()
         .find(|artifact| artifact["kind"] == "report_markdown")
-        .unwrap();
-    assert_eq!(artifact["sha256"], report_sha256);
-    let chunk = facade.tool(
-        "zcode_agent_result",
-        json!({
-            "agent_id":agent_id,
-            "artifact_id":artifact["artifact_id"],
-            "offset_bytes":0,
-            "limit_bytes":report.len()
-        }),
+        .cloned();
+    let chunk = artifact.as_ref().map(|artifact| {
+        facade.tool(
+            "zcode_agent_result",
+            json!({
+                "agent_id":agent_id,
+                "artifact_id":artifact["artifact_id"],
+                "offset_bytes":0,
+                "limit_bytes":report.len()
+            }),
+        )
+    });
+    let closed = facade.tool("zcode_agent_close", json!({"agent_id":agent_id}));
+
+    assert!(
+        denied_bash,
+        "official runtime did not preserve the typed deny path"
     );
+    assert!(!denied_target.exists());
+    assert_eq!(terminal["task"]["attempt_sequence"], 1);
+    assert_eq!(terminal["task"]["effective_budget"]["max_turns"], 2);
+    assert_eq!(terminal["task"]["effective_budget"]["max_tool_calls"], 6);
+    assert_eq!(result["result"]["outcome"], "SUCCEEDED", "{result}");
+    assert_eq!(
+        result["result"]["summary"],
+        "official runtime called the private general completion ingress"
+    );
+    assert_eq!(
+        result["result"]["checks"],
+        json!([
+            "typed permission denied",
+            "official runtime wrote the report artifact"
+        ])
+    );
+    assert_eq!(
+        terminal["result"]["result_sha256"],
+        result["result"]["result_sha256"]
+    );
+    assert_eq!(
+        result["result"]["result_sha256"].as_str().unwrap().len(),
+        64
+    );
+    let artifact = artifact.expect("official completion did not publish its report artifact");
+    assert_eq!(artifact["sha256"], report_sha256);
+    let chunk = chunk.unwrap();
     assert_eq!(
         BASE64
             .decode(chunk["artifact_chunk"]["bytes_base64"].as_str().unwrap())
@@ -1532,7 +1578,6 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
         report
     );
     assert_eq!(chunk["artifact_chunk"]["eof"], true);
-    let closed = facade.tool("zcode_agent_close", json!({"agent_id":agent_id}));
     assert_eq!(closed["task"]["resources_reaped"], true);
     assert!(!prepared.worktree.path.exists());
     assert_eq!(
