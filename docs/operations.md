@@ -13,6 +13,20 @@
 8. Use `stop` to cancel while preserving resources/history, then `close` when
    runtime resources should be reaped.
 
+For `subagent_v2`, use `zcode_agent_spawn`, then `zcode_agent_get/list/events/
+wait/message/respond/result/cancel/close`. `zcode_agent_list` requires at least
+one repository, feature, or ownership-token scope and the daemon applies that
+scope before the limit. Structured work starts with `zcode_review_spawn` and
+continues with `zcode_review_continue`; all later lifecycle operations use the
+common Agent tools. `attempt_sequence` distinguishes review attempts while the
+public `agent_id` and `review_id` remain stable.
+
+V2 `zcode_agent_result` returns verified artifact metadata. Request full bytes
+in chunks no larger than 8192 bytes by supplying the artifact ID, attempt,
+offset, and limit together. Every chunk repeats authoritative SHA-256/size and
+the daemon rehashes the non-symlink regular file before returning bytes. Reject
+metadata drift, gaps, oversized artifacts, or a final digest mismatch.
+
 `wait` accepts 1-5000 ms and a no-change timeout succeeds with
 `timed_out=true`. Event/list limits are 1-100. Result previews are 0-8192
 bytes. For complete evidence use the confined report artifact and verify its
@@ -50,7 +64,9 @@ not be replaced with a private runtime identifier.
 
 Public error classes are redacted and stable: validation, daemon unavailable,
 protocol version mismatch, timeout, oversized frame, not found, conflict,
-runtime lost, and protocol failure. Inspect daemon stderr and durable events for
+runtime lost, result invalid, and protocol failure. `service_generation`
+changes across daemon replacement and is the only public daemon generation
+token; it is not a task resume token. Inspect daemon stderr and durable events for
 operator diagnostics; never expect raw private failure text on public MCP.
 
 The facade may be restarted freely. A replacement process with the same socket
@@ -62,8 +78,10 @@ same database. If the daemon exits, follow `docs/recovery.md`.
 Shadow is optional and non-authoritative. Start the daemon, set
 `ZCODE_REVIEW_MCP_PATH` and `ZCODE_REVIEWD_SOCKET`, then run
 `sectioned-shadow /absolute/path/shadow-config.json`. A counted full review
-requires a created Agent, a fresh nonempty session, exact provenance, a valid
-final report, supported evidence, and successful reap. Duplicate/resumed runs
+explicitly starts the V2 facade. It retrieves the final report only through
+verified bounded artifact chunks; it does not trust a caller-provided artifact
+path. A counted full review requires a created Agent, fresh independent attempt,
+exact provenance, a valid final report, supported evidence, and successful reap. Duplicate runs
 cannot count as new independent evidence; DELTA is consultation only.
 
 Keep GPT and GLM RAW/admission/provenance artifacts separate. Main Codex alone

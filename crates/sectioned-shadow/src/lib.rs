@@ -332,7 +332,9 @@ pub struct RmcpFacadeClient {
 impl RmcpFacadeClient {
     pub async fn spawn(facade_program: &Path, daemon_socket: &Path) -> Result<Self, ShadowError> {
         let mut command = tokio::process::Command::new(facade_program);
-        command.env("ZCODE_REVIEWD_SOCKET", daemon_socket);
+        command
+            .env("ZCODE_REVIEWD_SOCKET", daemon_socket)
+            .env("ZCODE_PUBLIC_API_MODE", "subagent_v2");
         let transport = rmcp::transport::TokioChildProcess::new(command)
             .map_err(|error| ShadowError::Transport(error.to_string()))?;
         let service = rmcp::ServiceExt::serve((), transport)
@@ -375,6 +377,354 @@ impl PublicMcpClient for RmcpFacadeClient {
 pub struct ShadowRun {
     pub provenance: ShadowProvenance,
     pub artifacts: ArtifactPaths,
+}
+
+const SHADOW_REPORT_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+pub async fn run_shadow_v2<C: PublicMcpClient>(
+    client: &C,
+    config: &ShadowConfig,
+) -> Result<ShadowRun, ShadowError> {
+    let manifest = config.validate()?;
+    let started = Instant::now();
+    let spawn = client
+        .call("zcode_review_spawn", v2_spawn_arguments(&manifest))
+        .await?;
+    let agent_id = string_field(&spawn, "agent_id")?.to_owned();
+    let submission = string_field(&spawn, "submission_disposition")?.to_owned();
+    let spawn_provenance = spawn
+        .get("provenance")
+        .ok_or_else(|| ShadowError::Protocol("review spawn omitted provenance".into()))?;
+    let prompt_sha256 = string_field(spawn_provenance, "prompt_sha256")?.to_owned();
+    let counts_as_independent = spawn
+        .get("counts_as_independent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut last_sequence = 0_u64;
+    let mut checkpoint_count = 0_u64;
+    let mut unsupported = false;
+    let mut terminal = None;
+    for _ in 0..config.max_waits {
+        let status = match client
+            .call("zcode_agent_get", json!({"agent_id": agent_id}))
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => {
+                let _ = client
+                    .call("zcode_agent_close", json!({"agent_id": agent_id}))
+                    .await;
+                return persist_incomplete(
+                    config,
+                    &manifest,
+                    agent_id,
+                    submission,
+                    prompt_sha256,
+                    started,
+                );
+            }
+        };
+        unsupported |= status
+            .get("pending_requests")
+            .and_then(Value::as_array)
+            .is_some_and(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request["kind"] == "unsupported_input")
+            });
+        let task = status
+            .get("task")
+            .ok_or_else(|| ShadowError::Protocol("agent get omitted task".into()))?;
+        if string_field(task, "phase")? == "TERMINAL" {
+            terminal = Some(status);
+            break;
+        }
+        let waited = match client
+            .call(
+                "zcode_agent_wait",
+                json!({
+                    "agent_id": agent_id,
+                    "after_sequence": last_sequence,
+                    "timeout_ms": config.wait_timeout_ms
+                }),
+            )
+            .await
+        {
+            Ok(waited) => waited,
+            Err(_) => {
+                let _ = client
+                    .call("zcode_agent_close", json!({"agent_id": agent_id}))
+                    .await;
+                return persist_incomplete(
+                    config,
+                    &manifest,
+                    agent_id,
+                    submission,
+                    prompt_sha256,
+                    started,
+                );
+            }
+        };
+        if let Some(events) = waited.get("events").and_then(Value::as_array) {
+            checkpoint_count += events
+                .iter()
+                .filter(|event| event["event_type"] == "report.checkpoint")
+                .count() as u64;
+        }
+        last_sequence = waited
+            .get("next_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(last_sequence);
+        if waited
+            .get("task")
+            .and_then(|task| task.get("phase"))
+            .and_then(Value::as_str)
+            == Some("TERMINAL")
+        {
+            terminal = Some(json!({
+                "task": waited["task"].clone(),
+                "pending_requests": []
+            }));
+            break;
+        }
+    }
+    let Some(status) = terminal else {
+        let _ = client
+            .call("zcode_agent_close", json!({"agent_id": agent_id}))
+            .await;
+        return persist_incomplete(
+            config,
+            &manifest,
+            agent_id,
+            submission,
+            prompt_sha256,
+            started,
+        );
+    };
+    let task = status
+        .get("task")
+        .ok_or_else(|| ShadowError::Protocol("terminal agent get omitted task".into()))?;
+    let fresh_session = task
+        .get("fresh_session_observed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result = match client
+        .call("zcode_agent_result", json!({"agent_id": agent_id}))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = client
+                .call("zcode_agent_close", json!({"agent_id": agent_id}))
+                .await;
+            return persist_incomplete(
+                config,
+                &manifest,
+                agent_id,
+                submission,
+                prompt_sha256,
+                started,
+            );
+        }
+    };
+    let terminal_success = result
+        .get("result")
+        .and_then(|value| value.get("outcome"))
+        .and_then(Value::as_str)
+        == Some("SUCCEEDED");
+    let report = read_v2_verified_report(client, &agent_id, &result)
+        .await
+        .ok();
+    let report_valid = report.as_ref().is_some_and(|(_, _, bytes)| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .is_some_and(|text| text.contains("FINALIZED: true"))
+    });
+    let close_reaped = client
+        .call("zcode_agent_close", json!({"agent_id": agent_id}))
+        .await
+        .ok()
+        .and_then(|value| value.get("task").cloned())
+        .and_then(|task| task.get("resources_reaped").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let provenance_valid = spawn_provenance
+        .get("base_sha")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        && spawn_provenance
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && spawn_provenance
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && spawn_provenance
+            .get("prepared_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+    let complete_evidence =
+        provenance_valid && report_valid && terminal_success && close_reaped && !unsupported;
+    let classification = match config.mode {
+        ShadowMode::Full
+            if complete_evidence
+                && submission == "created"
+                && fresh_session
+                && counts_as_independent =>
+        {
+            EvidenceClassification::IndependentEvidence
+        }
+        ShadowMode::DeltaConsultation | ShadowMode::ResumeConsultation if complete_evidence => {
+            EvidenceClassification::Consultation
+        }
+        _ => EvidenceClassification::EvidenceIncomplete,
+    };
+    let report_sha256 = report.as_ref().map(|(sha256, _, _)| sha256.clone());
+    let report_bytes = report.as_ref().map(|(_, size, _)| *size);
+    let provenance = ShadowProvenance {
+        schema: SHADOW_SCHEMA.into(),
+        agent_id: agent_id.clone(),
+        submission_disposition: submission,
+        zcode_session_id: None,
+        fresh_session_observed: fresh_session,
+        classification,
+        review_kind: manifest.review_kind.as_str().into(),
+        round_kind: manifest.round_kind.as_str().into(),
+        manifest_sha256: optional_string(spawn_provenance, "manifest_sha256"),
+        prepared_sha256: optional_string(spawn_provenance, "prepared_sha256"),
+        prompt_sha256,
+        base_sha: optional_string(spawn_provenance, "base_sha"),
+        head_sha: optional_string(spawn_provenance, "head_sha"),
+        report_sha256,
+        report_bytes,
+        report_schema_compliant: report_valid,
+        checkpoint_count,
+        unsupported_input_observed: unsupported,
+        runtime_failure_observed: !terminal_success || !close_reaped,
+        wall_time_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    };
+    let artifacts = config.artifact_paths();
+    fs::create_dir_all(&config.artifact_directory)?;
+    let raw = report.map(|(_, _, bytes)| bytes).unwrap_or_else(|| {
+        b"# ZCode Shadow Review\n\nEvidence incomplete: the verified public artifact was unavailable.\n".to_vec()
+    });
+    atomic_write(&artifacts.glm_raw, &raw)?;
+    atomic_write(
+        &artifacts.glm_provenance,
+        &serde_json::to_vec_pretty(&provenance)?,
+    )?;
+    Ok(ShadowRun {
+        provenance,
+        artifacts,
+    })
+}
+
+fn public_path(repository: &Path, path: &Path) -> String {
+    path.strip_prefix(repository)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn v2_spawn_arguments(manifest: &ReviewManifest) -> Value {
+    let review_kind = match manifest.round_kind {
+        RoundKind::PlanReview => "plan_review",
+        RoundKind::InitialBounded => "initial_bounded",
+        RoundKind::RepairDelta => "repair_delta",
+        RoundKind::FinalBounded => "final_bounded",
+    };
+    json!({
+        "review_kind": review_kind,
+        "repository": manifest.repository,
+        "base_ref": manifest.base_ref,
+        "head_ref": manifest.head_ref,
+        "scope_manifest": manifest.scope_paths.iter().map(|path| public_path(&manifest.repository, path)).collect::<Vec<_>>(),
+        "requirements_path": public_path(&manifest.repository, &manifest.plan_path),
+        "report_path": public_path(&manifest.repository, &manifest.report_target),
+        "feature_id": manifest.feature_id,
+        "section_id": manifest.section_id,
+        "ownership_token": format!("sectioned-shadow:{}:{}", manifest.feature_id, manifest.section_id),
+        "idempotency_key": manifest.idempotency_key,
+        "read_only": true,
+        "attachments": manifest.context_paths.iter().map(|path| public_path(&manifest.repository, path)).collect::<Vec<_>>(),
+        "model": manifest.model
+    })
+}
+
+async fn read_v2_verified_report<C: PublicMcpClient>(
+    client: &C,
+    agent_id: &str,
+    result: &Value,
+) -> Result<(String, u64, Vec<u8>), ShadowError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    let artifact = result
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .and_then(|artifacts| {
+            artifacts
+                .iter()
+                .find(|artifact| artifact["kind"] == "report_markdown")
+        })
+        .ok_or_else(|| ShadowError::Protocol("result omitted report artifact".into()))?;
+    let artifact_id = string_field(artifact, "artifact_id")?.to_owned();
+    let sha256 = string_field(artifact, "sha256")?.to_owned();
+    let size_bytes = artifact
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ShadowError::Protocol("report artifact omitted size".into()))?;
+    if size_bytes > SHADOW_REPORT_CAP_BYTES {
+        return Err(ShadowError::Protocol(
+            "report artifact exceeds the shadow cap".into(),
+        ));
+    }
+    let attempt_sequence = result
+        .get("task")
+        .and_then(|task| task.get("attempt_sequence"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ShadowError::Protocol("result omitted attempt sequence".into()))?;
+    let mut bytes = Vec::with_capacity(size_bytes as usize);
+    while (bytes.len() as u64) < size_bytes {
+        let response = client
+            .call(
+                "zcode_agent_result",
+                json!({
+                    "agent_id": agent_id,
+                    "attempt_sequence": attempt_sequence,
+                    "artifact_id": artifact_id,
+                    "offset_bytes": bytes.len() as u64,
+                    "limit_bytes": 8192
+                }),
+            )
+            .await?;
+        let chunk = response
+            .get("artifact_chunk")
+            .ok_or_else(|| ShadowError::Protocol("artifact response omitted chunk".into()))?;
+        if string_field(chunk, "artifact_id")? != artifact_id
+            || string_field(chunk, "sha256")? != sha256
+            || chunk.get("size_bytes").and_then(Value::as_u64) != Some(size_bytes)
+            || chunk.get("offset_bytes").and_then(Value::as_u64) != Some(bytes.len() as u64)
+        {
+            return Err(ShadowError::Protocol(
+                "artifact chunk metadata changed during retrieval".into(),
+            ));
+        }
+        let decoded = BASE64
+            .decode(string_field(chunk, "bytes_base64")?)
+            .map_err(|_| ShadowError::Protocol("artifact chunk base64 is invalid".into()))?;
+        if decoded.is_empty() || bytes.len().saturating_add(decoded.len()) > size_bytes as usize {
+            return Err(ShadowError::Protocol(
+                "artifact chunk length is invalid".into(),
+            ));
+        }
+        bytes.extend_from_slice(&decoded);
+    }
+    if bytes.len() as u64 != size_bytes || format!("{:x}", Sha256::digest(&bytes)) != sha256 {
+        return Err(ShadowError::Protocol(
+            "artifact bytes failed final verification".into(),
+        ));
+    }
+    Ok((sha256, size_bytes, bytes))
 }
 
 pub async fn run_shadow<C: PublicMcpClient>(

@@ -1,5 +1,17 @@
 # Runtime Protocol Compatibility
 
+## Private daemon/facade compatibility
+
+S05 uses fail-closed private RPC version 8. It adds only daemon-authoritative
+scoped task listing, bounded readiness observation, typed V2 pending requests,
+minimal structured-review continuation, attempt-selectable results, and verified
+bounded artifact chunks. A V7 facade/daemon pairing is rejected before method
+dispatch; there is no version negotiation or mixed-version fallback.
+
+This private version is not the public MCP protocol version. Both the legacy
+ten-tool and V2 fourteen-tool catalogs still use rmcp framing, but a single
+facade process exposes exactly one startup-selected catalog.
+
 ## Evidence boundary
 
 Compatibility evidence is about the locally installed official runtime only.

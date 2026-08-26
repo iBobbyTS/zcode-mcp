@@ -1,4 +1,4 @@
-use sectioned_shadow::{run_shadow, RmcpFacadeClient, ShadowConfig};
+use sectioned_shadow::{run_shadow_v2, RmcpFacadeClient, ShadowConfig};
 use std::{env, fs, path::PathBuf};
 
 #[tokio::main]
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .ok_or("ZCODE_REVIEWD_SOCKET is required")?;
     let client = RmcpFacadeClient::spawn(&facade, &socket).await?;
-    let run = run_shadow(&client, &config).await?;
+    let run = run_shadow_v2(&client, &config).await?;
     println!("{}", serde_json::to_string(&run.provenance)?);
     client.shutdown().await?;
     Ok(())

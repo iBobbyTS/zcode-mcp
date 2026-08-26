@@ -5,8 +5,8 @@ use crate::{
     TurnBoundary, TurnSnapshot,
 };
 use review_store::{
-    BudgetRequest, Job, LifecycleWrite, MessageState, NewArtifact, NewTask, PendingRequestState,
-    TaskKind,
+    ArtifactKind, BudgetRequest, Job, LifecycleWrite, MessageState, NewArtifact, NewTask,
+    PendingRequestState, ResultArtifact, TaskKind, TaskOutcome, TaskResult,
 };
 use std::{
     collections::HashMap,
@@ -242,6 +242,71 @@ fn fixture_with_options(options: ServerOptions, control_timeout: Duration) -> Fi
     }
 }
 
+fn git(repository: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().into()
+}
+
+fn submit_general_fixture(
+    fixture: &Fixture,
+    name: &str,
+    feature_id: &str,
+    ownership_token: &str,
+) -> (PathBuf, String) {
+    let repository = fixture._directory.path().join(format!("repository-{name}"));
+    std::fs::create_dir_all(repository.join("src")).unwrap();
+    std::fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    git(&repository, &["init"]);
+    git(&repository, &["config", "user.name", "S05 Test"]);
+    git(
+        &repository,
+        &["config", "user.email", "s05@example.invalid"],
+    );
+    git(&repository, &["add", "src/lib.rs"]);
+    git(&repository, &["commit", "-m", "fixture"]);
+    let base_ref = git(&repository, &["rev-parse", "HEAD"]);
+    let repository = std::fs::canonicalize(repository).unwrap();
+    let agent_id = format!("s05-{name}");
+    let result = fixture
+        .service
+        .dispatch(RpcMethod::SubmitGeneral {
+            input: GeneralSubmitInput {
+                manifest: GeneralTaskManifest {
+                    schema: review_preparation::GENERAL_TASK_SCHEMA.into(),
+                    task_id: agent_id.clone(),
+                    repository: repository.clone(),
+                    base_ref,
+                    profile: GeneralProfile::AnalysisReadonly,
+                    prompt: "inspect the fixture".into(),
+                    repo_context: vec!["src/lib.rs".into()],
+                    attachments: Vec::new(),
+                    write_manifest: Vec::new(),
+                    scratch_root: ".agent-work/scratch/general".into(),
+                    artifact_root: PathBuf::from(".agent-work/artifacts").join(&agent_id),
+                    budget: None,
+                    validation_commands: Default::default(),
+                    retain_partial: false,
+                    idempotency_key: format!("s05-{name}-key"),
+                },
+                feature_id: feature_id.into(),
+                ownership_token: ownership_token.into(),
+            },
+        })
+        .unwrap();
+    assert!(matches!(result, RpcSuccess::GeneralSubmitted { .. }));
+    (repository, agent_id)
+}
+
 fn request(request_id: &str, method: RpcMethod) -> RpcRequest {
     RpcRequest {
         version: RPC_VERSION,
@@ -310,7 +375,7 @@ fn error(response: RpcResponse) -> RpcError {
 #[test]
 fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     let fixture = fixture();
-    assert_eq!(RPC_VERSION, 7);
+    assert_eq!(RPC_VERSION, 8);
     let first = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
         RpcSuccess::SystemStatus { status } => status,
         other => panic!("unexpected status result: {other:?}"),
@@ -364,30 +429,213 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
 }
 
 #[test]
-fn s04_v7_gate_rejects_s03_v6_before_method_dispatch() {
+fn s05_v8_gate_rejects_s04_v7_before_method_dispatch() {
     let fixture = fixture();
     let old_peer = fixture
         .service
-        .handle_bytes(br#"{"version":6,"request_id":"s03-peer","method":"missing"}"#);
-    assert_eq!(old_peer.version, 7);
-    assert_eq!(old_peer.request_id.as_deref(), Some("s03-peer"));
+        .handle_bytes(br#"{"version":7,"request_id":"s04-peer","method":"missing"}"#);
+    assert_eq!(old_peer.version, 8);
+    assert_eq!(old_peer.request_id.as_deref(), Some("s04-peer"));
     assert_eq!(error(old_peer).code, RpcErrorCode::UnsupportedVersion);
 
     let current_unknown = fixture
         .service
-        .handle_bytes(br#"{"version":7,"request_id":"s04-peer","method":"missing"}"#);
+        .handle_bytes(br#"{"version":8,"request_id":"s05-peer","method":"missing"}"#);
     assert_eq!(error(current_unknown).code, RpcErrorCode::UnknownMethod);
 
     let status = fixture
         .service
-        .handle_bytes(br#"{"version":7,"request_id":"s04-status","method":"system_status"}"#);
+        .handle_bytes(br#"{"version":8,"request_id":"s05-status","method":"system_status"}"#);
     match status.outcome {
         RpcOutcome::Success { result } => match *result {
-            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 7),
+            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 8),
             other => panic!("unexpected success: {other:?}"),
         },
         RpcOutcome::Error { error } => panic!("unexpected error: {error:?}"),
     }
+}
+
+#[test]
+fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
+    let fixture = fixture();
+    let (repository_a, agent_a) =
+        submit_general_fixture(&fixture, "scope-a", "feature-a", "owner-a");
+    let (_, agent_b) = submit_general_fixture(&fixture, "scope-b", "feature-b", "owner-b");
+
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskList(TaskListQuery {
+            repository: Some(repository_a.to_string_lossy().into_owned()),
+            feature_id: Some("feature-a".into()),
+            ownership_token: None,
+            limit: 10,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskListed { tasks } => {
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].agent_id, agent_a);
+            assert_ne!(tasks[0].agent_id, agent_b);
+        }
+        other => panic!("unexpected list: {other:?}"),
+    }
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskList(TaskListQuery {
+                repository: None,
+                feature_id: None,
+                ownership_token: None,
+                limit: 10,
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
+
+    let execution_id = fixture
+        .store
+        .get_task(&agent_a)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    fixture
+        .store
+        .insert_pending_request(
+            "s05-request",
+            &execution_id,
+            "private-correlation",
+            "permission",
+            r#"{"toolName":"read","input":{"path":"/private/repository/src/lib.rs"}}"#,
+        )
+        .unwrap();
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskPending { agent_id: agent_a })
+        .unwrap()
+    {
+        RpcSuccess::Pending { requests } => {
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].request_id, "s05-request");
+            assert_eq!(requests[0].operation, "read");
+            assert!(!requests[0].summary.contains("/private/repository"));
+        }
+        other => panic!("unexpected pending: {other:?}"),
+    }
+}
+
+#[test]
+fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
+    let fixture = fixture();
+    let started = Instant::now();
+    match fixture
+        .service
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 10 })
+        .unwrap()
+    {
+        RpcSuccess::SystemReadiness { ready, .. } => assert!(!ready),
+        other => panic!("unexpected readiness: {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let (repository, agent_id) =
+        submit_general_fixture(&fixture, "artifact", "feature-artifact", "owner-artifact");
+    let execution_id = fixture
+        .store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert!(fixture
+        .scheduler
+        .start_ready()
+        .unwrap()
+        .contains(&execution_id));
+    fixture.factory.runtime(&execution_id);
+    match fixture
+        .service
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 100 })
+        .unwrap()
+    {
+        RpcSuccess::SystemReadiness { ready, .. } => assert!(ready),
+        other => panic!("unexpected readiness: {other:?}"),
+    }
+    let bytes = b"verified bounded artifact";
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    let path = repository
+        .join(".agent-work/artifacts")
+        .join(&agent_id)
+        .join("check.txt");
+    std::fs::write(&path, bytes).unwrap();
+    fixture
+        .store
+        .insert_artifact(&NewArtifact {
+            artifact_id: "s05-artifact".into(),
+            agent_id: execution_id.clone(),
+            artifact_type: "check_report".into(),
+            path: path.to_string_lossy().into_owned(),
+            sha256: sha256.clone(),
+            bytes: bytes.len() as u64,
+            checkpoint_number: None,
+        })
+        .unwrap();
+    fixture
+        .store
+        .store_task_result(
+            &execution_id,
+            &TaskResult {
+                outcome: TaskOutcome::Succeeded,
+                summary: "completed".into(),
+                partial: false,
+                base_commit: None,
+                head_commit: None,
+                changed_files: Vec::new(),
+                diff_stat: None,
+                checks: vec!["check".into()],
+                residual_gaps: Vec::new(),
+                artifacts: vec![ResultArtifact {
+                    kind: ArtifactKind::CheckReport,
+                    artifact_id: "s05-artifact".into(),
+                    sha256: sha256.clone(),
+                }],
+            },
+        )
+        .unwrap();
+
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskArtifact(TaskArtifactQuery {
+            agent_id: agent_id.clone(),
+            attempt_sequence: None,
+            artifact_id: "s05-artifact".into(),
+            offset_bytes: 9,
+            limit_bytes: 7,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskArtifact { chunk } => {
+            assert_eq!(chunk.bytes, &bytes[9..16]);
+            assert_eq!(chunk.sha256, sha256);
+            assert!(!chunk.eof);
+        }
+        other => panic!("unexpected artifact: {other:?}"),
+    }
+
+    std::fs::write(&path, b"tampered").unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskArtifact(TaskArtifactQuery {
+                agent_id,
+                attempt_sequence: None,
+                artifact_id: "s05-artifact".into(),
+                offset_bytes: 0,
+                limit_bytes: MAX_ARTIFACT_CHUNK_BYTES,
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::ResultInvalid
+    );
 }
 
 #[test]
@@ -706,6 +954,7 @@ fn raw_call(path: &Path, frame: &[u8]) -> RpcResponse {
 fn typed_protocol_round_trips_every_method_and_outer_error() {
     let methods = vec![
         RpcMethod::SystemStatus,
+        RpcMethod::SystemEnsureReady { timeout_ms: 50 },
         RpcMethod::SubmitGeneral {
             input: GeneralSubmitInput {
                 manifest: GeneralTaskManifest {
@@ -742,6 +991,15 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcMethod::TaskStatus {
             agent_id: "general-1".into(),
         },
+        RpcMethod::TaskList(TaskListQuery {
+            repository: Some("/repository".into()),
+            feature_id: None,
+            ownership_token: None,
+            limit: 10,
+        }),
+        RpcMethod::TaskPending {
+            agent_id: "general-1".into(),
+        },
         RpcMethod::TaskEvents(TaskEventQuery {
             agent_id: "general-1".into(),
             after: 0,
@@ -769,7 +1027,15 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         },
         RpcMethod::TaskResult {
             agent_id: "general-1".into(),
+            attempt_sequence: None,
         },
+        RpcMethod::TaskArtifact(TaskArtifactQuery {
+            agent_id: "general-1".into(),
+            attempt_sequence: Some(1),
+            artifact_id: "artifact-1".into(),
+            offset_bytes: 0,
+            limit_bytes: 1024,
+        }),
         RpcMethod::TaskClose {
             agent_id: "general-1".into(),
         },
@@ -877,6 +1143,7 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcErrorCode::Persistence,
         RpcErrorCode::Timeout,
         RpcErrorCode::RuntimeLost,
+        RpcErrorCode::ResultInvalid,
         RpcErrorCode::Unavailable,
         RpcErrorCode::Internal,
     ] {

@@ -1,0 +1,49 @@
+# Merge this table into ~/.codex/config.toml and replace the absolute paths.
+[mcp_servers.zcode_subagent_v2]
+command = "/absolute/path/to/zcode-mcp/target/release/zcode-review-mcp"
+enabled = true
+required = true
+startup_timeout_sec = 10
+tool_timeout_sec = 10
+enabled_tools = [
+  "zcode_agent_cancel",
+  "zcode_agent_close",
+  "zcode_agent_events",
+  "zcode_agent_get",
+  "zcode_agent_list",
+  "zcode_agent_message",
+  "zcode_agent_respond",
+  "zcode_agent_result",
+  "zcode_agent_spawn",
+  "zcode_agent_wait",
+  "zcode_review_continue",
+  "zcode_review_spawn",
+  "zcode_system_ensure_ready",
+  "zcode_system_status",
+]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.zcode_subagent_v2.env]
+ZCODE_REVIEWD_SOCKET = "/absolute/private/zcode-reviewd.sock"
+ZCODE_PUBLIC_API_MODE = "subagent_v2"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_system_status]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_system_ensure_ready]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_agent_get]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_agent_list]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_agent_events]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_agent_wait]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent_v2.tools.zcode_agent_result]
+approval_mode = "auto"

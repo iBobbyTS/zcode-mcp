@@ -1,7 +1,7 @@
 use crate::{
     orchestration::{
-        OrchestrationError, ReviewJobOrchestrator, StructuredReviewContinuation,
-        StructuredReviewProjection, StructuredReviewSubmission,
+        MinimalStructuredReviewContinuation, OrchestrationError, ReviewJobOrchestrator,
+        StructuredReviewContinuation, StructuredReviewProjection, StructuredReviewSubmission,
     },
     MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
 };
@@ -14,7 +14,7 @@ use review_preparation::{
 use review_store::{
     DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
     StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
-    TaskOutcome, TaskPhase, TaskRecord, TurnState, WaitSnapshot,
+    TaskOutcome, TaskPhase, TaskQueryScope, TaskRecord, TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,13 +22,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 7;
+pub const RPC_VERSION: u16 = 8;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -36,6 +36,7 @@ pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
 pub const MAX_PAGE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_PREVIEW_BYTES: usize = 8 * 1024;
 pub const MAX_PENDING_REQUESTS: usize = 100;
+pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 pub const RPC_TRANSPORT_SUPPORTED: bool = cfg!(unix);
 
@@ -61,11 +62,18 @@ pub struct RpcRequest {
 )]
 pub enum RpcMethod {
     SystemStatus,
+    SystemEnsureReady {
+        timeout_ms: u64,
+    },
     SubmitGeneral {
         input: GeneralSubmitInput,
     },
     GeneralComplete(GeneralCompleteInput),
     TaskStatus {
+        agent_id: String,
+    },
+    TaskList(TaskListQuery),
+    TaskPending {
         agent_id: String,
     },
     TaskEvents(TaskEventQuery),
@@ -77,7 +85,10 @@ pub enum RpcMethod {
     },
     TaskResult {
         agent_id: String,
+        #[serde(default)]
+        attempt_sequence: Option<u64>,
     },
+    TaskArtifact(TaskArtifactQuery),
     TaskClose {
         agent_id: String,
     },
@@ -95,6 +106,9 @@ pub enum RpcMethod {
     },
     ContinueStructuredReview {
         input: StructuredReviewContinuation,
+    },
+    ContinueStructuredReviewMinimal {
+        input: MinimalStructuredReviewContinuation,
     },
     Enqueue {
         job: NewJobInput,
@@ -133,21 +147,26 @@ impl RpcMethod {
         matches!(
             name,
             "system_status"
+                | "system_ensure_ready"
                 | "submit_general"
                 | "general_complete"
                 | "task_status"
+                | "task_list"
+                | "task_pending"
                 | "task_events"
                 | "task_wait"
                 | "task_message"
                 | "task_respond"
                 | "task_cancel"
                 | "task_result"
+                | "task_artifact"
                 | "task_close"
                 | "task_reap"
                 | "spawn_review"
                 | "submit_review"
                 | "submit_structured_review"
                 | "continue_structured_review"
+                | "continue_structured_review_minimal"
                 | "enqueue"
                 | "start"
                 | "status"
@@ -165,6 +184,29 @@ impl RpcMethod {
                 | "review_tool"
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskListQuery {
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub feature_id: Option<String>,
+    #[serde(default)]
+    pub ownership_token: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskArtifactQuery {
+    pub agent_id: String,
+    #[serde(default)]
+    pub attempt_sequence: Option<u64>,
+    pub artifact_id: String,
+    pub offset_bytes: u64,
+    pub limit_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +425,11 @@ pub enum RpcSuccess {
     SystemStatus {
         status: SystemStatusView,
     },
+    SystemReadiness {
+        ready: bool,
+        status: SystemStatusView,
+        reason_code: Option<String>,
+    },
     GeneralSubmitted {
         task: TaskView,
     },
@@ -391,6 +438,9 @@ pub enum RpcSuccess {
     },
     TaskStatus {
         task: TaskView,
+    },
+    TaskListed {
+        tasks: Vec<TaskView>,
     },
     TaskEvents {
         page: TaskEventPage,
@@ -403,6 +453,10 @@ pub enum RpcSuccess {
     TaskResult {
         task: TaskView,
         result: Option<TaskResultView>,
+        artifacts: Vec<TaskArtifactMetadataView>,
+    },
+    TaskArtifact {
+        chunk: TaskArtifactChunkView,
     },
     ReviewSpawned {
         job: JobView,
@@ -530,6 +584,24 @@ pub struct TaskResultView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArtifactMetadataView {
+    pub artifact_id: String,
+    pub kind: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArtifactChunkView {
+    pub artifact_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub offset_bytes: u64,
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEventView {
     pub sequence: u64,
     pub source_sequence: u64,
@@ -559,6 +631,7 @@ pub enum RpcErrorCode {
     Persistence,
     Timeout,
     RuntimeLost,
+    ResultInvalid,
     Unavailable,
     Internal,
 }
@@ -1005,6 +1078,28 @@ impl RpcService {
             RpcMethod::SystemStatus => Ok(RpcSuccess::SystemStatus {
                 status: self.system_status(),
             }),
+            RpcMethod::SystemEnsureReady { timeout_ms } => {
+                if timeout_ms == 0 || timeout_ms > MAX_WAIT.as_millis() as u64 {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "readiness timeout is outside the allowed range",
+                    ));
+                }
+                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+                loop {
+                    let status = self.system_status();
+                    let ready = readiness_from_status(&status);
+                    if ready || Instant::now() >= deadline {
+                        return Ok(RpcSuccess::SystemReadiness {
+                            ready,
+                            status,
+                            reason_code: (!ready).then(|| "LOWER_LAYER_NOT_READY".into()),
+                        });
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
             RpcMethod::SubmitGeneral { input } => {
                 validate_text(&input.feature_id, "feature_id", 256)?;
                 validate_text(&input.ownership_token, "ownership_token", 512)?;
@@ -1029,6 +1124,73 @@ impl RpcService {
                 Ok(RpcSuccess::TaskStatus {
                     task: task_view(job, task),
                 })
+            }
+            RpcMethod::TaskList(query) => {
+                if query.limit == 0 || query.limit > MAX_LIST_JOBS {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "task list limit is outside the allowed range",
+                    ));
+                }
+                for (field, value, cap) in [
+                    ("repository", query.repository.as_deref(), 4096usize),
+                    ("feature_id", query.feature_id.as_deref(), 256usize),
+                    (
+                        "ownership_token",
+                        query.ownership_token.as_deref(),
+                        512usize,
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        validate_text(value, field, cap)?;
+                    }
+                }
+                if query.repository.is_none()
+                    && query.feature_id.is_none()
+                    && query.ownership_token.is_none()
+                {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "at least one task list scope is required",
+                    ));
+                }
+                let tasks = self
+                    .store
+                    .list_tasks_scoped(
+                        TaskQueryScope {
+                            repository: query.repository.as_deref(),
+                            feature_id: query.feature_id.as_deref(),
+                            ownership_token: query.ownership_token.as_deref(),
+                        },
+                        None,
+                        false,
+                        query.limit,
+                    )
+                    .map_err(map_store)?;
+                let mut views = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    let job = self
+                        .store
+                        .get_job(&task.execution_agent_id)
+                        .map_err(map_store)?
+                        .ok_or_else(|| {
+                            RpcError::new(RpcErrorCode::Internal, "task job disappeared")
+                        })?;
+                    views.push(task_view(job, task));
+                }
+                Ok(RpcSuccess::TaskListed { tasks: views })
+            }
+            RpcMethod::TaskPending { agent_id } => {
+                let (_, task) = self.require_task(&agent_id)?;
+                let policy = self.scheduler.active_policy(&task.execution_agent_id);
+                let requests = self
+                    .store
+                    .pending_requests_bounded(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+                    .map_err(map_store)?
+                    .into_iter()
+                    .map(|request| pending_request_view(policy.as_deref(), request))
+                    .collect();
+                Ok(RpcSuccess::Pending { requests })
             }
             RpcMethod::TaskEvents(query) => Ok(RpcSuccess::TaskEvents {
                 page: self.task_event_page(query)?,
@@ -1086,16 +1248,28 @@ impl RpcService {
                     state: state.into(),
                 })
             }
-            RpcMethod::TaskResult { agent_id } => {
-                let (job, task) = self.require_task(&agent_id)?;
+            RpcMethod::TaskResult {
+                agent_id,
+                attempt_sequence,
+            } => {
+                let (job, task) = self.require_task_attempt(&agent_id, attempt_sequence)?;
                 let result = self
                     .store
                     .task_result(&task.execution_agent_id)
                     .map_err(map_store)?
                     .map(TaskResultView::from);
+                let artifacts = self.task_artifact_metadata(&task)?;
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(job, task),
                     result,
+                    artifacts,
+                })
+            }
+            RpcMethod::TaskArtifact(query) => {
+                let (_, task) =
+                    self.require_task_attempt(&query.agent_id, query.attempt_sequence)?;
+                Ok(RpcSuccess::TaskArtifact {
+                    chunk: self.task_artifact_chunk(&task, &query)?,
                 })
             }
             RpcMethod::TaskClose { agent_id } => {
@@ -1180,6 +1354,18 @@ impl RpcService {
                 })?;
                 let review = orchestrator
                     .submit_structured_continuation(&input)
+                    .map_err(map_orchestration)?;
+                Ok(RpcSuccess::StructuredReviewSubmitted { review })
+            }
+            RpcMethod::ContinueStructuredReviewMinimal { input } => {
+                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        RpcErrorCode::Unavailable,
+                        "private review orchestration is unavailable",
+                    )
+                })?;
+                let review = orchestrator
+                    .submit_minimal_structured_continuation(&input)
                     .map_err(map_orchestration)?;
                 Ok(RpcSuccess::StructuredReviewSubmitted { review })
             }
@@ -1371,6 +1557,50 @@ impl RpcService {
             .get_task(agent_id)
             .map_err(map_store)?
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
+        self.require_task_record(task)
+    }
+
+    fn require_task_attempt(
+        &self,
+        agent_id: &str,
+        attempt_sequence: Option<u64>,
+    ) -> Result<(Job, TaskRecord), RpcError> {
+        let latest = self.require_task(agent_id)?;
+        let Some(attempt_sequence) = attempt_sequence else {
+            return Ok(latest);
+        };
+        if attempt_sequence == 0 {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "attempt_sequence must be positive",
+            ));
+        }
+        if latest.1.attempt_sequence == attempt_sequence {
+            return Ok(latest);
+        }
+        let task = self
+            .store
+            .list_tasks_scoped(
+                TaskQueryScope {
+                    repository: Some(&latest.1.repository),
+                    feature_id: Some(&latest.1.feature_id),
+                    ownership_token: Some(&latest.1.ownership_token),
+                },
+                None,
+                false,
+                MAX_LIST_JOBS,
+            )
+            .map_err(map_store)?
+            .into_iter()
+            .find(|candidate| {
+                candidate.public_agent_id == agent_id
+                    && candidate.attempt_sequence == attempt_sequence
+            })
+            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task attempt was not found"))?;
+        self.require_task_record(task)
+    }
+
+    fn require_task_record(&self, task: TaskRecord) -> Result<(Job, TaskRecord), RpcError> {
         let job = self
             .store
             .get_job(&task.execution_agent_id)
@@ -1391,6 +1621,85 @@ impl RpcService {
             return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
         }
         Ok((job, task))
+    }
+
+    fn task_artifact_metadata(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<Vec<TaskArtifactMetadataView>, RpcError> {
+        let result = self
+            .store
+            .task_result(&task.execution_agent_id)
+            .map_err(map_store)?;
+        let allowed = result
+            .as_ref()
+            .map(|stored| {
+                stored
+                    .result
+                    .artifacts
+                    .iter()
+                    .map(|artifact| (artifact.artifact_id.as_str(), artifact.sha256.as_str()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let review_task = matches!(
+            task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        );
+        let mut projected = Vec::new();
+        for artifact in self
+            .store
+            .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+            .map_err(map_store)?
+        {
+            let permitted = allowed
+                .get(artifact.artifact_id.as_str())
+                .is_some_and(|sha| *sha == artifact.sha256)
+                || (review_task && artifact.artifact_type == "report");
+            if permitted {
+                projected.push(TaskArtifactMetadataView {
+                    artifact_id: artifact.artifact_id,
+                    kind: public_artifact_kind(&artifact.artifact_type).into(),
+                    sha256: artifact.sha256,
+                    size_bytes: artifact.bytes,
+                });
+            }
+        }
+        projected.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+        Ok(projected)
+    }
+
+    fn task_artifact_chunk(
+        &self,
+        task: &TaskRecord,
+        query: &TaskArtifactQuery,
+    ) -> Result<TaskArtifactChunkView, RpcError> {
+        validate_id(&query.artifact_id, "artifact_id")?;
+        if query.limit_bytes == 0 || query.limit_bytes > MAX_ARTIFACT_CHUNK_BYTES {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "artifact chunk size is outside the allowed range",
+            ));
+        }
+        let metadata = self.task_artifact_metadata(task)?;
+        let expected = metadata
+            .into_iter()
+            .find(|artifact| artifact.artifact_id == query.artifact_id)
+            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "artifact was not found"))?;
+        if query.offset_bytes > expected.size_bytes {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "artifact offset exceeds authoritative size",
+            ));
+        }
+        let stored = self
+            .store
+            .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+            .map_err(map_store)?
+            .into_iter()
+            .find(|artifact| artifact.artifact_id == query.artifact_id)
+            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "artifact was not found"))?;
+        verified_artifact_chunk(stored, expected, query.offset_bytes, query.limit_bytes)
     }
 
     fn task_event_page(&self, query: TaskEventQuery) -> Result<TaskEventPage, RpcError> {
@@ -1654,6 +1963,84 @@ fn agent_capabilities() -> AgentCapabilitiesView {
         max_events: MAX_PAGE_EVENTS,
         max_wait_ms: MAX_WAIT.as_millis() as u64,
     }
+}
+
+fn readiness_from_status(status: &SystemStatusView) -> bool {
+    [
+        "daemon",
+        "store",
+        "scheduler",
+        "driver",
+        "runtime",
+        "model_auth",
+    ]
+    .iter()
+    .all(|component| status.components.get(*component) == Some(&ComponentStateView::Ready))
+}
+
+fn public_artifact_kind(stored: &str) -> &'static str {
+    match stored {
+        "report_markdown" | "report" => "report_markdown",
+        "changes_patch" => "changes_patch",
+        "check_report" => "check_report",
+        _ => "unknown",
+    }
+}
+
+fn verified_artifact_chunk(
+    stored: StoredArtifact,
+    expected: TaskArtifactMetadataView,
+    offset_bytes: u64,
+    limit_bytes: usize,
+) -> Result<TaskArtifactChunkView, RpcError> {
+    let metadata = std::fs::symlink_metadata(&stored.path)
+        .map_err(|_| RpcError::new(RpcErrorCode::ResultInvalid, "artifact is unavailable"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected.size_bytes
+        || stored.bytes != expected.size_bytes
+        || stored.sha256 != expected.sha256
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::ResultInvalid,
+            "artifact metadata does not match authoritative bytes",
+        ));
+    }
+    let mut file = File::open(&stored.path)
+        .map_err(|_| RpcError::new(RpcErrorCode::ResultInvalid, "artifact is unavailable"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| RpcError::new(RpcErrorCode::ResultInvalid, "artifact read failed"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let observed = format!("{:x}", hasher.finalize());
+    if observed != expected.sha256 {
+        return Err(RpcError::new(
+            RpcErrorCode::ResultInvalid,
+            "artifact digest does not match authoritative metadata",
+        ));
+    }
+    file.seek(SeekFrom::Start(offset_bytes))
+        .map_err(|_| RpcError::new(RpcErrorCode::ResultInvalid, "artifact seek failed"))?;
+    let remaining = expected.size_bytes - offset_bytes;
+    let requested = remaining.min(limit_bytes as u64) as usize;
+    let mut bytes = vec![0u8; requested];
+    file.read_exact(&mut bytes)
+        .map_err(|_| RpcError::new(RpcErrorCode::ResultInvalid, "artifact read failed"))?;
+    Ok(TaskArtifactChunkView {
+        artifact_id: expected.artifact_id,
+        sha256: expected.sha256,
+        size_bytes: expected.size_bytes,
+        offset_bytes,
+        eof: offset_bytes + bytes.len() as u64 == expected.size_bytes,
+        bytes,
+    })
 }
 
 fn task_view(job: Job, task: TaskRecord) -> TaskView {

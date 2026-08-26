@@ -5,6 +5,11 @@
 The MCP facade is stateless. Stop or replace it, retain the daemon/database, and
 start a new facade with the same `ZCODE_REVIEWD_SOCKET`. The same `agent_id`
 continues to address the durable job. No facade journal or restore step exists.
+Restart with the same catalog selector. A V2 replacement can use
+`zcode_agent_get` immediately; compare `zcode_system_status.service_generation`
+when deciding whether the daemon also changed. A differently configured legacy
+facade may share the daemon, but legacy by-ID/list operations intentionally
+cannot observe V2 task rows.
 
 ## Daemon restart
 
@@ -26,6 +31,11 @@ After restart:
 3. Close jobs only after verifying their durable state; close preserves history.
 4. Submit a new manifest/idempotency key for genuinely new independent evidence.
    A compatible replay is not a fresh review.
+
+In V2, list only with an explicit repository/feature/ownership-token scope.
+Continue a completed structured review with its stable public identities; the
+daemon reconstructs immutable parent context and assigns the next attempt.
+Retrying the same continuation idempotency key returns the same attempt.
 
 ## Database backup and migration
 
@@ -55,6 +65,11 @@ process outside this application's authority.
 Unsupported `interaction/requestUserInput` cannot be answered through this
 seam. It appears as non-respondable and makes shadow evidence incomplete; stop
 the job if it cannot proceed.
+
+If artifact retrieval returns `result_invalid`, stop trusting all previously
+read chunks for that artifact. Do not read the stored locator directly. Retain
+the durable task for diagnosis, repair or restore the confined artifact through
+its owning workflow, and retry metadata plus chunks from offset zero.
 
 ## Consumer rollback
 

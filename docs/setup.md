@@ -42,15 +42,37 @@ verified only for entry SHA-256 `9318f60f...e4274`.
 
 ## Configure Codex
 
-Copy the values, not the file paths, from
-`config/codex-zcode-review-mcp.toml` into `~/.codex/config.toml`. Replace both
-absolute placeholders. The command points to the stateless facade; the daemon
-is a separately managed local process.
+Choose exactly one startup-static public catalog per facade process:
+
+- `config/codex-zcode-review-mcp.toml` keeps the standalone-default
+  `legacy_review_v1` catalog with its exact ten existing tools.
+- `config/codex-zcode-subagent-mcp-v2.toml` selects `subagent_v2` explicitly
+  and permits exactly the fourteen high-level system, Agent, and review tools.
+
+Copy the values, not the file paths, into `~/.codex/config.toml` and replace the
+absolute placeholders. Both modes use the same stateless binary and may point
+at the same daemon/Store. A process never mixes catalogs. Empty, unknown, or
+combined `ZCODE_PUBLIC_API_MODE` values fail startup.
 
 The configuration allows exactly the accepted ten tools, gives the MCP process
 10 seconds to initialize and each call 10 seconds, and keeps mutating or
 destructive operations prompt-gated. Restart Codex after editing its config,
 then confirm the tool inventory before submitting a manifest.
+
+The repo-local plugin under `plugins/zcode-subagent-mcp-v2` is an alternative
+V2 entry point. It expects `zcode-review-mcp` on `PATH`, forwards the existing
+`ZCODE_REVIEWD_SOCKET`, and pins `ZCODE_PUBLIC_API_MODE=subagent_v2`. It is not
+installed automatically and does not start or own the daemon.
+
+Before spawning work in V2, call `zcode_system_ensure_ready` with a bounded
+timeout. `ready=false` is an evidence-bearing result: start or repair the
+configured runtime rather than treating facade discovery as runtime readiness.
+
+V2 general and structured-review inputs are supplied directly as strict tool
+arguments. Repository/base/head identities are immutable commit inputs;
+continuations need only the stable `agent_id`/`review_id`, new base/head,
+frozen finding IDs, idempotency key, optional attachments, and optional budget.
+The daemon reconstructs parent-owned scope and immutable context.
 
 ## Submit
 

@@ -23,8 +23,9 @@ use std::{
 use zcode_driver::observe_process_group;
 use zcode_reviewd::{
     orchestration::{
-        ReviewSubmissionDisposition, StructuredReviewContinuation, StructuredReviewKind,
-        StructuredReviewProjection, StructuredReviewSubmission,
+        MinimalStructuredReviewContinuation, ReviewSubmissionDisposition,
+        StructuredReviewContinuation, StructuredReviewKind, StructuredReviewProjection,
+        StructuredReviewSubmission,
     },
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
@@ -769,17 +770,26 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
     );
     assert_eq!(first_result.result.outcome, TaskOutcome::Succeeded);
 
-    let continuation_input = fixture.structured_continuation(
-        &first.agent_id,
-        &first.review_id,
-        "structured-continuation",
-    );
-    let second_report = fixture
-        .repository
-        .join(&continuation_input.manifest.report_target);
+    let continuation_input = MinimalStructuredReviewContinuation {
+        agent_id: first.agent_id.clone(),
+        review_id: first.review_id.clone(),
+        base_ref: fixture.head.clone(),
+        head_ref: fixture.head.clone(),
+        frozen_finding_ids: vec!["S06-F1".into()],
+        idempotency_key: "feature:S04:structured-continuation".into(),
+        attachments: Vec::new(),
+        budget: Some(BudgetLimits {
+            wall_time_ms: 7_000,
+            max_turns: 12,
+            max_tool_calls: 48,
+            max_context_bytes: 1_048_576,
+            max_result_bytes: 262_144,
+            max_artifact_bytes: 2_097_152,
+        }),
+    };
     let second = match fixture
         .service
-        .dispatch(RpcMethod::ContinueStructuredReview {
+        .dispatch(RpcMethod::ContinueStructuredReviewMinimal {
             input: continuation_input.clone(),
         })
         .unwrap()
@@ -799,7 +809,7 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
     );
     let replayed_second = match fixture
         .service
-        .dispatch(RpcMethod::ContinueStructuredReview {
+        .dispatch(RpcMethod::ContinueStructuredReviewMinimal {
             input: continuation_input.clone(),
         })
         .unwrap()
@@ -828,6 +838,10 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         .unwrap()
         .unwrap();
     let second_execution = second_task.execution_agent_id.clone();
+    let second_job = fixture.store.get_job(&second_execution).unwrap().unwrap();
+    let second_prepared: review_preparation::PreparedLaunchSpec =
+        serde_json::from_str(second_job.prepared_launch_json.as_deref().unwrap()).unwrap();
+    let second_report = second_prepared.report_target;
     assert_ne!(second_execution, first_execution);
     assert_eq!(second_task.task_kind, TaskKind::ReviewContinuation);
     assert_eq!(

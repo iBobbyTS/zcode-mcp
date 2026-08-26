@@ -21,6 +21,9 @@ use zcode_reviewd::rpc::{
     TurnStateView, WaitQuery, RPC_VERSION,
 };
 
+pub mod v2;
+pub use v2::{SubagentMcp, V2_PUBLIC_TOOLS};
+
 pub const PUBLIC_TOOLS: [&str; 10] = [
     "zcode_review_spawn",
     "zcode_review_status",
@@ -811,6 +814,34 @@ pub async fn serve_stdio(
         .await?;
     Ok(())
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicApiMode {
+    LegacyReviewV1,
+    SubagentV2,
+}
+
+impl PublicApiMode {
+    pub fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, String> {
+        match value.and_then(std::ffi::OsStr::to_str) {
+            None => Ok(Self::LegacyReviewV1),
+            Some("legacy_review_v1") => Ok(Self::LegacyReviewV1),
+            Some("subagent_v2") => Ok(Self::SubagentV2),
+            Some(_) => Err("ZCODE_PUBLIC_API_MODE must be legacy_review_v1 or subagent_v2".into()),
+        }
+    }
+}
+
+pub async fn serve_stdio_mode(
+    socket: PathBuf,
+    timeout: Duration,
+    mode: PublicApiMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match mode {
+        PublicApiMode::LegacyReviewV1 => serve_stdio(socket, timeout).await,
+        PublicApiMode::SubagentV2 => v2::serve_stdio_v2(socket, timeout).await,
+    }
+}
 fn read_manifest(path: &Path) -> Result<review_preparation::ReviewManifest, String> {
     if !path.is_absolute() {
         return Err("validation: manifest_path must be absolute".into());
@@ -907,6 +938,7 @@ fn public_error(e: RpcError) -> String {
         RpcErrorCode::Conflict => ("conflict", "review operation conflicts with durable state"),
         RpcErrorCode::Timeout => ("timeout", "daemon operation timed out"),
         RpcErrorCode::RuntimeLost => ("runtime_lost", "review runtime was lost"),
+        RpcErrorCode::ResultInvalid => ("result_invalid", "stored task result failed verification"),
         RpcErrorCode::Persistence | RpcErrorCode::Unavailable | RpcErrorCode::Internal => (
             "daemon_unavailable",
             "review daemon could not complete the operation",
@@ -1016,7 +1048,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn s04_consumer_rejects_an_s03_v6_daemon_response() {
+    fn s05_consumer_rejects_an_s04_v7_daemon_response() {
         use std::{
             io::{BufRead, BufReader, Write},
             os::unix::fs::PermissionsExt,
@@ -1026,7 +1058,7 @@ mod tests {
         };
         use zcode_reviewd::rpc::RpcResponse;
 
-        assert_eq!(RPC_VERSION, 7);
+        assert_eq!(RPC_VERSION, 8);
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("old-daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1041,13 +1073,13 @@ mod tests {
                 .read_line(&mut line)
                 .unwrap();
             let request: RpcRequest = serde_json::from_str(&line).unwrap();
-            assert_eq!(request.version, 7);
+            assert_eq!(request.version, 8);
             assert!(matches!(request.method, RpcMethod::SystemStatus));
             let mut response = RpcResponse::error(
                 Some(request.request_id),
                 RpcError::new(RpcErrorCode::UnsupportedVersion, "old daemon"),
             );
-            response.version = 6;
+            response.version = 7;
             serde_json::to_writer(&mut stream, &response).unwrap();
             stream.write_all(b"\n").unwrap();
         });
@@ -1089,6 +1121,25 @@ mod tests {
                 "public schema leaked {forbidden}"
             );
         }
+    }
+    #[test]
+    fn startup_selector_is_static_strict_and_legacy_by_default() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            PublicApiMode::parse(None).unwrap(),
+            PublicApiMode::LegacyReviewV1
+        );
+        assert_eq!(
+            PublicApiMode::parse(Some(OsStr::new("legacy_review_v1"))).unwrap(),
+            PublicApiMode::LegacyReviewV1
+        );
+        assert_eq!(
+            PublicApiMode::parse(Some(OsStr::new("subagent_v2"))).unwrap(),
+            PublicApiMode::SubagentV2
+        );
+        assert!(PublicApiMode::parse(Some(OsStr::new(""))).is_err());
+        assert!(PublicApiMode::parse(Some(OsStr::new("both"))).is_err());
     }
     #[tokio::test]
     async fn official_sdk_initialization_and_discovery_work_over_stream_transport() {

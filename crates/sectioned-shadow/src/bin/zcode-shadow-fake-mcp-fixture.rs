@@ -1,20 +1,34 @@
-use review_preparation::ReviewManifest;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router, Json, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
-use sectioned_shadow::normalized_manifest_sha256;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ManifestInput {
-    manifest_path: String,
+struct ReviewSpawnInput {
+    review_kind: String,
+    repository: String,
+    base_ref: String,
+    head_ref: String,
+    scope_manifest: Vec<String>,
+    requirements_path: String,
+    report_path: String,
+    feature_id: String,
+    section_id: String,
+    ownership_token: String,
+    idempotency_key: String,
+    read_only: bool,
+    #[serde(default)]
+    attachments: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -35,14 +49,22 @@ struct WaitInput {
 #[serde(deny_unknown_fields)]
 struct ResultInput {
     agent_id: String,
-    preview_bytes: usize,
+    #[serde(default)]
+    attempt_sequence: Option<u64>,
+    #[serde(default)]
+    artifact_id: Option<String>,
+    #[serde(default)]
+    offset_bytes: Option<u64>,
+    #[serde(default)]
+    limit_bytes: Option<usize>,
 }
 
 #[derive(Clone)]
 struct FixtureState {
     agent_id: String,
-    manifest: ReviewManifest,
-    manifest_sha256: String,
+    review_kind: String,
+    base_ref: String,
+    head_ref: String,
     report: Arc<Vec<u8>>,
 }
 
@@ -68,9 +90,9 @@ impl FixtureMcp {
             .lock()
             .map_err(|_| "fixture state unavailable".to_owned())?
             .clone()
-            .ok_or_else(|| "fixture has no submitted job".to_owned())?;
+            .ok_or_else(|| "fixture has no submitted task".to_owned())?;
         if state.agent_id != agent_id {
-            return Err("fixture job not found".into());
+            return Err("fixture task not found".into());
         }
         Ok(state)
     }
@@ -89,59 +111,72 @@ impl FixtureMcp {
     #[tool(name = "zcode_review_spawn", description = "fixture submit")]
     async fn spawn_tool(
         &self,
-        Parameters(input): Parameters<ManifestInput>,
+        Parameters(input): Parameters<ReviewSpawnInput>,
     ) -> Result<Json<Value>, String> {
-        let bytes = fs::read(&input.manifest_path).map_err(|error| error.to_string())?;
-        let manifest = ReviewManifest::from_json(&bytes).map_err(|error| error.to_string())?;
-        let manifest_sha256 =
-            normalized_manifest_sha256(&manifest).map_err(|error| error.to_string())?;
-        let agent_id = format!(
-            "fixture-{}-{}",
-            manifest.review_kind.as_str(),
-            manifest.section_id
+        if !input.read_only || input.scope_manifest.is_empty() {
+            return Err("fixture requires bounded read-only scope".into());
+        }
+        let manifest_sha256 = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&json!({
+                    "repository":input.repository,
+                    "requirements_path":input.requirements_path,
+                    "report_path":input.report_path,
+                    "feature_id":input.feature_id,
+                    "section_id":input.section_id,
+                    "ownership_token":input.ownership_token,
+                    "idempotency_key":input.idempotency_key,
+                    "attachments":input.attachments,
+                    "model":input.model
+                }))
+                .map_err(|error| error.to_string())?,
+            )
         );
+        let agent_id = format!("fixture-{}", input.review_kind);
         let report = Arc::new(
             format!(
-                "# ZCode Review Report\n\nFixture {} shadow evidence.\n",
-                manifest.review_kind.as_str()
+                "# ZCode Review Report\n\nREVIEW_KIND: {}\nFINALIZED: true\n\nFixture shadow evidence.\n",
+                input.review_kind
             )
             .into_bytes(),
         );
-        let report_path = if manifest.report_target.is_absolute() {
-            manifest.report_target.clone()
-        } else {
-            manifest.repository.join(&manifest.report_target)
+        let state = FixtureState {
+            agent_id: agent_id.clone(),
+            review_kind: input.review_kind,
+            base_ref: input.base_ref,
+            head_ref: input.head_ref,
+            report,
         };
-        fs::create_dir_all(
-            report_path
-                .parent()
-                .ok_or_else(|| "fixture report has no parent".to_owned())?,
-        )
-        .map_err(|error| error.to_string())?;
-        fs::write(&report_path, report.as_slice()).map_err(|error| error.to_string())?;
         *self
             .state
             .lock()
-            .map_err(|_| "fixture state unavailable".to_owned())? = Some(FixtureState {
-            agent_id: agent_id.clone(),
-            manifest,
-            manifest_sha256,
-            report,
-        });
+            .map_err(|_| "fixture state unavailable".to_owned())? = Some(state.clone());
         self.status_calls
             .store(0, std::sync::atomic::Ordering::Release);
         Ok(Json(json!({
             "agent_id":agent_id,
+            "review_id":"fixture-review",
             "submission_disposition":"created",
-            "state":"QUEUED",
-            "last_event_sequence":0,
-            "prompt_sha256":"fixture-prompt",
-            "capabilities":{}
+            "phase":"QUEUED",
+            "attempt_sequence":1,
+            "effective_budget":budget(),
+            "counts_as_independent":true,
+            "provenance":{
+                "review_kind":state.review_kind,
+                "manifest_sha256":manifest_sha256,
+                "prepared_sha256":"fixture-prepared",
+                "prompt_sha256":"fixture-prompt",
+                "base_sha":state.base_ref,
+                "head_sha":state.head_ref,
+                "requested_model":Value::Null,
+                "fresh_session_observed":true
+            }
         })))
     }
 
-    #[tool(name = "zcode_review_status", description = "fixture status")]
-    async fn status_tool(
+    #[tool(name = "zcode_agent_get", description = "fixture get")]
+    async fn get_tool(
         &self,
         Parameters(input): Parameters<AgentInput>,
     ) -> Result<Json<Value>, String> {
@@ -149,13 +184,16 @@ impl FixtureMcp {
         let calls = self
             .status_calls
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let terminal = calls > 0;
         Ok(Json(json!({
-            "job":job(&state, if calls == 0 { "RUNNING" } else { "COMPLETED" }),
+            "task":task(&state, if terminal { "TERMINAL" } else { "ACTIVE" }, false),
+            "result":if terminal { result() } else { Value::Null },
+            "artifacts":if terminal { artifacts(&state) } else { Vec::<Value>::new() },
             "pending_requests":[]
         })))
     }
 
-    #[tool(name = "zcode_review_wait", description = "fixture wait")]
+    #[tool(name = "zcode_agent_wait", description = "fixture wait")]
     async fn wait_tool(
         &self,
         Parameters(input): Parameters<WaitInput>,
@@ -165,77 +203,106 @@ impl FixtureMcp {
             return Err("timeout must be bounded".into());
         }
         Ok(Json(json!({
-            "job":job(&state,"RUNNING"),
-            "events":[{
-                "sequence":input.after_sequence + 1,
-                "event_type":"report.checkpoint",
-                "redaction_level":"allowlisted"
-            }],
+            "task":task(&state,"ACTIVE",false),
+            "events":[{"sequence":input.after_sequence + 1,"attempt_sequence":1,"event_type":"report.checkpoint","redaction_level":"allowlisted","pending_request_id":Value::Null}],
+            "next_sequence":input.after_sequence + 1,
+            "has_more":false,
             "timed_out":false
         })))
     }
 
-    #[tool(name = "zcode_review_result", description = "fixture result")]
+    #[tool(name = "zcode_agent_result", description = "fixture result")]
     async fn result_tool(
         &self,
         Parameters(input): Parameters<ResultInput>,
     ) -> Result<Json<Value>, String> {
         let state = self.state(&input.agent_id)?;
-        let hash = format!("{:x}", Sha256::digest(state.report.as_slice()));
-        let preview =
-            String::from_utf8_lossy(&state.report[..state.report.len().min(input.preview_bytes)]);
-        Ok(Json(json!({
-            "job":job(&state,"COMPLETED"),
-            "report":{
-                "finalized":true,
-                "integrity":"valid",
-                "expected_sha256":hash,
-                "observed_sha256":hash,
-                "expected_bytes":state.report.len(),
-                "observed_bytes":state.report.len(),
-                "checkpoint_number":1,
-                "preview":preview
+        let chunk = match (input.artifact_id, input.offset_bytes, input.limit_bytes) {
+            (None, None, None) => Value::Null,
+            (Some(artifact_id), Some(offset), Some(limit)) => {
+                if input.attempt_sequence != Some(1)
+                    || artifact_id != "fixture-report"
+                    || limit == 0
+                {
+                    return Err("fixture artifact selector is invalid".into());
+                }
+                let start = usize::try_from(offset).map_err(|_| "offset overflow")?;
+                let end = start.saturating_add(limit).min(state.report.len());
+                let bytes = state.report.get(start..end).ok_or("offset out of range")?;
+                json!({
+                    "artifact_id":"fixture-report",
+                    "offset_bytes":offset,
+                    "returned_bytes":bytes.len(),
+                    "eof":end == state.report.len(),
+                    "sha256":format!("{:x}",Sha256::digest(state.report.as_slice())),
+                    "size_bytes":state.report.len(),
+                    "bytes_base64":BASE64.encode(bytes)
+                })
             }
+            _ => return Err("fixture artifact selector is incomplete".into()),
+        };
+        Ok(Json(json!({
+            "task":task(&state,"TERMINAL",false),
+            "result":result(),
+            "artifacts":artifacts(&state),
+            "artifact_chunk":chunk
         })))
     }
 
-    #[tool(name = "zcode_review_close", description = "fixture close")]
+    #[tool(name = "zcode_agent_close", description = "fixture close")]
     async fn close_tool(
         &self,
         Parameters(input): Parameters<AgentInput>,
     ) -> Result<Json<Value>, String> {
-        self.state(&input.agent_id)?;
-        Ok(Json(json!({
-            "agent_id":input.agent_id,
-            "state":"COMPLETED",
-            "resources_reaped":true
-        })))
+        let state = self.state(&input.agent_id)?;
+        Ok(Json(json!({"task":task(&state,"TERMINAL",true)})))
     }
 }
 
-fn job(state: &FixtureState, job_state: &str) -> Value {
+fn budget() -> Value {
+    json!({"wall_time_ms":5000,"max_turns":8,"max_tool_calls":32,"max_context_bytes":1048576,"max_result_bytes":262144,"max_artifact_bytes":2097152})
+}
+
+fn task(state: &FixtureState, phase: &str, reaped: bool) -> Value {
     json!({
         "agent_id":state.agent_id,
-        "state":job_state,
-        "turn_state":"IDLE",
-        "review_kind":state.manifest.review_kind.as_str(),
-        "feature_id":state.manifest.feature_id,
-        "section_id":state.manifest.section_id,
-        "round_kind":state.manifest.round_kind.as_str(),
-        "created_at_ms":1,
-        "last_event_sequence":1,
-        "zcode_session_id":format!("fixture-session-{}",state.agent_id),
+        "review_id":"fixture-review",
+        "task_kind":"review",
+        "phase":phase,
+        "attempt_sequence":1,
+        "effective_budget":budget(),
+        "counts_as_independent":true,
         "fresh_session_observed":true,
-        "failure_code":Value::Null,
-        "manifest_sha256":state.manifest_sha256,
-        "prepared_sha256":"fixture-prepared",
-        "prompt_sha256":"fixture-prompt",
-        "base_sha":state.manifest.base_ref,
-        "head_sha":state.manifest.head_ref,
-        "requested_model":state.manifest.model,
-        "resources_reaped":false,
-        "capabilities":{}
+        "cancel_requested":false,
+        "close_requested":reaped,
+        "closed":reaped,
+        "resources_reaped":reaped
     })
+}
+
+fn result() -> Value {
+    json!({
+        "outcome":"SUCCEEDED",
+        "summary":"fixture completed",
+        "partial":false,
+        "retained":false,
+        "base_commit":Value::Null,
+        "head_commit":Value::Null,
+        "changed_files":[],
+        "diff_stat":Value::Null,
+        "checks":[],
+        "residual_gaps":[],
+        "result_sha256":"fixture-result"
+    })
+}
+
+fn artifacts(state: &FixtureState) -> Vec<Value> {
+    vec![json!({
+        "artifact_id":"fixture-report",
+        "kind":"report_markdown",
+        "sha256":format!("{:x}",Sha256::digest(state.report.as_slice())),
+        "size_bytes":state.report.len()
+    })]
 }
 
 #[tokio::main]

@@ -6,7 +6,7 @@ use review_ledger::{ArtifactIntegrity, LedgerManager};
 use review_preparation::{
     BudgetLimits, CompletionOutcome, GeneralCompletion, GeneralCompletionSubmission,
     GeneralFinalizer, PreparedGeneralTask, PreparedLaunchSpec, ReviewKind, ReviewManifest,
-    ReviewPreparer, RoundKind, WorktreeManager,
+    ReviewPreparer, RoundKind, ValidationCommand, WorktreeManager,
 };
 use review_store::{
     resolve_effective_budget, BudgetRequest, EffectiveBudget, Job, NewJob, NewTask, StoreError,
@@ -56,7 +56,11 @@ pub struct StructuredReviewSubmission {
     pub manifest: ReviewManifest,
     pub ownership_token: String,
     pub read_only: bool,
-    #[serde(default, deserialize_with = "deserialize_optional_budget")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_budget"
+    )]
     pub budget: Option<BudgetLimits>,
 }
 
@@ -69,7 +73,30 @@ pub struct StructuredReviewContinuation {
     pub manifest: ReviewManifest,
     pub frozen_finding_ids: Vec<String>,
     pub read_only: bool,
-    #[serde(default, deserialize_with = "deserialize_optional_budget")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_budget"
+    )]
+    pub budget: Option<BudgetLimits>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MinimalStructuredReviewContinuation {
+    pub agent_id: String,
+    pub review_id: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub frozen_finding_ids: Vec<String>,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub attachments: Vec<PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_budget"
+    )]
     pub budget: Option<BudgetLimits>,
 }
 
@@ -198,6 +225,184 @@ impl ReviewJobOrchestrator {
         input: &StructuredReviewContinuation,
     ) -> Result<StructuredReviewProjection, OrchestrationError> {
         self.submit_continuation_mode(input, false)
+    }
+
+    pub fn submit_minimal_structured_continuation(
+        &self,
+        input: &MinimalStructuredReviewContinuation,
+    ) -> Result<StructuredReviewProjection, OrchestrationError> {
+        validate_identifier(&input.agent_id, "agent_id")?;
+        validate_identifier(&input.review_id, "review_id")?;
+        validate_identifier(&input.idempotency_key, "idempotency_key")?;
+        validate_frozen_finding_ids(&input.frozen_finding_ids)?;
+        if input.attachments.len() > 32 {
+            return Err(OrchestrationError::Contract(
+                "too many continuation attachments",
+            ));
+        }
+        let store = self.scheduler.store();
+        let execution_agent_id = derived_id("review-attempt", &input.idempotency_key);
+        let existing_attempt = store
+            .task_by_execution_agent_id(&execution_agent_id)
+            .map_err(OrchestrationError::Store)?;
+        let parent = if let Some(existing) = existing_attempt.as_ref() {
+            if existing.public_agent_id != input.agent_id
+                || existing.review_id.as_deref() != Some(input.review_id.as_str())
+                || existing.task_kind != TaskKind::ReviewContinuation
+            {
+                return Err(OrchestrationError::Conflict(
+                    "continuation idempotency identity is incompatible",
+                ));
+            }
+            let parent_execution_id =
+                existing
+                    .continuation_of
+                    .as_deref()
+                    .ok_or(OrchestrationError::Conflict(
+                        "continuation parent identity is missing",
+                    ))?;
+            store
+                .task_by_execution_agent_id(parent_execution_id)
+                .map_err(OrchestrationError::Store)?
+                .ok_or(OrchestrationError::Conflict(
+                    "continuation parent was not found",
+                ))?
+        } else {
+            store
+                .get_task(&input.agent_id)
+                .map_err(OrchestrationError::Store)?
+                .ok_or(OrchestrationError::Conflict(
+                    "continuation parent was not found",
+                ))?
+        };
+        if parent.public_agent_id != input.agent_id
+            || parent.review_id.as_deref() != Some(input.review_id.as_str())
+            || !matches!(
+                parent.task_kind,
+                TaskKind::Review | TaskKind::ReviewContinuation
+            )
+        {
+            return Err(OrchestrationError::Conflict(
+                "continuation identity is incompatible",
+            ));
+        }
+        let parent_job = store
+            .get_job(&parent.execution_agent_id)
+            .map_err(OrchestrationError::Store)?
+            .ok_or(OrchestrationError::Conflict(
+                "continuation parent job is missing",
+            ))?;
+        let prepared = prepared_from_job(&parent_job)?;
+        let review_kind = match prepared.round_kind {
+            RoundKind::PlanReview => StructuredReviewKind::PlanReview,
+            RoundKind::InitialBounded | RoundKind::RepairDelta | RoundKind::FinalBounded => {
+                StructuredReviewKind::RepairDelta
+            }
+        };
+        let plan_path = prepared
+            .plan
+            .source_path
+            .strip_prefix(&prepared.repository)
+            .map(PathBuf::from)
+            .map_err(|_| {
+                OrchestrationError::Conflict("continuation parent plan ownership is invalid")
+            })?;
+        let mut context_paths = prepared
+            .context
+            .iter()
+            .map(|artifact| {
+                artifact
+                    .source_path
+                    .strip_prefix(&prepared.repository)
+                    .map(PathBuf::from)
+                    .map_err(|_| {
+                        OrchestrationError::Conflict(
+                            "continuation parent context ownership is invalid",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for attachment in &input.attachments {
+            if !context_paths.contains(attachment) && attachment != &plan_path {
+                context_paths.push(attachment.clone());
+            }
+        }
+        let validation_commands = prepared
+            .validation_commands
+            .iter()
+            .map(|(id, command)| {
+                let cwd = command
+                    .cwd
+                    .strip_prefix(&prepared.worktree.path)
+                    .map(PathBuf::from)
+                    .map_err(|_| {
+                        OrchestrationError::Conflict(
+                            "continuation validation command escaped parent worktree",
+                        )
+                    })?;
+                Ok((
+                    id.clone(),
+                    ValidationCommand {
+                        program: command.program.clone(),
+                        args: command.args.clone(),
+                        cwd,
+                        timeout_ms: command.timeout_ms,
+                        max_output_bytes: command.max_output_bytes,
+                    },
+                ))
+            })
+            .collect::<Result<_, OrchestrationError>>()?;
+        let job_root = prepared.worktree.scratch_worktrees_root.parent().ok_or(
+            OrchestrationError::Conflict("continuation parent scratch ownership is invalid"),
+        )?;
+        let scratch_root = job_root
+            .parent()
+            .ok_or(OrchestrationError::Conflict(
+                "continuation parent scratch ownership is invalid",
+            ))?
+            .to_path_buf();
+        let report_target =
+            continuation_report_target(&prepared.report_target, &input.idempotency_key)?;
+        let manifest = ReviewManifest {
+            schema: prepared.schema.clone(),
+            review_kind: prepared.review_kind,
+            feature_id: prepared.feature_id.clone(),
+            section_id: prepared.section_id.clone(),
+            round_kind: match review_kind {
+                StructuredReviewKind::PlanReview => RoundKind::PlanReview,
+                StructuredReviewKind::RepairDelta => RoundKind::RepairDelta,
+                StructuredReviewKind::InitialBounded => RoundKind::InitialBounded,
+                StructuredReviewKind::FinalBounded => RoundKind::FinalBounded,
+            },
+            repository: prepared.repository.clone(),
+            base_ref: input.base_ref.clone(),
+            head_ref: input.head_ref.clone(),
+            plan_path,
+            context_paths,
+            scope_paths: prepared
+                .scope
+                .iter()
+                .map(|scope| scope.repository_relative.clone())
+                .collect(),
+            forbidden_input_globs: prepared.forbidden_input_globs.clone(),
+            validation_commands,
+            report_target,
+            scratch_root,
+            model: prepared.model.clone(),
+            fresh_session: true,
+            network_policy: prepared.network_policy,
+            scratch_policy: prepared.scratch_policy,
+            idempotency_key: input.idempotency_key.clone(),
+        };
+        self.submit_structured_continuation(&StructuredReviewContinuation {
+            agent_id: input.agent_id.clone(),
+            review_id: input.review_id.clone(),
+            review_kind,
+            manifest,
+            frozen_finding_ids: input.frozen_finding_ids.clone(),
+            read_only: true,
+            budget: input.budget.clone(),
+        })
     }
 
     pub fn spawn_structured_continuation(
@@ -959,6 +1164,24 @@ fn derived_id(domain: &str, idempotency_key: &str) -> String {
     let digest =
         Sha256::digest(format!("structured-review/v1|{domain}|{idempotency_key}").as_bytes());
     format!("{domain}-{digest:x}")
+}
+
+fn continuation_report_target(
+    parent: &Path,
+    idempotency_key: &str,
+) -> Result<PathBuf, OrchestrationError> {
+    let directory = parent.parent().ok_or(OrchestrationError::Conflict(
+        "continuation parent report target is invalid",
+    ))?;
+    let stem =
+        parent
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or(OrchestrationError::Conflict(
+                "continuation parent report target is invalid",
+            ))?;
+    let digest = format!("{:x}", Sha256::digest(idempotency_key.as_bytes()));
+    Ok(directory.join(format!("{stem}-continuation-{}.md", &digest[..16])))
 }
 
 fn manifest_sha256(manifest: &ReviewManifest) -> Result<String, OrchestrationError> {

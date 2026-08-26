@@ -22,11 +22,19 @@ use zcode_reviewd::{
 };
 
 fn discover(protocol_version: &str) -> Vec<Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"))
-        .env(
-            "ZCODE_REVIEWD_SOCKET",
-            "/tmp/zcode-review-mcp-test-unused.sock",
-        )
+    discover_mode(protocol_version, None)
+}
+
+fn discover_mode(protocol_version: &str, mode: Option<&str>) -> Vec<Value> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"));
+    command.env(
+        "ZCODE_REVIEWD_SOCKET",
+        "/tmp/zcode-review-mcp-test-unused.sock",
+    );
+    if let Some(mode) = mode {
+        command.env("ZCODE_PUBLIC_API_MODE", mode);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -69,8 +77,16 @@ struct FacadeProcess {
 
 impl FacadeProcess {
     fn start(socket: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"))
-            .env("ZCODE_REVIEWD_SOCKET", socket)
+        Self::start_mode(socket, None)
+    }
+
+    fn start_mode(socket: &Path, mode: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"));
+        command.env("ZCODE_REVIEWD_SOCKET", socket);
+        if let Some(mode) = mode {
+            command.env("ZCODE_PUBLIC_API_MODE", mode);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -116,6 +132,15 @@ impl FacadeProcess {
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         let response = self.request("tools/call", json!({"name":name,"arguments":arguments}));
         assert!(response.get("error").is_none(), "{response}");
+        assert!(
+            response["result"]["content"]
+                .as_array()
+                .is_some_and(|content| content.iter().any(|item| {
+                    item["type"] == "text"
+                        && item["text"].as_str().is_some_and(|text| !text.is_empty())
+                })),
+            "missing text fallback: {response}"
+        );
         let structured = response["result"]["structuredContent"].clone();
         assert!(
             !structured.is_null(),
@@ -465,6 +490,133 @@ fn stdio_is_clean_and_modern_and_legacy_clients_discover_exact_tools() {
             ]
         ));
     }
+}
+
+#[test]
+fn v2_stdio_discovers_only_the_exact_static_catalog() {
+    let frames = discover_mode("2026-07-28", Some("subagent_v2"));
+    let tools = frames[1]["result"]["tools"].as_array().unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, zcode_review_mcp::V2_PUBLIC_TOOLS);
+    assert_eq!(tools.len(), 14);
+    assert!(tools.iter().all(|tool| {
+        tool["inputSchema"]["additionalProperties"] == false
+            && tool["outputSchema"]["additionalProperties"] == false
+            && tool["annotations"]["openWorldHint"] == false
+    }));
+    assert!(!names.contains(&"zcode_review_status"));
+    assert!(!names.contains(&"zcode_review_list"));
+}
+
+#[test]
+fn invalid_or_empty_catalog_selector_fails_before_stdio_startup() {
+    for selector in ["", "legacy_review_v1,subagent_v2", "unknown"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"))
+            .env(
+                "ZCODE_REVIEWD_SOCKET",
+                "/tmp/zcode-review-mcp-test-unused.sock",
+            )
+            .env("ZCODE_PUBLIC_API_MODE", selector)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "selector {selector:?} was accepted"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("ZCODE_PUBLIC_API_MODE"), "{stderr}");
+        assert!(!stderr.contains("/tmp/zcode-review-mcp-test-unused.sock"));
+    }
+}
+
+#[test]
+fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
+        bootstrap_entered: Arc::new(Barrier::new(2)),
+        bootstrap_release: Arc::new(Barrier::new(2)),
+    });
+    let scheduler = Scheduler::new(
+        "s05-v2-general",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc/review.sock");
+    let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let manifest_path = manifest_fixture(directory.path());
+    let manifest: ReviewManifest =
+        serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+
+    let mut first = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let readiness = first.tool("zcode_system_ensure_ready", json!({"timeout_ms":10}));
+    assert_eq!(readiness["ready"], false);
+    let spawn_input = json!({
+        "repository":manifest.repository,
+        "base_ref":manifest.base_ref,
+        "profile":"analysis_readonly",
+        "prompt":"inspect the repository without modifying it",
+        "feature_id":"s05-v2-process",
+        "ownership_token":"s05-v2-owner",
+        "idempotency_key":"s05-v2-general-process",
+        "write_manifest":[],
+        "repo_context":["src/lib.rs"],
+        "attachments":[],
+        "retain_partial":false
+    });
+    serde_json::from_value::<zcode_review_mcp::v2::AgentSpawnInput>(spawn_input.clone()).unwrap();
+    let spawned = first.tool("zcode_agent_spawn", spawn_input);
+    let agent_id = spawned["agent_id"].as_str().unwrap().to_owned();
+    assert_eq!(spawned["submission_disposition"], "created");
+    assert_eq!(spawned["attempt_sequence"], 1);
+    assert_eq!(spawned["phase"], "QUEUED");
+    drop(first);
+
+    let mut restarted = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let task = restarted.tool("zcode_agent_get", json!({"agent_id":agent_id}));
+    assert_eq!(task["task"]["agent_id"], agent_id);
+    assert_eq!(task["task"]["attempt_sequence"], 1);
+    assert!(task["pending_requests"].as_array().unwrap().is_empty());
+    let listed = restarted.tool(
+        "zcode_agent_list",
+        json!({"feature_id":"s05-v2-process","limit":10}),
+    );
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["tasks"][0]["agent_id"], agent_id);
+    let events = restarted.tool(
+        "zcode_agent_events",
+        json!({"agent_id":agent_id,"after_sequence":0,"limit":100}),
+    );
+    let next_sequence = events["next_sequence"].as_u64().unwrap();
+    let waited = restarted.tool(
+        "zcode_agent_wait",
+        json!({"agent_id":agent_id,"after_sequence":next_sequence,"timeout_ms":10}),
+    );
+    assert_eq!(waited["timed_out"], true);
+    assert!(waited["next_sequence"].as_u64().unwrap() >= next_sequence);
+    let public = serde_json::to_string(&(task, listed, events, waited)).unwrap();
+    for forbidden in [
+        directory.path().to_string_lossy().as_ref(),
+        "s05-v2-owner",
+        "inspect the repository",
+        "workspace_path",
+        "runtime_agent_id",
+        "correlation_id",
+    ] {
+        assert!(!public.contains(forbidden), "leaked {forbidden}: {public}");
+    }
+    let cancelled = restarted.tool("zcode_agent_cancel", json!({"agent_id":agent_id}));
+    assert_eq!(cancelled["task"]["phase"], "TERMINAL");
+    assert_eq!(cancelled["task"]["cancel_requested"], true);
+    let closed = restarted.tool("zcode_agent_close", json!({"agent_id":agent_id}));
+    assert_eq!(closed["task"]["closed"], true);
+    assert_eq!(closed["task"]["resources_reaped"], true);
 }
 
 #[test]

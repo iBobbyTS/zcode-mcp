@@ -1,0 +1,22 @@
+{
+  "name": "zcode-subagent-mcp-v2",
+  "version": "0.1.0",
+  "description": "Local bounded ZCode subagent and structured-review MCP facade",
+  "author": {
+    "name": "zcode-mcp maintainers"
+  },
+  "interface": {
+    "displayName": "ZCode Subagent MCP V2",
+    "shortDescription": "Run bounded local subagents and structured reviews.",
+    "longDescription": "Connects Codex to the local stateless V2 facade while the separately managed zcode-reviewd daemon owns durable task lifecycle state.",
+    "developerName": "zcode-mcp maintainers",
+    "category": "Productivity",
+    "capabilities": ["Local MCP", "Durable tasks", "Structured reviews"],
+    "defaultPrompt": [
+      "Check ZCode subagent readiness.",
+      "Run a bounded repository analysis task.",
+      "Start a structured section review."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
