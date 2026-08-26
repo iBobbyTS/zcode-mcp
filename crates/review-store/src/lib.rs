@@ -1843,6 +1843,21 @@ impl Store {
         for (agent_id, state, epoch) in rows {
             let old = JobState::parse(&state)?;
             let (next, code) = (JobState::FailedRuntimeLost, "DAEMON_RESTART_RUNTIME_LOST");
+            let restart_result = TaskResult {
+                outcome: TaskOutcome::RuntimeLost,
+                summary: "daemon restarted; live session reconnect is unsupported".into(),
+                partial: true,
+                base_commit: None,
+                head_commit: None,
+                changed_files: Vec::new(),
+                diff_stat: None,
+                checks: Vec::new(),
+                residual_gaps: vec!["DAEMON_RESTARTED".into()],
+                artifacts: Vec::new(),
+            };
+            let result_json = serde_json::to_vec(&restart_result)
+                .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            let result_sha256 = format!("{:x}", sha2::Sha256::digest(&result_json));
             transaction.execute(
                 "UPDATE agents SET state = ?1, completed_at = COALESCE(completed_at, ?2),
                      failure_code = ?3, failure_message = ?4
@@ -1855,6 +1870,33 @@ impl Store {
                     agent_id,
                     old.as_str(),
                 ],
+            )?;
+            transaction.execute(
+                "INSERT INTO task_results (
+                    execution_agent_id,outcome,summary,partial,retained,base_commit,
+                    head_commit,changed_files_json,diff_stat,checks_json,result_sha256,
+                    residual_gaps_json,artifacts_json,completed_at
+                 )
+                 SELECT ?1,'RUNTIME_LOST',?2,1,0,NULL,NULL,'[]',NULL,'[]',?3,?4,'[]',?5
+                 WHERE EXISTS (
+                    SELECT 1 FROM task_attempts
+                    WHERE execution_agent_id=?1
+                      AND phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
+                 )",
+                params![
+                    agent_id,
+                    restart_result.summary,
+                    result_sha256,
+                    serde_json::to_string(&restart_result.residual_gaps)
+                        .map_err(|error| StoreError::InvalidState(error.to_string()))?,
+                    now_millis(),
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE task_attempts SET phase='TERMINAL'
+                 WHERE execution_agent_id=?1
+                   AND phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')",
+                [&agent_id],
             )?;
             settle_terminal_commands(&transaction, &agent_id, "DAEMON_RESTART_RUNTIME_LOST")?;
             insert_ledger(
@@ -4572,6 +4614,75 @@ mod tests {
             reopened.reap_job("queued").unwrap(),
             JobState::FailedRuntimeLost
         );
+    }
+
+    #[test]
+    fn startup_reconciliation_atomically_terminalizes_v2_attempts_and_preserves_legacy_rows() {
+        let (_directory, _path, store) = file_store();
+        let general = general_task("restart-general", "public-general", "restart-general-key");
+        store.enqueue_task(&general).unwrap();
+        let mut review = general_task("restart-review", "public-review", "restart-review-key");
+        review.task_kind = TaskKind::Review;
+        review.review_id = Some("review-restart".into());
+        review.job.review_kind = Some("initial".into());
+        store.enqueue_task(&review).unwrap();
+        store
+            .enqueue_job(&NewJob::new("restart-legacy", "/legacy-workspace"))
+            .unwrap();
+
+        let general_claim = store.claim_next("daemon-old", 8, 8).unwrap().unwrap();
+        assert_eq!(general_claim.job.agent_id, "restart-general");
+        store
+            .mark_running(
+                "restart-general",
+                general_claim.owner_epoch,
+                "runtime-general",
+                None,
+            )
+            .unwrap();
+        let review_claim = store.claim_next("daemon-old", 8, 8).unwrap().unwrap();
+        assert_eq!(review_claim.job.agent_id, "restart-review");
+        let legacy_claim = store.claim_next("daemon-old", 8, 8).unwrap().unwrap();
+        assert_eq!(legacy_claim.job.agent_id, "restart-legacy");
+
+        let reconciled = store.reconcile_startup().unwrap();
+        assert_eq!(reconciled.len(), 3);
+        for execution_id in ["restart-general", "restart-review"] {
+            let job = store.get_job(execution_id).unwrap().unwrap();
+            assert_eq!(job.state, JobState::FailedRuntimeLost);
+            assert_eq!(
+                job.failure_code.as_deref(),
+                Some("DAEMON_RESTART_RUNTIME_LOST")
+            );
+            let task = store
+                .get_task_scoped(
+                    if execution_id == "restart-general" {
+                        "public-general"
+                    } else {
+                        "public-review"
+                    },
+                    TaskQueryScope {
+                        repository: Some("repo"),
+                        feature_id: None,
+                        ownership_token: None,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.phase, TaskPhase::Terminal);
+            let result = store.task_result(execution_id).unwrap().unwrap();
+            assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+            assert_eq!(result.result.residual_gaps, vec!["DAEMON_RESTARTED"]);
+            assert!(!result.retained);
+        }
+
+        let legacy = store.get_job("restart-legacy").unwrap().unwrap();
+        assert_eq!(legacy.state, JobState::FailedRuntimeLost);
+        assert_eq!(
+            legacy.failure_code.as_deref(),
+            Some("DAEMON_RESTART_RUNTIME_LOST")
+        );
+        assert!(store.task_result("restart-legacy").unwrap().is_none());
     }
 
     #[test]

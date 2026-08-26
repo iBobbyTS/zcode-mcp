@@ -4,7 +4,10 @@ use crate::{
     RuntimeEvent, RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady,
     TurnBoundary, TurnSnapshot,
 };
-use review_store::{Job, LifecycleWrite, MessageState, NewArtifact, PendingRequestState};
+use review_store::{
+    BudgetRequest, Job, LifecycleWrite, MessageState, NewArtifact, NewTask, PendingRequestState,
+    TaskKind,
+};
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
@@ -303,6 +306,148 @@ fn error(response: RpcResponse) -> RpcError {
     }
 }
 
+#[test]
+fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
+    let fixture = fixture();
+    let first = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
+        RpcSuccess::SystemStatus { status } => status,
+        other => panic!("unexpected status result: {other:?}"),
+    };
+    let repeated = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
+        RpcSuccess::SystemStatus { status } => status,
+        other => panic!("unexpected status result: {other:?}"),
+    };
+    assert_eq!(first.service_generation, repeated.service_generation);
+    assert_eq!(first.service_generation.len(), 32);
+    assert!(first
+        .service_generation
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first.api_surface, "subagent_v2");
+    assert_eq!(first.protocol_version, RPC_VERSION);
+    assert_eq!(
+        first.components.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "daemon",
+            "driver",
+            "facade",
+            "model_auth",
+            "runtime",
+            "scheduler",
+            "store"
+        ]
+    );
+    assert_eq!(first.capabilities.max_rpc_frame_bytes, MAX_FRAME_BYTES);
+    assert_eq!(first.capabilities.max_wait_ms, MAX_WAIT.as_millis() as u64);
+
+    let replacement =
+        RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
+    let replacement = match replacement.dispatch(RpcMethod::SystemStatus).unwrap() {
+        RpcSuccess::SystemStatus { status } => status,
+        other => panic!("unexpected status result: {other:?}"),
+    };
+    assert_ne!(first.service_generation, replacement.service_generation);
+
+    let oversized = fixture
+        .service
+        .handle_bytes(&vec![b' '; MAX_FRAME_BYTES + 1]);
+    assert_eq!(error(oversized).code, RpcErrorCode::Oversized);
+    let unknown_outer = fixture.service.handle_bytes(
+        format!(
+            "{{\"version\":{RPC_VERSION},\"request_id\":\"strict\",\"method\":\"system_status\",\"extra\":true}}"
+        )
+        .as_bytes(),
+    );
+    assert_eq!(error(unknown_outer).code, RpcErrorCode::Validation);
+}
+
+#[test]
+fn legacy_rpc_cannot_observe_or_control_v2_task_rows() {
+    let fixture = fixture();
+    fixture
+        .store
+        .enqueue_task(&NewTask {
+            job: NewJob::new("v2-general", "/workspace"),
+            public_agent_id: "v2-general".into(),
+            task_kind: TaskKind::General,
+            review_id: None,
+            continuation_of: None,
+            repository: "/repository".into(),
+            feature_id: "feature".into(),
+            ownership_token: "owner-group".into(),
+            budget: BudgetRequest::Omitted,
+            retain_partial: false,
+        })
+        .unwrap();
+
+    for method in [
+        RpcMethod::Status {
+            agent_id: "v2-general".into(),
+        },
+        RpcMethod::Pending {
+            agent_id: "v2-general".into(),
+        },
+        RpcMethod::Events(EventQuery {
+            agent_id: "v2-general".into(),
+            runtime_agent_id: None,
+            after: 0,
+            limit: 1,
+        }),
+        RpcMethod::Wait(WaitQuery {
+            agent_id: "v2-general".into(),
+            runtime_agent_id: None,
+            after: 0,
+            timeout_ms: 1,
+        }),
+        RpcMethod::Message(MessageInput {
+            agent_id: "v2-general".into(),
+            message_id: "message-1".into(),
+            mode: "queue".into(),
+            content: "continue".into(),
+        }),
+        RpcMethod::Respond(RespondInput {
+            agent_id: "v2-general".into(),
+            request_id: "request-1".into(),
+            decision: ResponseDecision::Deny,
+            content: None,
+        }),
+        RpcMethod::Stop {
+            agent_id: "v2-general".into(),
+        },
+        RpcMethod::Result(ResultQuery {
+            agent_id: "v2-general".into(),
+            preview_bytes: 0,
+        }),
+        RpcMethod::Close {
+            agent_id: "v2-general".into(),
+        },
+        RpcMethod::Reap {
+            agent_id: "v2-general".into(),
+        },
+        RpcMethod::ReviewTool(ReviewToolInput {
+            agent_id: "v2-general".into(),
+            tool: "review_checkpoint".into(),
+            arguments: serde_json::json!({}),
+        }),
+    ] {
+        assert_eq!(
+            fixture.service.dispatch(method).unwrap_err().code,
+            RpcErrorCode::NotFound
+        );
+    }
+    match fixture
+        .service
+        .dispatch(RpcMethod::List {
+            scope: JobListScopeView::Recent,
+            limit: 10,
+        })
+        .unwrap()
+    {
+        RpcSuccess::Listed { jobs } => assert!(jobs.is_empty()),
+        other => panic!("unexpected list result: {other:?}"),
+    }
+}
+
 fn enqueue_request(agent_id: &str, key: &str) -> RpcMethod {
     RpcMethod::Enqueue {
         job: NewJobInput {
@@ -415,6 +560,77 @@ fn raw_call(path: &Path, frame: &[u8]) -> RpcResponse {
 #[test]
 fn typed_protocol_round_trips_every_method_and_outer_error() {
     let methods = vec![
+        RpcMethod::SystemStatus,
+        RpcMethod::SubmitGeneral {
+            input: GeneralSubmitInput {
+                manifest: GeneralTaskManifest {
+                    schema: review_preparation::GENERAL_TASK_SCHEMA.into(),
+                    task_id: "general-1".into(),
+                    repository: "/repository".into(),
+                    base_ref: "a".repeat(40),
+                    profile: GeneralProfile::AnalysisReadonly,
+                    prompt: "analyze".into(),
+                    repo_context: vec!["README.md".into()],
+                    attachments: Vec::new(),
+                    write_manifest: Vec::new(),
+                    scratch_root: ".agent-work/scratch/general-1".into(),
+                    artifact_root: ".agent-work/artifacts/general-1".into(),
+                    budget: Some(GeneralProfile::AnalysisReadonly.default_budget()),
+                    validation_commands: Default::default(),
+                    retain_partial: false,
+                    idempotency_key: "general-1-key".into(),
+                },
+                feature_id: "feature".into(),
+                ownership_token: "owner-group".into(),
+            },
+        },
+        RpcMethod::GeneralComplete(GeneralCompleteInput {
+            agent_id: "general-1".into(),
+            submission: GeneralCompletionSubmission {
+                requested_outcome: review_preparation::CompletionOutcome::Succeeded,
+                summary: "complete".into(),
+                checks: Vec::new(),
+                residual_gaps: Vec::new(),
+                artifact_intents: Vec::new(),
+            },
+        }),
+        RpcMethod::TaskStatus {
+            agent_id: "general-1".into(),
+        },
+        RpcMethod::TaskEvents(TaskEventQuery {
+            agent_id: "general-1".into(),
+            after: 0,
+            limit: 10,
+        }),
+        RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: "general-1".into(),
+            after: 0,
+            timeout_ms: 50,
+        }),
+        RpcMethod::TaskMessage(MessageInput {
+            agent_id: "general-1".into(),
+            message_id: "general-message".into(),
+            mode: "queue".into(),
+            content: "continue".into(),
+        }),
+        RpcMethod::TaskRespond(RespondInput {
+            agent_id: "general-1".into(),
+            request_id: "general-request".into(),
+            decision: ResponseDecision::Deny,
+            content: None,
+        }),
+        RpcMethod::TaskCancel {
+            agent_id: "general-1".into(),
+        },
+        RpcMethod::TaskResult {
+            agent_id: "general-1".into(),
+        },
+        RpcMethod::TaskClose {
+            agent_id: "general-1".into(),
+        },
+        RpcMethod::TaskReap {
+            agent_id: "general-1".into(),
+        },
         RpcMethod::SpawnReview {
             manifest: ReviewManifest {
                 schema: "sectioned-zcode-review/v1".into(),
@@ -539,7 +755,8 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
     assert_eq!(
         error(raw_call(
             &fixture.socket,
-            b"{\"version\":5,\"request_id\":\"m\",\"method\":\"missing\"}\n"
+            format!("{{\"version\":{RPC_VERSION},\"request_id\":\"m\",\"method\":\"missing\"}}\n")
+                .as_bytes()
         ))
         .code,
         RpcErrorCode::UnknownMethod

@@ -14,8 +14,8 @@ use std::{
 #[cfg(debug_assertions)]
 use std::{io::Write, os::unix::net::UnixStream};
 use zcode_reviewd::{
-    ledger_mcp, rpc::ServerOptions, CommandRuntimeFactory, Daemon, InternalLedgerMcpConfig,
-    RuntimeFactory, Scheduler, SchedulerConfig,
+    general_mcp, ledger_mcp, rpc::ServerOptions, CommandRuntimeFactory, Daemon,
+    InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 
 struct Config {
@@ -30,6 +30,9 @@ const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ledger-mcp")) {
         return run_ledger_mcp().map_err(Into::into);
+    }
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--general-mcp")) {
+        return run_general_mcp().map_err(Into::into);
     }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
@@ -220,6 +223,42 @@ fn run_ledger_mcp() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     ledger_mcp::serve(
+        &socket,
+        &agent_id,
+        BufReader::new(stdin.lock()),
+        stdout.lock(),
+    )
+}
+
+fn run_general_mcp() -> io::Result<()> {
+    let mut socket = None;
+    let mut agent_id = None;
+    let mut arguments = env::args_os().skip(2);
+    while let Some(argument) = arguments.next() {
+        let value = arguments.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "general MCP option is missing a value",
+            )
+        })?;
+        match argument.to_string_lossy().as_ref() {
+            "--socket" => socket = Some(PathBuf::from(value)),
+            "--agent-id" => agent_id = Some(value.to_string_lossy().into_owned()),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unknown general MCP option",
+                ))
+            }
+        }
+    }
+    let socket = socket
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--socket is required"))?;
+    let agent_id = agent_id
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--agent-id is required"))?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    general_mcp::serve(
         &socket,
         &agent_id,
         BufReader::new(stdin.lock()),
