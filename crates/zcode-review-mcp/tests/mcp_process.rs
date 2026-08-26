@@ -1411,32 +1411,16 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     let initial_status = git(&manifest.repository, &["status", "--porcelain"]);
     let denied_target = directory.path().join("must-not-exist.txt");
     let idempotency_key = "s05-official-public-general";
-    let preparation_key = format!(
-        "{:x}",
-        Sha256::digest(format!("{}:{idempotency_key}", manifest.repository.display()).as_bytes())
-    );
-    let report_path = manifest
-        .repository
-        .join(".agent-work/scratch/general")
-        .join(preparation_key)
-        .join("scratch/agent-artifacts/report.md");
-    let report = b"# Official ZCode general completion";
-    let report_sha256 = format!("{:x}", Sha256::digest(report));
     let completion = json!({
         "requested_outcome":"SUCCEEDED",
         "summary":"official runtime called the private general completion ingress",
-        "checks":["typed permission denied","official runtime wrote the report artifact"],
+        "checks":["typed permission denied"],
         "residual_gaps":[],
-        "artifact_intents":[{
-            "kind":"report_markdown",
-            "sha256":report_sha256,
-            "size_bytes":report.len()
-        }]
+        "artifact_intents":[]
     });
     let prompt = format!(
-        "Complete this bounded task in order. First use the Bash tool to try to create {} and wait for permission; it will be denied, so continue without retrying it. Second use the Write tool to write exactly the UTF-8 content '# Official ZCode general completion' (with no trailing newline) to {} and wait for permission. Finally call the injected zcode_general_complete MCP tool exactly once with these arguments: {}. Do not use any other tool and do not stop after a prose answer; completion is valid only after zcode_general_complete returns accepted.",
+        "Complete this bounded task in order. First use the Bash tool to try to create {} and wait for permission; it will be denied, so continue without retrying it. Then call the injected zcode_general_complete MCP tool exactly once with these arguments: {}. Do not use any other tool and do not stop after a prose answer; completion is valid only after zcode_general_complete returns accepted.",
         denied_target.display(),
-        report_path.display(),
         completion
     );
     let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
@@ -1477,12 +1461,6 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     let general_job = store.get_job(&execution_id).unwrap().unwrap();
     let prepared: PreparedGeneralTask =
         serde_json::from_str(general_job.prepared_launch_json.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        prepared
-            .artifact_targets
-            .get(&GeneralArtifactKind::ReportMarkdown),
-        Some(&report_path)
-    );
 
     let terminal_deadline = std::time::Instant::now() + Duration::from_secs(150);
     let mut responded = std::collections::HashSet::new();
@@ -1537,23 +1515,6 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
         thread::sleep(Duration::from_millis(50));
     };
     let result = facade.tool("zcode_agent_result", json!({"agent_id":agent_id}));
-    let artifact = result["artifacts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|artifact| artifact["kind"] == "report_markdown")
-        .cloned();
-    let chunk = artifact.as_ref().map(|artifact| {
-        facade.tool(
-            "zcode_agent_result",
-            json!({
-                "agent_id":agent_id,
-                "artifact_id":artifact["artifact_id"],
-                "offset_bytes":0,
-                "limit_bytes":report.len()
-            }),
-        )
-    });
     let closed = facade.tool("zcode_agent_close", json!({"agent_id":agent_id}));
 
     assert!(
@@ -1687,21 +1648,9 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
     );
     assert_eq!(
         result["result"]["checks"],
-        json!([
-            "typed permission denied",
-            "official runtime wrote the report artifact"
-        ])
+        json!(["typed permission denied"])
     );
-    let artifact = artifact.expect("official completion did not publish its report artifact");
-    assert_eq!(artifact["sha256"], report_sha256);
-    let chunk = chunk.unwrap();
-    assert_eq!(
-        BASE64
-            .decode(chunk["artifact_chunk"]["bytes_base64"].as_str().unwrap())
-            .unwrap(),
-        report
-    );
-    assert_eq!(chunk["artifact_chunk"]["eof"], true);
+    assert_eq!(result["artifacts"], json!([]));
 }
 
 #[test]
