@@ -11,7 +11,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -29,9 +28,10 @@ use zcode_reviewd::{
     rpc::{
         AgentCapabilitiesView, ComponentStateView, GeneralSubmitInput, MessageDispositionView,
         MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView, RpcClient, RpcMethod,
-        RpcOutcome, RpcRequest, RpcSuccess, SystemStatusView, TaskArtifactMetadataView,
-        TaskArtifactQuery, TaskEventPage, TaskEventQuery, TaskListQuery, TaskResultView, TaskView,
-        TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+        RpcOutcome, RpcRequest, RpcSuccess, SubmissionDispositionView, SystemStatusView,
+        TaskArtifactMetadataView, TaskArtifactQuery, TaskEventPage, TaskEventQuery, TaskListQuery,
+        TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES,
+        RPC_VERSION,
     },
 };
 
@@ -464,8 +464,68 @@ pub struct AgentListInput {
     pub feature_id: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub ownership_token: Option<String>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    pub phase: Option<PublicTaskPhase>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    pub outcome: Option<PublicOutcomeFilter>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    pub profile: Option<PublicProfile>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 100))]
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicTaskPhase {
+    Queued,
+    Preparing,
+    Running,
+    WaitingInput,
+    Cancelling,
+    Terminal,
+}
+
+impl From<PublicTaskPhase> for TaskPhaseFilter {
+    fn from(value: PublicTaskPhase) -> Self {
+        match value {
+            PublicTaskPhase::Queued => Self::Queued,
+            PublicTaskPhase::Preparing => Self::Preparing,
+            PublicTaskPhase::Running => Self::Running,
+            PublicTaskPhase::WaitingInput => Self::WaitingInput,
+            PublicTaskPhase::Cancelling => Self::Cancelling,
+            PublicTaskPhase::Terminal => Self::Terminal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicOutcomeFilter {
+    Succeeded,
+    Blocked,
+    Failed,
+    Cancelled,
+    TimedOut,
+    BudgetExhausted,
+    RuntimeLost,
+    ResultInvalid,
+}
+
+impl From<PublicOutcomeFilter> for TaskOutcome {
+    fn from(value: PublicOutcomeFilter) -> Self {
+        match value {
+            PublicOutcomeFilter::Succeeded => Self::Succeeded,
+            PublicOutcomeFilter::Blocked => Self::Blocked,
+            PublicOutcomeFilter::Failed => Self::Failed,
+            PublicOutcomeFilter::Cancelled => Self::Cancelled,
+            PublicOutcomeFilter::TimedOut => Self::TimedOut,
+            PublicOutcomeFilter::BudgetExhausted => Self::BudgetExhausted,
+            PublicOutcomeFilter::RuntimeLost => Self::RuntimeLost,
+            PublicOutcomeFilter::ResultInvalid => Self::ResultInvalid,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -852,11 +912,6 @@ impl SubagentMcp {
     }
 }
 
-fn derived_task_id(repository: &str, idempotency_key: &str) -> String {
-    let digest = Sha256::digest(format!("{repository}:{idempotency_key}").as_bytes());
-    format!("ztask-{digest:x}")
-}
-
 fn attachment(value: &PublicAttachmentInput) -> Result<AttachmentInput, String> {
     validate_text(&value.logical_name, "attachment.logical_name", 256)?;
     validate_path(&value.source_path, "attachment.source_path")?;
@@ -898,7 +953,7 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
     if !repository.is_absolute() {
         return Err("validation: repository must be absolute".into());
     }
-    let task_id = derived_task_id(&input.repository, &input.idempotency_key);
+    let task_id = "daemon-prepared".to_owned();
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
         task_id: task_id.clone(),
@@ -1155,17 +1210,15 @@ impl SubagentMcp {
         &self,
         Parameters(input): Parameters<AgentSpawnInput>,
     ) -> Result<Json<AgentSpawnOutput>, String> {
-        let expected_id = derived_task_id(&input.repository, &input.idempotency_key);
-        let existed = self.status(&expected_id).is_ok();
         let manifest = general_manifest(&input)?;
-        let task = match self.rpc(RpcMethod::SubmitGeneral {
+        let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral {
             input: GeneralSubmitInput {
                 manifest,
                 feature_id: input.feature_id,
                 ownership_token: input.ownership_token,
             },
         })? {
-            RpcSuccess::GeneralSubmitted { task } => task,
+            RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
             _ => return Err(protocol_error()),
         };
         let capabilities = match self.rpc(RpcMethod::SystemStatus)? {
@@ -1174,10 +1227,9 @@ impl SubagentMcp {
         };
         Ok(Json(AgentSpawnOutput {
             agent_id: task.agent_id,
-            submission_disposition: if existed {
-                SubmissionDisposition::Existing
-            } else {
-                SubmissionDisposition::Created
+            submission_disposition: match disposition {
+                SubmissionDispositionView::Created => SubmissionDisposition::Created,
+                SubmissionDispositionView::Existing => SubmissionDisposition::Existing,
             },
             phase: task.phase,
             attempt_sequence: task.attempt_sequence,
@@ -1237,11 +1289,15 @@ impl SubagentMcp {
             repository: input.repository,
             feature_id: input.feature_id,
             ownership_token: input.ownership_token,
+            phase: input.phase.map(Into::into),
+            outcome: input.outcome.map(Into::into),
+            profile: input.profile.map(Into::into),
+            cursor: input.cursor,
             limit: input.limit,
         }))? {
-            RpcSuccess::TaskListed { tasks } => Ok(Json(AgentListOutput {
+            RpcSuccess::TaskListed { tasks, next_cursor } => Ok(Json(AgentListOutput {
                 tasks: tasks.into_iter().map(Into::into).collect(),
-                next_cursor: None,
+                next_cursor,
             })),
             _ => Err(protocol_error()),
         }
@@ -1751,13 +1807,13 @@ mod tests {
             retain_partial: false,
         };
         let manifest = general_manifest(&input).unwrap();
+        assert_eq!(manifest.task_id, "daemon-prepared");
         let prepared = GeneralTaskPreparer::new(Vec::new())
             .unwrap()
-            .prepare(&manifest)
+            .prepare_submission(&manifest)
             .unwrap();
-        assert_eq!(
-            prepared.task_id,
-            derived_task_id(&input.repository, &input.idempotency_key)
-        );
+        assert!(prepared.task_id.starts_with("ztask-"));
+        assert_ne!(prepared.task_id, manifest.task_id);
+        assert_eq!(prepared.repository, repository);
     }
 }

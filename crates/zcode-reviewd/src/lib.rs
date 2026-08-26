@@ -3,12 +3,12 @@ use review_store::{
     ArtifactKind, BudgetRequest, DeliveryClaim, EffectiveBudget, Job, JobClaim, JobState,
     LifecycleWrite, MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
     ResultArtifact, Store, StoreError, StoredMessage, StoredProcessIdentity, TaskKind, TaskOutcome,
-    TaskRecord, TaskResult, TerminalUpdate, TurnState,
+    TaskRecord, TaskResult, TaskSubmissionDisposition, TerminalUpdate, TurnState,
 };
 use std::{
     collections::HashMap,
     fmt, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1226,6 +1226,14 @@ impl ManagedRuntime for RuntimeOwner {
 pub trait RuntimeFactory: Send + Sync + 'static {
     fn spawn(&self, job: &Job, sink: Arc<dyn LifecycleSink>)
         -> io::Result<Arc<dyn ManagedRuntime>>;
+
+    fn spawn_readiness(
+        &self,
+        job: &Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        self.spawn(job, sink)
+    }
 }
 
 pub struct CommandRuntimeFactory<F> {
@@ -1280,6 +1288,15 @@ where
                 }
             }
         }
+        let command = (self.command)(job)?;
+        Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
+    }
+
+    fn spawn_readiness(
+        &self,
+        job: &Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
         let command = (self.command)(job)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
@@ -1478,6 +1495,49 @@ pub struct ResponseOutcome {
 pub struct SubmittedTask {
     pub job: Job,
     pub task: TaskRecord,
+    pub disposition: TaskSubmissionDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimePreflight {
+    pub driver_ready: bool,
+    pub runtime_ready: bool,
+    pub model_auth_ready: bool,
+    pub reaped: bool,
+}
+
+struct ReadinessSink;
+
+impl LifecycleSink for ReadinessSink {
+    fn emit(&self, _record: LifecycleRecord) {}
+}
+
+fn readiness_job(workspace: &Path) -> Job {
+    static NEXT_READINESS_ID: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_READINESS_ID.fetch_add(1, Ordering::AcqRel);
+    Job {
+        agent_id: format!("readiness-{}-{sequence}", std::process::id()),
+        idempotency_key: None,
+        state: JobState::Starting,
+        workspace_path: workspace.to_string_lossy().into_owned(),
+        initial_prompt: "Runtime readiness preflight. Do not modify files.".into(),
+        prepared_launch_json: None,
+        prepared_launch_sha256: None,
+        owner_id: None,
+        owner_epoch: 0,
+        close_requested: false,
+        stop_requested: false,
+        last_event_seq: 0,
+        failure_code: None,
+        failure_message: None,
+        runtime_agent_id: None,
+        zcode_session_id: None,
+        turn_state: TurnState::Idle,
+        process_identity: None,
+        closed_at: None,
+        reaped_at: None,
+        created_at: 0,
+    }
 }
 
 struct StoreLifecycleSink {
@@ -2294,7 +2354,7 @@ impl Scheduler {
             .map(|attachment| attachment.allowed_root.clone())
             .collect();
         let prepared = GeneralTaskPreparer::new(attachment_roots)
-            .and_then(|preparer| preparer.prepare(manifest))
+            .and_then(|preparer| preparer.prepare_submission(manifest))
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         let prepared_json = serde_json::to_string(&prepared)
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
@@ -2327,8 +2387,70 @@ impl Scheduler {
             budget: BudgetRequest::Limits(budget),
             retain_partial: prepared.retain_partial,
         };
-        let (job, task) = self.inner.store.enqueue_task(&task)?;
-        Ok(SubmittedTask { job, task })
+        let enqueued = self.inner.store.enqueue_task_authoritative(&task)?;
+        Ok(SubmittedTask {
+            job: enqueued.job,
+            task: enqueued.task,
+            disposition: enqueued.disposition,
+        })
+    }
+
+    pub fn preflight_runtime(&self, timeout: Duration) -> RuntimePreflight {
+        if timeout.is_zero() {
+            return RuntimePreflight {
+                driver_ready: false,
+                runtime_ready: false,
+                model_auth_ready: false,
+                reaped: true,
+            };
+        }
+        let workspace = match tempfile::Builder::new()
+            .prefix("zcode-reviewd-readiness-")
+            .tempdir()
+        {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                return RuntimePreflight {
+                    driver_ready: false,
+                    runtime_ready: false,
+                    model_auth_ready: false,
+                    reaped: true,
+                }
+            }
+        };
+        let job = readiness_job(workspace.path());
+        let sink: Arc<dyn LifecycleSink> = Arc::new(ReadinessSink);
+        let runtime = match self.inner.factory.spawn_readiness(&job, sink) {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return RuntimePreflight {
+                    driver_ready: false,
+                    runtime_ready: false,
+                    model_auth_ready: false,
+                    reaped: true,
+                }
+            }
+        };
+        let cleanup_grace = self.inner.config.stop_grace.min(timeout / 3);
+        let bootstrap_timeout = timeout
+            .checked_sub(cleanup_grace)
+            .filter(|remaining| !remaining.is_zero())
+            .unwrap_or(Duration::from_millis(1));
+        let bootstrapped = runtime.bootstrap_session(&job, bootstrap_timeout).is_ok();
+        let terminal = runtime.stop(cleanup_grace);
+        let reaped = matches!(
+            terminal,
+            RuntimeTerminal::Stopped(_)
+                | RuntimeTerminal::Completed(_)
+                | RuntimeTerminal::FailedTurn(_)
+                | RuntimeTerminal::Exited(_)
+        );
+        RuntimePreflight {
+            driver_ready: true,
+            runtime_ready: bootstrapped,
+            model_auth_ready: bootstrapped,
+            reaped,
+        }
     }
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, JobState)>, SchedulerError> {
@@ -5564,30 +5686,31 @@ sleep 10
                 .enqueue_general(&manifest, "feature", "owner-group")
                 .unwrap();
             let prepared = prepared_general(&submitted.job);
+            let execution_id = &submitted.job.agent_id;
             let state = if close {
-                scheduler.close_job(task_id)
+                scheduler.close_job(execution_id)
             } else {
-                scheduler.stop_job(task_id)
+                scheduler.stop_job(execution_id)
             }
             .unwrap();
             assert_eq!(state, JobState::Cancelled);
-            let result = store.task_result(task_id).unwrap().unwrap();
+            let result = store.task_result(execution_id).unwrap().unwrap();
             assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
             assert!(result.result.residual_gaps.contains(&"CANCELLED".into()));
-            let job = store.get_job(task_id).unwrap().unwrap();
+            let job = store.get_job(execution_id).unwrap().unwrap();
             assert_eq!(job.state, JobState::Cancelled);
             assert_eq!(job.closed_at.is_some(), close);
             assert_general_workspace_cleaned(&prepared);
             assert_eq!(
                 if close {
-                    scheduler.close_job(task_id)
+                    scheduler.close_job(execution_id)
                 } else {
-                    scheduler.stop_job(task_id)
+                    scheduler.stop_job(execution_id)
                 }
                 .unwrap(),
                 JobState::Cancelled
             );
-            assert_eq!(store.task_result(task_id).unwrap().unwrap(), result);
+            assert_eq!(store.task_result(execution_id).unwrap().unwrap(), result);
         }
     }
 
@@ -5599,13 +5722,14 @@ sleep 10
             .enqueue_general(&manifest, "feature", "owner-group")
             .unwrap();
         let prepared = prepared_general(&submitted.job);
-        factory.fail("general-spawn-fail");
+        let execution_id = &submitted.job.agent_id;
+        factory.fail(execution_id);
 
         assert!(matches!(
             scheduler.start_ready(),
             Err(SchedulerError::RuntimeSpawn { .. })
         ));
-        let result = store.task_result("general-spawn-fail").unwrap().unwrap();
+        let result = store.task_result(execution_id).unwrap().unwrap();
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
         assert!(result
             .result
@@ -5619,13 +5743,14 @@ sleep 10
     fn general_completion_persistence_fault_converges_to_result_invalid() {
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
         let manifest = general_manifest(directory.path(), "general-result-fault", None);
-        scheduler
+        let submitted = scheduler
             .enqueue_general(&manifest, "feature", "owner-group")
             .unwrap();
+        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         scheduler
             .submit_general_completion(
-                "general-result-fault",
+                &execution_id,
                 GeneralCompletionSubmission {
                     requested_outcome: CompletionOutcome::Succeeded,
                     summary: "would have succeeded".into(),
@@ -5636,19 +5761,19 @@ sleep 10
             )
             .unwrap();
         let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
-        raw.execute_batch(
+        raw.execute_batch(&format!(
             "CREATE TRIGGER reject_exact_success_result BEFORE INSERT ON task_results
-             WHEN NEW.execution_agent_id='general-result-fault' AND NEW.outcome='SUCCEEDED'
-             BEGIN SELECT RAISE(FAIL, 'scripted exact result write failure'); END;",
-        )
+             WHEN NEW.execution_agent_id='{execution_id}' AND NEW.outcome='SUCCEEDED'
+             BEGIN SELECT RAISE(FAIL, 'scripted exact result write failure'); END;"
+        ))
         .unwrap();
         factory
-            .runtime("general-result-fault")
+            .runtime(&execution_id)
             .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                 ChildExit::Exited(Some(0)),
             )));
 
-        let result = wait_for_task_result(&store, "general-result-fault");
+        let result = wait_for_task_result(&store, &execution_id);
         assert_eq!(result.result.outcome, TaskOutcome::ResultInvalid);
         assert!(result
             .result
@@ -5656,7 +5781,7 @@ sleep 10
             .contains(&"GENERAL_COMPLETION_PERSIST_FAILED".into()));
         assert_eq!(
             store
-                .task_by_execution_agent_id("general-result-fault")
+                .task_by_execution_agent_id(&execution_id)
                 .unwrap()
                 .unwrap()
                 .phase,
@@ -5745,6 +5870,7 @@ sleep 10
             .enqueue_general(&manifest, "feature", "owner-group")
             .unwrap();
         let prepared = prepared_general(&submitted.job);
+        let execution_id = &submitted.job.agent_id;
         let started = Instant::now();
         assert!(matches!(
             scheduler.start_ready(),
@@ -5755,7 +5881,7 @@ sleep 10
         assert!(bootstrap_timeout < Duration::from_millis(160));
         assert!(bootstrap_timeout < Duration::from_secs(1));
         assert!(existed.load(Ordering::Acquire));
-        let result = store.task_result("bootstrap-wall").unwrap().unwrap();
+        let result = store.task_result(execution_id).unwrap().unwrap();
         assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
         assert!(result
             .result
@@ -5775,6 +5901,7 @@ sleep 10
             .enqueue_general(&implementation, "feature", "owner-group")
             .unwrap();
         let prepared = prepared_general(&submitted.job);
+        let implementation_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         std::fs::write(
             prepared.worktree.path.join("src/lib.rs"),
@@ -5786,7 +5913,7 @@ sleep 10
         store
             .insert_pending_request(
                 "implementation-edit",
-                "implementation-policy",
+                &implementation_id,
                 "\"runtime-edit\"",
                 "permission",
                 &serde_json::json!({
@@ -5797,12 +5924,7 @@ sleep 10
             )
             .unwrap();
         let allowed = scheduler
-            .respond_job(
-                "implementation-policy",
-                "implementation-edit",
-                "allow",
-                None,
-            )
+            .respond_job(&implementation_id, "implementation-edit", "allow", None)
             .unwrap();
         assert_eq!(allowed.effective_decision, "allow");
         assert!(!allowed.policy_overrode);
@@ -5810,7 +5932,7 @@ sleep 10
         store
             .insert_pending_request(
                 "implementation-network",
-                "implementation-policy",
+                &implementation_id,
                 "\"runtime-network\"",
                 "permission",
                 &serde_json::json!({
@@ -5821,12 +5943,7 @@ sleep 10
             )
             .unwrap();
         let denied = scheduler
-            .respond_job(
-                "implementation-policy",
-                "implementation-network",
-                "allow",
-                None,
-            )
+            .respond_job(&implementation_id, "implementation-network", "allow", None)
             .unwrap();
         assert_eq!(denied.effective_decision, "deny");
         assert_eq!(
@@ -5834,24 +5951,25 @@ sleep 10
             Some("network_not_enforced_and_request_denied")
         );
         let responses = factory
-            .runtime("implementation-policy")
+            .runtime(&implementation_id)
             .responses
             .lock()
             .unwrap()
             .clone();
         assert_eq!(responses[0].1, "allow");
         assert_eq!(responses[1].1, "deny");
-        scheduler.close_job("implementation-policy").unwrap();
+        scheduler.close_job(&implementation_id).unwrap();
 
         let readonly = general_manifest(directory.path(), "readonly-policy", None);
-        scheduler
+        let readonly = scheduler
             .enqueue_general(&readonly, "feature", "owner-group")
             .unwrap();
+        let readonly_id = readonly.job.agent_id;
         scheduler.start_ready().unwrap();
         store
             .insert_pending_request(
                 "readonly-edit",
-                "readonly-policy",
+                &readonly_id,
                 "\"runtime-readonly-edit\"",
                 "permission",
                 &serde_json::json!({
@@ -5862,35 +5980,39 @@ sleep 10
             )
             .unwrap();
         let denied = scheduler
-            .respond_job("readonly-policy", "readonly-edit", "allow", None)
+            .respond_job(&readonly_id, "readonly-edit", "allow", None)
             .unwrap();
         assert_eq!(denied.effective_decision, "deny");
         assert_eq!(
             denied.policy_reason_code.as_deref(),
             Some("tracked_writes_denied_for_profile")
         );
-        scheduler.close_job("readonly-policy").unwrap();
+        scheduler.close_job(&readonly_id).unwrap();
     }
 
     #[test]
     fn cancellation_intent_wins_natural_terminal_under_shared_operation_lock() {
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
-        for task_id in ["natural-cancel-race", "natural-next"] {
-            scheduler
-                .enqueue_general(
-                    &general_manifest(directory.path(), task_id, None),
-                    "feature",
-                    "owner-group",
-                )
-                .unwrap();
-        }
-        assert_eq!(
-            scheduler.start_ready().unwrap(),
-            vec!["natural-cancel-race"]
-        );
+        let first = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "natural-cancel-race", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let first_id = first.job.agent_id;
+        let next = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "natural-next", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let next_id = next.job.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![first_id.clone()]);
         scheduler
             .submit_general_completion(
-                "natural-cancel-race",
+                &first_id,
                 GeneralCompletionSubmission {
                     requested_outcome: CompletionOutcome::Succeeded,
                     summary: "natural success attempted".into(),
@@ -5900,35 +6022,33 @@ sleep 10
                 },
             )
             .unwrap();
-        let operation = scheduler.active_session("natural-cancel-race").unwrap().3;
+        let operation = scheduler.active_session(&first_id).unwrap().3;
         let guard = operation.lock().unwrap();
-        let decision = store.request_close("natural-cancel-race").unwrap();
+        let decision = store.request_close(&first_id).unwrap();
         assert_eq!(decision.state, JobState::Stopping);
         factory
-            .runtime("natural-cancel-race")
+            .runtime(&first_id)
             .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                 ChildExit::Exited(Some(0)),
             )));
         drop(guard);
 
-        let result = wait_for_task_result(&store, "natural-cancel-race");
+        let result = wait_for_task_result(&store, &first_id);
         assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
-        assert_eq!(
-            scheduler.close_job("natural-cancel-race").unwrap(),
-            JobState::Cancelled
-        );
-        factory.runtime("natural-next");
+        assert_eq!(scheduler.close_job(&first_id).unwrap(), JobState::Cancelled);
+        factory.runtime(&next_id);
         assert_eq!(scheduler.active_count(), 1);
-        scheduler.close_job("natural-next").unwrap();
+        scheduler.close_job(&next_id).unwrap();
 
         let late = general_manifest(directory.path(), "natural-wins", None);
-        scheduler
+        let late = scheduler
             .enqueue_general(&late, "feature", "owner-group")
             .unwrap();
+        let late_id = late.job.agent_id;
         scheduler.start_ready().unwrap();
         scheduler
             .submit_general_completion(
-                "natural-wins",
+                &late_id,
                 GeneralCompletionSubmission {
                     requested_outcome: CompletionOutcome::Succeeded,
                     summary: "natural winner".into(),
@@ -5939,56 +6059,51 @@ sleep 10
             )
             .unwrap();
         factory
-            .runtime("natural-wins")
+            .runtime(&late_id)
             .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                 ChildExit::Exited(Some(0)),
             )));
-        let succeeded = wait_for_task_result(&store, "natural-wins");
+        let succeeded = wait_for_task_result(&store, &late_id);
         assert_eq!(succeeded.result.outcome, TaskOutcome::Succeeded);
-        assert_eq!(
-            scheduler.close_job("natural-wins").unwrap(),
-            JobState::Completed
-        );
-        assert_eq!(
-            store.task_result("natural-wins").unwrap().unwrap(),
-            succeeded
-        );
+        assert_eq!(scheduler.close_job(&late_id).unwrap(), JobState::Completed);
+        assert_eq!(store.task_result(&late_id).unwrap().unwrap(), succeeded);
     }
 
     #[test]
     fn cancellation_intent_wins_sink_error_under_shared_operation_lock() {
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
-        scheduler
+        let submitted = scheduler
             .enqueue_general(
                 &general_manifest(directory.path(), "sink-cancel-race", None),
                 "feature",
                 "owner-group",
             )
             .unwrap();
+        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
-        let runtime = factory.runtime("sink-cancel-race");
-        let operation = scheduler.active_session("sink-cancel-race").unwrap().3;
+        let runtime = factory.runtime(&execution_id);
+        let operation = scheduler.active_session(&execution_id).unwrap().3;
         let guard = operation.lock().unwrap();
         assert_eq!(
-            store.request_stop("sink-cancel-race").unwrap().state,
+            store.request_stop(&execution_id).unwrap().state,
             JobState::Stopping
         );
         let raw = rusqlite::Connection::open(directory.path().join("review.sqlite3")).unwrap();
-        raw.execute_batch(
+        raw.execute_batch(&format!(
             "CREATE TRIGGER fail_sink_race_event BEFORE INSERT ON events
-             WHEN NEW.agent_id='sink-cancel-race'
-             BEGIN SELECT RAISE(FAIL, 'scripted sink race failure'); END;",
-        )
+             WHEN NEW.agent_id='{execution_id}'
+             BEGIN SELECT RAISE(FAIL, 'scripted sink race failure'); END;"
+        ))
         .unwrap();
         runtime.emit_partial("cannot persist");
         drop(guard);
 
-        let result = wait_for_task_result(&store, "sink-cancel-race");
+        let result = wait_for_task_result(&store, &execution_id);
         assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
         assert!(result.result.residual_gaps.contains(&"CANCELLED".into()));
         assert_eq!(scheduler.active_count(), 0);
         assert_eq!(
-            scheduler.stop_job("sink-cancel-race").unwrap(),
+            scheduler.stop_job(&execution_id).unwrap(),
             JobState::Cancelled
         );
     }
@@ -6016,8 +6131,12 @@ sleep 10
             .unwrap();
         assert_eq!(first.job.agent_id, repeated.job.agent_id);
         assert_eq!(first.task, repeated.task);
+        let execution_id = &first.job.agent_id;
 
-        assert_eq!(scheduler.start_ready().unwrap(), vec!["general-success"]);
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![execution_id.to_owned()]
+        );
         let submission = GeneralCompletionSubmission {
             requested_outcome: CompletionOutcome::Succeeded,
             summary: "analysis completed".into(),
@@ -6026,18 +6145,18 @@ sleep 10
             artifact_intents: Vec::new(),
         };
         assert!(scheduler
-            .submit_general_completion("general-success", submission.clone())
+            .submit_general_completion(execution_id, submission.clone())
             .unwrap());
         assert!(!scheduler
-            .submit_general_completion("general-success", submission)
+            .submit_general_completion(execution_id, submission)
             .unwrap());
         factory
-            .runtime("general-success")
+            .runtime(execution_id)
             .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                 ChildExit::Exited(Some(0)),
             )));
 
-        let result = wait_for_task_result(&store, "general-success");
+        let result = wait_for_task_result(&store, execution_id);
         assert_eq!(result.result.outcome, TaskOutcome::Succeeded);
         assert_eq!(result.result.summary, "analysis completed");
         assert_eq!(result.result.checks, vec!["context inspected"]);
@@ -6045,7 +6164,7 @@ sleep 10
         assert_eq!(
             store
                 .get_task_scoped(
-                    "general-success",
+                    &first.task.public_agent_id,
                     review_store::TaskQueryScope {
                         repository: Some(first.task.repository.as_str()),
                         feature_id: None,
@@ -6066,14 +6185,16 @@ sleep 10
         budget.max_tool_calls = 1;
         let first = general_manifest(directory.path(), "general-budget", Some(budget));
         let second = general_manifest(directory.path(), "general-next", None);
-        scheduler
+        let first = scheduler
             .enqueue_general(&first, "feature", "owner-group")
             .unwrap();
-        scheduler
+        let second = scheduler
             .enqueue_general(&second, "feature", "owner-group")
             .unwrap();
-        assert_eq!(scheduler.start_ready().unwrap(), vec!["general-budget"]);
-        let runtime = factory.runtime("general-budget");
+        let first_id = first.job.agent_id;
+        let second_id = second.job.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![first_id.clone()]);
+        let runtime = factory.runtime(&first_id);
         let tool_event = |tool_call_id: &str| {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(EventEnvelope {
                 method: "session/event".into(),
@@ -6086,9 +6207,9 @@ sleep 10
         runtime.emit_event(tool_event("tool-1"));
         runtime.emit_event(tool_event("tool-1"));
         thread::sleep(Duration::from_millis(80));
-        assert!(store.task_result("general-budget").unwrap().is_none());
+        assert!(store.task_result(&first_id).unwrap().is_none());
         runtime.emit_event(tool_event("tool-2"));
-        let exhausted = wait_for_task_result(&store, "general-budget");
+        let exhausted = wait_for_task_result(&store, &first_id);
         assert_eq!(exhausted.result.outcome, TaskOutcome::BudgetExhausted);
         assert!(exhausted
             .result
@@ -6096,7 +6217,7 @@ sleep 10
             .contains(&"TOOL_CALL_BUDGET_EXHAUSTED".into()));
         assert!(scheduler
             .submit_general_completion(
-                "general-budget",
+                &first_id,
                 GeneralCompletionSubmission {
                     requested_outcome: CompletionOutcome::Succeeded,
                     summary: "late".into(),
@@ -6106,12 +6227,12 @@ sleep 10
                 },
             )
             .is_err());
-        factory.runtime("general-next");
+        factory.runtime(&second_id);
         assert_eq!(
-            store.get_job("general-next").unwrap().unwrap().state,
+            store.get_job(&second_id).unwrap().unwrap().state,
             JobState::Running
         );
-        scheduler.close_job("general-next").unwrap();
+        scheduler.close_job(&second_id).unwrap();
     }
 
     fn wait_for_job_state(store: &Store, agent_id: &str, expected: JobState) {
@@ -6208,42 +6329,40 @@ sleep 10
             Duration::from_millis(5),
             Duration::from_millis(60),
         );
-        scheduler
+        let submitted = scheduler
             .enqueue_general(
                 &general_manifest(directory.path(), "respond-lock-timeout", None),
                 "feature",
                 "owner-group",
             )
             .unwrap();
+        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         store
             .insert_pending_request(
                 "respond-lock-request",
-                "respond-lock-timeout",
+                &execution_id,
                 "\"runtime-respond-lock\"",
                 "permission",
                 "{}",
             )
             .unwrap();
-        let operation = scheduler.active_session("respond-lock-timeout").unwrap().3;
+        let operation = scheduler.active_session(&execution_id).unwrap().3;
         let guard = operation.lock().unwrap();
         let caller = {
             let scheduler = scheduler.clone();
+            let execution_id = execution_id.clone();
             thread::spawn(move || {
                 let started = Instant::now();
-                let result = scheduler.respond_job(
-                    "respond-lock-timeout",
-                    "respond-lock-request",
-                    "deny",
-                    None,
-                );
+                let result =
+                    scheduler.respond_job(&execution_id, "respond-lock-request", "deny", None);
                 (started.elapsed(), result)
             })
         };
         let claim_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if store
-                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .pending_request(&execution_id, "respond-lock-request")
                 .unwrap()
                 .is_some_and(|request| request.state == PendingRequestState::Sending)
             {
@@ -6261,14 +6380,14 @@ sleep 10
         assert!(elapsed < Duration::from_millis(250));
         assert_eq!(
             store
-                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .pending_request(&execution_id, "respond-lock-request")
                 .unwrap()
                 .unwrap()
                 .state,
             PendingRequestState::Pending
         );
         assert!(factory
-            .runtime("respond-lock-timeout")
+            .runtime(&execution_id)
             .responses
             .lock()
             .unwrap()
@@ -6277,20 +6396,20 @@ sleep 10
 
         assert_eq!(
             scheduler
-                .respond_job("respond-lock-timeout", "respond-lock-request", "deny", None,)
+                .respond_job(&execution_id, "respond-lock-request", "deny", None,)
                 .unwrap()
                 .disposition,
             ResponseDisposition::Responded
         );
         assert_eq!(
             store
-                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .pending_request(&execution_id, "respond-lock-request")
                 .unwrap()
                 .unwrap()
                 .state,
             PendingRequestState::Responded
         );
-        scheduler.close_job("respond-lock-timeout").unwrap();
+        scheduler.close_job(&execution_id).unwrap();
     }
 
     #[test]
@@ -6301,40 +6420,37 @@ sleep 10
             Duration::from_millis(5),
             Duration::from_millis(200),
         );
-        scheduler
+        let submitted = scheduler
             .enqueue_general(
                 &general_manifest(directory.path(), "respond-cancel-winner", None),
                 "feature",
                 "owner-group",
             )
             .unwrap();
+        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         store
             .insert_pending_request(
                 "respond-cancel-request",
-                "respond-cancel-winner",
+                &execution_id,
                 "\"runtime-cancel-winner\"",
                 "permission",
                 "{}",
             )
             .unwrap();
-        let operation = scheduler.active_session("respond-cancel-winner").unwrap().3;
+        let operation = scheduler.active_session(&execution_id).unwrap().3;
         let guard = operation.lock().unwrap();
         let caller = {
             let scheduler = scheduler.clone();
+            let execution_id = execution_id.clone();
             thread::spawn(move || {
-                scheduler.respond_job(
-                    "respond-cancel-winner",
-                    "respond-cancel-request",
-                    "deny",
-                    None,
-                )
+                scheduler.respond_job(&execution_id, "respond-cancel-request", "deny", None)
             })
         };
         let claim_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if store
-                .pending_request("respond-cancel-winner", "respond-cancel-request")
+                .pending_request(&execution_id, "respond-cancel-request")
                 .unwrap()
                 .is_some_and(|request| request.state == PendingRequestState::Sending)
             {
@@ -6346,7 +6462,7 @@ sleep 10
             );
             thread::sleep(Duration::from_millis(1));
         }
-        let decision = store.request_stop("respond-cancel-winner").unwrap();
+        let decision = store.request_stop(&execution_id).unwrap();
         assert!(decision.needs_runtime_stop);
         drop(guard);
 
@@ -6356,33 +6472,30 @@ sleep 10
         ));
         assert_eq!(
             store
-                .pending_request("respond-cancel-winner", "respond-cancel-request")
+                .pending_request(&execution_id, "respond-cancel-request")
                 .unwrap()
                 .unwrap()
                 .state,
             PendingRequestState::Pending
         );
         assert!(factory
-            .runtime("respond-cancel-winner")
+            .runtime(&execution_id)
             .responses
             .lock()
             .unwrap()
             .is_empty());
 
         assert_eq!(
-            scheduler.stop_job("respond-cancel-winner").unwrap(),
+            scheduler.stop_job(&execution_id).unwrap(),
             JobState::Cancelled
         );
-        let result = store.task_result("respond-cancel-winner").unwrap().unwrap();
+        let result = store.task_result(&execution_id).unwrap().unwrap();
         assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
         assert_eq!(scheduler.active_count(), 0);
         assert_eq!(store.active_count().unwrap(), 0);
-        scheduler.close_job("respond-cancel-winner").unwrap();
-        scheduler.reap_job("respond-cancel-winner").unwrap();
-        assert_eq!(
-            store.task_result("respond-cancel-winner").unwrap().unwrap(),
-            result
-        );
+        scheduler.close_job(&execution_id).unwrap();
+        scheduler.reap_job(&execution_id).unwrap();
+        assert_eq!(store.task_result(&execution_id).unwrap().unwrap(), result);
     }
 
     #[test]
@@ -6401,27 +6514,23 @@ sleep 10
             )
             .unwrap();
         let prepared = prepared_general(&submitted.job);
+        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         store
             .insert_pending_request(
                 "respond-write-request",
-                "respond-write-timeout",
+                &execution_id,
                 "\"runtime-write-timeout\"",
                 "permission",
                 "{}",
             )
             .unwrap();
-        let runtime = factory.runtime("respond-write-timeout");
+        let runtime = factory.runtime(&execution_id);
         runtime.timeout_response_write();
 
         let started = Instant::now();
         assert!(matches!(
-            scheduler.respond_job(
-                "respond-write-timeout",
-                "respond-write-request",
-                "deny",
-                None,
-            ),
+            scheduler.respond_job(&execution_id, "respond-write-request", "deny", None,),
             Err(SchedulerError::RuntimeCommand { .. })
         ));
         let elapsed = started.elapsed();
@@ -6433,7 +6542,7 @@ sleep 10
         assert!(write_budget < Duration::from_millis(150));
         assert_eq!(
             store
-                .pending_request("respond-write-timeout", "respond-write-request")
+                .pending_request(&execution_id, "respond-write-request")
                 .unwrap()
                 .unwrap()
                 .state,
@@ -6443,29 +6552,26 @@ sleep 10
         assert_eq!(runtime.stop_calls(), 1);
         assert!(runtime.wait_terminal(Duration::from_millis(20)).is_some());
 
-        let result = store.task_result("respond-write-timeout").unwrap().unwrap();
+        let result = store.task_result(&execution_id).unwrap().unwrap();
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
         assert!(result
             .result
             .residual_gaps
             .contains(&"CONTROL_DEADLINE_EXCEEDED".into()));
         assert!(store
-            .get_job("respond-write-timeout")
+            .get_job(&execution_id)
             .unwrap()
             .unwrap()
             .state
             .is_terminal());
         assert_eq!(scheduler.active_count(), 0);
         assert_eq!(store.active_count().unwrap(), 0);
-        assert!(scheduler.active_session("respond-write-timeout").is_none());
+        assert!(scheduler.active_session(&execution_id).is_none());
         assert_general_workspace_cleaned(&prepared);
 
-        scheduler.close_job("respond-write-timeout").unwrap();
-        scheduler.reap_job("respond-write-timeout").unwrap();
-        assert_eq!(
-            store.task_result("respond-write-timeout").unwrap().unwrap(),
-            result
-        );
+        scheduler.close_job(&execution_id).unwrap();
+        scheduler.reap_job(&execution_id).unwrap();
+        assert_eq!(store.task_result(&execution_id).unwrap().unwrap(), result);
     }
 
     #[test]

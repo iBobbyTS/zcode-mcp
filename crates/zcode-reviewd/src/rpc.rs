@@ -6,7 +6,7 @@ use crate::{
     MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
 };
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
-use review_preparation::ReviewManifest;
+use review_preparation::{canonical_general_repository, ReviewManifest};
 use review_preparation::{
     BudgetLimits, GeneralCompletionSubmission, GeneralProfile, GeneralTaskManifest,
     PreparedGeneralTask, PreparedLaunchSpec,
@@ -14,7 +14,8 @@ use review_preparation::{
 use review_store::{
     DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
     StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
-    TaskOutcome, TaskPhase, TaskQueryScope, TaskRecord, TurnState, WaitSnapshot,
+    TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
+    TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +24,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
+    path::Path,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -195,7 +197,39 @@ pub struct TaskListQuery {
     pub feature_id: Option<String>,
     #[serde(default)]
     pub ownership_token: Option<String>,
+    #[serde(default)]
+    pub phase: Option<TaskPhaseFilter>,
+    #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+    #[serde(default)]
+    pub profile: Option<GeneralProfile>,
+    #[serde(default)]
+    pub cursor: Option<String>,
     pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskPhaseFilter {
+    Queued,
+    Preparing,
+    Running,
+    WaitingInput,
+    Cancelling,
+    Terminal,
+}
+
+impl From<TaskPhaseFilter> for TaskPhase {
+    fn from(value: TaskPhaseFilter) -> Self {
+        match value {
+            TaskPhaseFilter::Queued => Self::Queued,
+            TaskPhaseFilter::Preparing => Self::Preparing,
+            TaskPhaseFilter::Running => Self::Running,
+            TaskPhaseFilter::WaitingInput => Self::WaitingInput,
+            TaskPhaseFilter::Cancelling => Self::Cancelling,
+            TaskPhaseFilter::Terminal => Self::Terminal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +466,7 @@ pub enum RpcSuccess {
     },
     GeneralSubmitted {
         task: TaskView,
+        disposition: SubmissionDispositionView,
     },
     GeneralCompletionAccepted {
         accepted: bool,
@@ -441,6 +476,7 @@ pub enum RpcSuccess {
     },
     TaskListed {
         tasks: Vec<TaskView>,
+        next_cursor: Option<String>,
     },
     TaskEvents {
         page: TaskEventPage,
@@ -529,6 +565,22 @@ pub enum ComponentStateView {
     Degraded,
     Unavailable,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionDispositionView {
+    Created,
+    Existing,
+}
+
+impl From<TaskSubmissionDisposition> for SubmissionDispositionView {
+    fn from(value: TaskSubmissionDisposition) -> Self {
+        match value {
+            TaskSubmissionDisposition::Created => Self::Created,
+            TaskSubmissionDisposition::Existing => Self::Existing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1085,20 +1137,46 @@ impl RpcService {
                         "readiness timeout is outside the allowed range",
                     ));
                 }
-                let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-                loop {
-                    let status = self.system_status();
-                    let ready = readiness_from_status(&status);
-                    if ready || Instant::now() >= deadline {
-                        return Ok(RpcSuccess::SystemReadiness {
-                            ready,
-                            status,
-                            reason_code: (!ready).then(|| "LOWER_LAYER_NOT_READY".into()),
-                        });
-                    }
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    thread::sleep(remaining.min(Duration::from_millis(10)));
-                }
+                let preflight = self
+                    .scheduler
+                    .preflight_runtime(Duration::from_millis(timeout_ms));
+                let mut status = self.system_status();
+                status.components.insert(
+                    "driver".into(),
+                    if preflight.driver_ready {
+                        ComponentStateView::Ready
+                    } else {
+                        ComponentStateView::Unavailable
+                    },
+                );
+                status.components.insert(
+                    "runtime".into(),
+                    if preflight.runtime_ready {
+                        ComponentStateView::Ready
+                    } else {
+                        ComponentStateView::Unavailable
+                    },
+                );
+                status.components.insert(
+                    "model_auth".into(),
+                    if preflight.model_auth_ready {
+                        ComponentStateView::Ready
+                    } else {
+                        ComponentStateView::Unavailable
+                    },
+                );
+                let ready = preflight.reaped && readiness_from_status(&status);
+                Ok(RpcSuccess::SystemReadiness {
+                    ready,
+                    status,
+                    reason_code: if !preflight.reaped {
+                        Some("RUNTIME_CLEANUP_FAILED".into())
+                    } else if !ready {
+                        Some("LOWER_LAYER_NOT_READY".into())
+                    } else {
+                        None
+                    },
+                })
             }
             RpcMethod::SubmitGeneral { input } => {
                 validate_text(&input.feature_id, "feature_id", 256)?;
@@ -1109,6 +1187,7 @@ impl RpcService {
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted.job, submitted.task),
+                    disposition: submitted.disposition.into(),
                 })
             }
             RpcMethod::GeneralComplete(input) => {
@@ -1145,6 +1224,9 @@ impl RpcService {
                         validate_text(value, field, cap)?;
                     }
                 }
+                if let Some(cursor) = query.cursor.as_deref() {
+                    validate_text(cursor, "cursor", 64)?;
+                }
                 if query.repository.is_none()
                     && query.feature_id.is_none()
                     && query.ownership_token.is_none()
@@ -1154,21 +1236,36 @@ impl RpcService {
                         "at least one task list scope is required",
                     ));
                 }
-                let tasks = self
+                let canonical_repository = query
+                    .repository
+                    .as_deref()
+                    .map(|repository| canonical_general_repository(Path::new(repository)))
+                    .transpose()
+                    .map_err(|_| {
+                        RpcError::new(RpcErrorCode::Validation, "repository scope is invalid")
+                    })?
+                    .map(|repository| repository.to_string_lossy().into_owned());
+                let profile = query.profile.map(general_profile_name);
+                let page = self
                     .store
-                    .list_tasks_scoped(
+                    .list_task_page(
                         TaskQueryScope {
-                            repository: query.repository.as_deref(),
+                            repository: canonical_repository.as_deref(),
                             feature_id: query.feature_id.as_deref(),
                             ownership_token: query.ownership_token.as_deref(),
                         },
                         None,
-                        false,
+                        TaskPageFilter {
+                            phase: query.phase.map(Into::into),
+                            outcome: query.outcome,
+                            profile,
+                        },
+                        query.cursor.as_deref().map(parse_task_cursor).transpose()?,
                         query.limit,
                     )
                     .map_err(map_store)?;
-                let mut views = Vec::with_capacity(tasks.len());
-                for task in tasks {
+                let mut views = Vec::with_capacity(page.tasks.len());
+                for task in page.tasks {
                     let job = self
                         .store
                         .get_job(&task.execution_agent_id)
@@ -1178,7 +1275,10 @@ impl RpcService {
                         })?;
                     views.push(task_view(job, task));
                 }
-                Ok(RpcSuccess::TaskListed { tasks: views })
+                Ok(RpcSuccess::TaskListed {
+                    tasks: views,
+                    next_cursor: page.next_cursor.map(format_task_cursor),
+                })
             }
             RpcMethod::TaskPending { agent_id } => {
                 let (_, task) = self.require_task(&agent_id)?;
@@ -1533,14 +1633,9 @@ impl RpcService {
             },
         );
         components.insert("scheduler".into(), ComponentStateView::Ready);
-        let runtime_state = if self.scheduler.active_count() == 0 {
-            ComponentStateView::Unknown
-        } else {
-            ComponentStateView::Ready
-        };
-        components.insert("driver".into(), runtime_state);
-        components.insert("runtime".into(), runtime_state);
-        components.insert("model_auth".into(), runtime_state);
+        components.insert("driver".into(), ComponentStateView::Unknown);
+        components.insert("runtime".into(), ComponentStateView::Unknown);
+        components.insert("model_auth".into(), ComponentStateView::Unknown);
         SystemStatusView {
             api_surface: "subagent_v2".into(),
             protocol_version: RPC_VERSION,
@@ -1580,22 +1675,8 @@ impl RpcService {
         }
         let task = self
             .store
-            .list_tasks_scoped(
-                TaskQueryScope {
-                    repository: Some(&latest.1.repository),
-                    feature_id: Some(&latest.1.feature_id),
-                    ownership_token: Some(&latest.1.ownership_token),
-                },
-                None,
-                false,
-                MAX_LIST_JOBS,
-            )
+            .get_task_attempt(agent_id, attempt_sequence)
             .map_err(map_store)?
-            .into_iter()
-            .find(|candidate| {
-                candidate.public_agent_id == agent_id
-                    && candidate.attempt_sequence == attempt_sequence
-            })
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task attempt was not found"))?;
         self.require_task_record(task)
     }
@@ -1631,6 +1712,53 @@ impl RpcService {
             .store
             .task_result(&task.execution_agent_id)
             .map_err(map_store)?;
+        if matches!(
+            task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        ) {
+            let source_valid = result.as_ref().is_some_and(|stored| {
+                stored.result.outcome == TaskOutcome::Succeeded && !stored.result.partial
+            });
+            if !source_valid {
+                return Ok(Vec::new());
+            }
+            let Some(verified) = self
+                .scheduler
+                .verify_review_artifact(&task.execution_agent_id, 0)
+                .map_err(map_scheduler)?
+            else {
+                return Ok(Vec::new());
+            };
+            if !verified.finalized || verified.integrity != ArtifactIntegrity::Valid {
+                return Ok(Vec::new());
+            }
+            let (Some(expected_sha256), Some(expected_bytes)) =
+                (verified.expected_sha256, verified.expected_bytes)
+            else {
+                return Ok(Vec::new());
+            };
+            let artifact = self
+                .store
+                .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+                .map_err(map_store)?
+                .into_iter()
+                .find(|artifact| {
+                    artifact.artifact_type == "review_report"
+                        && artifact.path == verified.locator
+                        && artifact.sha256 == expected_sha256
+                        && artifact.bytes == expected_bytes
+                });
+            return Ok(artifact
+                .map(|artifact| {
+                    vec![TaskArtifactMetadataView {
+                        artifact_id: artifact.artifact_id,
+                        kind: "report_markdown".into(),
+                        sha256: artifact.sha256,
+                        size_bytes: artifact.bytes,
+                    }]
+                })
+                .unwrap_or_default());
+        }
         let allowed = result
             .as_ref()
             .map(|stored| {
@@ -1642,10 +1770,6 @@ impl RpcService {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let review_task = matches!(
-            task.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        );
         let mut projected = Vec::new();
         for artifact in self
             .store
@@ -1654,8 +1778,7 @@ impl RpcService {
         {
             let permitted = allowed
                 .get(artifact.artifact_id.as_str())
-                .is_some_and(|sha| *sha == artifact.sha256)
-                || (review_task && artifact.artifact_type == "report");
+                .is_some_and(|sha| *sha == artifact.sha256);
             if permitted {
                 projected.push(TaskArtifactMetadataView {
                     artifact_id: artifact.artifact_id,
@@ -1976,6 +2099,27 @@ fn readiness_from_status(status: &SystemStatusView) -> bool {
     ]
     .iter()
     .all(|component| status.components.get(*component) == Some(&ComponentStateView::Ready))
+}
+
+fn general_profile_name(profile: GeneralProfile) -> &'static str {
+    match profile {
+        GeneralProfile::AnalysisReadonly => "analysis_readonly",
+        GeneralProfile::ImplementationWorktree => "implementation_worktree",
+        GeneralProfile::TestRunner => "test_runner",
+    }
+}
+
+fn parse_task_cursor(cursor: &str) -> Result<u64, RpcError> {
+    let value = cursor
+        .strip_prefix("task:")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RpcError::new(RpcErrorCode::Validation, "task cursor is invalid"))?;
+    Ok(value)
+}
+
+fn format_task_cursor(cursor: u64) -> String {
+    format!("task:{cursor}")
 }
 
 fn public_artifact_kind(stored: &str) -> &'static str {

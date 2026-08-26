@@ -30,6 +30,7 @@ use zcode_reviewd::{
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
         ReviewToolInput, RpcErrorCode, RpcMethod, RpcServer, RpcService, RpcSuccess, ServerOptions,
+        TaskArtifactQuery,
     },
     CommandRuntimeFactory, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
 };
@@ -769,6 +770,46 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         Some("fixture-model")
     );
     assert_eq!(first_result.result.outcome, TaskOutcome::Succeeded);
+    let first_public_artifact = match fixture
+        .service
+        .dispatch(RpcMethod::TaskResult {
+            agent_id: first.agent_id.clone(),
+            attempt_sequence: Some(1),
+        })
+        .unwrap()
+    {
+        RpcSuccess::TaskResult {
+            result: Some(result),
+            artifacts,
+            ..
+        } => {
+            assert_eq!(result.outcome, TaskOutcome::Succeeded);
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(artifacts[0].kind, "report_markdown");
+            assert_eq!(artifacts[0].size_bytes, first_report_bytes.len() as u64);
+            artifacts[0].clone()
+        }
+        other => panic!("unexpected finalized public result: {other:?}"),
+    };
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskArtifact(TaskArtifactQuery {
+            agent_id: first.agent_id.clone(),
+            attempt_sequence: Some(1),
+            artifact_id: first_public_artifact.artifact_id.clone(),
+            offset_bytes: 0,
+            limit_bytes: 8 * 1024,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskArtifact { chunk } => {
+            assert_eq!(chunk.sha256, first_public_artifact.sha256);
+            assert_eq!(chunk.size_bytes, first_public_artifact.size_bytes);
+            assert_eq!(chunk.bytes, first_report_bytes);
+            assert!(chunk.eof);
+        }
+        other => panic!("unexpected finalized public artifact: {other:?}"),
+    }
 
     let continuation_input = MinimalStructuredReviewContinuation {
         agent_id: first.agent_id.clone(),
@@ -977,6 +1018,89 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         first_snapshot
     );
     assert_eq!(fs::read(&first_report).unwrap(), first_report_bytes);
+    fs::write(&first_report, "tampered after finalization\n").unwrap();
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskResult {
+            agent_id: first.agent_id.clone(),
+            attempt_sequence: Some(1),
+        })
+        .unwrap()
+    {
+        RpcSuccess::TaskResult { artifacts, .. } => assert!(artifacts.is_empty()),
+        other => panic!("unexpected tampered public result: {other:?}"),
+    }
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskArtifact(TaskArtifactQuery {
+                agent_id: first.agent_id,
+                attempt_sequence: Some(1),
+                artifact_id: first_public_artifact.artifact_id,
+                offset_bytes: 0,
+                limit_bytes: 8 * 1024,
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::NotFound
+    );
+}
+
+#[test]
+fn unfinalized_structured_review_projects_no_public_report_artifact() {
+    let fixture = Fixture::new();
+    let input = fixture.structured_submission("structured-missing-final");
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview { input })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let execution = fixture
+        .store
+        .get_task(&review.agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![execution.clone()]
+    );
+    let permission = fixture
+        .wait_pending(&execution)
+        .into_iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: review.agent_id.clone(),
+            request_id: permission.request_id,
+            decision: ResponseDecision::Allow,
+            content: None,
+        }))
+        .unwrap();
+    assert_eq!(fixture.wait_terminal(&execution).state, JobState::Failed);
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskResult {
+            agent_id: review.agent_id,
+            attempt_sequence: Some(1),
+        })
+        .unwrap()
+    {
+        RpcSuccess::TaskResult {
+            result: Some(result),
+            artifacts,
+            ..
+        } => {
+            assert_ne!(result.outcome, TaskOutcome::Succeeded);
+            assert!(artifacts.is_empty());
+        }
+        other => panic!("unexpected unfinalized public result: {other:?}"),
+    }
 }
 
 #[test]

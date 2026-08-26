@@ -470,6 +470,25 @@ impl GeneralTaskPreparer {
             }
         }
     }
+
+    pub fn prepare_submission(
+        &self,
+        manifest: &GeneralTaskManifest,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        let repository = canonical_general_repository(&manifest.repository)?;
+        let task_id = format!(
+            "ztask-{}",
+            hash(&serde_json::to_vec(&(
+                repository.as_path(),
+                manifest.idempotency_key.as_str(),
+            ))?)
+        );
+        let mut canonical = manifest.clone();
+        canonical.repository = repository;
+        canonical.task_id = task_id.clone();
+        canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(task_id);
+        self.prepare(&canonical)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1262,7 +1281,7 @@ fn validate_budget(v: &BudgetLimits) -> PreparationResult<()> {
     }
     Ok(())
 }
-fn canonical_repository(path: &Path) -> PreparationResult<PathBuf> {
+pub fn canonical_general_repository(path: &Path) -> PreparationResult<PathBuf> {
     if !path.is_absolute() {
         return Err(PreparationError::InvalidPath {
             path: path.into(),
@@ -1277,6 +1296,10 @@ fn canonical_repository(path: &Path) -> PreparationResult<PathBuf> {
         });
     }
     Ok(p)
+}
+
+fn canonical_repository(path: &Path) -> PreparationResult<PathBuf> {
+    canonical_general_repository(path)
 }
 fn resolve_commit(repo: &Path, r: &str) -> PreparationResult<String> {
     if r.len() != 40 || !r.bytes().all(|b| b.is_ascii_hexdigit()) {

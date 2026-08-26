@@ -351,6 +351,12 @@ pub struct SubmissionOwnership {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSubmissionDisposition {
+    Created,
+    Existing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPhase {
     Queued,
     Preparing,
@@ -539,6 +545,26 @@ pub struct TaskQueryScope<'a> {
     pub repository: Option<&'a str>,
     pub feature_id: Option<&'a str>,
     pub ownership_token: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPageFilter<'a> {
+    pub phase: Option<TaskPhase>,
+    pub outcome: Option<TaskOutcome>,
+    pub profile: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskRecord>,
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueuedTask {
+    pub job: Job,
+    pub task: TaskRecord,
+    pub disposition: TaskSubmissionDisposition,
 }
 
 const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
@@ -1025,6 +1051,11 @@ impl Store {
     }
 
     pub fn enqueue_task(&self, task: &NewTask) -> StoreResult<(Job, TaskRecord)> {
+        let enqueued = self.enqueue_task_authoritative(task)?;
+        Ok((enqueued.job, enqueued.task))
+    }
+
+    pub fn enqueue_task_authoritative(&self, task: &NewTask) -> StoreResult<EnqueuedTask> {
         validate_task(task)?;
         validate_prepared_launch(&task.job)?;
         let effective = resolve_effective_budget(&task.budget)?;
@@ -1064,7 +1095,11 @@ impl Store {
                 let record = query_task_record(&transaction, &owner.execution_agent_id)?
                     .ok_or_else(|| StoreError::InvalidState("task metadata disappeared".into()))?;
                 transaction.commit()?;
-                return Ok((job, record));
+                return Ok(EnqueuedTask {
+                    job,
+                    task: record,
+                    disposition: TaskSubmissionDisposition::Existing,
+                });
             }
         }
         if query_job(&transaction, &task.job.agent_id)?.is_some() {
@@ -1098,7 +1133,11 @@ impl Store {
         let job = query_job(&transaction, &task.job.agent_id)?.unwrap();
         let record = query_task_record(&transaction, &task.job.agent_id)?.unwrap();
         transaction.commit()?;
-        Ok((job, record))
+        Ok(EnqueuedTask {
+            job,
+            task: record,
+            disposition: TaskSubmissionDisposition::Created,
+        })
     }
 
     pub fn submission_by_idempotency(&self, key: &str) -> StoreResult<Option<SubmissionOwnership>> {
@@ -1125,6 +1164,31 @@ impl Store {
                 "SELECT execution_agent_id FROM task_attempts
                  WHERE public_agent_id=?1 ORDER BY attempt_sequence DESC LIMIT 1",
                 [public_agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        execution_id
+            .map(|execution_id| query_task_record(&connection, &execution_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn get_task_attempt(
+        &self,
+        public_agent_id: &str,
+        attempt_sequence: u64,
+    ) -> StoreResult<Option<TaskRecord>> {
+        if public_agent_id.is_empty() || attempt_sequence == 0 {
+            return Err(StoreError::InvalidState(
+                "task attempt identity must be non-empty and positive".into(),
+            ));
+        }
+        let connection = self.connection.lock().unwrap();
+        let execution_id = connection
+            .query_row(
+                "SELECT execution_agent_id FROM task_attempts
+                 WHERE public_agent_id=?1 AND attempt_sequence=?2",
+                params![public_agent_id, u64_to_i64(attempt_sequence)?],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -1169,31 +1233,99 @@ impl Store {
         legacy_compatible_review_only: bool,
         limit: usize,
     ) -> StoreResult<Vec<TaskRecord>> {
-        let connection = self.connection.lock().unwrap();
-        validate_scope(&scope)?;
         if legacy_compatible_review_only {
             return Ok(Vec::new());
         }
-        let kind_filter = kind;
-        let mut statement = connection.prepare("SELECT execution_agent_id FROM task_attempts WHERE (?1 IS NULL OR repository=?1) AND (?2 IS NULL OR feature_id=?2) AND (?3 IS NULL OR ownership_token=?3) AND (?4 IS NULL OR task_kind=?4) ORDER BY rowid DESC LIMIT ?5")?;
-        let ids = statement
+        Ok(self
+            .list_task_page(
+                scope,
+                kind,
+                TaskPageFilter {
+                    phase: None,
+                    outcome: None,
+                    profile: None,
+                },
+                None,
+                limit,
+            )?
+            .tasks)
+    }
+
+    pub fn list_task_page(
+        &self,
+        scope: TaskQueryScope<'_>,
+        kind: Option<TaskKind>,
+        filter: TaskPageFilter<'_>,
+        before_cursor: Option<u64>,
+        limit: usize,
+    ) -> StoreResult<TaskPage> {
+        validate_scope(&scope)?;
+        if limit == 0 {
+            return Err(StoreError::InvalidState(
+                "task page limit must be positive".into(),
+            ));
+        }
+        if filter.profile.is_some_and(str::is_empty) {
+            return Err(StoreError::InvalidState(
+                "task profile filter must be non-empty".into(),
+            ));
+        }
+        let connection = self.connection.lock().unwrap();
+        let fetch_limit = limit
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidState("task page limit overflow".into()))?;
+        let mut statement = connection.prepare(
+            "SELECT ta.rowid, ta.execution_agent_id
+             FROM task_attempts ta
+             JOIN agents a ON a.agent_id=ta.execution_agent_id
+             LEFT JOIN task_results tr ON tr.execution_agent_id=ta.execution_agent_id
+             WHERE (?1 IS NULL OR ta.repository=?1)
+               AND (?2 IS NULL OR ta.feature_id=?2)
+               AND (?3 IS NULL OR ta.ownership_token=?3)
+               AND (?4 IS NULL OR ta.task_kind=?4)
+               AND (?5 IS NULL OR ta.phase=?5)
+               AND (?6 IS NULL OR tr.outcome=?6)
+               AND (?7 IS NULL OR CASE
+                    WHEN json_valid(a.prepared_launch_json)
+                    THEN json_extract(a.prepared_launch_json, '$.profile')
+                    ELSE NULL
+                   END=?7)
+               AND (?8 IS NULL OR ta.rowid<?8)
+             ORDER BY ta.rowid DESC
+             LIMIT ?9",
+        )?;
+        let mut rows = statement
             .query_map(
                 params![
                     scope.repository,
                     scope.feature_id,
                     scope.ownership_token,
-                    kind_filter.map(TaskKind::as_str),
-                    usize_to_i64(limit)?
+                    kind.map(TaskKind::as_str),
+                    filter.phase.map(TaskPhase::as_str),
+                    filter.outcome.map(TaskOutcome::as_str),
+                    filter.profile,
+                    before_cursor.map(u64_to_i64).transpose()?,
+                    usize_to_i64(fetch_limit)?
                 ],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        ids.into_iter()
-            .map(|id| {
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = has_more
+            .then(|| rows.last().map(|(rowid, _)| i64_to_u64(*rowid)))
+            .flatten()
+            .transpose()?;
+        let tasks = rows
+            .into_iter()
+            .map(|(_, id)| {
                 query_task_record(&connection, &id)?
                     .ok_or_else(|| StoreError::InvalidState("task disappeared".into()))
             })
-            .collect()
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(TaskPage { tasks, next_cursor })
     }
 
     pub fn store_task_result(
@@ -5591,10 +5723,17 @@ mod tests {
     fn task_identity_idempotency_scope_and_budget_are_durable() {
         let (_directory, path, store) = file_store();
         let task = general_task("execution-1", "public-1", "key-1");
-        let (_, first) = store.enqueue_task(&task).unwrap();
+        let first_submission = store.enqueue_task_authoritative(&task).unwrap();
+        assert_eq!(
+            first_submission.disposition,
+            TaskSubmissionDisposition::Created
+        );
+        let first = first_submission.task;
         assert_eq!(first.task_kind, TaskKind::General);
         assert_eq!(first.effective_budget, DEFAULT_BUDGET);
-        assert_eq!(store.enqueue_task(&task).unwrap().1, first);
+        let replay = store.enqueue_task_authoritative(&task).unwrap();
+        assert_eq!(replay.disposition, TaskSubmissionDisposition::Existing);
+        assert_eq!(replay.task, first);
         let mut conflict = task.clone();
         conflict.repository = "other".into();
         assert!(matches!(
@@ -6121,6 +6260,167 @@ mod tests {
             ),
             Err(StoreError::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn task_page_filters_before_limit_paginates_stably_and_point_lookup_has_no_recent_cap() {
+        let (_directory, _path, store) = file_store();
+        let complete = |store: &Store, execution_id: &str| {
+            store
+                .set_task_phase(execution_id, TaskPhase::Preparing)
+                .unwrap();
+            store
+                .set_task_phase(execution_id, TaskPhase::Running)
+                .unwrap();
+            store
+                .store_task_result(
+                    execution_id,
+                    &TaskResult {
+                        outcome: TaskOutcome::Succeeded,
+                        summary: "complete".into(),
+                        partial: false,
+                        base_commit: None,
+                        head_commit: None,
+                        changed_files: Vec::new(),
+                        diff_stat: None,
+                        checks: Vec::new(),
+                        residual_gaps: Vec::new(),
+                        artifacts: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+
+        for index in 1..=3 {
+            let mut task = general_task(
+                &format!("page-match-{index}"),
+                &format!("page-public-{index}"),
+                &format!("page-key-{index}"),
+            );
+            task.feature_id = "page-feature".into();
+            task.job.prepared_launch_json = Some(r#"{"profile":"analysis_readonly"}"#.into());
+            task.job.prepared_launch_sha256 = Some("profile-fixture".into());
+            store.enqueue_task(&task).unwrap();
+            complete(&store, &task.job.agent_id);
+        }
+        for index in 0..101 {
+            let mut task = general_task(
+                &format!("page-noise-{index:03}"),
+                &format!("page-noise-public-{index:03}"),
+                &format!("page-noise-key-{index:03}"),
+            );
+            task.feature_id = "page-feature".into();
+            task.job.prepared_launch_json = Some(r#"{"profile":"test_runner"}"#.into());
+            task.job.prepared_launch_sha256 = Some("profile-fixture".into());
+            store.enqueue_task(&task).unwrap();
+        }
+        let mut malformed = general_task(
+            "page-malformed-preparation",
+            "page-malformed-public",
+            "page-malformed-key",
+        );
+        malformed.feature_id = "page-feature".into();
+        malformed.job.prepared_launch_json = Some("not-json".into());
+        malformed.job.prepared_launch_sha256 = Some("profile-fixture".into());
+        store.enqueue_task(&malformed).unwrap();
+        let filter = TaskPageFilter {
+            phase: Some(TaskPhase::Terminal),
+            outcome: Some(TaskOutcome::Succeeded),
+            profile: Some("analysis_readonly"),
+        };
+        let first = store
+            .list_task_page(
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: Some("page-feature"),
+                    ownership_token: None,
+                },
+                None,
+                filter.clone(),
+                None,
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            first
+                .tasks
+                .iter()
+                .map(|task| task.execution_agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["page-match-3", "page-match-2"]
+        );
+        let cursor = first.next_cursor.expect("first page must continue");
+        let second = store
+            .list_task_page(
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: Some("page-feature"),
+                    ownership_token: None,
+                },
+                None,
+                filter,
+                Some(cursor),
+                2,
+            )
+            .unwrap();
+        assert_eq!(second.tasks.len(), 1);
+        assert_eq!(second.tasks[0].execution_agent_id, "page-match-1");
+        assert_eq!(second.next_cursor, None);
+
+        let mut fresh = general_task("attempt-001", "attempt-public", "attempt-key-001");
+        fresh.task_kind = TaskKind::Review;
+        fresh.job.review_kind = Some("code".into());
+        fresh.review_id = Some("attempt-review".into());
+        store.enqueue_task(&fresh).unwrap();
+        let mut previous = fresh.job.agent_id;
+        for sequence in 2..=102 {
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE agents SET state='COMPLETED' WHERE agent_id=?1",
+                    [&previous],
+                )
+                .unwrap();
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id=?1",
+                    [&previous],
+                )
+                .unwrap();
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO review_finalizations (agent_id,signal,payload_json,payload_sha256,revision,created_at) VALUES (?1,'no_findings_observed','{}','hash',1,1)",
+                    [&previous],
+                )
+                .unwrap();
+            let execution_id = format!("attempt-{sequence:03}");
+            let mut continuation = general_task(
+                &execution_id,
+                "attempt-public",
+                &format!("attempt-key-{sequence:03}"),
+            );
+            continuation.task_kind = TaskKind::ReviewContinuation;
+            continuation.job.review_kind = Some("code".into());
+            continuation.review_id = Some("attempt-review".into());
+            continuation.continuation_of = Some(previous);
+            let (_, record) = store.enqueue_task(&continuation).unwrap();
+            assert_eq!(record.attempt_sequence, sequence);
+            previous = execution_id;
+        }
+        let oldest = store
+            .get_task_attempt("attempt-public", 1)
+            .unwrap()
+            .expect("oldest attempt must remain point-addressable");
+        assert_eq!(oldest.execution_agent_id, "attempt-001");
+        assert_eq!(oldest.attempt_sequence, 1);
     }
 
     #[test]

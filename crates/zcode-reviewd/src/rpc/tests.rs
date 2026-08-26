@@ -276,14 +276,14 @@ fn submit_general_fixture(
     git(&repository, &["commit", "-m", "fixture"]);
     let base_ref = git(&repository, &["rev-parse", "HEAD"]);
     let repository = std::fs::canonicalize(repository).unwrap();
-    let agent_id = format!("s05-{name}");
+    let requested_agent_id = format!("s05-{name}");
     let result = fixture
         .service
         .dispatch(RpcMethod::SubmitGeneral {
             input: GeneralSubmitInput {
                 manifest: GeneralTaskManifest {
                     schema: review_preparation::GENERAL_TASK_SCHEMA.into(),
-                    task_id: agent_id.clone(),
+                    task_id: requested_agent_id.clone(),
                     repository: repository.clone(),
                     base_ref,
                     profile: GeneralProfile::AnalysisReadonly,
@@ -292,7 +292,7 @@ fn submit_general_fixture(
                     attachments: Vec::new(),
                     write_manifest: Vec::new(),
                     scratch_root: ".agent-work/scratch/general".into(),
-                    artifact_root: PathBuf::from(".agent-work/artifacts").join(&agent_id),
+                    artifact_root: PathBuf::from(".agent-work/artifacts").join(&requested_agent_id),
                     budget: None,
                     validation_commands: Default::default(),
                     retain_partial: false,
@@ -303,7 +303,13 @@ fn submit_general_fixture(
             },
         })
         .unwrap();
-    assert!(matches!(result, RpcSuccess::GeneralSubmitted { .. }));
+    let agent_id = match result {
+        RpcSuccess::GeneralSubmitted {
+            task,
+            disposition: SubmissionDispositionView::Created,
+        } => task.agent_id,
+        other => panic!("unexpected general submission: {other:?}"),
+    };
     (repository, agent_id)
 }
 
@@ -461,6 +467,8 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
     let (repository_a, agent_a) =
         submit_general_fixture(&fixture, "scope-a", "feature-a", "owner-a");
     let (_, agent_b) = submit_general_fixture(&fixture, "scope-b", "feature-b", "owner-b");
+    let (_, agent_c) = submit_general_fixture(&fixture, "scope-c", "feature-a", "owner-a");
+    let (_, agent_d) = submit_general_fixture(&fixture, "scope-d", "feature-a", "owner-a");
 
     match fixture
         .service
@@ -468,17 +476,88 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
             repository: Some(repository_a.to_string_lossy().into_owned()),
             feature_id: Some("feature-a".into()),
             ownership_token: None,
+            phase: None,
+            outcome: None,
+            profile: None,
+            cursor: None,
             limit: 10,
         }))
         .unwrap()
     {
-        RpcSuccess::TaskListed { tasks } => {
+        RpcSuccess::TaskListed { tasks, .. } => {
             assert_eq!(tasks.len(), 1);
             assert_eq!(tasks[0].agent_id, agent_a);
             assert_ne!(tasks[0].agent_id, agent_b);
         }
         other => panic!("unexpected list: {other:?}"),
     }
+    let (first_page, cursor) = match fixture
+        .service
+        .dispatch(RpcMethod::TaskList(TaskListQuery {
+            repository: None,
+            feature_id: Some("feature-a".into()),
+            ownership_token: None,
+            phase: Some(TaskPhaseFilter::Queued),
+            outcome: None,
+            profile: Some(GeneralProfile::AnalysisReadonly),
+            cursor: None,
+            limit: 2,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskListed { tasks, next_cursor } => {
+            (tasks, next_cursor.expect("first page must expose a cursor"))
+        }
+        other => panic!("unexpected first page: {other:?}"),
+    };
+    assert_eq!(first_page.len(), 2);
+    let second_page = match fixture
+        .service
+        .dispatch(RpcMethod::TaskList(TaskListQuery {
+            repository: None,
+            feature_id: Some("feature-a".into()),
+            ownership_token: None,
+            phase: Some(TaskPhaseFilter::Queued),
+            outcome: None,
+            profile: Some(GeneralProfile::AnalysisReadonly),
+            cursor: Some(cursor),
+            limit: 2,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskListed { tasks, next_cursor } => {
+            assert!(next_cursor.is_none());
+            tasks
+        }
+        other => panic!("unexpected second page: {other:?}"),
+    };
+    assert_eq!(second_page.len(), 1);
+    let listed_ids = first_page
+        .into_iter()
+        .chain(second_page)
+        .map(|task| task.agent_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        listed_ids,
+        [agent_a.clone(), agent_c, agent_d].into_iter().collect()
+    );
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskList(TaskListQuery {
+                repository: None,
+                feature_id: Some("feature-a".into()),
+                ownership_token: None,
+                phase: None,
+                outcome: None,
+                profile: None,
+                cursor: Some("not-a-cursor".into()),
+                limit: 2,
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
     assert_eq!(
         fixture
             .service
@@ -486,6 +565,10 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
                 repository: None,
                 feature_id: None,
                 ownership_token: None,
+                phase: None,
+                outcome: None,
+                profile: None,
+                cursor: None,
                 limit: 10,
             }))
             .unwrap_err()
@@ -527,16 +610,84 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
 #[test]
 fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
     let fixture = fixture();
+    assert_eq!(fixture.scheduler.active_count(), 0);
     let started = Instant::now();
     match fixture
         .service
         .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 10 })
         .unwrap()
     {
-        RpcSuccess::SystemReadiness { ready, .. } => assert!(!ready),
+        RpcSuccess::SystemReadiness {
+            ready,
+            status,
+            reason_code,
+        } => {
+            assert!(ready);
+            assert_eq!(reason_code, None);
+            for component in ["driver", "runtime", "model_auth"] {
+                assert_eq!(
+                    status.components.get(component),
+                    Some(&ComponentStateView::Ready)
+                );
+            }
+        }
         other => panic!("unexpected readiness: {other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(fixture.scheduler.active_count(), 0);
+    assert!(fixture.store.list_jobs(10).unwrap().is_empty());
+    assert!(fixture
+        .factory
+        .runtimes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(agent_id, _)| agent_id.starts_with("readiness-"))
+        .all(|(_, runtime)| runtime.terminal.lock().unwrap().is_some()));
+
+    struct InvalidReadinessFactory;
+    impl RuntimeFactory for InvalidReadinessFactory {
+        fn spawn(
+            &self,
+            _job: &Job,
+            _sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "configured runtime is unavailable",
+            ))
+        }
+    }
+    let invalid_store =
+        Arc::new(Store::open(fixture._directory.path().join("invalid-readiness.sqlite3")).unwrap());
+    let invalid_scheduler = Scheduler::new(
+        "invalid-readiness",
+        Arc::clone(&invalid_store),
+        Arc::new(InvalidReadinessFactory),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    let invalid_service = RpcService::new(invalid_scheduler, invalid_store).unwrap();
+    let invalid_started = Instant::now();
+    match invalid_service
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 10 })
+        .unwrap()
+    {
+        RpcSuccess::SystemReadiness {
+            ready,
+            status,
+            reason_code,
+        } => {
+            assert!(!ready);
+            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(
+                status.components.get("driver"),
+                Some(&ComponentStateView::Unavailable)
+            );
+        }
+        other => panic!("unexpected invalid readiness: {other:?}"),
+    }
+    assert!(invalid_started.elapsed() < Duration::from_secs(1));
 
     let (repository, agent_id) =
         submit_general_fixture(&fixture, "artifact", "feature-artifact", "owner-artifact");
@@ -995,6 +1146,10 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
             repository: Some("/repository".into()),
             feature_id: None,
             ownership_token: None,
+            phase: None,
+            outcome: None,
+            profile: None,
+            cursor: None,
             limit: 10,
         }),
         RpcMethod::TaskPending {

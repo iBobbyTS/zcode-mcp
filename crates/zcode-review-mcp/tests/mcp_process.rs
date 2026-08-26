@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Barrier, Mutex,
     },
+    thread,
     time::Duration,
 };
 use zcode_driver::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
@@ -231,6 +232,7 @@ struct PublicFakeRuntime {
     turn: Mutex<TurnSnapshot>,
     bootstrap_entered: Arc<Barrier>,
     bootstrap_release: Arc<Barrier>,
+    readiness: bool,
 }
 
 impl PublicFakeRuntime {
@@ -261,27 +263,31 @@ impl ManagedRuntime for PublicFakeRuntime {
         job: &review_store::Job,
         _timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        self.bootstrap_entered.wait();
-        self.bootstrap_release.wait();
+        if !self.readiness {
+            self.bootstrap_entered.wait();
+            self.bootstrap_release.wait();
+        }
         *self.turn.lock().unwrap() = TurnSnapshot {
             generation: 1,
             active: true,
             boundary: None,
         };
-        self.emit(RuntimeEvent::Driver(Inbound::Message(
-            WireMessage::Request(RequestEnvelope::new(
-                WireId::String("permission-wire".into()),
-                "interaction/requestPermission",
-                json!({"toolCallId":"tool-1","toolName":"git_ref_mutation","input":{}}),
-            )),
-        )));
-        self.emit(RuntimeEvent::Driver(Inbound::Message(
-            WireMessage::Request(RequestEnvelope::new(
-                WireId::String("input-wire".into()),
-                "interaction/requestUserInput",
-                json!({"question":"private unsupported payload"}),
-            )),
-        )));
+        if !self.readiness {
+            self.emit(RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::Request(RequestEnvelope::new(
+                    WireId::String("permission-wire".into()),
+                    "interaction/requestPermission",
+                    json!({"toolCallId":"tool-1","toolName":"git_ref_mutation","input":{}}),
+                )),
+            )));
+            self.emit(RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::Request(RequestEnvelope::new(
+                    WireId::String("input-wire".into()),
+                    "interaction/requestUserInput",
+                    json!({"question":"private unsupported payload"}),
+                )),
+            )));
+        }
         Ok(SessionReady {
             session_id: format!("session-{}", job.agent_id),
             initial_turn_id: Some("turn-1".into()),
@@ -324,13 +330,9 @@ struct PublicFakeFactory {
     bootstrap_entered: Arc<Barrier>,
     bootstrap_release: Arc<Barrier>,
 }
-impl RuntimeFactory for PublicFakeFactory {
-    fn spawn(
-        &self,
-        _job: &review_store::Job,
-        sink: Arc<dyn LifecycleSink>,
-    ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
-        Ok(Arc::new(PublicFakeRuntime {
+impl PublicFakeFactory {
+    fn runtime(&self, sink: Arc<dyn LifecycleSink>, readiness: bool) -> Arc<dyn ManagedRuntime> {
+        Arc::new(PublicFakeRuntime {
             sink,
             sequence: AtomicU64::new(1),
             terminal: Mutex::new(None),
@@ -341,7 +343,25 @@ impl RuntimeFactory for PublicFakeFactory {
             }),
             bootstrap_entered: Arc::clone(&self.bootstrap_entered),
             bootstrap_release: Arc::clone(&self.bootstrap_release),
-        }))
+            readiness,
+        })
+    }
+}
+impl RuntimeFactory for PublicFakeFactory {
+    fn spawn(
+        &self,
+        _job: &review_store::Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
+        Ok(self.runtime(sink, false))
+    }
+
+    fn spawn_readiness(
+        &self,
+        _job: &review_store::Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
+        Ok(self.runtime(sink, true))
     }
 }
 
@@ -556,7 +576,7 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
 
     let mut first = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
     let readiness = first.tool("zcode_system_ensure_ready", json!({"timeout_ms":10}));
-    assert_eq!(readiness["ready"], false);
+    assert_eq!(readiness["ready"], true);
     let spawn_input = json!({
         "repository":manifest.repository,
         "base_ref":manifest.base_ref,
@@ -617,6 +637,100 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
     let closed = restarted.tool("zcode_agent_close", json!({"agent_id":agent_id}));
     assert_eq!(closed["task"]["closed"], true);
     assert_eq!(closed["task"]["resources_reaped"], true);
+}
+
+#[test]
+fn concurrent_v2_facades_use_canonical_identity_and_authoritative_disposition() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(PublicFakeFactory {
+        bootstrap_entered: Arc::new(Barrier::new(2)),
+        bootstrap_release: Arc::new(Barrier::new(2)),
+    });
+    let scheduler = Scheduler::new(
+        "s05-v2-canonical",
+        Arc::clone(&store),
+        runtime_factory,
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+    let socket = directory.path().join("rpc/review.sock");
+    let _server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let manifest_path = manifest_fixture(directory.path());
+    let manifest: ReviewManifest =
+        serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+    let alias = directory.path().join("repository-alias");
+    std::os::unix::fs::symlink(&manifest.repository, &alias).unwrap();
+    let input_for = |repository: &Path| {
+        json!({
+            "repository":repository,
+            "base_ref":manifest.base_ref,
+            "profile":"analysis_readonly",
+            "prompt":"inspect the repository without modifying it",
+            "feature_id":"s05-v2-canonical",
+            "ownership_token":"s05-v2-owner",
+            "idempotency_key":"s05-v2-canonical-replay",
+            "write_manifest":[],
+            "repo_context":["src/lib.rs"],
+            "attachments":[],
+            "retain_partial":false
+        })
+    };
+    let barrier = Arc::new(Barrier::new(3));
+    let responses = thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for repository in [&manifest.repository, &alias] {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            let input = input_for(repository);
+            workers.push(scope.spawn(move || {
+                let mut facade = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+                barrier.wait();
+                facade.tool("zcode_agent_spawn", input)
+            }));
+        }
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(responses[0]["agent_id"], responses[1]["agent_id"]);
+    let mut dispositions = responses
+        .iter()
+        .map(|response| response["submission_disposition"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    dispositions.sort_unstable();
+    assert_eq!(dispositions, ["created", "existing"]);
+
+    let mut replay = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
+    let replayed = replay.tool("zcode_agent_spawn", input_for(&alias));
+    assert_eq!(replayed["agent_id"], responses[0]["agent_id"]);
+    assert_eq!(replayed["submission_disposition"], "existing");
+    let listed = replay.tool(
+        "zcode_agent_list",
+        json!({
+            "repository":alias,
+            "phase":"QUEUED",
+            "profile":"analysis_readonly",
+            "limit":1
+        }),
+    );
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["tasks"][0]["agent_id"], responses[0]["agent_id"]);
+    assert!(listed["next_cursor"].is_null());
+    let terminal_only = replay.tool(
+        "zcode_agent_list",
+        json!({
+            "repository":alias,
+            "outcome":"SUCCEEDED",
+            "limit":1
+        }),
+    );
+    assert!(terminal_only["tasks"].as_array().unwrap().is_empty());
+    assert!(terminal_only["next_cursor"].is_null());
+    assert_eq!(store.list_jobs(10).unwrap().len(), 1);
 }
 
 #[test]
