@@ -1,5 +1,8 @@
 use crate::{
-    orchestration::{OrchestrationError, ReviewJobOrchestrator},
+    orchestration::{
+        OrchestrationError, ReviewJobOrchestrator, StructuredReviewContinuation,
+        StructuredReviewProjection, StructuredReviewSubmission,
+    },
     MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
 };
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
@@ -11,7 +14,7 @@ use review_preparation::{
 use review_store::{
     DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
     StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
-    TaskOutcome, TaskPhase, TaskQueryScope, TaskRecord, TurnState, WaitSnapshot,
+    TaskOutcome, TaskPhase, TaskRecord, TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +90,12 @@ pub enum RpcMethod {
     SubmitReview {
         manifest: ReviewManifest,
     },
+    SubmitStructuredReview {
+        input: StructuredReviewSubmission,
+    },
+    ContinueStructuredReview {
+        input: StructuredReviewContinuation,
+    },
     Enqueue {
         job: NewJobInput,
     },
@@ -137,6 +146,8 @@ impl RpcMethod {
                 | "task_reap"
                 | "spawn_review"
                 | "submit_review"
+                | "submit_structured_review"
+                | "continue_structured_review"
                 | "enqueue"
                 | "start"
                 | "status"
@@ -406,6 +417,9 @@ pub enum RpcSuccess {
         resumed_existing: bool,
         capabilities: ReviewCapabilitiesView,
     },
+    StructuredReviewSubmitted {
+        review: StructuredReviewProjection,
+    },
     Enqueued {
         job: JobView,
     },
@@ -486,10 +500,13 @@ pub struct AgentCapabilitiesView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub agent_id: String,
+    pub review_id: Option<String>,
     pub task_kind: String,
     pub phase: String,
     pub attempt_sequence: u64,
     pub effective_budget: EffectiveBudget,
+    pub independent_evidence: bool,
+    pub fresh_session_observed: bool,
     pub stop_requested: bool,
     pub close_requested: bool,
     pub closed: bool,
@@ -1142,6 +1159,30 @@ impl RpcService {
                     capabilities,
                 })
             }
+            RpcMethod::SubmitStructuredReview { input } => {
+                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        RpcErrorCode::Unavailable,
+                        "private review orchestration is unavailable",
+                    )
+                })?;
+                let review = orchestrator
+                    .submit_structured_review(&input)
+                    .map_err(map_orchestration)?;
+                Ok(RpcSuccess::StructuredReviewSubmitted { review })
+            }
+            RpcMethod::ContinueStructuredReview { input } => {
+                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        RpcErrorCode::Unavailable,
+                        "private review orchestration is unavailable",
+                    )
+                })?;
+                let review = orchestrator
+                    .submit_structured_continuation(&input)
+                    .map_err(map_orchestration)?;
+                Ok(RpcSuccess::StructuredReviewSubmitted { review })
+            }
             RpcMethod::Enqueue { job } => {
                 validate_id(&job.agent_id, "agent_id")?;
                 validate_text(&job.workspace_path, "workspace_path", 4096)?;
@@ -1325,35 +1366,30 @@ impl RpcService {
 
     fn require_task(&self, agent_id: &str) -> Result<(Job, TaskRecord), RpcError> {
         validate_id(agent_id, "agent_id")?;
+        let task = self
+            .store
+            .get_task(agent_id)
+            .map_err(map_store)?
+            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
         let job = self
             .store
-            .get_job(agent_id)
+            .get_job(&task.execution_agent_id)
             .map_err(map_store)?
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
         let prepared_json = job
             .prepared_launch_json
             .as_deref()
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let repository = serde_json::from_str::<PreparedGeneralTask>(prepared_json)
+        let prepared_repository = serde_json::from_str::<PreparedGeneralTask>(prepared_json)
             .map(|prepared| prepared.repository)
             .or_else(|_| {
                 serde_json::from_str::<PreparedLaunchSpec>(prepared_json)
                     .map(|prepared| prepared.repository)
             })
             .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let repository = repository.to_string_lossy().into_owned();
-        let task = self
-            .store
-            .get_task_scoped(
-                agent_id,
-                TaskQueryScope {
-                    repository: Some(&repository),
-                    feature_id: None,
-                    ownership_token: None,
-                },
-            )
-            .map_err(map_store)?
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
+        if prepared_repository.to_string_lossy() != task.repository {
+            return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
+        }
         Ok((job, task))
     }
 
@@ -1621,8 +1657,13 @@ fn agent_capabilities() -> AgentCapabilitiesView {
 }
 
 fn task_view(job: Job, task: TaskRecord) -> TaskView {
+    let fresh_session_observed = job
+        .zcode_session_id
+        .as_deref()
+        .is_some_and(|session| !session.trim().is_empty());
     TaskView {
         agent_id: task.public_agent_id,
+        review_id: task.review_id,
         task_kind: match task.task_kind {
             TaskKind::General => "general",
             TaskKind::Review => "review",
@@ -1640,6 +1681,8 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
         .into(),
         attempt_sequence: task.attempt_sequence,
         effective_budget: task.effective_budget,
+        independent_evidence: task.independent_evidence,
+        fresh_session_observed,
         stop_requested: job.stop_requested,
         close_requested: job.close_requested,
         closed: job.closed_at.is_some(),
@@ -1942,15 +1985,24 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
 
 fn map_orchestration(error: OrchestrationError) -> RpcError {
     match error {
+        OrchestrationError::Contract(_) => RpcError::new(
+            RpcErrorCode::Validation,
+            "structured review fields are invalid",
+        ),
+        OrchestrationError::Conflict(_) => RpcError::new(
+            RpcErrorCode::Conflict,
+            "structured review conflicts with durable state",
+        ),
         OrchestrationError::Preparation(message) if message.contains("idempotency conflict") => {
             RpcError::new(
                 RpcErrorCode::Conflict,
                 "review submission conflicts with durable state",
             )
         }
-        OrchestrationError::Preparation(message) | OrchestrationError::Prompt(message) => {
-            RpcError::new(RpcErrorCode::Validation, message)
-        }
+        OrchestrationError::Preparation(_) | OrchestrationError::Prompt(_) => RpcError::new(
+            RpcErrorCode::Validation,
+            "review preparation failed validation",
+        ),
         OrchestrationError::Scheduler(error) => map_scheduler(error),
         OrchestrationError::Store(error) => map_store(error),
         OrchestrationError::Unavailable(message) => {

@@ -3,12 +3,14 @@ use review_ledger::{
     REVIEW_VALIDATION_RECORD,
 };
 use review_preparation::{
-    NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
+    BudgetLimits, NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind,
+    ScratchPolicy,
 };
 use review_store::{
     BudgetRequest, Job, JobState, MessageState, NewJob, NewTask, PendingRequestState, Store,
-    TaskKind, TaskOutcome, TaskPhase,
+    TaskKind, TaskOutcome, TaskPhase, TaskQueryScope,
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     os::unix::fs::PermissionsExt,
@@ -20,6 +22,10 @@ use std::{
 };
 use zcode_driver::observe_process_group;
 use zcode_reviewd::{
+    orchestration::{
+        ReviewSubmissionDisposition, StructuredReviewContinuation, StructuredReviewKind,
+        StructuredReviewSubmission,
+    },
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
         ReviewToolInput, RpcErrorCode, RpcMethod, RpcServer, RpcService, RpcSuccess, ServerOptions,
@@ -183,6 +189,49 @@ impl Fixture {
             network_policy: NetworkPolicy::Deny,
             scratch_policy: ScratchPolicy::Isolated,
             idempotency_key: format!("feature:S06:{suffix}"),
+        }
+    }
+
+    fn structured_submission(&self, suffix: &str) -> StructuredReviewSubmission {
+        StructuredReviewSubmission {
+            review_kind: StructuredReviewKind::InitialBounded,
+            manifest: self.manifest(suffix, "S04"),
+            ownership_token: "s04-owner".into(),
+            read_only: true,
+            budget: Some(BudgetLimits {
+                wall_time_ms: 5_000,
+                max_turns: 8,
+                max_tool_calls: 32,
+                max_context_bytes: 1_048_576,
+                max_result_bytes: 262_144,
+                max_artifact_bytes: 2_097_152,
+            }),
+        }
+    }
+
+    fn structured_continuation(
+        &self,
+        agent_id: &str,
+        review_id: &str,
+        suffix: &str,
+    ) -> StructuredReviewContinuation {
+        let mut manifest = self.manifest(suffix, "S04");
+        manifest.round_kind = RoundKind::RepairDelta;
+        StructuredReviewContinuation {
+            agent_id: agent_id.into(),
+            review_id: review_id.into(),
+            review_kind: StructuredReviewKind::RepairDelta,
+            manifest,
+            frozen_finding_ids: vec!["S06-F1".into()],
+            read_only: true,
+            budget: Some(BudgetLimits {
+                wall_time_ms: 7_000,
+                max_turns: 12,
+                max_tool_calls: 48,
+                max_context_bytes: 1_048_576,
+                max_result_bytes: 262_144,
+                max_artifact_bytes: 2_097_152,
+            }),
         }
     }
 
@@ -496,6 +545,583 @@ fn submit_only_returns_stable_job_before_runtime_bootstrap() {
 }
 
 #[test]
+fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
+    let fixture = Fixture::new();
+    let expected_runtime = "f".repeat(64);
+    let first_input = fixture.structured_submission("structured-first");
+    let first_report = fixture.repository.join(&first_input.manifest.report_target);
+    let first = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: first_input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    assert_eq!(
+        first.submission_disposition,
+        ReviewSubmissionDisposition::Created
+    );
+    assert_eq!(first.phase, "QUEUED");
+    assert_eq!(first.attempt_sequence, 1);
+    assert!(!first.counts_as_independent);
+    assert!(!first.provenance.fresh_session_observed);
+    assert_eq!(
+        first.provenance.review_kind,
+        StructuredReviewKind::InitialBounded
+    );
+    assert_eq!(first.provenance.base_sha, fixture.head);
+    assert_eq!(first.provenance.head_sha, fixture.head);
+    assert_eq!(first.effective_budget.wall_time_ms, 5_000);
+    let replayed_first = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: first_input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected idempotent submission: {other:?}"),
+    };
+    assert_eq!(replayed_first.agent_id, first.agent_id);
+    assert_eq!(replayed_first.review_id, first.review_id);
+    assert_eq!(replayed_first.attempt_sequence, 1);
+    assert_eq!(
+        replayed_first.submission_disposition,
+        ReviewSubmissionDisposition::Existing
+    );
+    let redacted = serde_json::to_string(&first).unwrap();
+    for forbidden in [
+        fixture.repository.to_string_lossy().as_ref(),
+        "s04-owner",
+        "initial_prompt",
+        "workspace_path",
+        "zcode_session_id",
+        "runtime_agent_id",
+        "correlation",
+        "payload_json",
+        "environment",
+    ] {
+        assert!(
+            !redacted.contains(forbidden),
+            "leaked {forbidden}: {redacted}"
+        );
+    }
+
+    let first_task = fixture
+        .store
+        .get_task_scoped(
+            &first.agent_id,
+            TaskQueryScope {
+                repository: None,
+                feature_id: Some("feature"),
+                ownership_token: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let first_execution = first_task.execution_agent_id.clone();
+    assert_eq!(first_task.task_kind, TaskKind::Review);
+    assert!(first_task.independent_evidence);
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![first_execution.clone()]
+    );
+    let first_running = fixture.store.get_job(&first_execution).unwrap().unwrap();
+    let first_identity = first_running.process_identity.clone().unwrap();
+    let first_session = first_running.zcode_session_id.clone().unwrap();
+    assert!(!first_session.is_empty());
+    assert!(first_running
+        .initial_prompt
+        .contains("ROUND_KIND: INITIAL_BOUNDED"));
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(first_running.initial_prompt.as_bytes())
+        ),
+        first.provenance.prompt_sha256
+    );
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskStatus {
+            agent_id: first.agent_id.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::TaskStatus { task } => {
+            assert_eq!(task.review_id.as_deref(), Some(first.review_id.as_str()));
+            assert!(task.independent_evidence);
+            assert!(task.fresh_session_observed);
+        }
+        other => panic!("unexpected structured task status: {other:?}"),
+    }
+    let first_worktree = PathBuf::from(first_running.workspace_path);
+    let first_pending = fixture.wait_pending(&first_execution);
+    let first_permission = first_pending
+        .iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    let first_response = fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: first.agent_id.clone(),
+            request_id: first_permission.request_id.clone(),
+            decision: ResponseDecision::Allow,
+            content: None,
+        }));
+    assert!(
+        matches!(first_response, Ok(RpcSuccess::Respond { .. })),
+        "response={first_response:?} job={:?} task={:?} last_error={:?}",
+        fixture.store.get_job(&first_execution).unwrap(),
+        fixture
+            .store
+            .task_by_execution_agent_id(&first_execution)
+            .unwrap(),
+        fixture.scheduler.last_error(&first_execution)
+    );
+    assert_eq!(
+        fixture.wait_terminal(&first_execution).state,
+        JobState::Completed
+    );
+    assert!(!first_worktree.exists());
+    assert!(observe_process_group(first_identity.process_group_id)
+        .unwrap()
+        .is_empty());
+    let first_snapshot = fixture
+        .store
+        .review_snapshot(&first_execution)
+        .unwrap()
+        .unwrap();
+    let first_result = fixture
+        .store
+        .task_result(&first_execution)
+        .unwrap()
+        .unwrap();
+    let first_report_bytes = fs::read(&first_report).unwrap();
+    assert!(first_snapshot.report.finalized);
+    assert_eq!(
+        first_snapshot.provenance.runtime_sha256.as_deref(),
+        Some(expected_runtime.as_str())
+    );
+    assert_eq!(
+        first_snapshot.provenance.manifest_sha256,
+        first.provenance.manifest_sha256
+    );
+    assert_eq!(
+        first_snapshot.provenance.prepared_sha256,
+        first.provenance.prepared_sha256
+    );
+    assert_eq!(
+        first_snapshot.provenance.base_sha,
+        first.provenance.base_sha
+    );
+    assert_eq!(
+        first_snapshot.provenance.head_sha,
+        first.provenance.head_sha
+    );
+    assert_eq!(
+        first_snapshot.provenance.requested_model.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(first_result.result.outcome, TaskOutcome::Succeeded);
+
+    let continuation_input = fixture.structured_continuation(
+        &first.agent_id,
+        &first.review_id,
+        "structured-continuation",
+    );
+    let second_report = fixture
+        .repository
+        .join(&continuation_input.manifest.report_target);
+    let second = match fixture
+        .service
+        .dispatch(RpcMethod::ContinueStructuredReview {
+            input: continuation_input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected continuation submission: {other:?}"),
+    };
+    assert_eq!(second.agent_id, first.agent_id);
+    assert_eq!(second.review_id, first.review_id);
+    assert_eq!(second.attempt_sequence, 2);
+    assert_eq!(second.phase, "QUEUED");
+    assert_eq!(second.effective_budget.wall_time_ms, 7_000);
+    assert!(!second.counts_as_independent);
+    assert_eq!(
+        second.provenance.review_kind,
+        StructuredReviewKind::RepairDelta
+    );
+    let replayed_second = match fixture
+        .service
+        .dispatch(RpcMethod::ContinueStructuredReview {
+            input: continuation_input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected idempotent continuation: {other:?}"),
+    };
+    assert_eq!(replayed_second.agent_id, first.agent_id);
+    assert_eq!(replayed_second.review_id, first.review_id);
+    assert_eq!(replayed_second.attempt_sequence, 2);
+    assert_eq!(
+        replayed_second.submission_disposition,
+        ReviewSubmissionDisposition::Existing
+    );
+
+    let second_task = fixture
+        .store
+        .get_task_scoped(
+            &first.agent_id,
+            TaskQueryScope {
+                repository: None,
+                feature_id: Some("feature"),
+                ownership_token: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let second_execution = second_task.execution_agent_id.clone();
+    assert_ne!(second_execution, first_execution);
+    assert_eq!(second_task.task_kind, TaskKind::ReviewContinuation);
+    assert_eq!(
+        second_task.continuation_of.as_deref(),
+        Some(first_execution.as_str())
+    );
+    assert!(!second_task.independent_evidence);
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![second_execution.clone()]
+    );
+    let second_running = fixture.store.get_job(&second_execution).unwrap().unwrap();
+    let second_identity = second_running.process_identity.clone().unwrap();
+    let second_session = second_running.zcode_session_id.clone().unwrap();
+    assert_ne!(second_session, first_session);
+    assert_ne!(
+        second_identity.process_group_id,
+        first_identity.process_group_id
+    );
+    assert!(second_running
+        .initial_prompt
+        .contains("ROUND_KIND: REPAIR_DELTA"));
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(second_running.initial_prompt.as_bytes())
+        ),
+        second.provenance.prompt_sha256
+    );
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskStatus {
+            agent_id: first.agent_id.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::TaskStatus { task } => {
+            assert_eq!(task.review_id.as_deref(), Some(first.review_id.as_str()));
+            assert_eq!(task.attempt_sequence, 2);
+            assert!(!task.independent_evidence);
+            assert!(task.fresh_session_observed);
+        }
+        other => panic!("unexpected continuation task status: {other:?}"),
+    }
+    assert!(second_running
+        .initial_prompt
+        .contains("COUNTS_AS_INDEPENDENT: false"));
+    assert!(second_running
+        .initial_prompt
+        .contains("FROZEN_FINDING_IDS: [\"S06-F1\"]"));
+    assert!(!second_running
+        .initial_prompt
+        .contains("candidate disproved"));
+    let second_worktree = PathBuf::from(second_running.workspace_path);
+    let second_pending = fixture.wait_pending(&second_execution);
+    let second_permission = second_pending
+        .iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .get_task(&first.agent_id)
+            .unwrap()
+            .unwrap()
+            .execution_agent_id,
+        second_execution
+    );
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: first.agent_id.clone(),
+            request_id: second_permission.request_id.clone(),
+            decision: ResponseDecision::Allow,
+            content: None,
+        }))
+        .unwrap();
+    assert_eq!(
+        fixture.wait_terminal(&second_execution).state,
+        JobState::Completed
+    );
+    assert!(!second_worktree.exists());
+    assert!(observe_process_group(second_identity.process_group_id)
+        .unwrap()
+        .is_empty());
+    let second_snapshot = fixture
+        .store
+        .review_snapshot(&second_execution)
+        .unwrap()
+        .unwrap();
+    assert!(second_snapshot.report.finalized);
+    assert_eq!(
+        second_snapshot.provenance.runtime_sha256.as_deref(),
+        Some(expected_runtime.as_str())
+    );
+    assert_eq!(
+        second_snapshot.provenance.manifest_sha256,
+        second.provenance.manifest_sha256
+    );
+    assert_eq!(
+        second_snapshot.provenance.prepared_sha256,
+        second.provenance.prepared_sha256
+    );
+    assert!(fs::read_to_string(&second_report)
+        .unwrap()
+        .contains("FINALIZED: true"));
+
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&first_execution)
+            .unwrap()
+            .unwrap(),
+        first_snapshot
+    );
+    assert_eq!(
+        fixture
+            .store
+            .task_result(&first_execution)
+            .unwrap()
+            .unwrap(),
+        first_result
+    );
+    assert_eq!(fs::read(&first_report).unwrap(), first_report_bytes);
+    fixture.scheduler.close_job(&second_execution).unwrap();
+    fixture.scheduler.reap_job(&second_execution).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&first_execution)
+            .unwrap()
+            .unwrap(),
+        first_snapshot
+    );
+    assert_eq!(fs::read(&first_report).unwrap(), first_report_bytes);
+}
+
+#[test]
+fn structured_continuation_rejects_active_closed_incompatible_and_conflicting_inputs() {
+    let fixture = Fixture::new();
+    let input = fixture.structured_submission("structured-rejections");
+    let first = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let mut conflicting_replay = input.clone();
+    conflicting_replay.manifest.model = Some("different-model".into());
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::SubmitStructuredReview {
+                input: conflicting_replay,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    assert_eq!(
+        fixture
+            .store
+            .list_tasks_scoped(
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: Some("feature"),
+                    ownership_token: None,
+                },
+                None,
+                false,
+                10,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let active_continuation =
+        fixture.structured_continuation(&first.agent_id, &first.review_id, "active-continuation");
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview {
+                input: active_continuation,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+
+    let first_task = fixture.store.get_task(&first.agent_id).unwrap().unwrap();
+    let first_execution = first_task.execution_agent_id;
+    fixture.scheduler.start_ready().unwrap();
+    let pending = fixture.wait_pending(&first_execution);
+    let permission = pending
+        .iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: first.agent_id.clone(),
+            request_id: permission.request_id.clone(),
+            decision: ResponseDecision::Allow,
+            content: None,
+        }))
+        .unwrap();
+    assert_eq!(
+        fixture.wait_terminal(&first_execution).state,
+        JobState::Completed
+    );
+
+    let mut wrong_kind = fixture.structured_continuation(
+        &first.agent_id,
+        &first.review_id,
+        "wrong-kind-continuation",
+    );
+    wrong_kind.review_kind = StructuredReviewKind::PlanReview;
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview { input: wrong_kind })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
+
+    let mut wrong_scope = fixture.structured_continuation(
+        &first.agent_id,
+        &first.review_id,
+        "wrong-scope-continuation",
+    );
+    wrong_scope.manifest.scope_paths = vec!["src".into()];
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview { input: wrong_scope })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+
+    fs::write(fixture.repository.join("src/new.rs"), "pub fn newer() {}\n").unwrap();
+    git(&fixture.repository, &["add", "src/new.rs"]);
+    git(&fixture.repository, &["commit", "-m", "new lineage"]);
+    let unrelated = git(&fixture.repository, &["rev-parse", "HEAD"]);
+    let mut wrong_base = fixture.structured_continuation(
+        &first.agent_id,
+        &first.review_id,
+        "wrong-base-continuation",
+    );
+    wrong_base.manifest.base_ref = unrelated.clone();
+    wrong_base.manifest.head_ref = unrelated;
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview { input: wrong_base })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+
+    let mut invalid_head = fixture.structured_continuation(
+        &first.agent_id,
+        &first.review_id,
+        "invalid-head-continuation",
+    );
+    invalid_head.manifest.head_ref = "missing-review-head".into();
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview {
+                input: invalid_head,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
+
+    fixture.scheduler.close_job(&first_execution).unwrap();
+    let closed =
+        fixture.structured_continuation(&first.agent_id, &first.review_id, "closed-continuation");
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview { input: closed })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_task(&first.agent_id)
+            .unwrap()
+            .unwrap()
+            .attempt_sequence,
+        1
+    );
+
+    let independent = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission("new-independent-review"),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected independent review: {other:?}"),
+    };
+    assert_ne!(independent.agent_id, first.agent_id);
+    assert_ne!(independent.review_id, first.review_id);
+    assert_eq!(independent.attempt_sequence, 1);
+    let independent_task = fixture
+        .store
+        .get_task(&independent.agent_id)
+        .unwrap()
+        .unwrap();
+    let independent_job = fixture
+        .store
+        .get_job(&independent_task.execution_agent_id)
+        .unwrap()
+        .unwrap();
+    let independent_worktree = PathBuf::from(independent_job.workspace_path);
+    fixture
+        .scheduler
+        .stop_job(&independent_task.execution_agent_id)
+        .unwrap();
+    assert!(!independent_worktree.exists());
+}
+
+#[test]
 fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions() {
     let fixture = Fixture::new();
     let source_before = git(&fixture.repository, &["status", "--porcelain=v1"]);
@@ -641,7 +1267,8 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
         first_done.zcode_session_id
     );
 
-    let second_manifest = fixture.manifest("plan-second", "S06");
+    let mut second_manifest = fixture.manifest("plan-second", "S06");
+    second_manifest.round_kind = RoundKind::PlanReview;
     let (second, resumed, independent) = fixture.spawn(second_manifest);
     assert!(!resumed && independent);
     assert_ne!(first, second);

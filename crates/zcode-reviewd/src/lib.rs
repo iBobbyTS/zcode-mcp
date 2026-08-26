@@ -2205,6 +2205,13 @@ impl Scheduler {
         self.inner.ledger.as_ref().map(Arc::clone)
     }
 
+    pub(crate) fn review_runtime_hash(&self) -> Option<String> {
+        self.inner
+            .ledger_mcp
+            .as_ref()
+            .and_then(|config| config.runtime_sha256.clone())
+    }
+
     pub(crate) fn review_completion_enabled(&self) -> bool {
         self.inner.review_completion.is_some()
     }

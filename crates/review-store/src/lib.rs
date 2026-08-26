@@ -1012,7 +1012,7 @@ impl Store {
     pub fn enqueue_task(&self, task: &NewTask) -> StoreResult<(Job, TaskRecord)> {
         validate_task(task)?;
         validate_prepared_launch(&task.job)?;
-        let effective = effective_budget(&task.budget)?;
+        let effective = resolve_effective_budget(&task.budget)?;
         let fingerprint = task_fingerprint(task, &effective);
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1070,6 +1070,25 @@ impl Store {
     ) -> StoreResult<Option<TaskRecord>> {
         let connection = self.connection.lock().unwrap();
         query_latest_task_scoped(&connection, public_agent_id, scope)
+    }
+
+    /// Resolves a stable lifecycle handle to its latest private attempt.
+    /// Scoped discovery remains on `get_task_scoped`; this is for by-ID control
+    /// paths that already possess the opaque public handle.
+    pub fn get_task(&self, public_agent_id: &str) -> StoreResult<Option<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let execution_id = connection
+            .query_row(
+                "SELECT execution_agent_id FROM task_attempts
+                 WHERE public_agent_id=?1 ORDER BY attempt_sequence DESC LIMIT 1",
+                [public_agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        execution_id
+            .map(|execution_id| query_task_record(&connection, &execution_id))
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn task_by_execution_agent_id(
@@ -3399,7 +3418,10 @@ fn validate_scope(scope: &TaskQueryScope<'_>) -> StoreResult<()> {
     }
 }
 
-fn effective_budget(request: &BudgetRequest) -> StoreResult<EffectiveBudget> {
+/// Resolves an optional task budget through the Store-owned defaults and hard
+/// caps. Callers that compare idempotent submissions use this projection
+/// instead of copying the durable budget rules.
+pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<EffectiveBudget> {
     let value = match request {
         BudgetRequest::Omitted => DEFAULT_BUDGET,
         BudgetRequest::Null => {
@@ -5314,6 +5336,11 @@ mod tests {
     #[test]
     fn budget_null_zero_and_above_cap_fail_before_enqueue() {
         let (_directory, _path, store) = file_store();
+        assert_eq!(
+            resolve_effective_budget(&BudgetRequest::Omitted).unwrap(),
+            DEFAULT_BUDGET
+        );
+        assert!(resolve_effective_budget(&BudgetRequest::Null).is_err());
         let mut task = general_task("bad-budget", "public", "budget-key");
         task.budget = BudgetRequest::Null;
         assert!(matches!(
@@ -5365,6 +5392,7 @@ mod tests {
         assert_eq!(second.attempt_sequence, 2);
         assert!(!second.independent_evidence);
         assert_eq!(second.public_agent_id, first.public_agent_id);
+        assert_eq!(store.get_task("stable-agent").unwrap().unwrap(), second);
         assert!(store
             .list_tasks_scoped(
                 TaskQueryScope {
@@ -5378,6 +5406,52 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn result_invalid_review_cannot_continue() {
+        let (_directory, _path, store) = file_store();
+        let mut fresh = general_task("invalid-review", "invalid-public", "invalid-key");
+        fresh.task_kind = TaskKind::Review;
+        fresh.job.review_kind = Some("code".into());
+        fresh.review_id = Some("invalid-review-id".into());
+        store.enqueue_task(&fresh).unwrap();
+        store
+            .set_task_phase("invalid-review", TaskPhase::Preparing)
+            .unwrap();
+        store
+            .set_task_phase("invalid-review", TaskPhase::Running)
+            .unwrap();
+        store
+            .store_task_result(
+                "invalid-review",
+                &TaskResult {
+                    outcome: TaskOutcome::ResultInvalid,
+                    summary: "review provenance is invalid".into(),
+                    partial: true,
+                    base_commit: None,
+                    head_commit: None,
+                    changed_files: Vec::new(),
+                    diff_stat: None,
+                    checks: Vec::new(),
+                    residual_gaps: vec!["RESULT_INVALID".into()],
+                    artifacts: Vec::new(),
+                },
+            )
+            .unwrap();
+        let mut continuation = general_task(
+            "invalid-continuation",
+            "invalid-public",
+            "invalid-continuation-key",
+        );
+        continuation.task_kind = TaskKind::ReviewContinuation;
+        continuation.job.review_kind = Some("code".into());
+        continuation.review_id = Some("invalid-review-id".into());
+        continuation.continuation_of = Some("invalid-review".into());
+        assert!(matches!(
+            store.enqueue_task(&continuation),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]

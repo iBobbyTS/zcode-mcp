@@ -1,4 +1,4 @@
-use review_preparation::{PreparedLaunchSpec, ReviewKind};
+use review_preparation::{PreparedLaunchSpec, ReviewKind, RoundKind};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -31,6 +31,7 @@ impl ReviewPromptKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPrompt {
     pub kind: ReviewPromptKind,
+    pub round_kind: RoundKind,
     pub text: String,
     pub sha256: String,
 }
@@ -86,6 +87,7 @@ pub fn build_review_prompt(prepared: &PreparedLaunchSpec) -> Result<ReviewPrompt
     let header = format!(
         "PROMPT_SCHEMA: {PROMPT_SCHEMA}\n\
 REVIEW_KIND: {}\n\
+ROUND_KIND: {}\n\
 FRESH_SESSION_REQUIRED: true\n\
 PRIOR_REVIEW_CONTEXT: forbidden\n\
 LIVE_STEER: false\n\
@@ -96,16 +98,91 @@ PLAN_INPUT: {plan}\n\
 CONTEXT_INPUTS: {context}\n\
 SCOPE_PATHS: {scope}",
         kind.as_str(),
+        prepared.round_kind.as_str(),
         prepared.base_sha,
         prepared.head_sha,
     );
     let text = format!("{header}\n\n{template}");
-    validate_review_prompt(kind, &text)?;
+    validate_review_prompt(kind, prepared.round_kind, &text)?;
     let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    Ok(ReviewPrompt { kind, text, sha256 })
+    Ok(ReviewPrompt {
+        kind,
+        round_kind: prepared.round_kind,
+        text,
+        sha256,
+    })
 }
 
-pub fn validate_review_prompt(kind: ReviewPromptKind, text: &str) -> Result<(), PromptError> {
+pub fn build_review_continuation_prompt(
+    prepared: &PreparedLaunchSpec,
+    frozen_finding_ids: &[String],
+) -> Result<ReviewPrompt, PromptError> {
+    let base = build_review_prompt(prepared)?;
+    let frozen = serde_json::to_string(frozen_finding_ids)
+        .map_err(|error| PromptError::Json(error.to_string()))?;
+    let text = base.text.replacen(
+        "PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false",
+        &format!(
+            "PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\n\
+COUNTS_AS_INDEPENDENT: false\n\
+FROZEN_FINDING_IDS: {frozen}\n\
+LIVE_STEER: false"
+        ),
+        1,
+    );
+    validate_review_continuation_prompt(base.kind, base.round_kind, &text, frozen_finding_ids)?;
+    let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+    Ok(ReviewPrompt {
+        kind: base.kind,
+        round_kind: base.round_kind,
+        text,
+        sha256,
+    })
+}
+
+pub fn validate_review_continuation_prompt(
+    kind: ReviewPromptKind,
+    round_kind: RoundKind,
+    text: &str,
+    frozen_finding_ids: &[String],
+) -> Result<(), PromptError> {
+    validate_prompt_kind(kind, round_kind)?;
+    let (header, instructions) = text.split_once("\n\n").ok_or(PromptError::InvalidContract(
+        "prompt header and instructions are not separated",
+    ))?;
+    let frozen = serde_json::to_string(frozen_finding_ids)
+        .map_err(|error| PromptError::Json(error.to_string()))?;
+    let lines = header.lines().collect::<Vec<_>>();
+    let fixed = [
+        format!("PROMPT_SCHEMA: {PROMPT_SCHEMA}"),
+        format!("REVIEW_KIND: {}", kind.as_str()),
+        format!("ROUND_KIND: {}", round_kind.as_str()),
+        "FRESH_SESSION_REQUIRED: true".into(),
+        "PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only".into(),
+        "COUNTS_AS_INDEPENDENT: false".into(),
+        format!("FROZEN_FINDING_IDS: {frozen}"),
+        "LIVE_STEER: false".into(),
+        "LEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review".into(),
+    ];
+    if lines.len() != 14
+        || fixed
+            .iter()
+            .enumerate()
+            .any(|(index, line)| lines[index] != line)
+    {
+        return Err(PromptError::InvalidContract(
+            "fixed continuation prompt fields are invalid",
+        ));
+    }
+    validate_dynamic_header_and_instructions(&lines, fixed.len(), instructions)
+}
+
+pub fn validate_review_prompt(
+    kind: ReviewPromptKind,
+    round_kind: RoundKind,
+    text: &str,
+) -> Result<(), PromptError> {
+    validate_prompt_kind(kind, round_kind)?;
     let (header, instructions) = text.split_once("\n\n").ok_or(PromptError::InvalidContract(
         "prompt header and instructions are not separated",
     ))?;
@@ -113,12 +190,13 @@ pub fn validate_review_prompt(kind: ReviewPromptKind, text: &str) -> Result<(), 
     let fixed = [
         format!("PROMPT_SCHEMA: {PROMPT_SCHEMA}"),
         format!("REVIEW_KIND: {}", kind.as_str()),
+        format!("ROUND_KIND: {}", round_kind.as_str()),
         "FRESH_SESSION_REQUIRED: true".into(),
         "PRIOR_REVIEW_CONTEXT: forbidden".into(),
         "LIVE_STEER: false".into(),
         "LEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review".into(),
     ];
-    if lines.len() != 11
+    if lines.len() != 12
         || fixed
             .iter()
             .enumerate()
@@ -128,6 +206,31 @@ pub fn validate_review_prompt(kind: ReviewPromptKind, text: &str) -> Result<(), 
             "fixed prompt header fields are invalid",
         ));
     }
+    validate_dynamic_header_and_instructions(&lines, fixed.len(), instructions)
+}
+
+fn validate_prompt_kind(kind: ReviewPromptKind, round_kind: RoundKind) -> Result<(), PromptError> {
+    let compatible = matches!(
+        (kind, round_kind),
+        (ReviewPromptKind::Plan, RoundKind::PlanReview)
+            | (
+                ReviewPromptKind::Code,
+                RoundKind::InitialBounded | RoundKind::RepairDelta | RoundKind::FinalBounded
+            )
+    );
+    if !compatible {
+        return Err(PromptError::InvalidContract(
+            "review and round prompt kinds are incompatible",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dynamic_header_and_instructions(
+    lines: &[&str],
+    fixed_fields: usize,
+    instructions: &str,
+) -> Result<(), PromptError> {
     for (index, field) in [
         "BASE_SHA:",
         "HEAD_SHA:",
@@ -138,7 +241,7 @@ pub fn validate_review_prompt(kind: ReviewPromptKind, text: &str) -> Result<(), 
     .iter()
     .enumerate()
     {
-        if lines[index + fixed.len()]
+        if lines[index + fixed_fields]
             .strip_prefix(&format!("{field} "))
             .is_none_or(str::is_empty)
         {
@@ -195,22 +298,30 @@ mod tests {
     #[test]
     fn validator_rejects_hidden_and_caller_owned_language() {
         let base = format!(
-            "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nFRESH_SESSION_REQUIRED: true\n\
+            "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nROUND_KIND: INITIAL_BOUNDED\nFRESH_SESSION_REQUIRED: true\n\
 PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_checkpoint review_finding_upsert \
 review_validation_record review_finalize exactly once observable repository covered scope, gaps, \
 uncertainty one legal final signal"
         );
-        assert!(validate_review_prompt(ReviewPromptKind::Code, &base).is_ok());
+        assert!(
+            validate_review_prompt(ReviewPromptKind::Code, RoundKind::InitialBounded, &base)
+                .is_ok()
+        );
+        assert!(
+            validate_review_prompt(ReviewPromptKind::Code, RoundKind::PlanReview, &base).is_err()
+        );
         for forbidden in [
             "hidden reasoning",
             "you approve this change",
             "admission authority belongs to you",
             "merge readiness",
         ] {
-            assert!(
-                validate_review_prompt(ReviewPromptKind::Code, &format!("{base} {forbidden}"))
-                    .is_err()
-            );
+            assert!(validate_review_prompt(
+                ReviewPromptKind::Code,
+                RoundKind::InitialBounded,
+                &format!("{base} {forbidden}")
+            )
+            .is_err());
         }
 
         let legal_metadata = base
@@ -220,6 +331,11 @@ uncertainty one legal final signal"
                 "CONTEXT_INPUTS: [\"context/admission.json\"]",
             )
             .replace("SCOPE_PATHS: []", "SCOPE_PATHS: [\"src/approval.rs\"]");
-        assert!(validate_review_prompt(ReviewPromptKind::Code, &legal_metadata).is_ok());
+        assert!(validate_review_prompt(
+            ReviewPromptKind::Code,
+            RoundKind::InitialBounded,
+            &legal_metadata
+        )
+        .is_ok());
     }
 }
