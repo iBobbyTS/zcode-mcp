@@ -86,7 +86,14 @@ fn official_runtime_permission_and_unsupported_input_are_bounded() {
     assert!(params
         .get("options")
         .is_some_and(serde_json::Value::is_array));
-    owner.respond_request(&correlation, "deny", None).unwrap();
+    owner
+        .respond_request(
+            &correlation,
+            "deny",
+            None,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
     owner
         .stop_turn(&ready.session_id, Duration::from_secs(30))
         .unwrap();

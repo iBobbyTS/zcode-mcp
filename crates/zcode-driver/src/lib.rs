@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -10,7 +12,7 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, TryLockError,
     },
     thread,
     time::{Duration, Instant},
@@ -302,6 +304,50 @@ impl Driver {
         self.send(&ResponseEnvelope::success(id, result))
     }
 
+    #[cfg(unix)]
+    pub fn respond_before(
+        &self,
+        id: WireId,
+        result: serde_json::Value,
+        deadline: Instant,
+    ) -> Result<(), RequestError> {
+        let encoded = encode(&ResponseEnvelope::success(id, result))
+            .map_err(|error| RequestError::WriteFailed(error.to_string()))?;
+        let mut frame = encoded.into_bytes();
+        frame.push(b'\n');
+        self.write_frame_before(&frame, deadline)
+    }
+
+    #[cfg(unix)]
+    fn write_frame_before(&self, frame: &[u8], deadline: Instant) -> Result<(), RequestError> {
+        let mut input = loop {
+            remaining_before(deadline)?;
+            match self.stdin.try_lock() {
+                Ok(input) => break input,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(RequestError::WriteFailed(
+                        "runtime stdin lock is poisoned".into(),
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = remaining_before(deadline)?;
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        };
+        remaining_before(deadline)?;
+
+        let fd = input.as_raw_fd();
+        let mut flags = NonblockingFdFlags::install(fd).map_err(request_write_error)?;
+        let write_result = write_all_before(&mut input, frame, deadline);
+        let restore_result = flags.restore().map_err(request_write_error);
+        match (write_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
     pub fn respond_error(&self, id: WireId, error: serde_json::Value) -> io::Result<()> {
         self.send(&ResponseEnvelope::failure(id, error))
     }
@@ -487,6 +533,167 @@ impl Driver {
                 _ => None,
             },
         )
+    }
+}
+
+#[cfg(unix)]
+fn remaining_before(deadline: Instant) -> Result<Duration, RequestError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(RequestError::Timeout)
+}
+
+#[cfg(unix)]
+fn request_write_error(error: io::Error) -> RequestError {
+    if error.kind() == io::ErrorKind::TimedOut {
+        RequestError::Timeout
+    } else {
+        RequestError::WriteFailed(error.to_string())
+    }
+}
+
+#[cfg(unix)]
+fn get_fd_flags(fd: RawFd) -> io::Result<libc::c_int> {
+    loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            return Ok(flags);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_fd_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
+    loop {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(unix)]
+struct NonblockingFdFlags {
+    fd: RawFd,
+    original: libc::c_int,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl NonblockingFdFlags {
+    fn install(fd: RawFd) -> io::Result<Self> {
+        let original = get_fd_flags(fd)?;
+        set_fd_flags(fd, original | libc::O_NONBLOCK)?;
+        Ok(Self {
+            fd,
+            original,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        set_fd_flags(self.fd, self.original)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NonblockingFdFlags {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = set_fd_flags(self.fd, self.original);
+        }
+    }
+}
+
+#[cfg(all(unix, test))]
+fn settable_fd_flags(flags: libc::c_int) -> libc::c_int {
+    flags & (libc::O_APPEND | libc::O_ASYNC | libc::O_NONBLOCK)
+}
+
+#[cfg(unix)]
+fn write_all_before(
+    input: &mut ChildStdin,
+    frame: &[u8],
+    deadline: Instant,
+) -> Result<(), RequestError> {
+    let fd = input.as_raw_fd();
+    let mut offset = 0;
+    while offset < frame.len() {
+        remaining_before(deadline)?;
+        match input.write(&frame[offset..]) {
+            Ok(0) => {
+                return Err(RequestError::WriteFailed(
+                    "runtime stdin accepted a zero-length write".into(),
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_writable_before(fd, deadline)?;
+            }
+            Err(error) => return Err(request_write_error(error)),
+        }
+    }
+
+    loop {
+        remaining_before(deadline)?;
+        match input.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_writable_before(fd, deadline)?;
+            }
+            Err(error) => return Err(request_write_error(error)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_writable_before(fd: RawFd, deadline: Instant) -> Result<(), RequestError> {
+    loop {
+        let remaining = remaining_before(deadline)?;
+        let timeout_millis = remaining
+            .as_millis()
+            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+            .clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(RequestError::WriteFailed(
+                    "runtime stdin descriptor is invalid".into(),
+                ));
+            }
+            if descriptor.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0 {
+                return Ok(());
+            }
+            continue;
+        }
+        if result == 0 {
+            remaining_before(deadline)?;
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(request_write_error(error));
+        }
     }
 }
 
@@ -1065,6 +1272,145 @@ fn exit_class(status: ExitStatus) -> ChildExit {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[cfg(unix)]
+    fn stdin_settable_flags(driver: &Driver) -> i32 {
+        let input = driver.stdin.lock().unwrap();
+        settable_fd_flags(get_fd_flags(input.as_raw_fd()).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn fill_stdin_pipe(driver: &Driver) {
+        let mut input = driver.stdin.lock().unwrap();
+        let fd = input.as_raw_fd();
+        let mut flags = NonblockingFdFlags::install(fd).unwrap();
+        let chunk = [b'x'; 4096];
+        loop {
+            match input.write(&chunk) {
+                Ok(0) => panic!("stdin pipe unexpectedly accepted a zero-length write"),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("failed to fill stdin pipe: {error}"),
+            }
+        }
+        flags.restore().unwrap();
+    }
+
+    fn capture_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "zcode-driver-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn wait_for_file(path: &std::path::Path) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read(path) {
+                return contents;
+            }
+            assert!(Instant::now() < deadline, "response capture timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_deadline_bounds_stdin_mutex_acquisition_without_leaking_writer() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let driver = Arc::new(Driver::spawn(command).unwrap());
+        let guard = driver.stdin.lock().unwrap();
+        let responder = Arc::clone(&driver);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            let result = responder.respond_before(
+                WireId::String("mutex-deadline".into()),
+                serde_json::json!({"decision": "deny"}),
+                Instant::now() + Duration::from_millis(60),
+            );
+            finished_tx.send((started.elapsed(), result)).unwrap();
+        });
+
+        let (elapsed, result) = finished_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("bounded response writer did not return");
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_millis(250));
+        drop(guard);
+        worker.join().unwrap();
+
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+        assert!(observe_process_group(driver.identity().pgid)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_deadline_bounds_pipe_backpressure_and_restores_fd_flags() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let driver = Driver::spawn(command).unwrap();
+        let original_flags = stdin_settable_flags(&driver);
+        fill_stdin_pipe(&driver);
+        assert_eq!(stdin_settable_flags(&driver), original_flags);
+
+        let started = Instant::now();
+        let result = driver.respond_before(
+            WireId::String("backpressure-deadline".into()),
+            serde_json::json!({"decision": "allow"}),
+            Instant::now() + Duration::from_millis(60),
+        );
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(stdin_settable_flags(&driver), original_flags);
+
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+        assert!(observe_process_group(driver.identity().pgid)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_before_writes_one_complete_line_and_restores_fd_flags() {
+        let path = capture_path("response-line");
+        let mut command = Command::new("sh");
+        command.env("RESPONSE_PATH", &path).args([
+            "-c",
+            "IFS= read -r line; printf '%s\\n' \"$line\" > \"$RESPONSE_PATH\"; sleep 10",
+        ]);
+        let driver = Driver::spawn(command).unwrap();
+        let original_flags = stdin_settable_flags(&driver);
+        let id = WireId::String("complete-line".into());
+        let result = serde_json::json!({"decision": "deny"});
+        driver
+            .respond_before(
+                id.clone(),
+                result.clone(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let expected = format!(
+            "{}\n",
+            encode(&ResponseEnvelope::success(id, result)).unwrap()
+        );
+        assert_eq!(wait_for_file(&path), expected.as_bytes());
+        assert_eq!(stdin_settable_flags(&driver), original_flags);
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn dispatch_interleaved() {
         let mut c = Command::new("sh");

@@ -723,6 +723,7 @@ impl RuntimeOwner {
         correlation_id: &str,
         decision: &str,
         content: Option<&str>,
+        deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         let id = serde_json::from_str::<WireId>(correlation_id).map_err(|_| {
             RuntimeCommandError::InvalidSession("stored request correlation is invalid".into())
@@ -745,8 +746,8 @@ impl RuntimeOwner {
         };
         let _ = content;
         self.driver
-            .respond(id, result)
-            .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+            .respond_before(id, result, deadline)
+            .map_err(RuntimeCommandError::from)?;
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
     }
@@ -1117,6 +1118,7 @@ pub trait ManagedRuntime: Send + Sync + 'static {
         _correlation_id: &str,
         _decision: &str,
         _content: Option<&str>,
+        _deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         Err(RuntimeCommandError::Unsupported)
     }
@@ -1195,8 +1197,9 @@ impl ManagedRuntime for RuntimeOwner {
         correlation_id: &str,
         decision: &str,
         content: Option<&str>,
+        deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
-        self.respond_request(correlation_id, decision, content)
+        self.respond_request(correlation_id, decision, content, deadline)
     }
 
     fn close_session(
@@ -1322,14 +1325,20 @@ impl ControlDeadline {
     }
 
     fn runtime_phase(self, stop_grace: Duration) -> Option<Duration> {
+        self.runtime_phase_deadline(stop_grace)?
+            .checked_duration_since(Instant::now())
+            .filter(|phase| !phase.is_zero())
+    }
+
+    fn runtime_phase_deadline(self, stop_grace: Duration) -> Option<Instant> {
         let remaining = self.remaining()?;
         let maximum_cleanup = stop_grace
             .checked_mul(3)
             .unwrap_or(remaining)
             .min(remaining / 2);
-        remaining
+        self.expires_at
             .checked_sub(maximum_cleanup)
-            .filter(|phase| !phase.is_zero())
+            .filter(|deadline| *deadline > Instant::now())
     }
 
     fn cleanup_grace(self, configured: Duration) -> Duration {
@@ -2114,6 +2123,16 @@ impl Scheduler {
     ) -> Result<Duration, SchedulerError> {
         deadline
             .runtime_phase(self.inner.config.stop_grace)
+            .ok_or_else(|| Self::control_timeout_error(agent_id))
+    }
+
+    fn runtime_phase_deadline(
+        &self,
+        agent_id: &str,
+        deadline: ControlDeadline,
+    ) -> Result<Instant, SchedulerError> {
+        deadline
+            .runtime_phase_deadline(self.inner.config.stop_grace)
             .ok_or_else(|| Self::control_timeout_error(agent_id))
     }
 
@@ -3996,19 +4015,20 @@ impl Scheduler {
                 message: "runtime is stopping or no longer active".into(),
             });
         }
-        match self.runtime_phase_timeout(agent_id, deadline) {
-            Ok(_) => {}
+        let response_deadline = match self.runtime_phase_deadline(agent_id, deadline) {
+            Ok(deadline) => deadline,
             Err(error) => {
                 self.inner
                     .store
                     .release_pending_response(agent_id, request_id)?;
                 return Err(error);
             }
-        }
+        };
         if let Err(error) = runtime.respond_request(
             &request.correlation_id,
             effective_decision,
             effective_content,
+            response_deadline,
         ) {
             self.inner
                 .store
@@ -5178,6 +5198,8 @@ sleep 10
         stop_turn_timeouts: Mutex<Vec<Duration>>,
         send_timeouts: Mutex<Vec<Duration>>,
         timeout_send_after_write: AtomicBool,
+        timeout_response_write: AtomicBool,
+        response_write_deadlines: Mutex<Vec<(Instant, Instant)>>,
         responses: Mutex<Vec<(String, String, Option<String>)>>,
     }
 
@@ -5198,6 +5220,8 @@ sleep 10
                 stop_turn_timeouts: Mutex::new(Vec::new()),
                 send_timeouts: Mutex::new(Vec::new()),
                 timeout_send_after_write: AtomicBool::new(false),
+                timeout_response_write: AtomicBool::new(false),
+                response_write_deadlines: Mutex::new(Vec::new()),
                 responses: Mutex::new(Vec::new()),
             }
         }
@@ -5240,6 +5264,10 @@ sleep 10
 
         fn timeout_send_after_write(&self) {
             self.timeout_send_after_write.store(true, Ordering::Release);
+        }
+
+        fn timeout_response_write(&self) {
+            self.timeout_response_write.store(true, Ordering::Release);
         }
     }
 
@@ -5321,7 +5349,21 @@ sleep 10
             correlation_id: &str,
             decision: &str,
             content: Option<&str>,
+            deadline: Instant,
         ) -> Result<(), RuntimeCommandError> {
+            if self.timeout_response_write.load(Ordering::Acquire) {
+                self.response_write_deadlines
+                    .lock()
+                    .unwrap()
+                    .push((Instant::now(), deadline));
+                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+                return Err(RuntimeCommandError::Timeout);
+            }
             self.responses.lock().unwrap().push((
                 correlation_id.into(),
                 decision.into(),
@@ -6332,6 +6374,89 @@ sleep 10
         scheduler.reap_job("respond-cancel-winner").unwrap();
         assert_eq!(
             store.task_result("respond-cancel-winner").unwrap().unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn response_write_deadline_fails_closed_without_completing_pending_delivery() {
+        let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(160),
+        );
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "respond-write-timeout", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.job);
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                "respond-write-request",
+                "respond-write-timeout",
+                "\"runtime-write-timeout\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let runtime = factory.runtime("respond-write-timeout");
+        runtime.timeout_response_write();
+
+        let started = Instant::now();
+        assert!(matches!(
+            scheduler.respond_job(
+                "respond-write-timeout",
+                "respond-write-request",
+                "deny",
+                None,
+            ),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(100));
+        assert!(elapsed < Duration::from_secs(2));
+        let (write_started, write_deadline) = runtime.response_write_deadlines.lock().unwrap()[0];
+        let write_budget = write_deadline.duration_since(write_started);
+        assert!(write_budget >= Duration::from_millis(100));
+        assert!(write_budget < Duration::from_millis(150));
+        assert_eq!(
+            store
+                .pending_request("respond-write-timeout", "respond-write-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        assert!(runtime.responses.lock().unwrap().is_empty());
+        assert_eq!(runtime.stop_calls(), 1);
+        assert!(runtime.wait_terminal(Duration::from_millis(20)).is_some());
+
+        let result = store.task_result("respond-write-timeout").unwrap().unwrap();
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"CONTROL_DEADLINE_EXCEEDED".into()));
+        assert!(store
+            .get_job("respond-write-timeout")
+            .unwrap()
+            .unwrap()
+            .state
+            .is_terminal());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(store.active_count().unwrap(), 0);
+        assert!(scheduler.active_session("respond-write-timeout").is_none());
+        assert_general_workspace_cleaned(&prepared);
+
+        scheduler.close_job("respond-write-timeout").unwrap();
+        scheduler.reap_job("respond-write-timeout").unwrap();
+        assert_eq!(
+            store.task_result("respond-write-timeout").unwrap().unwrap(),
             result
         );
     }
