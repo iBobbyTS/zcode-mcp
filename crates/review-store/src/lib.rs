@@ -2412,6 +2412,59 @@ impl Store {
         Ok(agent_ids)
     }
 
+    pub fn validate_review_report_ownership(&self) -> StoreResult<()> {
+        let connection = self.connection.lock().unwrap();
+        let mismatch = connection
+            .query_row(
+                "SELECT r.agent_id, a.report_path, r.expected_path
+                 FROM review_reports r
+                 LEFT JOIN agents a ON a.agent_id = r.agent_id
+                 WHERE a.agent_id IS NULL
+                    OR a.report_path IS NULL
+                    OR a.report_path <> r.expected_path
+                 ORDER BY r.created_at, r.agent_id
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((agent_id, report_path, expected_path)) = mismatch {
+            return Err(StoreError::Conflict(format!(
+                "persisted review {agent_id} has inconsistent report ownership: agent={report_path:?}, ledger={expected_path:?}"
+            )));
+        }
+
+        let duplicate_target = connection
+            .query_row(
+                "WITH report_owners(agent_id, target) AS (
+                    SELECT agent_id, report_path FROM agents WHERE report_path IS NOT NULL
+                    UNION
+                    SELECT agent_id, expected_path FROM review_reports
+                 )
+                 SELECT target
+                 FROM report_owners
+                 GROUP BY target
+                 HAVING COUNT(*) > 1
+                 ORDER BY target
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(target) = duplicate_target {
+            return Err(StoreError::Conflict(format!(
+                "persisted review report target has multiple owners: {target}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn record_review_runtime(
         &self,
         agent_id: &str,
@@ -5374,6 +5427,72 @@ mod tests {
         let owner = store.submission_by_idempotency("v2-key").unwrap().unwrap();
         assert_eq!(owner.execution_agent_id, "queued-v2-owner");
         assert_eq!(owner.task_kind, Some(TaskKind::Review));
+    }
+
+    #[test]
+    fn persisted_review_report_ownership_rejects_legacy_duplicates_and_mismatches() {
+        let (_directory, path, store) = file_store();
+        for (agent_id, report_path) in [
+            ("legacy-review-a", "/canonical/a.md"),
+            ("legacy-review-b", "/canonical/b.md"),
+        ] {
+            let mut job = NewJob::new(agent_id, "/workspace");
+            job.report_path = Some(report_path.into());
+            store.enqueue_job(&job).unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        for (agent_id, report_path, created_at) in [
+            ("legacy-review-a", "/canonical/a.md", 1_i64),
+            ("legacy-review-b", "/canonical/b.md", 2_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO review_reports (
+                        agent_id, expected_path, report_root, created_at, updated_at
+                     ) VALUES (?1, ?2, '/canonical', ?3, ?3)",
+                    params![agent_id, report_path, created_at],
+                )
+                .unwrap();
+        }
+        store.validate_review_report_ownership().unwrap();
+
+        connection
+            .execute(
+                "UPDATE agents SET report_path = '/canonical/a.md'
+                 WHERE agent_id = 'legacy-review-b'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE review_reports SET expected_path = '/canonical/a.md'
+                 WHERE agent_id = 'legacy-review-b'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.validate_review_report_ownership(),
+            Err(StoreError::Conflict(message)) if message.contains("multiple owners")
+        ));
+
+        connection
+            .execute(
+                "UPDATE agents SET report_path = '/canonical/other.md'
+                 WHERE agent_id = 'legacy-review-b'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE review_reports SET expected_path = '/canonical/b.md'
+                 WHERE agent_id = 'legacy-review-b'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.validate_review_report_ownership(),
+            Err(StoreError::Conflict(message)) if message.contains("inconsistent report ownership")
+        ));
     }
 
     fn cancelled_task_result(summary: &str) -> TaskResult {

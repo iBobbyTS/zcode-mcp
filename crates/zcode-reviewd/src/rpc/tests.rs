@@ -310,6 +310,7 @@ fn error(response: RpcResponse) -> RpcError {
 #[test]
 fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     let fixture = fixture();
+    assert_eq!(RPC_VERSION, 7);
     let first = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
         RpcSuccess::SystemStatus { status } => status,
         other => panic!("unexpected status result: {other:?}"),
@@ -360,6 +361,33 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
         .as_bytes(),
     );
     assert_eq!(error(unknown_outer).code, RpcErrorCode::Validation);
+}
+
+#[test]
+fn s04_v7_gate_rejects_s03_v6_before_method_dispatch() {
+    let fixture = fixture();
+    let old_peer = fixture
+        .service
+        .handle_bytes(br#"{"version":6,"request_id":"s03-peer","method":"missing"}"#);
+    assert_eq!(old_peer.version, 7);
+    assert_eq!(old_peer.request_id.as_deref(), Some("s03-peer"));
+    assert_eq!(error(old_peer).code, RpcErrorCode::UnsupportedVersion);
+
+    let current_unknown = fixture
+        .service
+        .handle_bytes(br#"{"version":7,"request_id":"s04-peer","method":"missing"}"#);
+    assert_eq!(error(current_unknown).code, RpcErrorCode::UnknownMethod);
+
+    let status = fixture
+        .service
+        .handle_bytes(br#"{"version":7,"request_id":"s04-status","method":"system_status"}"#);
+    match status.outcome {
+        RpcOutcome::Success { result } => match *result {
+            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 7),
+            other => panic!("unexpected success: {other:?}"),
+        },
+        RpcOutcome::Error { error } => panic!("unexpected error: {error:?}"),
+    }
 }
 
 #[test]

@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 6;
+pub const RPC_VERSION: u16 = 7;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;

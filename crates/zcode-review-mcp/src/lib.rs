@@ -1013,6 +1013,54 @@ mod tests {
             "daemon_unavailable: review daemon is unavailable"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn s04_consumer_rejects_an_s03_v6_daemon_response() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::fs::PermissionsExt,
+            os::unix::net::UnixListener,
+            sync::{Arc, Barrier},
+            thread,
+        };
+        use zcode_reviewd::rpc::RpcResponse;
+
+        assert_eq!(RPC_VERSION, 7);
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("old-daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let ready = Arc::new(Barrier::new(2));
+        let peer_ready = Arc::clone(&ready);
+        let old_daemon = thread::spawn(move || {
+            peer_ready.wait();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.version, 7);
+            assert!(matches!(request.method, RpcMethod::SystemStatus));
+            let mut response = RpcResponse::error(
+                Some(request.request_id),
+                RpcError::new(RpcErrorCode::UnsupportedVersion, "old daemon"),
+            );
+            response.version = 6;
+            serde_json::to_writer(&mut stream, &response).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        ready.wait();
+        let facade = ReviewMcp::new(socket, Duration::from_secs(5));
+        let result = facade.rpc(RpcMethod::SystemStatus);
+        old_daemon.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "protocol_version_mismatch: incompatible review daemon"
+        );
+    }
     #[test]
     fn inventory_and_schemas_are_exact() {
         let s = ReviewMcp::new(PathBuf::from("/tmp/unused"), Duration::from_secs(1));

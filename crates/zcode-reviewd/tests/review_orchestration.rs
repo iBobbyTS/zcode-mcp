@@ -2036,6 +2036,104 @@ fn completion_failure_matrix_is_typed_nonclean_and_reaps_runtime_groups() {
         .is_some_and(|snapshot| !snapshot.report.finalized));
 }
 
+fn initialize_startup_review(
+    fixture: &Fixture,
+    suffix: &str,
+) -> (String, review_preparation::PreparedLaunchSpec) {
+    let prepared = ReviewPreparer
+        .prepare(&fixture.manifest(suffix, "S04"))
+        .unwrap();
+    let agent_id = format!("startup-{suffix}");
+    let mut job = NewJob::new(&agent_id, prepared.worktree.path.to_string_lossy());
+    job.idempotency_key = Some(format!("startup-key-{suffix}"));
+    job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+    job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+    job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    fixture.store.enqueue_job(&job).unwrap();
+    LedgerManager::new(Arc::clone(&fixture.store))
+        .initialize(&agent_id, &prepared, Some(&"a".repeat(64)))
+        .unwrap();
+    (agent_id, prepared)
+}
+
+fn assert_startup_rejection_preserves_reports(
+    fixture: &Fixture,
+    agents: [&str; 2],
+    targets: [&Path; 2],
+) {
+    let before_bytes = targets.map(|target| fs::read(target).unwrap());
+    let before_snapshots =
+        agents.map(|agent_id| fixture.store.review_snapshot(agent_id).unwrap().unwrap());
+    let before_artifacts = agents.map(|agent_id| fixture.store.artifacts(agent_id, 10).unwrap());
+
+    let error = fixture.scheduler.reconcile_startup().unwrap_err();
+    assert!(error.to_string().contains("ledger conflict"));
+    assert_eq!(
+        targets.map(|target| fs::read(target).unwrap()),
+        before_bytes
+    );
+    assert_eq!(
+        agents.map(|agent_id| fixture.store.review_snapshot(agent_id).unwrap().unwrap()),
+        before_snapshots
+    );
+    assert_eq!(
+        agents.map(|agent_id| fixture.store.artifacts(agent_id, 10).unwrap()),
+        before_artifacts
+    );
+}
+
+#[test]
+fn startup_recovery_rejects_legacy_duplicate_report_owners_before_any_write() {
+    let fixture = Fixture::new();
+    let (agent_a, prepared_a) = initialize_startup_review(&fixture, "owner-duplicate-a");
+    let (agent_b, prepared_b) = initialize_startup_review(&fixture, "owner-duplicate-b");
+    let connection = rusqlite::Connection::open(fixture.store.database_path()).unwrap();
+    let target_a = prepared_a.report_target.to_string_lossy().into_owned();
+    connection
+        .execute(
+            "UPDATE agents SET report_path = ?1 WHERE agent_id = ?2",
+            rusqlite::params![target_a, agent_b],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE review_reports SET expected_path = ?1 WHERE agent_id = ?2",
+            rusqlite::params![target_a, agent_b],
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(&prepared_a.report_target, b"legacy duplicate sentinel\n").unwrap();
+
+    assert_startup_rejection_preserves_reports(
+        &fixture,
+        [&agent_a, &agent_b],
+        [&prepared_a.report_target, &prepared_b.report_target],
+    );
+}
+
+#[test]
+fn startup_recovery_rejects_legacy_report_owner_mismatch_before_any_write() {
+    let fixture = Fixture::new();
+    let (agent_a, prepared_a) = initialize_startup_review(&fixture, "owner-mismatch-a");
+    let (agent_b, prepared_b) = initialize_startup_review(&fixture, "owner-mismatch-b");
+    let connection = rusqlite::Connection::open(fixture.store.database_path()).unwrap();
+    let unrelated = fixture.repository.join("unrelated-owner.md");
+    connection
+        .execute(
+            "UPDATE agents SET report_path = ?1 WHERE agent_id = ?2",
+            rusqlite::params![unrelated.to_string_lossy(), agent_b],
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(&prepared_b.report_target, b"legacy mismatch sentinel\n").unwrap();
+
+    assert_startup_rejection_preserves_reports(
+        &fixture,
+        [&agent_a, &agent_b],
+        [&prepared_a.report_target, &prepared_b.report_target],
+    );
+}
+
 fn wait_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

@@ -410,6 +410,7 @@ impl LedgerManager {
 
     pub fn recover_all(&self) -> LedgerResult<Vec<String>> {
         let _guard = self.mutation_lock.lock().unwrap();
+        self.store.validate_review_report_ownership()?;
         let mut recovered = Vec::new();
         for agent_id in self.store.review_report_agent_ids()? {
             let before = self
