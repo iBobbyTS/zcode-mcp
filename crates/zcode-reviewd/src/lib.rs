@@ -594,6 +594,9 @@ impl RuntimeOwner {
         requested_model: Option<&str>,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RuntimeCommandError::Timeout)?;
         let workspace = WorkspaceRef {
             workspace_key: workspace_path,
             workspace_path,
@@ -603,9 +606,11 @@ impl RuntimeOwner {
             mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        let created = self
-            .driver
-            .request(SESSION_CREATE, create_params, timeout)?;
+        let created = self.driver.request(
+            SESSION_CREATE,
+            create_params,
+            remaining_runtime_time(deadline)?,
+        )?;
         let result = created.result.as_ref().ok_or_else(|| {
             RuntimeCommandError::InvalidSession("session/create result is missing".into())
         })?;
@@ -624,10 +629,13 @@ impl RuntimeOwner {
             include_snapshot: true,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        self.driver
-            .request(SESSION_SUBSCRIBE, subscribe_params, timeout)?;
+        self.driver.request(
+            SESSION_SUBSCRIBE,
+            subscribe_params,
+            remaining_runtime_time(deadline)?,
+        )?;
         *self.session_id.lock().unwrap() = Some(session_id.clone());
-        let initial_turn_id = self.send_turn(&session_id, initial_prompt, timeout)?;
+        let initial_turn_id = self.send_turn_before(&session_id, initial_prompt, deadline)?;
         Ok(SessionReady {
             session_id,
             initial_turn_id,
@@ -641,7 +649,18 @@ impl RuntimeOwner {
         content: &str,
         timeout: Duration,
     ) -> Result<Option<String>, RuntimeCommandError> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RuntimeCommandError::Timeout)?;
+        self.send_turn_before(session_id, content, deadline)
+    }
+
+    fn send_turn_before(
+        &self,
+        session_id: &str,
+        content: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
         let previous = self.turn_tracker.snapshot().generation;
         let params = serde_json::to_value(SendParams {
@@ -1353,6 +1372,8 @@ struct SchedulerInner {
     ledger: Option<Arc<LedgerManager>>,
     ledger_mcp: Option<InternalLedgerMcpConfig>,
     review_completion: Option<Arc<orchestration::ReviewCompletionGate>>,
+    #[cfg(test)]
+    preflight_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<SchedulerState>,
 }
 
@@ -2105,6 +2126,8 @@ impl Scheduler {
                 ledger: None,
                 ledger_mcp: None,
                 review_completion: None,
+                #[cfg(test)]
+                preflight_hook: None,
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
@@ -2134,6 +2157,14 @@ impl Scheduler {
         inner.ledger = Some(ledger);
         inner.ledger_mcp = Some(config);
         Ok(self)
+    }
+
+    #[cfg(test)]
+    fn with_preflight_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("preflight hook must attach before scheduler cloning")
+            .preflight_hook = Some(Arc::new(hook));
+        self
     }
 
     pub fn ledger(&self) -> Option<Arc<LedgerManager>> {
@@ -2323,6 +2354,9 @@ impl Scheduler {
             .inner
             .store
             .task_by_execution_agent_id(&claim.job.agent_id)?;
+        let budget = task
+            .as_ref()
+            .map(|task| Arc::new(AttemptBudget::from_effective(&task.effective_budget)));
         let route = match task_route(&claim.job) {
             Ok(route) => route,
             Err(message) => {
@@ -2366,6 +2400,12 @@ impl Scheduler {
             }
             return Err(SchedulerError::InvalidConfig(message));
         }
+        #[cfg(test)]
+        if task.is_some() {
+            if let Some(hook) = &self.inner.preflight_hook {
+                hook();
+            }
+        }
         if let Err(error) = self.ensure_job_ledger(&claim.job, &route) {
             let message = error.to_string();
             self.finish_unstarted_route(
@@ -2400,9 +2440,6 @@ impl Scheduler {
             }
         };
         let runtime_agent_id = format!("{}:{}", claim.job.agent_id, claim.owner_epoch);
-        let budget = task
-            .as_ref()
-            .map(|task| Arc::new(AttemptBudget::from_effective(&task.effective_budget)));
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
             claim.job.agent_id.clone(),
@@ -2841,7 +2878,8 @@ impl Scheduler {
                 })
             })
         };
-        if let Some((TaskRoute::General(prepared), task, submission)) = route_and_submission {
+        if let Some((TaskRoute::General(prepared), task, submission)) = route_and_submission.clone()
+        {
             let terminal = runtime.stop(stop_grace);
             let current = self.inner.store.get_job(agent_id)?;
             let result = if current.as_ref().is_some_and(|job| {
@@ -2905,6 +2943,40 @@ impl Scheduler {
                     },
                 )
             };
+            self.release_active(agent_id, owner_epoch);
+            return result;
+        }
+        if let Some((TaskRoute::Review(prepared), Some(task), _)) = route_and_submission {
+            let terminal = runtime.stop(stop_grace);
+            let current = self.inner.store.get_job(agent_id)?;
+            let cancellation_wins = current
+                .as_ref()
+                .is_some_and(|job| job.stop_requested || job.close_requested);
+            let (outcome, reason) = if cancellation_wins {
+                (CompletionOutcome::Cancelled, "CANCELLED".into())
+            } else if let Some((code, _)) = failure {
+                (CompletionOutcome::Failed, code.into())
+            } else {
+                (
+                    CompletionOutcome::Cancelled,
+                    "REVIEW_START_CANCELLED".into(),
+                )
+            };
+            let result = self.finish_routed_terminal(
+                TerminalTarget {
+                    agent_id,
+                    owner_epoch,
+                    sink,
+                    route: &TaskRoute::Review(prepared),
+                    task: Some(&task),
+                },
+                TerminalDecision {
+                    terminal,
+                    natural_completion: false,
+                    general_submission: None,
+                    forced_outcome: Some((outcome, reason)),
+                },
+            );
             self.release_active(agent_id, owner_epoch);
             return result;
         }
@@ -4313,6 +4385,30 @@ sleep 10
             .collect()
     }
 
+    fn staged_deadline_runtime(method_log: &std::path::Path) -> Command {
+        let mut command = Command::new("sh");
+        command.env("METHOD_LOG", method_log).args([
+            "-c",
+            r#"
+IFS= read -r create || exit 1
+printf '%s\n' "$create" >> "$METHOD_LOG"
+sleep 0.09
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"session-1"}}}'
+IFS= read -r subscribe || exit 1
+printf '%s\n' "$subscribe" >> "$METHOD_LOG"
+sleep 0.09
+printf '%s\n' '{"id":2,"result":{}}'
+IFS= read -r send || exit 1
+printf '%s\n' "$send" >> "$METHOD_LOG"
+printf '%s\n' '{"id":3,"result":{"turnId":"turn-1"}}'
+sleep 0.09
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.started","payload":{"turnId":"turn-1"}}}'
+sleep 10
+"#,
+        ]);
+        command
+    }
+
     fn stored_model_job(
         directory: &tempfile::TempDir,
         agent_id: &str,
@@ -4573,6 +4669,32 @@ sleep 10
         .unwrap();
         assert_eq!(ready.session_id, "session-1");
         assert_eq!(ready.observed_model.as_deref(), Some("GLM-5.3"));
+        assert_eq!(
+            recorded_runtime_methods(&method_log),
+            vec![SESSION_CREATE, SESSION_SUBSCRIBE, SESSION_SEND]
+        );
+        assert!(matches!(
+            owner.stop(Duration::from_millis(100)),
+            RuntimeTerminal::Stopped(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_owner_bootstrap_stages_share_one_absolute_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let method_log = directory.path().join("deadline-methods.jsonl");
+        let owner = RuntimeOwner::spawn(
+            staged_deadline_runtime(&method_log),
+            Arc::new(MemorySink::default()),
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        assert_eq!(
+            owner.bootstrap_session("/workspace", "review", Duration::from_millis(220)),
+            Err(RuntimeCommandError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(
             recorded_runtime_methods(&method_log),
             vec![SESSION_CREATE, SESSION_SUBSCRIBE, SESSION_SEND]
@@ -5311,7 +5433,7 @@ sleep 10
     }
 
     #[test]
-    fn wall_deadline_bounds_bootstrap_and_persists_timed_out_after_stop() {
+    fn wall_deadline_includes_preflight_and_persists_timed_out_after_stop() {
         struct SlowBootstrapRuntime {
             inner: FakeRuntime,
             worktree: PathBuf,
@@ -5381,9 +5503,10 @@ sleep 10
                 ..SchedulerConfig::default()
             },
         )
-        .unwrap();
+        .unwrap()
+        .with_preflight_hook(|| thread::sleep(Duration::from_millis(80)));
         let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
-        budget.wall_time_ms = 40;
+        budget.wall_time_ms = 200;
         let manifest = general_manifest(directory.path(), "bootstrap-wall", Some(budget));
         let submitted = scheduler
             .enqueue_general(&manifest, "feature", "owner-group")
@@ -5396,7 +5519,7 @@ sleep 10
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
         let bootstrap_timeout = observed_timeouts.lock().unwrap()[0];
-        assert!(bootstrap_timeout <= Duration::from_millis(40));
+        assert!(bootstrap_timeout < Duration::from_millis(160));
         assert!(bootstrap_timeout < Duration::from_secs(1));
         assert!(existed.load(Ordering::Acquire));
         let result = store.task_result("bootstrap-wall").unwrap().unwrap();

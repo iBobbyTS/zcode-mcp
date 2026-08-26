@@ -1,6 +1,7 @@
 use review_ledger::{LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE};
 use review_preparation::{
-    NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
+    NetworkPolicy, PreparedLaunchSpec, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind,
+    ScratchPolicy,
 };
 use review_store::{
     BudgetRequest, EffectiveBudget, NewJob, NewTask, Store, TaskKind, TaskOutcome, TaskPhase,
@@ -180,6 +181,68 @@ struct BudgetFactory {
     runtime: Arc<Mutex<Option<Arc<BudgetRuntime>>>>,
 }
 
+fn prepare_review(directory: &TempDir, name: &str) -> PreparedLaunchSpec {
+    let repository = create_repository(directory);
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    ReviewPreparer
+        .prepare(&ReviewManifest {
+            schema: "sectioned-zcode-review/v1".into(),
+            review_kind: ReviewKind::Code,
+            feature_id: "feature".into(),
+            section_id: "S03".into(),
+            round_kind: RoundKind::InitialBounded,
+            repository,
+            base_ref: head.clone(),
+            head_ref: head,
+            plan_path: ".agent-work/PLAN.md".into(),
+            context_paths: Vec::new(),
+            scope_paths: vec!["src".into()],
+            forbidden_input_globs: Vec::new(),
+            validation_commands: Default::default(),
+            report_target: format!(".agent-work/reviews/feature/S03/{name}.md").into(),
+            scratch_root: ".agent-work/scratch/jobs".into(),
+            model: None,
+            fresh_session: true,
+            network_policy: NetworkPolicy::Deny,
+            scratch_policy: ScratchPolicy::Isolated,
+            idempotency_key: format!("feature:S03:{name}"),
+        })
+        .unwrap()
+}
+
+fn enqueue_v2_review(
+    store: &Store,
+    execution_id: &str,
+    public_id: &str,
+    prepared: &PreparedLaunchSpec,
+    budget: BudgetRequest,
+) {
+    let mut job = NewJob::new(execution_id, prepared.worktree.path.to_string_lossy());
+    job.idempotency_key = Some(prepared.idempotency_key.clone());
+    job.review_kind = Some(prepared.review_kind.as_str().into());
+    job.feature_id = Some(prepared.feature_id.clone());
+    job.section_id = Some(prepared.section_id.clone());
+    job.round_kind = Some(prepared.round_kind.as_str().into());
+    job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+    job.initial_prompt = "review".into();
+    job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+    job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    store
+        .enqueue_task(&NewTask {
+            job,
+            public_agent_id: public_id.into(),
+            task_kind: TaskKind::Review,
+            review_id: Some(format!("{public_id}-id")),
+            continuation_of: None,
+            repository: prepared.repository.to_string_lossy().into_owned(),
+            feature_id: prepared.feature_id.clone(),
+            ownership_token: "owner".into(),
+            budget,
+            retain_partial: false,
+        })
+        .unwrap();
+}
+
 impl RuntimeFactory for BudgetFactory {
     fn spawn(
         &self,
@@ -199,67 +262,22 @@ impl RuntimeFactory for BudgetFactory {
 #[test]
 fn v2_review_attempt_enforces_effective_turn_budget_and_releases_slot() {
     let directory = tempfile::tempdir().unwrap();
-    let repository = create_repository(&directory);
-    let head = git(&repository, &["rev-parse", "HEAD"]);
-    let prepared = ReviewPreparer
-        .prepare(&ReviewManifest {
-            schema: "sectioned-zcode-review/v1".into(),
-            review_kind: ReviewKind::Code,
-            feature_id: "feature".into(),
-            section_id: "S03".into(),
-            round_kind: RoundKind::InitialBounded,
-            repository: repository.clone(),
-            base_ref: head.clone(),
-            head_ref: head,
-            plan_path: ".agent-work/PLAN.md".into(),
-            context_paths: Vec::new(),
-            scope_paths: vec!["src".into()],
-            forbidden_input_globs: Vec::new(),
-            validation_commands: Default::default(),
-            report_target: ".agent-work/reviews/feature/S03/budget.md".into(),
-            scratch_root: ".agent-work/scratch/jobs".into(),
-            model: None,
-            fresh_session: true,
-            network_policy: NetworkPolicy::Deny,
-            scratch_policy: ScratchPolicy::Isolated,
-            idempotency_key: "feature:S03:review-budget".into(),
-        })
-        .unwrap();
+    let prepared = prepare_review(&directory, "review-budget");
     let store = Arc::new(Store::open(directory.path().join("review-budget.sqlite3")).unwrap());
-    let mut job = NewJob::new(
+    enqueue_v2_review(
+        &store,
         "review-budget-attempt",
-        prepared.worktree.path.to_string_lossy(),
+        "review-budget",
+        &prepared,
+        BudgetRequest::Limits(EffectiveBudget {
+            wall_time_ms: 10_000,
+            max_turns: 1,
+            max_tool_calls: 10,
+            max_context_bytes: 1_048_576,
+            max_result_bytes: 1_048_576,
+            max_artifact_bytes: 16_777_216,
+        }),
     );
-    job.idempotency_key = Some(prepared.idempotency_key.clone());
-    job.review_kind = Some(prepared.review_kind.as_str().into());
-    job.feature_id = Some(prepared.feature_id.clone());
-    job.section_id = Some(prepared.section_id.clone());
-    job.round_kind = Some(prepared.round_kind.as_str().into());
-    job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
-    job.initial_prompt = "review".into();
-    job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
-    job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
-    store
-        .enqueue_task(&NewTask {
-            job,
-            public_agent_id: "review-budget".into(),
-            task_kind: TaskKind::Review,
-            review_id: Some("review-budget-id".into()),
-            continuation_of: None,
-            repository: repository.to_string_lossy().into_owned(),
-            feature_id: "feature".into(),
-            ownership_token: "owner".into(),
-            budget: BudgetRequest::Limits(EffectiveBudget {
-                wall_time_ms: 10_000,
-                max_turns: 1,
-                max_tool_calls: 10,
-                max_context_bytes: 1_048_576,
-                max_result_bytes: 1_048_576,
-                max_artifact_bytes: 16_777_216,
-            }),
-            retain_partial: false,
-        })
-        .unwrap();
     let runtime = Arc::new(Mutex::new(None));
     let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let scheduler = Scheduler::new(
@@ -316,6 +334,175 @@ fn v2_review_attempt_enforces_effective_turn_budget_and_releases_slot() {
     );
     assert!(runtime.stop_calls.load(Ordering::Acquire) >= 1);
     assert_eq!(scheduler.active_count(), 0);
+}
+
+struct RegisteredFailureRuntime {
+    worktree: PathBuf,
+    stop_calls: AtomicUsize,
+    worktree_existed_at_stop: AtomicBool,
+}
+
+impl ManagedRuntime for RegisteredFailureRuntime {
+    fn identity(&self) -> Option<zcode_driver::ProcessIdentity> {
+        None
+    }
+
+    fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+        self.stop_calls.fetch_add(1, Ordering::AcqRel);
+        self.worktree_existed_at_stop
+            .store(self.worktree.exists(), Ordering::Release);
+        RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+    }
+
+    fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+        None
+    }
+
+    fn bootstrap_session_with_mcp(
+        &self,
+        _job: &review_store::Job,
+        _servers: &[StdioMcpServer],
+        _timeout: Duration,
+    ) -> Result<SessionReady, zcode_reviewd::RuntimeCommandError> {
+        Ok(SessionReady {
+            session_id: "registered-failure-session".into(),
+            initial_turn_id: Some("turn-1".into()),
+            observed_model: None,
+        })
+    }
+
+    fn turn_snapshot(&self) -> TurnSnapshot {
+        TurnSnapshot {
+            generation: 1,
+            active: true,
+            boundary: None,
+        }
+    }
+}
+
+struct TriggeringReviewFactory {
+    database: PathBuf,
+    trigger_sql: String,
+    runtime: Arc<Mutex<Option<Arc<RegisteredFailureRuntime>>>>,
+}
+
+impl RuntimeFactory for TriggeringReviewFactory {
+    fn spawn(
+        &self,
+        job: &review_store::Job,
+        _sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        rusqlite::Connection::open(&self.database)
+            .and_then(|connection| connection.execute_batch(&self.trigger_sql))
+            .map_err(io::Error::other)?;
+        let runtime = Arc::new(RegisteredFailureRuntime {
+            worktree: PathBuf::from(&job.workspace_path),
+            stop_calls: AtomicUsize::new(0),
+            worktree_existed_at_stop: AtomicBool::new(false),
+        });
+        *self.runtime.lock().unwrap() = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+}
+
+fn assert_registered_review_failure_converges(
+    attempt: &str,
+    trigger_sql: String,
+    expected_reason: &str,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let prepared = prepare_review(&directory, attempt);
+    let database = directory.path().join(format!("{attempt}.sqlite3"));
+    let store = Arc::new(Store::open(&database).unwrap());
+    enqueue_v2_review(
+        &store,
+        attempt,
+        &format!("public-{attempt}"),
+        &prepared,
+        BudgetRequest::Omitted,
+    );
+    let runtime = Arc::new(Mutex::new(None));
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
+    let scheduler = Scheduler::new(
+        format!("owner-{attempt}"),
+        Arc::clone(&store),
+        Arc::new(TriggeringReviewFactory {
+            database,
+            trigger_sql,
+            runtime: Arc::clone(&runtime),
+        }),
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        ledger,
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join(format!("{attempt}.sock")),
+            runtime_sha256: None,
+        },
+    )
+    .unwrap();
+
+    assert!(scheduler.start_ready().is_err());
+    let runtime = runtime.lock().unwrap().clone().unwrap();
+    assert_eq!(runtime.stop_calls.load(Ordering::Acquire), 1);
+    assert!(runtime.worktree_existed_at_stop.load(Ordering::Acquire));
+    assert!(!prepared.worktree.path.exists());
+    let listed = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&prepared.repository)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(!String::from_utf8_lossy(&listed.stdout)
+        .contains(prepared.worktree.path.to_string_lossy().as_ref()));
+
+    let result = store.task_result(attempt).unwrap().unwrap();
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    assert!(result
+        .result
+        .residual_gaps
+        .contains(&expected_reason.to_owned()));
+    assert_eq!(
+        store
+            .task_by_execution_agent_id(attempt)
+            .unwrap()
+            .unwrap()
+            .phase,
+        TaskPhase::Terminal
+    );
+    assert!(store.get_job(attempt).unwrap().unwrap().state.is_terminal());
+    assert_eq!(store.active_count().unwrap(), 0);
+    assert_eq!(scheduler.active_count(), 0);
+
+    scheduler.close_job(attempt).unwrap();
+    scheduler.reap_job(attempt).unwrap();
+    assert_eq!(store.task_result(attempt).unwrap().unwrap(), result);
+}
+
+#[test]
+fn review_runtime_provenance_failure_stops_cleans_and_persists_one_result() {
+    assert_registered_review_failure_converges(
+        "review-provenance-failure",
+        "CREATE TRIGGER fail_review_runtime BEFORE UPDATE OF zcode_session_id ON review_provenance
+         WHEN NEW.agent_id='review-provenance-failure'
+         BEGIN SELECT RAISE(FAIL, 'scripted provenance failure'); END;"
+            .into(),
+        "REPORT_PROVENANCE_FAILED",
+    );
+}
+
+#[test]
+fn review_mark_running_failure_stops_cleans_and_persists_one_result() {
+    assert_registered_review_failure_converges(
+        "review-mark-running-failure",
+        "CREATE TRIGGER fail_review_mark_running BEFORE UPDATE OF state ON agents
+         WHEN NEW.agent_id='review-mark-running-failure' AND NEW.state='RUNNING'
+         BEGIN SELECT RAISE(FAIL, 'scripted mark running failure'); END;"
+            .into(),
+        "STORE_START_FAILED",
+    );
 }
 
 #[test]
