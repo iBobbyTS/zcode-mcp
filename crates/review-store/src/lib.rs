@@ -1072,6 +1072,14 @@ impl Store {
         query_latest_task_scoped(&connection, public_agent_id, scope)
     }
 
+    pub fn task_by_execution_agent_id(
+        &self,
+        execution_agent_id: &str,
+    ) -> StoreResult<Option<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        query_task_record(&connection, execution_agent_id)
+    }
+
     pub fn get_review_scoped(
         &self,
         review_id: &str,
@@ -1174,10 +1182,13 @@ impl Store {
         }
         if !matches!(
             task.phase,
-            TaskPhase::Running | TaskPhase::WaitingInput | TaskPhase::Cancelling
+            TaskPhase::Preparing
+                | TaskPhase::Running
+                | TaskPhase::WaitingInput
+                | TaskPhase::Cancelling
         ) {
             return Err(StoreError::Conflict(
-                "task completion requires an active/cancelling phase".into(),
+                "task completion requires a preparing/active/cancelling phase".into(),
             ));
         }
         let retained = if !result.partial {
@@ -1419,8 +1430,23 @@ impl Store {
         }
     }
     pub fn list_legacy_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
+        self.list_legacy_jobs_scoped(JobListScope::All, limit)
+    }
+
+    pub fn list_legacy_jobs_scoped(
+        &self,
+        scope: JobListScope,
+        limit: usize,
+    ) -> StoreResult<Vec<Job>> {
         let connection = self.connection.lock().unwrap();
-        let mut statement=connection.prepare("SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id, owner_epoch, close_requested, stop_requested, last_event_seq, failure_code, failure_message, runtime_agent_id, zcode_session_id, turn_state, pid, process_group_id, process_uid, process_start_token, closed_at, reaped_at, created_at, prepared_launch_json, prepared_launch_sha256 FROM agents a WHERE NOT EXISTS(SELECT 1 FROM task_attempts t WHERE t.execution_agent_id=a.agent_id) ORDER BY created_at DESC,rowid DESC LIMIT ?1")?;
+        let active_predicate = match scope {
+            JobListScope::Active => " AND a.state IN ('QUEUED', 'STARTING', 'RUNNING', 'STOPPING')",
+            JobListScope::Recent | JobListScope::All => "",
+        };
+        let sql = format!(
+            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id, owner_epoch, close_requested, stop_requested, last_event_seq, failure_code, failure_message, runtime_agent_id, zcode_session_id, turn_state, pid, process_group_id, process_uid, process_start_token, closed_at, reaped_at, created_at, prepared_launch_json, prepared_launch_sha256 FROM agents a WHERE NOT EXISTS(SELECT 1 FROM task_attempts t WHERE t.execution_agent_id=a.agent_id){active_predicate} ORDER BY created_at DESC,rowid DESC LIMIT ?1"
+        );
+        let mut statement = connection.prepare(&sql)?;
         let rows = statement
             .query_map([usize_to_i64(limit)?], map_job_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1719,7 +1745,16 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
+        let is_v2 = transaction
+            .query_row(
+                "SELECT 1 FROM task_attempts WHERE execution_agent_id=?1",
+                [agent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
         let (next, needs_runtime_stop) = match state {
+            JobState::Queued if is_v2 => (JobState::Stopping, false),
             JobState::Queued => (JobState::Cancelled, false),
             JobState::Starting | JobState::Running => (JobState::Stopping, true),
             JobState::Stopping => (JobState::Stopping, true),
@@ -1766,7 +1801,16 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
+        let is_v2 = transaction
+            .query_row(
+                "SELECT 1 FROM task_attempts WHERE execution_agent_id=?1",
+                [agent_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
         let (next, needs_runtime_stop) = match state {
+            JobState::Queued if is_v2 => (JobState::Stopping, false),
             JobState::Queued => (JobState::Cancelled, false),
             JobState::Starting | JobState::Running => (JobState::Stopping, true),
             JobState::Stopping => (JobState::Stopping, true),
@@ -5098,6 +5142,98 @@ mod tests {
             budget: BudgetRequest::Omitted,
             retain_partial: false,
         }
+    }
+
+    fn cancelled_task_result(summary: &str) -> TaskResult {
+        TaskResult {
+            outcome: TaskOutcome::Cancelled,
+            summary: summary.into(),
+            partial: true,
+            base_commit: None,
+            head_commit: None,
+            changed_files: Vec::new(),
+            diff_stat: None,
+            checks: Vec::new(),
+            residual_gaps: vec!["CANCELLED".into()],
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn queued_v2_cancel_remains_converging_until_precise_result_is_stored() {
+        let (_directory, _path, store) = file_store();
+        store
+            .enqueue_task(&general_task("queued-v2", "public-v2", "queued-v2-key"))
+            .unwrap();
+
+        let decision = store.request_stop("queued-v2").unwrap();
+        assert_eq!(decision.state, JobState::Stopping);
+        assert!(!decision.needs_runtime_stop);
+        assert_eq!(
+            store
+                .task_by_execution_agent_id("queued-v2")
+                .unwrap()
+                .unwrap()
+                .phase,
+            TaskPhase::Cancelling
+        );
+        assert!(store.task_result("queued-v2").unwrap().is_none());
+
+        let result = cancelled_task_result("cancelled before launch");
+        store.store_task_result("queued-v2", &result).unwrap();
+        assert_eq!(
+            store.get_job("queued-v2").unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            store
+                .task_by_execution_agent_id("queued-v2")
+                .unwrap()
+                .unwrap()
+                .phase,
+            TaskPhase::Terminal
+        );
+        assert_eq!(
+            store.task_result("queued-v2").unwrap().unwrap().result,
+            result
+        );
+    }
+
+    #[test]
+    fn legacy_active_scope_is_composed_before_limit_and_excludes_v2_rows() {
+        let (_directory, _path, store) = file_store();
+        enqueue(&store, "old-active", "/legacy-active");
+        let active_claim = claim(&store, "old-active");
+        store
+            .mark_running(
+                "old-active",
+                active_claim.owner_epoch,
+                "runtime-active",
+                None,
+            )
+            .unwrap();
+
+        for index in 0..101 {
+            let id = format!("new-terminal-{index:03}");
+            enqueue(&store, &id, "/legacy-terminal");
+            assert_eq!(store.request_stop(&id).unwrap().state, JobState::Cancelled);
+        }
+        store
+            .enqueue_task(&general_task("new-v2", "public-new-v2", "new-v2-key"))
+            .unwrap();
+        assert_eq!(
+            store.request_stop("new-v2").unwrap().state,
+            JobState::Stopping
+        );
+        store
+            .store_task_result("new-v2", &cancelled_task_result("v2 cancelled"))
+            .unwrap();
+
+        let active = store
+            .list_legacy_jobs_scoped(JobListScope::Active, 1)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].agent_id, "old-active");
     }
 
     #[test]

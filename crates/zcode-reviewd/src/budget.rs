@@ -1,4 +1,6 @@
+#[cfg(test)]
 use review_preparation::BudgetLimits;
+use review_store::EffectiveBudget;
 use std::{
     collections::HashSet,
     sync::Mutex,
@@ -14,15 +16,17 @@ pub(crate) enum BudgetViolation {
     WallTime,
     TurnLimit,
     ToolCallLimit,
+    AmbiguousTurnIdentity,
     AmbiguousToolIdentity,
 }
 
 impl BudgetViolation {
     pub(crate) fn reason_code(self) -> &'static str {
         match self {
-            Self::WallTime => "WALL_TIME_BUDGET_EXHAUSTED",
+            Self::WallTime => "WALL_TIME_DEADLINE_EXCEEDED",
             Self::TurnLimit => "TURN_BUDGET_EXHAUSTED",
             Self::ToolCallLimit => "TOOL_CALL_BUDGET_EXHAUSTED",
+            Self::AmbiguousTurnIdentity => "TURN_IDENTITY_AMBIGUOUS",
             Self::AmbiguousToolIdentity => "TOOL_CALL_IDENTITY_AMBIGUOUS",
         }
     }
@@ -30,7 +34,7 @@ impl BudgetViolation {
 
 #[derive(Debug)]
 struct BudgetState {
-    turns: u64,
+    turns: HashSet<String>,
     tool_calls: HashSet<String>,
     violation: Option<BudgetViolation>,
 }
@@ -44,15 +48,24 @@ pub(crate) struct AttemptBudget {
 }
 
 impl AttemptBudget {
+    #[cfg(test)]
     pub(crate) fn new(limits: &BudgetLimits) -> Self {
+        Self::with_limits(limits.wall_time_ms, limits.max_turns, limits.max_tool_calls)
+    }
+
+    pub(crate) fn from_effective(limits: &EffectiveBudget) -> Self {
+        Self::with_limits(limits.wall_time_ms, limits.max_turns, limits.max_tool_calls)
+    }
+
+    fn with_limits(wall_time_ms: u64, max_turns: u64, max_tool_calls: u64) -> Self {
         Self {
             deadline: Instant::now()
-                .checked_add(Duration::from_millis(limits.wall_time_ms))
+                .checked_add(Duration::from_millis(wall_time_ms))
                 .unwrap_or_else(Instant::now),
-            max_turns: limits.max_turns,
-            max_tool_calls: limits.max_tool_calls,
+            max_turns,
+            max_tool_calls,
             state: Mutex::new(BudgetState {
-                turns: 0,
+                turns: HashSet::new(),
                 tool_calls: HashSet::new(),
                 violation: None,
             }),
@@ -72,27 +85,22 @@ impl AttemptBudget {
         }
         match kind {
             "turn.started" => {
-                state.turns = state.turns.saturating_add(1);
-                if state.turns > self.max_turns {
+                let Some(identity) = unique_event_identity(event, "turnId") else {
+                    state.violation = Some(BudgetViolation::AmbiguousTurnIdentity);
+                    return;
+                };
+                state.turns.insert(identity);
+                if state.turns.len() as u64 > self.max_turns {
                     state.violation = Some(BudgetViolation::TurnLimit);
                 }
             }
             "tool.updated" => {
-                let identity = event
-                    .params
-                    .get("payload")
-                    .and_then(|payload| payload.get("toolCallId"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|identity| {
-                        !identity.is_empty()
-                            && identity.len() <= MAX_RUNTIME_ID_BYTES
-                            && !identity.contains('\0')
-                    });
+                let identity = unique_event_identity(event, "toolCallId");
                 let Some(identity) = identity else {
                     state.violation = Some(BudgetViolation::AmbiguousToolIdentity);
                     return;
                 };
-                state.tool_calls.insert(identity.to_owned());
+                state.tool_calls.insert(identity);
                 if state.tool_calls.len() as u64 > self.max_tool_calls {
                     state.violation = Some(BudgetViolation::ToolCallLimit);
                 }
@@ -109,11 +117,39 @@ impl AttemptBudget {
         state.violation
     }
 
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
+    }
+
     #[cfg(test)]
     fn counts(&self) -> (u64, usize) {
         let state = self.state.lock().unwrap();
-        (state.turns, state.tool_calls.len())
+        (state.turns.len() as u64, state.tool_calls.len())
     }
+}
+
+fn unique_event_identity(event: &zcode_protocol::EventEnvelope, key: &str) -> Option<String> {
+    let nested = event
+        .params
+        .get("payload")
+        .and_then(|payload| payload.get(key));
+    let top_level = event.params.get(key);
+    match (
+        nested.map(valid_runtime_identity),
+        top_level.map(valid_runtime_identity),
+    ) {
+        (Some(Some(nested)), Some(Some(top_level))) if nested == top_level => {
+            Some(nested.to_owned())
+        }
+        (Some(Some(identity)), None) | (None, Some(Some(identity))) => Some(identity.to_owned()),
+        _ => None,
+    }
+}
+
+fn valid_runtime_identity(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().filter(|identity| {
+        !identity.is_empty() && identity.len() <= MAX_RUNTIME_ID_BYTES && !identity.contains('\0')
+    })
 }
 
 #[cfg(test)]
@@ -166,6 +202,47 @@ mod tests {
         assert_eq!(
             ambiguous.violation(),
             Some(BudgetViolation::AmbiguousToolIdentity)
+        );
+    }
+
+    #[test]
+    fn duplicate_turn_identity_counts_once_and_ambiguous_identity_fails_closed() {
+        let budget = AttemptBudget::new(&limits());
+        budget.observe(&event(
+            "turn.started",
+            serde_json::json!({"turnId":"turn-1"}),
+        ));
+        budget.observe(&event(
+            "turn.started",
+            serde_json::json!({"turnId":"turn-1"}),
+        ));
+        assert_eq!(budget.counts(), (1, 0));
+        assert_eq!(budget.violation(), None);
+        budget.observe(&event(
+            "turn.started",
+            serde_json::json!({"turnId":"turn-2"}),
+        ));
+        assert_eq!(budget.counts(), (2, 0));
+        assert_eq!(budget.violation(), None);
+
+        let missing = AttemptBudget::new(&limits());
+        missing.observe(&event("turn.started", serde_json::json!({})));
+        assert_eq!(
+            missing.violation(),
+            Some(BudgetViolation::AmbiguousTurnIdentity)
+        );
+
+        let conflicting = AttemptBudget::new(&limits());
+        let Inbound::Message(WireMessage::Event(mut event)) =
+            event("turn.started", serde_json::json!({"turnId":"turn-1"}))
+        else {
+            unreachable!()
+        };
+        event.params["turnId"] = serde_json::json!("other-turn");
+        conflicting.observe(&Inbound::Message(WireMessage::Event(event)));
+        assert_eq!(
+            conflicting.violation(),
+            Some(BudgetViolation::AmbiguousTurnIdentity)
         );
     }
 }

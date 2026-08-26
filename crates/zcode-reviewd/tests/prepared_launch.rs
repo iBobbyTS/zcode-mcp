@@ -2,21 +2,24 @@ use review_ledger::{LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE};
 use review_preparation::{
     NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
 };
-use review_store::Store;
+use review_store::{
+    BudgetRequest, EffectiveBudget, NewJob, NewTask, Store, TaskKind, TaskOutcome, TaskPhase,
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
     },
     thread,
     time::Duration,
 };
 use tempfile::TempDir;
+use zcode_driver::Inbound;
 use zcode_driver::{ChildExit, StopOutcome};
-use zcode_protocol::StdioMcpServer;
+use zcode_protocol::{EventEnvelope, StdioMcpServer, WireMessage};
 use zcode_reviewd::{
     CommandRuntimeFactory, InternalLedgerMcpConfig, LifecycleRecord, LifecycleSink, ManagedRuntime,
     RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig, SessionReady, TurnBoundary,
@@ -41,6 +44,278 @@ impl RuntimeFactory for UnusedFactory {
             "runtime must not start during preparation",
         ))
     }
+}
+
+struct CountingFactory {
+    calls: Arc<AtomicUsize>,
+}
+
+impl RuntimeFactory for CountingFactory {
+    fn spawn(
+        &self,
+        _job: &review_store::Job,
+        _sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Err(io::Error::other("spawn must remain unreachable"))
+    }
+}
+
+#[test]
+fn review_without_ledger_fails_closed_before_runtime_spawn() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = create_repository(&directory);
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    let prepared = ReviewPreparer
+        .prepare(&ReviewManifest {
+            schema: "sectioned-zcode-review/v1".into(),
+            review_kind: ReviewKind::Code,
+            feature_id: "feature".into(),
+            section_id: "S03".into(),
+            round_kind: RoundKind::InitialBounded,
+            repository,
+            base_ref: head.clone(),
+            head_ref: head,
+            plan_path: ".agent-work/PLAN.md".into(),
+            context_paths: Vec::new(),
+            scope_paths: vec!["src".into()],
+            forbidden_input_globs: Vec::new(),
+            validation_commands: Default::default(),
+            report_target: ".agent-work/reviews/feature/S03/no-ledger.md".into(),
+            scratch_root: ".agent-work/scratch/jobs".into(),
+            model: None,
+            fresh_session: true,
+            network_policy: NetworkPolicy::Deny,
+            scratch_policy: ScratchPolicy::Isolated,
+            idempotency_key: "feature:S03:no-ledger".into(),
+        })
+        .unwrap();
+    let store = Arc::new(Store::open(directory.path().join("no-ledger.sqlite3")).unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let scheduler = Scheduler::new(
+        "no-ledger",
+        Arc::clone(&store),
+        Arc::new(CountingFactory {
+            calls: Arc::clone(&calls),
+        }),
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+    scheduler
+        .enqueue_prepared("no-ledger-review", "review", &prepared)
+        .unwrap();
+
+    assert!(scheduler.start_ready().is_err());
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    let failed = store.get_job("no-ledger-review").unwrap().unwrap();
+    assert!(failed.state.is_terminal());
+    assert_eq!(
+        failed.failure_code.as_deref(),
+        Some("REPORT_INITIALIZATION_FAILED")
+    );
+    assert_eq!(store.active_count().unwrap(), 0);
+}
+
+struct BudgetRuntime {
+    sink: Arc<dyn LifecycleSink>,
+    sequence: AtomicU64,
+    stop_calls: AtomicUsize,
+}
+
+impl BudgetRuntime {
+    fn emit_turn(&self, turn_id: &str) {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel);
+        self.sink.emit(LifecycleRecord {
+            sequence,
+            event: zcode_reviewd::RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                EventEnvelope {
+                    method: "session/event".into(),
+                    params: serde_json::json!({
+                        "type":"turn.started",
+                        "payload":{"turnId":turn_id}
+                    }),
+                },
+            ))),
+        });
+    }
+}
+
+impl ManagedRuntime for BudgetRuntime {
+    fn identity(&self) -> Option<zcode_driver::ProcessIdentity> {
+        None
+    }
+
+    fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+        self.stop_calls.fetch_add(1, Ordering::AcqRel);
+        RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+    }
+
+    fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+        thread::sleep(timeout);
+        None
+    }
+
+    fn bootstrap_session(
+        &self,
+        _job: &review_store::Job,
+        _timeout: Duration,
+    ) -> Result<SessionReady, zcode_reviewd::RuntimeCommandError> {
+        Ok(SessionReady {
+            session_id: "budget-review-session".into(),
+            initial_turn_id: Some("initial-turn".into()),
+            observed_model: None,
+        })
+    }
+
+    fn turn_snapshot(&self) -> TurnSnapshot {
+        TurnSnapshot {
+            generation: 1,
+            active: true,
+            boundary: None,
+        }
+    }
+}
+
+struct BudgetFactory {
+    runtime: Arc<Mutex<Option<Arc<BudgetRuntime>>>>,
+}
+
+impl RuntimeFactory for BudgetFactory {
+    fn spawn(
+        &self,
+        _job: &review_store::Job,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        let runtime = Arc::new(BudgetRuntime {
+            sink,
+            sequence: AtomicU64::new(1),
+            stop_calls: AtomicUsize::new(0),
+        });
+        *self.runtime.lock().unwrap() = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+}
+
+#[test]
+fn v2_review_attempt_enforces_effective_turn_budget_and_releases_slot() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = create_repository(&directory);
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    let prepared = ReviewPreparer
+        .prepare(&ReviewManifest {
+            schema: "sectioned-zcode-review/v1".into(),
+            review_kind: ReviewKind::Code,
+            feature_id: "feature".into(),
+            section_id: "S03".into(),
+            round_kind: RoundKind::InitialBounded,
+            repository: repository.clone(),
+            base_ref: head.clone(),
+            head_ref: head,
+            plan_path: ".agent-work/PLAN.md".into(),
+            context_paths: Vec::new(),
+            scope_paths: vec!["src".into()],
+            forbidden_input_globs: Vec::new(),
+            validation_commands: Default::default(),
+            report_target: ".agent-work/reviews/feature/S03/budget.md".into(),
+            scratch_root: ".agent-work/scratch/jobs".into(),
+            model: None,
+            fresh_session: true,
+            network_policy: NetworkPolicy::Deny,
+            scratch_policy: ScratchPolicy::Isolated,
+            idempotency_key: "feature:S03:review-budget".into(),
+        })
+        .unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review-budget.sqlite3")).unwrap());
+    let mut job = NewJob::new(
+        "review-budget-attempt",
+        prepared.worktree.path.to_string_lossy(),
+    );
+    job.idempotency_key = Some(prepared.idempotency_key.clone());
+    job.review_kind = Some(prepared.review_kind.as_str().into());
+    job.feature_id = Some(prepared.feature_id.clone());
+    job.section_id = Some(prepared.section_id.clone());
+    job.round_kind = Some(prepared.round_kind.as_str().into());
+    job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+    job.initial_prompt = "review".into();
+    job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+    job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    store
+        .enqueue_task(&NewTask {
+            job,
+            public_agent_id: "review-budget".into(),
+            task_kind: TaskKind::Review,
+            review_id: Some("review-budget-id".into()),
+            continuation_of: None,
+            repository: repository.to_string_lossy().into_owned(),
+            feature_id: "feature".into(),
+            ownership_token: "owner".into(),
+            budget: BudgetRequest::Limits(EffectiveBudget {
+                wall_time_ms: 10_000,
+                max_turns: 1,
+                max_tool_calls: 10,
+                max_context_bytes: 1_048_576,
+                max_result_bytes: 1_048_576,
+                max_artifact_bytes: 16_777_216,
+            }),
+            retain_partial: false,
+        })
+        .unwrap();
+    let runtime = Arc::new(Mutex::new(None));
+    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
+    let scheduler = Scheduler::new(
+        "review-budget-owner",
+        Arc::clone(&store),
+        Arc::new(BudgetFactory {
+            runtime: Arc::clone(&runtime),
+        }),
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        ledger,
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join("review-budget.sock"),
+            runtime_sha256: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        scheduler.start_ready().unwrap(),
+        vec!["review-budget-attempt"]
+    );
+    let runtime = runtime.lock().unwrap().clone().unwrap();
+    runtime.emit_turn("turn-1");
+    runtime.emit_turn("turn-1");
+    thread::sleep(Duration::from_millis(80));
+    assert!(store
+        .task_result("review-budget-attempt")
+        .unwrap()
+        .is_none());
+    runtime.emit_turn("turn-2");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let result = loop {
+        if let Some(result) = store.task_result("review-budget-attempt").unwrap() {
+            break result;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(result.result.outcome, TaskOutcome::BudgetExhausted);
+    assert!(result
+        .result
+        .residual_gaps
+        .contains(&"TURN_BUDGET_EXHAUSTED".into()));
+    assert_eq!(
+        store
+            .task_by_execution_agent_id("review-budget-attempt")
+            .unwrap()
+            .unwrap()
+            .phase,
+        TaskPhase::Terminal
+    );
+    assert!(runtime.stop_calls.load(Ordering::Acquire) >= 1);
+    assert_eq!(scheduler.active_count(), 0);
 }
 
 #[test]

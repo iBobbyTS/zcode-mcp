@@ -1157,13 +1157,14 @@ impl RpcService {
                 job: self.require_legacy_job(&agent_id)?.into(),
             }),
             RpcMethod::Pending { agent_id } => {
-                let job = self.require_legacy_job(&agent_id)?;
+                self.require_legacy_job(&agent_id)?;
+                let policy = self.scheduler.active_policy(&agent_id);
                 let requests = self
                     .store
                     .pending_requests_bounded(&agent_id, MAX_PENDING_REQUESTS)
                     .map_err(map_store)?
                     .into_iter()
-                    .map(|request| pending_request_view(&job, request))
+                    .map(|request| pending_request_view(policy.as_deref(), request))
                     .collect();
                 Ok(RpcSuccess::Pending { requests })
             }
@@ -1230,13 +1231,9 @@ impl RpcService {
                 }
                 let jobs = self
                     .store
-                    .list_legacy_jobs(MAX_LIST_JOBS)
+                    .list_legacy_jobs_scoped(scope.into(), limit)
                     .map_err(map_store)?
                     .into_iter()
-                    .filter(|job| {
-                        !matches!(scope, JobListScopeView::Active) || !job.state.is_terminal()
-                    })
-                    .take(limit)
                     .map(JobView::from)
                     .collect();
                 Ok(RpcSuccess::Listed { jobs })
@@ -1725,7 +1722,10 @@ fn verified_artifact_view(artifact: VerifiedArtifact, requested: usize) -> Artif
     }
 }
 
-fn pending_request_view(job: &Job, request: StoredPendingRequest) -> PendingRequestView {
+fn pending_request_view(
+    policy: Option<&review_preparation::PolicyLauncher>,
+    request: StoredPendingRequest,
+) -> PendingRequestView {
     let state = match request.state {
         PendingRequestState::Pending => PendingRequestStateView::Pending,
         PendingRequestState::Sending => PendingRequestStateView::Sending,
@@ -1761,12 +1761,7 @@ fn pending_request_view(job: &Job, request: StoredPendingRequest) -> PendingRequ
     let policy_preview = params
         .as_ref()
         .and_then(|params| {
-            let prepared = serde_json::from_str::<review_preparation::PreparedLaunchSpec>(
-                job.prepared_launch_json.as_deref()?,
-            )
-            .ok()?;
-            let launcher = prepared.launcher().ok()?;
-            let decision = launcher
+            let decision = policy?
                 .decide_zcode_permission(params, review_preparation::ExternalDecision::Allow);
             Some(if decision.allowed {
                 "externally_decidable"

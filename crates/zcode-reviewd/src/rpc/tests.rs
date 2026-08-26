@@ -448,6 +448,110 @@ fn legacy_rpc_cannot_observe_or_control_v2_task_rows() {
     }
 }
 
+#[test]
+fn legacy_active_rpc_scope_is_applied_before_the_caller_limit() {
+    let fixture = fixture();
+    fixture
+        .scheduler
+        .enqueue(&NewJob::new("old-active", "/active-workspace"))
+        .unwrap();
+    assert_eq!(fixture.scheduler.start_ready().unwrap(), vec!["old-active"]);
+
+    for index in 0..101 {
+        let agent_id = format!("new-terminal-{index:03}");
+        fixture
+            .scheduler
+            .enqueue(&NewJob::new(&agent_id, "/terminal-workspace"))
+            .unwrap();
+        assert_eq!(
+            fixture.store.request_stop(&agent_id).unwrap().state,
+            JobState::Cancelled
+        );
+    }
+    fixture
+        .store
+        .enqueue_task(&NewTask {
+            job: NewJob::new("new-v2", "/v2-workspace"),
+            public_agent_id: "public-new-v2".into(),
+            task_kind: TaskKind::General,
+            review_id: None,
+            continuation_of: None,
+            repository: "/repository".into(),
+            feature_id: "feature".into(),
+            ownership_token: "owner-group".into(),
+            budget: BudgetRequest::Omitted,
+            retain_partial: false,
+        })
+        .unwrap();
+
+    match fixture
+        .service
+        .dispatch(RpcMethod::List {
+            scope: JobListScopeView::Active,
+            limit: 1,
+        })
+        .unwrap()
+    {
+        RpcSuccess::Listed { jobs } => {
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].agent_id, "old-active");
+        }
+        other => panic!("unexpected list result: {other:?}"),
+    }
+}
+
+#[test]
+fn pending_permission_preview_uses_the_typed_active_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let worktree = directory.path().join("worktree");
+    let scratch = directory.path().join("scratch");
+    let artifact_root = directory.path().join("artifacts");
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    std::fs::write(worktree.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let policy = review_preparation::PolicyLauncher::for_general(
+        worktree,
+        scratch,
+        artifact_root.join("result.json"),
+        Vec::new(),
+        std::collections::BTreeMap::new(),
+        review_preparation::PolicyCapabilities::default(),
+        review_preparation::PolicyMode::GeneralImplementation {
+            tracked_write_roots: vec![PathBuf::from("src")],
+        },
+    )
+    .unwrap();
+    let request = |request_id: &str, payload_json: &str| StoredPendingRequest {
+        request_id: request_id.into(),
+        agent_id: "general-task".into(),
+        correlation_id: format!("correlation-{request_id}"),
+        request_type: "permission".into(),
+        payload_json: payload_json.into(),
+        state: PendingRequestState::Pending,
+        response_decision: None,
+        response_content: None,
+    };
+
+    let editable = pending_request_view(
+        Some(&policy),
+        request(
+            "edit",
+            r#"{"toolName":"edit","input":{"path":"src/lib.rs"}}"#,
+        ),
+    );
+    assert_eq!(editable.policy_preview, "externally_decidable");
+
+    let network = pending_request_view(
+        Some(&policy),
+        request(
+            "network",
+            r#"{"toolName":"network","input":{"target":"example.com"}}"#,
+        ),
+    );
+    assert_eq!(network.policy_preview, "hard_deny");
+}
+
 fn enqueue_request(agent_id: &str, key: &str) -> RpcMethod {
     RpcMethod::Enqueue {
         job: NewJobInput {
