@@ -16,8 +16,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fmt,
-    path::PathBuf,
+    ffi::OsString,
+    fmt, fs, io,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -241,13 +242,12 @@ impl ReviewJobOrchestrator {
         )? {
             return Ok(existing);
         }
-        let prepared = ReviewPreparer
-            .prepare(&input.manifest)
-            .map_err(|error| OrchestrationError::Preparation(error.to_string()))?;
+        self.ensure_structured_idempotency_unclaimed(&input.manifest.idempotency_key)?;
+        let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
         let prompt = match build_review_prompt(&prepared) {
             Ok(prompt) => prompt,
             Err(error) => {
-                cleanup_prepared(&prepared)?;
+                self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
                 return Err(OrchestrationError::Prompt(error.to_string()));
             }
         };
@@ -263,6 +263,7 @@ impl ReviewJobOrchestrator {
                 review_kind: input.review_kind,
             },
             &prepared,
+            prepared_created,
             prompt,
             start,
         )
@@ -313,6 +314,7 @@ impl ReviewJobOrchestrator {
                 "idempotent continuation identity is incomplete",
             ));
         }
+        self.ensure_structured_idempotency_unclaimed(&input.manifest.idempotency_key)?;
         let context = self.continuation_context(input)?;
         if let Some(existing) = self.replay_projection(
             &execution_agent_id,
@@ -329,17 +331,15 @@ impl ReviewJobOrchestrator {
         )? {
             return Ok(existing);
         }
-        let prepared = ReviewPreparer
-            .prepare(&input.manifest)
-            .map_err(|error| OrchestrationError::Preparation(error.to_string()))?;
+        let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
         if let Err(error) = validate_continuation_prepared(&context, &prepared) {
-            cleanup_prepared(&prepared)?;
+            self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
         }
         let prompt = match build_review_continuation_prompt(&prepared, &input.frozen_finding_ids) {
             Ok(prompt) => prompt,
             Err(error) => {
-                cleanup_prepared(&prepared)?;
+                self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
                 return Err(OrchestrationError::Prompt(error.to_string()));
             }
         };
@@ -355,6 +355,7 @@ impl ReviewJobOrchestrator {
                 review_kind: input.review_kind,
             },
             &prepared,
+            prepared_created,
             prompt,
             start,
         )
@@ -619,6 +620,7 @@ impl ReviewJobOrchestrator {
         &self,
         attempt: StructuredAttempt,
         prepared: &PreparedLaunchSpec,
+        prepared_created: bool,
         prompt: ReviewPrompt,
         start: bool,
     ) -> Result<StructuredReviewProjection, OrchestrationError> {
@@ -658,13 +660,7 @@ impl ReviewJobOrchestrator {
         let (job, task_record) = match store.enqueue_task(&task) {
             Ok(stored) => stored,
             Err(error) => {
-                if store
-                    .get_job(&attempt.execution_agent_id)
-                    .map_err(OrchestrationError::Store)?
-                    .is_none()
-                {
-                    let _ = cleanup_prepared(prepared);
-                }
+                self.cleanup_new_unclaimed_prepared(prepared, prepared_created)?;
                 return Err(OrchestrationError::Store(error));
             }
         };
@@ -724,6 +720,63 @@ impl ReviewJobOrchestrator {
         ))
     }
 
+    fn ensure_structured_idempotency_unclaimed(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<(), OrchestrationError> {
+        if self
+            .scheduler
+            .store()
+            .submission_by_idempotency(idempotency_key)
+            .map_err(OrchestrationError::Store)?
+            .is_some()
+        {
+            return Err(OrchestrationError::Conflict(
+                "idempotency key is owned by another submission family or execution",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_legacy_idempotency_family(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<(), OrchestrationError> {
+        if self
+            .scheduler
+            .store()
+            .submission_by_idempotency(idempotency_key)
+            .map_err(OrchestrationError::Store)?
+            .is_some_and(|owner| owner.task_kind.is_some())
+        {
+            return Err(OrchestrationError::Conflict(
+                "idempotency key is owned by a structured submission",
+            ));
+        }
+        Ok(())
+    }
+
+    fn cleanup_new_unclaimed_prepared(
+        &self,
+        prepared: &PreparedLaunchSpec,
+        prepared_created: bool,
+    ) -> Result<(), OrchestrationError> {
+        if !prepared_created {
+            return Ok(());
+        }
+        if self
+            .scheduler
+            .store()
+            .submission_by_idempotency(&prepared.idempotency_key)
+            .map_err(OrchestrationError::Store)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        cleanup_prepared(prepared)?;
+        cleanup_prepared_job_root(prepared)
+    }
+
     fn require_structured_review_owner(&self) -> Result<(), OrchestrationError> {
         if self.scheduler.ledger().is_none() || !self.scheduler.review_completion_enabled() {
             return Err(OrchestrationError::Unavailable(
@@ -752,16 +805,20 @@ impl ReviewJobOrchestrator {
         manifest: &ReviewManifest,
         start: bool,
     ) -> Result<SpawnedReview, OrchestrationError> {
-        let prepared = ReviewPreparer
-            .prepare(manifest)
-            .map_err(|error| OrchestrationError::Preparation(error.to_string()))?;
-        let prompt = build_review_prompt(&prepared)
-            .map_err(|error| OrchestrationError::Prompt(error.to_string()))?;
-        let agent_id = format!("review-{}", prepared.prepared_sha256);
         let _guard = self
             .spawn_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_legacy_idempotency_family(&manifest.idempotency_key)?;
+        let (prepared, prepared_created) = prepare_with_ownership(manifest)?;
+        let prompt = match build_review_prompt(&prepared) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
+                return Err(OrchestrationError::Prompt(error.to_string()));
+            }
+        };
+        let agent_id = format!("review-{}", prepared.prepared_sha256);
         if self
             .scheduler
             .store()
@@ -784,10 +841,16 @@ impl ReviewJobOrchestrator {
                 resumed_existing: true,
             });
         }
-        let stored = self
+        let stored = match self
             .scheduler
             .enqueue_prepared(agent_id, prompt.text, &prepared)
-            .map_err(OrchestrationError::Scheduler)?;
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
+                return Err(OrchestrationError::Scheduler(error));
+            }
+        };
 
         if start {
             let _ = self.scheduler.start_ready();
@@ -956,6 +1019,73 @@ fn validate_continuation_prepared(
     Ok(())
 }
 
+struct PreparationBaseline {
+    scratch_root: Option<PathBuf>,
+    existing_entries: Option<HashSet<OsString>>,
+}
+
+impl PreparationBaseline {
+    fn capture(manifest: &ReviewManifest) -> Self {
+        let Some(repository) = fs::canonicalize(&manifest.repository).ok() else {
+            return Self {
+                scratch_root: None,
+                existing_entries: None,
+            };
+        };
+        let requested = if manifest.scratch_root.is_absolute() {
+            manifest.scratch_root.clone()
+        } else {
+            repository.join(&manifest.scratch_root)
+        };
+        let scratch_root = match fs::canonicalize(&requested) {
+            Ok(canonical) => Some(canonical),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(requested),
+            Err(_) => None,
+        };
+        let existing_entries = scratch_root.as_deref().and_then(snapshot_directory_entries);
+        Self {
+            scratch_root,
+            existing_entries,
+        }
+    }
+
+    fn created_job_root(&self, prepared: &PreparedLaunchSpec) -> bool {
+        let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
+            return false;
+        };
+        let Some(job_root_name) = job_root.file_name() else {
+            return false;
+        };
+        self.scratch_root.as_deref() == job_root.parent()
+            && self
+                .existing_entries
+                .as_ref()
+                .is_some_and(|entries| !entries.contains(job_root_name))
+    }
+}
+
+fn snapshot_directory_entries(path: &Path) -> Option<HashSet<OsString>> {
+    match fs::read_dir(path) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<HashSet<_>, _>>()
+            .ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(HashSet::new()),
+        Err(_) => None,
+    }
+}
+
+fn prepare_with_ownership(
+    manifest: &ReviewManifest,
+) -> Result<(PreparedLaunchSpec, bool), OrchestrationError> {
+    let baseline = PreparationBaseline::capture(manifest);
+    let prepared = ReviewPreparer
+        .prepare(manifest)
+        .map_err(|error| OrchestrationError::Preparation(error.to_string()))?;
+    let created = baseline.created_job_root(&prepared);
+    Ok((prepared, created))
+}
+
 fn cleanup_prepared(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationError> {
     let job_root = prepared
         .worktree
@@ -979,6 +1109,24 @@ fn cleanup_prepared(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationEr
     manager
         .cleanup_from_record(&record)
         .map(|_| ())
+        .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))
+}
+
+fn cleanup_prepared_job_root(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationError> {
+    let job_root = prepared.worktree.scratch_worktrees_root.parent().ok_or(
+        OrchestrationError::Unavailable("prepared review has no cleanup owner"),
+    )?;
+    if !job_root.exists() {
+        return Ok(());
+    }
+    let canonical = fs::canonicalize(job_root)
+        .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))?;
+    if canonical != job_root || canonical.parent().is_none() {
+        return Err(OrchestrationError::Unavailable(
+            "prepared review cleanup owner changed",
+        ));
+    }
+    fs::remove_dir_all(&canonical)
         .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))
 }
 

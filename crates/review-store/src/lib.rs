@@ -343,6 +343,13 @@ pub enum TaskKind {
     ReviewContinuation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionOwnership {
+    pub execution_agent_id: String,
+    pub task_kind: Option<TaskKind>,
+    semantic_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPhase {
     Queued,
@@ -953,7 +960,14 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(key) = &job.idempotency_key {
-            if let Some(existing) = query_job_by_idempotency(&transaction, key)? {
+            if let Some(owner) = query_submission_ownership_by_idempotency(&transaction, key)? {
+                if owner.task_kind.is_some() {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} is owned by a structured task"
+                    )));
+                }
+                let existing = query_job(&transaction, &owner.execution_agent_id)?
+                    .ok_or_else(|| StoreError::InvalidState("legacy job disappeared".into()))?;
                 let compatible = match (
                     job.prepared_launch_sha256.as_deref(),
                     existing.prepared_launch_sha256.as_deref(),
@@ -977,6 +991,7 @@ impl Store {
                 job.agent_id
             )));
         }
+        ensure_report_target_available(&transaction, job.report_path.as_deref(), &job.agent_id)?;
         let created_at = now_millis();
         transaction.execute(
             "INSERT INTO agents (
@@ -1017,18 +1032,36 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(key) = &task.job.idempotency_key {
-            let existing = transaction.query_row(
-                "SELECT a.agent_id, t.semantic_fingerprint FROM agents a JOIN task_attempts t ON t.execution_agent_id=a.agent_id WHERE a.idempotency_key=?1",
-                [key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?;
-            if let Some((execution_id, stored_fingerprint)) = existing {
+            if let Some(owner) = query_submission_ownership_by_idempotency(&transaction, key)? {
+                let Some(stored_kind) = owner.task_kind else {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} is owned by a legacy task"
+                    )));
+                };
+                if stored_kind != task.task_kind {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} is owned by a different task family"
+                    )));
+                }
+                if owner.execution_agent_id != task.job.agent_id {
+                    return Err(StoreError::Conflict(format!(
+                        "idempotency key {key} names a different task execution"
+                    )));
+                }
+                let stored_fingerprint =
+                    owner.semantic_fingerprint.as_deref().ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "structured submission is missing its semantic fingerprint".into(),
+                        )
+                    })?;
                 if stored_fingerprint != fingerprint {
                     return Err(StoreError::Conflict(format!(
                         "idempotency key {key} names a semantically different task"
                     )));
                 }
-                let job = query_job(&transaction, &execution_id)?
+                let job = query_job(&transaction, &owner.execution_agent_id)?
                     .ok_or_else(|| StoreError::InvalidState("task job disappeared".into()))?;
-                let record = query_task_record(&transaction, &execution_id)?
+                let record = query_task_record(&transaction, &owner.execution_agent_id)?
                     .ok_or_else(|| StoreError::InvalidState("task metadata disappeared".into()))?;
                 transaction.commit()?;
                 return Ok((job, record));
@@ -1040,6 +1073,11 @@ impl Store {
                 task.job.agent_id
             )));
         }
+        ensure_report_target_available(
+            &transaction,
+            task.job.report_path.as_deref(),
+            &task.job.agent_id,
+        )?;
         let (attempt_sequence, independent_evidence) = continuation_identity(&transaction, task)?;
         bind_task_identity(&transaction, task)?;
         let created_at = now_millis();
@@ -1061,6 +1099,11 @@ impl Store {
         let record = query_task_record(&transaction, &task.job.agent_id)?.unwrap();
         transaction.commit()?;
         Ok((job, record))
+    }
+
+    pub fn submission_by_idempotency(&self, key: &str) -> StoreResult<Option<SubmissionOwnership>> {
+        let connection = self.connection.lock().unwrap();
+        query_submission_ownership_by_idempotency(&connection, key)
     }
 
     pub fn get_task_scoped(
@@ -3851,21 +3894,59 @@ fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>
     row.map(convert_job_row).transpose()
 }
 
-fn query_job_by_idempotency(connection: &Connection, key: &str) -> StoreResult<Option<Job>> {
+fn query_submission_ownership_by_idempotency(
+    connection: &Connection,
+    key: &str,
+) -> StoreResult<Option<SubmissionOwnership>> {
     let row = connection
         .query_row(
-            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
-                    owner_epoch, close_requested, stop_requested, last_event_seq,
-                    failure_code, failure_message, runtime_agent_id,
-                    zcode_session_id, turn_state, pid, process_group_id,
-                    process_uid, process_start_token, closed_at, reaped_at, created_at,
-                    prepared_launch_json, prepared_launch_sha256
-             FROM agents WHERE idempotency_key = ?1",
+            "SELECT a.agent_id,t.task_kind,t.semantic_fingerprint
+         FROM agents a
+         LEFT JOIN task_attempts t ON t.execution_agent_id=a.agent_id
+         WHERE a.idempotency_key = ?1
+         ORDER BY a.created_at,a.rowid
+         LIMIT 1",
             [key],
-            map_job_row,
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    row.map(convert_job_row).transpose()
+    row.map(|(execution_agent_id, task_kind, semantic_fingerprint)| {
+        Ok(SubmissionOwnership {
+            execution_agent_id,
+            task_kind: task_kind.map(|kind| TaskKind::parse(&kind)).transpose()?,
+            semantic_fingerprint,
+        })
+    })
+    .transpose()
+}
+
+fn ensure_report_target_available(
+    connection: &Connection,
+    report_path: Option<&str>,
+    execution_agent_id: &str,
+) -> StoreResult<()> {
+    let Some(report_path) = report_path else {
+        return Ok(());
+    };
+    let owner = connection
+        .query_row(
+            "SELECT agent_id FROM agents WHERE report_path=?1 AND agent_id<>?2 LIMIT 1",
+            params![report_path, execution_agent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if owner.is_some() {
+        return Err(StoreError::Conflict(
+            "report target is owned by another execution".into(),
+        ));
+    }
+    Ok(())
 }
 
 type JobRow = (
@@ -5164,6 +5245,135 @@ mod tests {
             budget: BudgetRequest::Omitted,
             retain_partial: false,
         }
+    }
+
+    #[test]
+    fn report_target_is_globally_reserved_inside_enqueue_transaction() {
+        let (_directory, path, store) = file_store();
+        drop(store);
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let results = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for (store, agent_id, key) in [
+                (&first, "report-owner-a", "report-key-a"),
+                (&second, "report-owner-b", "report-key-b"),
+            ] {
+                let barrier = Arc::clone(&barrier);
+                workers.push(scope.spawn(move || {
+                    let mut job = NewJob::new(agent_id, "/workspace");
+                    job.idempotency_key = Some(key.into());
+                    job.report_path = Some("/canonical/review.md".into());
+                    barrier.wait();
+                    store.enqueue_job(&job)
+                }));
+            }
+            barrier.wait();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::Conflict(_))))
+                .count(),
+            1
+        );
+        let owner = results
+            .iter()
+            .find_map(|result| result.as_ref().ok())
+            .unwrap();
+        assert!(matches!(
+            owner.agent_id.as_str(),
+            "report-owner-a" | "report-owner-b"
+        ));
+        let compatible = first
+            .enqueue_job(&NewJob {
+                agent_id: "compatible-report-replay".into(),
+                idempotency_key: owner.idempotency_key.clone(),
+                parent_agent_id: None,
+                review_kind: None,
+                feature_id: None,
+                section_id: None,
+                round_kind: None,
+                workspace_path: "/workspace".into(),
+                report_path: Some("/canonical/review.md".into()),
+                runtime_hash: None,
+                prepared_launch_json: None,
+                prepared_launch_sha256: None,
+                initial_prompt: "Begin review.".into(),
+            })
+            .unwrap();
+        assert_eq!(compatible.agent_id, owner.agent_id);
+    }
+
+    #[test]
+    fn report_target_and_idempotency_collisions_cross_legacy_and_v2_families() {
+        let (_directory, _path, store) = file_store();
+        let mut legacy = NewJob::new("legacy-owner", "/legacy-workspace");
+        legacy.idempotency_key = Some("shared-legacy-key".into());
+        legacy.report_path = Some("/canonical/legacy-report.md".into());
+        store.enqueue_job(&legacy).unwrap();
+
+        let mut structured = general_task(
+            "structured-collision",
+            "structured-public",
+            "shared-legacy-key",
+        );
+        structured.task_kind = TaskKind::Review;
+        structured.review_id = Some("structured-review".into());
+        structured.job.review_kind = Some("code".into());
+        assert!(matches!(
+            store.enqueue_task(&structured),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(store
+            .task_by_execution_agent_id("structured-collision")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .submission_by_idempotency("shared-legacy-key")
+                .unwrap()
+                .unwrap()
+                .task_kind,
+            None
+        );
+
+        let mut queued_v2 = general_task("queued-v2-owner", "queued-v2-public", "v2-key");
+        queued_v2.task_kind = TaskKind::Review;
+        queued_v2.review_id = Some("queued-v2-review".into());
+        queued_v2.job.review_kind = Some("code".into());
+        queued_v2.job.report_path = Some("/canonical/v2-report.md".into());
+        store.enqueue_task(&queued_v2).unwrap();
+
+        let mut legacy_idempotency_collision =
+            NewJob::new("legacy-idempotency-collision", "/legacy-workspace-2");
+        legacy_idempotency_collision.idempotency_key = Some("v2-key".into());
+        assert!(matches!(
+            store.enqueue_job(&legacy_idempotency_collision),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut legacy_report_collision =
+            NewJob::new("legacy-report-collision", "/legacy-workspace-3");
+        legacy_report_collision.idempotency_key = Some("legacy-report-key".into());
+        legacy_report_collision.report_path = Some("/canonical/v2-report.md".into());
+        assert!(matches!(
+            store.enqueue_job(&legacy_report_collision),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(store
+            .get_job("legacy-idempotency-collision")
+            .unwrap()
+            .is_none());
+        assert!(store.get_job("legacy-report-collision").unwrap().is_none());
+        let owner = store.submission_by_idempotency("v2-key").unwrap().unwrap();
+        assert_eq!(owner.execution_agent_id, "queued-v2-owner");
+        assert_eq!(owner.task_kind, Some(TaskKind::Review));
     }
 
     fn cancelled_task_result(summary: &str) -> TaskResult {

@@ -24,7 +24,7 @@ use zcode_driver::observe_process_group;
 use zcode_reviewd::{
     orchestration::{
         ReviewSubmissionDisposition, StructuredReviewContinuation, StructuredReviewKind,
-        StructuredReviewSubmission,
+        StructuredReviewProjection, StructuredReviewSubmission,
     },
     rpc::{
         ArtifactIntegrityView, MessageInput, RespondInput, ResponseDecision, ResultQuery,
@@ -389,6 +389,48 @@ impl Fixture {
                 .filter(|job| job.state.is_terminal())
         })
     }
+}
+
+fn submit_and_complete_structured(
+    fixture: &Fixture,
+    input: &StructuredReviewSubmission,
+) -> (StructuredReviewProjection, String) {
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let execution = fixture
+        .store
+        .get_task(&review.agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![execution.clone()]
+    );
+    let permission = fixture
+        .wait_pending(&execution)
+        .into_iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: review.agent_id.clone(),
+            request_id: permission.request_id,
+            decision: ResponseDecision::Allow,
+            content: None,
+        }))
+        .unwrap();
+    assert_eq!(fixture.wait_terminal(&execution).state, JobState::Completed);
+    (review, execution)
 }
 
 #[test]
@@ -921,6 +963,333 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         first_snapshot
     );
     assert_eq!(fs::read(&first_report).unwrap(), first_report_bytes);
+}
+
+#[test]
+fn report_target_conflicts_preserve_finalized_owner_across_reviews_and_lineages() {
+    let fixture = Fixture::new();
+    let first_input = fixture.structured_submission("global-report-owner");
+    let first_report = fixture.repository.join(&first_input.manifest.report_target);
+    let (_first, first_execution) = submit_and_complete_structured(&fixture, &first_input);
+    let first_snapshot = fixture
+        .store
+        .review_snapshot(&first_execution)
+        .unwrap()
+        .unwrap();
+    let first_report_bytes = fs::read(&first_report).unwrap();
+    let first_artifact = fixture
+        .scheduler
+        .verify_review_artifact(&first_execution, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_artifact.integrity, ArtifactIntegrity::Valid);
+
+    let roots_before_fresh = scratch_job_roots(&fixture.repository);
+    let mut fresh_collision = fixture.structured_submission("global-report-collision");
+    fresh_collision.manifest.report_target = first_input.manifest.report_target.clone();
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::SubmitStructuredReview {
+                input: fresh_collision,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    assert_eq!(scratch_job_roots(&fixture.repository), roots_before_fresh);
+
+    let other_input = fixture.structured_submission("other-report-lineage");
+    let (other, _other_execution) = submit_and_complete_structured(&fixture, &other_input);
+    let mut continuation = fixture.structured_continuation(
+        &other.agent_id,
+        &other.review_id,
+        "other-lineage-report-collision",
+    );
+    continuation.manifest.report_target = first_input.manifest.report_target.clone();
+    let roots_before_continuation = scratch_job_roots(&fixture.repository);
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::ContinueStructuredReview {
+                input: continuation,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    assert_eq!(
+        scratch_job_roots(&fixture.repository),
+        roots_before_continuation
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&first_execution)
+            .unwrap()
+            .unwrap(),
+        first_snapshot
+    );
+    assert_eq!(fs::read(&first_report).unwrap(), first_report_bytes);
+    let artifact_after = fixture
+        .scheduler
+        .verify_review_artifact(&first_execution, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(artifact_after.integrity, ArtifactIntegrity::Valid);
+    assert_eq!(
+        artifact_after.expected_sha256,
+        first_artifact.expected_sha256
+    );
+    assert_eq!(artifact_after.actual_sha256, first_artifact.actual_sha256);
+    assert_eq!(artifact_after.expected_bytes, first_artifact.expected_bytes);
+    assert_eq!(artifact_after.actual_bytes, first_artifact.actual_bytes);
+}
+
+#[test]
+fn legacy_active_idempotency_owner_survives_structured_collision() {
+    let fixture = Fixture::new();
+    let manifest = fixture.manifest("legacy-active-owner", "S04");
+    let (legacy_agent, _, _) = fixture.spawn(manifest.clone());
+    fixture.wait_pending(&legacy_agent);
+    let legacy_before = fixture.store.get_job(&legacy_agent).unwrap().unwrap();
+    let identity = legacy_before.process_identity.clone().unwrap();
+    let workspace = PathBuf::from(&legacy_before.workspace_path);
+    let marker = workspace.join("legacy-owner-marker.txt");
+    fs::write(&marker, "legacy owner remains live\n").unwrap();
+    let registrations_before = git(&fixture.repository, &["worktree", "list", "--porcelain"]);
+    let report = fixture.repository.join(&manifest.report_target);
+    let report_before = fs::read(&report).unwrap();
+    let snapshot_before = fixture
+        .store
+        .review_snapshot(&legacy_agent)
+        .unwrap()
+        .unwrap();
+    let input = StructuredReviewSubmission {
+        review_kind: StructuredReviewKind::InitialBounded,
+        manifest,
+        ownership_token: "structured-collision-owner".into(),
+        read_only: true,
+        budget: None,
+    };
+
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::SubmitStructuredReview { input })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    let legacy_after = fixture.store.get_job(&legacy_agent).unwrap().unwrap();
+    assert_eq!(
+        legacy_after.process_identity,
+        legacy_before.process_identity
+    );
+    assert_eq!(legacy_after.state, legacy_before.state);
+    assert!(workspace.is_dir());
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "legacy owner remains live\n"
+    );
+    assert_eq!(
+        git(&fixture.repository, &["worktree", "list", "--porcelain"]),
+        registrations_before
+    );
+    assert!(observe_process_group(identity.process_group_id)
+        .unwrap()
+        .iter()
+        .any(|process| process.pid == identity.pid));
+    assert_eq!(fs::read(&report).unwrap(), report_before);
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&legacy_agent)
+            .unwrap()
+            .unwrap(),
+        snapshot_before
+    );
+    assert!(fixture
+        .store
+        .task_by_execution_agent_id(&legacy_agent)
+        .unwrap()
+        .is_none());
+
+    assert!(matches!(
+        fixture.scheduler.stop_job(&legacy_agent).unwrap(),
+        JobState::Stopping | JobState::Cancelled
+    ));
+    assert_eq!(
+        fixture.wait_terminal(&legacy_agent).state,
+        JobState::Cancelled
+    );
+    assert!(observe_process_group(identity.process_group_id)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn structured_first_idempotency_owner_rejects_legacy_without_mutation() {
+    let fixture = Fixture::new();
+    let input = fixture.structured_submission("structured-first-owner");
+    let report = fixture.repository.join(&input.manifest.report_target);
+    let structured = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: input.clone(),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let task_before = fixture
+        .store
+        .get_task(&structured.agent_id)
+        .unwrap()
+        .unwrap();
+    let snapshot_before = fixture
+        .store
+        .review_snapshot(&task_before.execution_agent_id)
+        .unwrap()
+        .unwrap();
+    let artifacts_before = fixture
+        .store
+        .artifact_count(&task_before.execution_agent_id)
+        .unwrap();
+    let report_before = fs::read(&report).unwrap();
+    let roots_before = scratch_job_roots(&fixture.repository);
+    let tasks_before = fixture
+        .store
+        .list_tasks_scoped(
+            TaskQueryScope {
+                repository: None,
+                feature_id: Some("feature"),
+                ownership_token: None,
+            },
+            None,
+            false,
+            10,
+        )
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::SubmitReview {
+                manifest: input.manifest,
+            })
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Conflict
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_task(&structured.agent_id)
+            .unwrap()
+            .unwrap(),
+        task_before
+    );
+    assert_eq!(
+        fixture
+            .store
+            .review_snapshot(&task_before.execution_agent_id)
+            .unwrap()
+            .unwrap(),
+        snapshot_before
+    );
+    assert_eq!(fs::read(&report).unwrap(), report_before);
+    assert_eq!(scratch_job_roots(&fixture.repository), roots_before);
+    assert_eq!(
+        fixture
+            .store
+            .list_tasks_scoped(
+                TaskQueryScope {
+                    repository: None,
+                    feature_id: Some("feature"),
+                    ownership_token: None,
+                },
+                None,
+                false,
+                10,
+            )
+            .unwrap(),
+        tasks_before
+    );
+    assert_eq!(
+        fixture
+            .store
+            .artifact_count(&task_before.execution_agent_id)
+            .unwrap(),
+        artifacts_before
+    );
+    fixture
+        .scheduler
+        .stop_job(&task_before.execution_agent_id)
+        .unwrap();
+}
+
+#[test]
+fn concurrent_legacy_and_structured_same_key_preserve_the_single_winner_root() {
+    let fixture = Fixture::new();
+    let manifest = fixture.manifest("cross-family-concurrent", "S04");
+    let structured = StructuredReviewSubmission {
+        review_kind: StructuredReviewKind::InitialBounded,
+        manifest: manifest.clone(),
+        ownership_token: "concurrent-owner".into(),
+        read_only: true,
+        budget: None,
+    };
+    let barrier = Arc::new(Barrier::new(3));
+    let results = thread::scope(|scope| {
+        let legacy_service = fixture.service.clone();
+        let legacy_barrier = Arc::clone(&barrier);
+        let legacy = scope.spawn(move || {
+            legacy_barrier.wait();
+            legacy_service.dispatch(RpcMethod::SubmitReview { manifest })
+        });
+        let structured_service = fixture.service.clone();
+        let structured_barrier = Arc::clone(&barrier);
+        let structured = scope.spawn(move || {
+            structured_barrier.wait();
+            structured_service.dispatch(RpcMethod::SubmitStructuredReview { input: structured })
+        });
+        barrier.wait();
+        vec![legacy.join().unwrap(), structured.join().unwrap()]
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result
+                .as_ref()
+                .is_err_and(|error| error.code == RpcErrorCode::Conflict))
+            .count(),
+        1
+    );
+    let owner = fixture
+        .store
+        .submission_by_idempotency("feature:S06:cross-family-concurrent")
+        .unwrap()
+        .unwrap();
+    let job = fixture
+        .store
+        .get_job(&owner.execution_agent_id)
+        .unwrap()
+        .unwrap();
+    let workspace = PathBuf::from(&job.workspace_path);
+    assert!(workspace.is_dir());
+    assert!(
+        git(&fixture.repository, &["worktree", "list", "--porcelain"])
+            .contains(workspace.to_string_lossy().as_ref())
+    );
+    assert_eq!(scratch_job_roots(&fixture.repository).len(), 1);
+    fixture
+        .scheduler
+        .stop_job(&owner.execution_agent_id)
+        .unwrap();
 }
 
 #[test]
@@ -1676,6 +2045,15 @@ fn wait_until<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         assert!(Instant::now() < deadline, "fixture deadline elapsed");
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn scratch_job_roots(repository: &Path) -> Vec<String> {
+    let mut roots = fs::read_dir(repository.join(".agent-work/scratch/jobs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
 }
 
 fn workspace_fake_runtime() -> PathBuf {
