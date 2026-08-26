@@ -115,6 +115,7 @@ pub enum RpcMethod {
     Reap {
         agent_id: String,
     },
+    TaskReviewTool(ReviewToolInput),
     ReviewTool(ReviewToolInput),
 }
 
@@ -149,6 +150,7 @@ impl RpcMethod {
                 | "list"
                 | "close"
                 | "reap"
+                | "task_review_tool"
                 | "review_tool"
         )
     }
@@ -1253,6 +1255,31 @@ impl RpcService {
                     state: state.into(),
                     resources_reaped,
                 })
+            }
+            RpcMethod::TaskReviewTool(input) => {
+                validate_id(&input.agent_id, "agent_id")?;
+                let task = self
+                    .store
+                    .task_by_execution_agent_id(&input.agent_id)
+                    .map_err(map_store)?
+                    .ok_or_else(|| {
+                        RpcError::new(RpcErrorCode::NotFound, "review task was not found")
+                    })?;
+                if !matches!(
+                    task.task_kind,
+                    TaskKind::Review | TaskKind::ReviewContinuation
+                ) {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "internal review ledger is unavailable for this task kind",
+                    ));
+                }
+                validate_text(&input.tool, "review tool", 128)?;
+                let result = self
+                    .scheduler
+                    .call_task_review_tool(&input.agent_id, &input.tool, input.arguments)
+                    .map_err(map_scheduler)?;
+                Ok(RpcSuccess::ReviewTool { result })
             }
             RpcMethod::ReviewTool(input) => {
                 self.require_legacy_job(&input.agent_id)?;

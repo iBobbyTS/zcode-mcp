@@ -29,7 +29,10 @@ const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ledger-mcp")) {
-        return run_ledger_mcp().map_err(Into::into);
+        return run_ledger_mcp(false).map_err(Into::into);
+    }
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--task-ledger-mcp")) {
+        return run_ledger_mcp(true).map_err(Into::into);
     }
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--general-mcp")) {
         return run_general_mcp().map_err(Into::into);
@@ -194,7 +197,7 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn run_ledger_mcp() -> io::Result<()> {
+fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
     let mut socket = None;
     let mut agent_id = None;
     let mut arguments = env::args_os().skip(2);
@@ -222,12 +225,21 @@ fn run_ledger_mcp() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--agent-id is required"))?;
     let stdin = io::stdin();
     let stdout = io::stdout();
-    ledger_mcp::serve(
-        &socket,
-        &agent_id,
-        BufReader::new(stdin.lock()),
-        stdout.lock(),
-    )
+    if task_scoped {
+        ledger_mcp::serve_task(
+            &socket,
+            &agent_id,
+            BufReader::new(stdin.lock()),
+            stdout.lock(),
+        )
+    } else {
+        ledger_mcp::serve(
+            &socket,
+            &agent_id,
+            BufReader::new(stdin.lock()),
+            stdout.lock(),
+        )
+    }
 }
 
 fn run_general_mcp() -> io::Result<()> {

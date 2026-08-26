@@ -22,6 +22,7 @@ use zcode_driver::Inbound;
 use zcode_driver::{ChildExit, StopOutcome};
 use zcode_protocol::{EventEnvelope, StdioMcpServer, WireMessage};
 use zcode_reviewd::{
+    rpc::{ReviewToolInput, RpcMethod, RpcService},
     CommandRuntimeFactory, InternalLedgerMcpConfig, LifecycleRecord, LifecycleSink, ManagedRuntime,
     RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig, SessionReady, TurnBoundary,
     TurnSnapshot,
@@ -333,6 +334,13 @@ fn v2_review_attempt_enforces_effective_turn_budget_and_releases_slot() {
         TaskPhase::Terminal
     );
     assert!(runtime.stop_calls.load(Ordering::Acquire) >= 1);
+    while scheduler.active_count() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "budget terminal result did not release its active epoch"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(scheduler.active_count(), 0);
 }
 
@@ -502,6 +510,95 @@ fn review_mark_running_failure_stops_cleans_and_persists_one_result() {
          BEGIN SELECT RAISE(FAIL, 'scripted mark running failure'); END;"
             .into(),
         "STORE_START_FAILED",
+    );
+}
+
+#[test]
+fn v2_review_ledger_failure_stops_cleans_and_persists_one_immutable_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let prepared = prepare_review(&directory, "review-ledger-mutation-failure");
+    let database = directory
+        .path()
+        .join("review-ledger-mutation-failure.sqlite3");
+    let store = Arc::new(Store::open(&database).unwrap());
+    enqueue_v2_review(
+        &store,
+        "review-ledger-mutation-failure",
+        "public-review-ledger-mutation-failure",
+        &prepared,
+        BudgetRequest::Omitted,
+    );
+    let runtime = Arc::new(Mutex::new(None));
+    let scheduler = Scheduler::new(
+        "review-ledger-mutation-owner",
+        Arc::clone(&store),
+        Arc::new(TriggeringReviewFactory {
+            database,
+            trigger_sql: String::new(),
+            runtime: Arc::clone(&runtime),
+        }),
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_ledger(
+        Arc::new(LedgerManager::new(Arc::clone(&store))),
+        InternalLedgerMcpConfig {
+            command: PathBuf::from("/usr/bin/false"),
+            socket: directory.path().join("review-ledger-mutation.sock"),
+            runtime_sha256: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        scheduler.start_ready().unwrap(),
+        vec!["review-ledger-mutation-failure"]
+    );
+    let runtime = runtime.lock().unwrap().clone().unwrap();
+    let service = RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
+
+    assert!(service
+        .dispatch(RpcMethod::TaskReviewTool(ReviewToolInput {
+            agent_id: "review-ledger-mutation-failure".into(),
+            tool: REVIEW_CHECKPOINT.into(),
+            arguments: serde_json::json!({"checkpoint_id":"missing-required-fields"}),
+        }))
+        .is_err());
+
+    assert_eq!(runtime.stop_calls.load(Ordering::Acquire), 1);
+    assert!(runtime.worktree_existed_at_stop.load(Ordering::Acquire));
+    assert!(!prepared.worktree.path.exists());
+    let result = store
+        .task_result("review-ledger-mutation-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    assert!(result
+        .result
+        .residual_gaps
+        .contains(&"REVIEW_LEDGER_INVALID".into()));
+    assert_eq!(
+        store
+            .task_by_execution_agent_id("review-ledger-mutation-failure")
+            .unwrap()
+            .unwrap()
+            .phase,
+        TaskPhase::Terminal
+    );
+    assert_eq!(store.active_count().unwrap(), 0);
+    assert_eq!(scheduler.active_count(), 0);
+
+    scheduler
+        .close_job("review-ledger-mutation-failure")
+        .unwrap();
+    scheduler
+        .reap_job("review-ledger-mutation-failure")
+        .unwrap();
+    assert_eq!(
+        store
+            .task_result("review-ledger-mutation-failure")
+            .unwrap()
+            .unwrap(),
+        result
     );
 }
 

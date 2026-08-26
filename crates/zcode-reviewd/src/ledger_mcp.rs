@@ -17,6 +17,25 @@ const MAX_MCP_FRAME_BYTES: usize = 64 * 1024;
 pub fn serve<R: BufRead, W: Write>(
     socket: &Path,
     agent_id: &str,
+    reader: R,
+    writer: W,
+) -> io::Result<()> {
+    serve_routed(socket, agent_id, false, reader, writer)
+}
+
+pub fn serve_task<R: BufRead, W: Write>(
+    socket: &Path,
+    agent_id: &str,
+    reader: R,
+    writer: W,
+) -> io::Result<()> {
+    serve_routed(socket, agent_id, true, reader, writer)
+}
+
+fn serve_routed<R: BufRead, W: Write>(
+    socket: &Path,
+    agent_id: &str,
+    task_scoped: bool,
     mut reader: R,
     mut writer: W,
 ) -> io::Result<()> {
@@ -74,7 +93,7 @@ pub fn serve<R: BufRead, W: Write>(
             }),
             "tools/call" => {
                 sequence = sequence.saturating_add(1);
-                call_tool(&client, agent_id, sequence, &value, id)
+                call_tool(&client, agent_id, task_scoped, sequence, &value, id)
             }
             _ => json!({
                 "jsonrpc":"2.0",
@@ -132,6 +151,7 @@ fn read_frame(reader: &mut impl BufRead, cap: usize) -> io::Result<FrameRead> {
 fn call_tool(
     client: &RpcClient,
     agent_id: &str,
+    task_scoped: bool,
     sequence: u64,
     request: &Value,
     id: Value,
@@ -152,14 +172,19 @@ fn call_tool(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let input = ReviewToolInput {
+        agent_id: agent_id.to_owned(),
+        tool: name.to_owned(),
+        arguments,
+    };
     let rpc = RpcRequest {
         version: RPC_VERSION,
         request_id: format!("ledger-{sequence}"),
-        method: RpcMethod::ReviewTool(ReviewToolInput {
-            agent_id: agent_id.to_owned(),
-            tool: name.to_owned(),
-            arguments,
-        }),
+        method: if task_scoped {
+            RpcMethod::TaskReviewTool(input)
+        } else {
+            RpcMethod::ReviewTool(input)
+        },
     };
     match client.call(&rpc) {
         Ok(response) => match response.outcome {

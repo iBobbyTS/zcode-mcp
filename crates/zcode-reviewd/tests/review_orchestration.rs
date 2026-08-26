@@ -2,8 +2,13 @@ use review_ledger::{
     ArtifactIntegrity, LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_FINDING_UPSERT,
     REVIEW_VALIDATION_RECORD,
 };
-use review_preparation::{NetworkPolicy, ReviewKind, ReviewManifest, RoundKind, ScratchPolicy};
-use review_store::{Job, JobState, MessageState, PendingRequestState, Store};
+use review_preparation::{
+    NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
+};
+use review_store::{
+    BudgetRequest, Job, JobState, MessageState, NewJob, NewTask, PendingRequestState, Store,
+    TaskKind, TaskOutcome, TaskPhase,
+};
 use std::{
     fs, io,
     os::unix::fs::PermissionsExt,
@@ -335,6 +340,103 @@ impl Fixture {
                 .filter(|job| job.state.is_terminal())
         })
     }
+}
+
+#[test]
+fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
+    let fixture = Fixture::new();
+    let manifest = fixture.manifest("v2-injected-ledger", "S03");
+    let prepared = ReviewPreparer.prepare(&manifest).unwrap();
+    let execution_id = "v2-injected-ledger-attempt";
+    let public_id = execution_id;
+    let mut job = NewJob::new(execution_id, prepared.worktree.path.to_string_lossy());
+    job.idempotency_key = Some(prepared.idempotency_key.clone());
+    job.review_kind = Some(prepared.review_kind.as_str().into());
+    job.feature_id = Some(prepared.feature_id.clone());
+    job.section_id = Some(prepared.section_id.clone());
+    job.round_kind = Some(prepared.round_kind.as_str().into());
+    job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+    job.initial_prompt = "review through the injected ledger".into();
+    job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+    job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    fixture
+        .store
+        .enqueue_task(&NewTask {
+            job,
+            public_agent_id: public_id.into(),
+            task_kind: TaskKind::Review,
+            review_id: Some("v2-injected-ledger-review".into()),
+            continuation_of: None,
+            repository: prepared.repository.to_string_lossy().into_owned(),
+            feature_id: prepared.feature_id.clone(),
+            ownership_token: "owner".into(),
+            budget: BudgetRequest::Omitted,
+            retain_partial: false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![execution_id.to_owned()]
+    );
+    let legacy_error = fixture
+        .service
+        .dispatch(RpcMethod::ReviewTool(ReviewToolInput {
+            agent_id: execution_id.into(),
+            tool: REVIEW_CHECKPOINT.into(),
+            arguments: serde_json::json!({
+                "checkpoint_id":"legacy-must-not-see-v2","stage":"inspection",
+                "summary":"must remain hidden"
+            }),
+        }))
+        .unwrap_err();
+    assert_eq!(legacy_error.code, RpcErrorCode::NotFound);
+
+    let pending = fixture.wait_pending(execution_id);
+    let permission = pending
+        .iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskRespond(RespondInput {
+                agent_id: public_id.into(),
+                request_id: permission.request_id.clone(),
+                decision: ResponseDecision::Allow,
+                content: None,
+            }))
+            .unwrap(),
+        RpcSuccess::Respond { .. }
+    ));
+
+    let terminal = fixture.wait_terminal(execution_id);
+    assert_eq!(terminal.state, JobState::Completed);
+    let task = fixture
+        .store
+        .task_by_execution_agent_id(execution_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.phase, TaskPhase::Terminal);
+    let result = fixture.store.task_result(execution_id).unwrap().unwrap();
+    assert_eq!(result.result.outcome, TaskOutcome::Succeeded);
+    let snapshot = fixture
+        .store
+        .review_snapshot(execution_id)
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.report.finalized);
+    assert_eq!(snapshot.checkpoints.len(), 1);
+    assert_eq!(snapshot.validations.len(), 1);
+    assert!(snapshot.finalization.is_some());
+    assert!(!prepared.worktree.path.exists());
+
+    fixture.scheduler.close_job(execution_id).unwrap();
+    fixture.scheduler.reap_job(execution_id).unwrap();
+    assert_eq!(
+        fixture.store.task_result(execution_id).unwrap().unwrap(),
+        result
+    );
 }
 
 #[test]

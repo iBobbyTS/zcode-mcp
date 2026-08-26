@@ -435,6 +435,18 @@ fn legacy_rpc_cannot_observe_or_control_v2_task_rows() {
             RpcErrorCode::NotFound
         );
     }
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskReviewTool(ReviewToolInput {
+                agent_id: "v2-general".into(),
+                tool: "review_checkpoint".into(),
+                arguments: serde_json::json!({}),
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
     match fixture
         .service
         .dispatch(RpcMethod::List {
@@ -735,6 +747,11 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcMethod::TaskReap {
             agent_id: "general-1".into(),
         },
+        RpcMethod::TaskReviewTool(ReviewToolInput {
+            agent_id: "general-1".into(),
+            tool: "review_checkpoint".into(),
+            arguments: serde_json::json!({"checkpoint_id":"cp-task"}),
+        }),
         RpcMethod::SpawnReview {
             manifest: ReviewManifest {
                 schema: "sectioned-zcode-review/v1".into(),

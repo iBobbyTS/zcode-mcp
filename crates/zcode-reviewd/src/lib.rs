@@ -155,6 +155,21 @@ impl InternalLedgerMcpConfig {
         }
     }
 
+    pub fn task_server_for(&self, agent_id: &str) -> StdioMcpServer {
+        StdioMcpServer {
+            name: "review-ledger".into(),
+            command: self.command.to_string_lossy().into_owned(),
+            args: vec![
+                "--task-ledger-mcp".into(),
+                "--socket".into(),
+                self.socket.to_string_lossy().into_owned(),
+                "--agent-id".into(),
+                agent_id.into(),
+            ],
+            env: Vec::new(),
+        }
+    }
+
     pub fn general_server_for(&self, agent_id: &str) -> StdioMcpServer {
         StdioMcpServer {
             name: "general-completion".into(),
@@ -2497,6 +2512,9 @@ impl Scheduler {
             .as_ref()
             .map(|config| match &route {
                 TaskRoute::General(_) => vec![config.general_server_for(&claim.job.agent_id)],
+                TaskRoute::Review(_) if task.is_some() => {
+                    vec![config.task_server_for(&claim.job.agent_id)]
+                }
                 TaskRoute::Review(_) => vec![config.server_for(&claim.job.agent_id)],
                 TaskRoute::Legacy => Vec::new(),
             })
@@ -3525,6 +3543,120 @@ impl Scheduler {
         }
     }
 
+    pub fn call_task_review_tool(
+        &self,
+        agent_id: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<ToolResult, SchedulerError> {
+        let durable_task = self
+            .inner
+            .store
+            .task_by_execution_agent_id(agent_id)?
+            .ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(format!(
+                    "unknown review task {agent_id}"
+                )))
+            })?;
+        if !matches!(
+            durable_task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        ) {
+            return Err(SchedulerError::InvalidConfig(
+                "internal review ledger is unavailable for this task kind".into(),
+            ));
+        }
+        let deadline = self.control_deadline();
+        let (owner_epoch, runtime, sink, operation, route, task) = {
+            let state = self.inner.state.lock().unwrap();
+            let active =
+                state
+                    .active
+                    .get(agent_id)
+                    .ok_or_else(|| SchedulerError::RuntimeCommand {
+                        agent_id: agent_id.into(),
+                        message: "review runtime is not active".into(),
+                    })?;
+            if !matches!(active.route, TaskRoute::Review(_))
+                || active.task.as_ref().is_none_or(|task| {
+                    !matches!(
+                        task.task_kind,
+                        TaskKind::Review | TaskKind::ReviewContinuation
+                    )
+                })
+            {
+                return Err(SchedulerError::InvalidConfig(
+                    "active runtime is not a durable review task".into(),
+                ));
+            }
+            (
+                active.owner_epoch,
+                Arc::clone(&active.runtime),
+                Arc::clone(&active.sink),
+                Arc::clone(&active.operation),
+                active.route.clone(),
+                active.task.clone(),
+            )
+        };
+        let _guard = self.lock_operation(agent_id, &operation, deadline)?;
+        let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!(
+                "unknown review task {agent_id}"
+            )))
+        })?;
+        if current.owner_epoch != owner_epoch
+            || current.state != JobState::Running
+            || current.stop_requested
+            || current.close_requested
+        {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "review task no longer accepts ledger updates".into(),
+            });
+        }
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
+        let ledger = self.inner.ledger.as_ref().ok_or_else(|| {
+            SchedulerError::InvalidConfig("internal review ledger is unavailable".into())
+        })?;
+        match ledger.call_tool(agent_id, tool, arguments) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let failure =
+                    if tool == REVIEW_FINALIZE && matches!(&error, LedgerError::Conflict(_)) {
+                        ReviewFailure::FinalizationConflict
+                    } else {
+                        ReviewFailure::LedgerMalformed
+                    };
+                let _ = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
+                let finish = self.finish_routed_terminal(
+                    TerminalTarget {
+                        agent_id,
+                        owner_epoch,
+                        sink: &sink,
+                        route: &route,
+                        task: task.as_ref(),
+                    },
+                    TerminalDecision {
+                        terminal: RuntimeTerminal::ReviewFailed(failure),
+                        natural_completion: false,
+                        general_submission: None,
+                        forced_outcome: Some((CompletionOutcome::Failed, failure.code().into())),
+                    },
+                );
+                self.release_active(agent_id, owner_epoch);
+                if let Err(finish_error) = finish {
+                    self.record_failure(agent_id, finish_error.to_string());
+                }
+                if let Err(start_error) = self.start_ready() {
+                    self.record_failure(agent_id, start_error.to_string());
+                }
+                Err(SchedulerError::InvalidConfig(error.to_string()))
+            }
+        }
+    }
+
     fn fail_active_review(&self, agent_id: &str, failure: ReviewFailure) {
         let Some((owner_epoch, runtime, _session_id, operation)) = self.active_session(agent_id)
         else {
@@ -3744,6 +3876,7 @@ impl Scheduler {
         decision: &str,
         content: Option<&str>,
     ) -> Result<ResponseOutcome, SchedulerError> {
+        let deadline = self.control_deadline();
         let request = self
             .inner
             .store
@@ -3823,7 +3956,8 @@ impl Scheduler {
                 policy_reason_code: policy_reason,
             });
         }
-        let Some((_epoch, runtime, _session_id, operation)) = self.active_session(agent_id) else {
+        let Some((owner_epoch, runtime, _session_id, operation)) = self.active_session(agent_id)
+        else {
             self.inner
                 .store
                 .release_pending_response(agent_id, request_id)?;
@@ -3832,10 +3966,27 @@ impl Scheduler {
                 message: "runtime is not active".into(),
             });
         };
-        let _guard = operation.lock().unwrap();
+        let _guard = match self.lock_operation(agent_id, &operation, deadline) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.inner
+                    .store
+                    .release_pending_response(agent_id, request_id)?;
+                return Err(error);
+            }
+        };
+        if deadline.remaining().is_none() {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(Self::control_timeout_error(agent_id));
+        }
         let current = self.inner.store.get_job(agent_id)?;
         if current.as_ref().is_none_or(|job| {
-            job.state != JobState::Running || job.stop_requested || job.close_requested
+            job.owner_epoch != owner_epoch
+                || job.state != JobState::Running
+                || job.stop_requested
+                || job.close_requested
         }) {
             self.inner
                 .store
@@ -3845,6 +3996,15 @@ impl Scheduler {
                 message: "runtime is stopping or no longer active".into(),
             });
         }
+        match self.runtime_phase_timeout(agent_id, deadline) {
+            Ok(_) => {}
+            Err(error) => {
+                self.inner
+                    .store
+                    .release_pending_response(agent_id, request_id)?;
+                return Err(error);
+            }
+        }
         if let Err(error) = runtime.respond_request(
             &request.correlation_id,
             effective_decision,
@@ -3853,10 +4013,34 @@ impl Scheduler {
             self.inner
                 .store
                 .release_pending_response(agent_id, request_id)?;
-            return Err(SchedulerError::RuntimeCommand {
+            let scheduler_error = SchedulerError::RuntimeCommand {
                 agent_id: agent_id.into(),
                 message: error.to_string(),
-            });
+            };
+            self.fail_closed_control(
+                agent_id,
+                owner_epoch,
+                &runtime,
+                deadline,
+                control_failure_code(&error),
+                error.to_string(),
+            )?;
+            return Err(scheduler_error);
+        }
+        if deadline.remaining().is_none() {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            let error = Self::control_timeout_error(agent_id);
+            self.fail_closed_control(
+                agent_id,
+                owner_epoch,
+                &runtime,
+                deadline,
+                "CONTROL_DEADLINE_EXCEEDED",
+                error.to_string(),
+            )?;
+            return Err(error);
         }
         if !self
             .inner
@@ -5965,6 +6149,191 @@ sleep 10
             MessageDisposition::Queued
         );
         scheduler.close_job("locked-control").unwrap();
+    }
+
+    #[test]
+    fn respond_lock_timeout_releases_claim_and_later_retry_progresses() {
+        let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(60),
+        );
+        scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "respond-lock-timeout", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                "respond-lock-request",
+                "respond-lock-timeout",
+                "\"runtime-respond-lock\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let operation = scheduler.active_session("respond-lock-timeout").unwrap().3;
+        let guard = operation.lock().unwrap();
+        let caller = {
+            let scheduler = scheduler.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let result = scheduler.respond_job(
+                    "respond-lock-timeout",
+                    "respond-lock-request",
+                    "deny",
+                    None,
+                );
+                (started.elapsed(), result)
+            })
+        };
+        let claim_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store
+                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .unwrap()
+                .is_some_and(|request| request.state == PendingRequestState::Sending)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < claim_deadline,
+                "response was never claimed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (elapsed, result) = caller.join().unwrap();
+        assert!(matches!(result, Err(SchedulerError::RuntimeCommand { .. })));
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(
+            store
+                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        assert!(factory
+            .runtime("respond-lock-timeout")
+            .responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        drop(guard);
+
+        assert_eq!(
+            scheduler
+                .respond_job("respond-lock-timeout", "respond-lock-request", "deny", None,)
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        assert_eq!(
+            store
+                .pending_request("respond-lock-timeout", "respond-lock-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Responded
+        );
+        scheduler.close_job("respond-lock-timeout").unwrap();
+    }
+
+    #[test]
+    fn durable_cancel_intent_wins_over_claimed_late_response() {
+        let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(200),
+        );
+        scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "respond-cancel-winner", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                "respond-cancel-request",
+                "respond-cancel-winner",
+                "\"runtime-cancel-winner\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let operation = scheduler.active_session("respond-cancel-winner").unwrap().3;
+        let guard = operation.lock().unwrap();
+        let caller = {
+            let scheduler = scheduler.clone();
+            thread::spawn(move || {
+                scheduler.respond_job(
+                    "respond-cancel-winner",
+                    "respond-cancel-request",
+                    "deny",
+                    None,
+                )
+            })
+        };
+        let claim_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store
+                .pending_request("respond-cancel-winner", "respond-cancel-request")
+                .unwrap()
+                .is_some_and(|request| request.state == PendingRequestState::Sending)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < claim_deadline,
+                "response was never claimed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let decision = store.request_stop("respond-cancel-winner").unwrap();
+        assert!(decision.needs_runtime_stop);
+        drop(guard);
+
+        assert!(matches!(
+            caller.join().unwrap(),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        assert_eq!(
+            store
+                .pending_request("respond-cancel-winner", "respond-cancel-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        assert!(factory
+            .runtime("respond-cancel-winner")
+            .responses
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            scheduler.stop_job("respond-cancel-winner").unwrap(),
+            JobState::Cancelled
+        );
+        let result = store.task_result("respond-cancel-winner").unwrap().unwrap();
+        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(store.active_count().unwrap(), 0);
+        scheduler.close_job("respond-cancel-winner").unwrap();
+        scheduler.reap_job("respond-cancel-winner").unwrap();
+        assert_eq!(
+            store.task_result("respond-cancel-winner").unwrap().unwrap(),
+            result
+        );
     }
 
     #[test]
