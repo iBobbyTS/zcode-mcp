@@ -1,9 +1,9 @@
 use review_preparation::{
-    general_control_header, AttachmentInput, CompletionOutcome, ExternalDecision,
-    GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
-    GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError,
-    PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
+    general_control_header, general_launch_prompt, AttachmentInput, CompletionOutcome,
+    ExternalDecision, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion,
+    GeneralCompletionSubmission, GeneralFinalizer, GeneralNamedCommand, GeneralProfile,
+    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PolicyCapabilities,
+    PolicyLauncher, PreparationError, PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,6 +143,13 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     assert!(header.contains("\"command_id\": \"unit\""));
     assert!(header.contains("mcp__general-completion__zcode_general_complete"));
     assert!(header.contains("mcp__general-completion__zcode_general_run_check"));
+    assert!(header.contains("prose-only output is not successful completion"));
+    assert!(header.contains("exactly one accepted bounded terminal-result call"));
+    assert!(header.contains("Use SUCCEEDED only when the bounded task is complete"));
+    assert!(header.contains("Use BLOCKED only for a truthful bounded inability to finish"));
+    assert!(header.contains("public result, status, or artifact content"));
+    assert!(header
+        .contains("hidden reasoning, credentials, absolute host paths, or low-level tool details"));
     assert!(header.contains(&prepared.prompt_sha256));
     assert!(!header.contains("changes_patch"));
     assert!(!header.contains(&manifest.prompt));
@@ -186,6 +193,106 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
     assert!(GeneralFinalizer::finalize(&changed, CompletionOutcome::Blocked).cleaned);
     assert!(GeneralFinalizer::finalize(&implementation, CompletionOutcome::Blocked).cleaned);
+}
+
+#[test]
+fn named_command_identity_uses_pinned_base_canonical_cwd() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.repository.join("pinned")).unwrap();
+    fs::create_dir_all(f.repository.join("current")).unwrap();
+    fs::write(f.repository.join("pinned/.keep"), "pinned\n").unwrap();
+    fs::write(f.repository.join("current/.keep"), "current\n").unwrap();
+    symlink("pinned", f.repository.join("command-cwd")).unwrap();
+    git(&f.repository, &["add", "pinned", "current", "command-cwd"]);
+    git(&f.repository, &["commit", "-m", "add command cwd symlink"]);
+    let pinned_base = git(&f.repository, &["rev-parse", "HEAD"]);
+
+    fs::remove_file(f.repository.join("command-cwd")).unwrap();
+    symlink("current", f.repository.join("command-cwd")).unwrap();
+
+    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    manifest.base_ref = pinned_base;
+    manifest.idempotency_key = "pinned-command-cwd".into();
+    let named = BTreeMap::from([(
+        "unit".into(),
+        GeneralNamedCommand {
+            command: ValidationCommand {
+                program: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                cwd: "command-cwd".into(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+            },
+            readonly_safe: false,
+        },
+    )]);
+
+    let prepared = f
+        .preparer()
+        .prepare_named_submission(&manifest, &named)
+        .unwrap();
+    assert_eq!(
+        prepared.validation_commands["unit"].cwd,
+        fs::canonicalize(prepared.worktree.path.join("pinned")).unwrap()
+    );
+    assert_ne!(
+        prepared.validation_commands["unit"].cwd,
+        fs::canonicalize(f.repository.join("command-cwd")).unwrap()
+    );
+    let header = general_control_header(&prepared).unwrap();
+    let replay = f
+        .preparer()
+        .prepare_named_submission(&manifest, &named)
+        .unwrap();
+    assert_eq!(replay.manifest_sha256, prepared.manifest_sha256);
+    assert_eq!(general_control_header(&replay).unwrap(), header);
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+}
+
+#[test]
+fn composed_prompt_budget_checks_zero_inputs_at_exact_boundary_and_reaps_rejection() {
+    let f = Fixture::new();
+    let mut manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    manifest.repo_context.clear();
+    manifest.attachments.clear();
+    manifest.idempotency_key = "composed-prompt-budget".into();
+
+    let generous = f.preparer().prepare_submission(&manifest).unwrap();
+    let exact_bytes = general_launch_prompt(&generous, &manifest.prompt)
+        .unwrap()
+        .len() as u64;
+    assert!(GeneralFinalizer::finalize(&generous, CompletionOutcome::Blocked).cleaned);
+
+    let mut exact_budget = GeneralProfile::AnalysisReadonly.default_budget();
+    exact_budget.max_context_bytes = exact_bytes;
+    manifest.budget = Some(exact_budget.clone());
+    let exact = f.preparer().prepare_submission(&manifest).unwrap();
+    assert_eq!(
+        general_launch_prompt(&exact, &manifest.prompt)
+            .unwrap()
+            .len() as u64,
+        exact_bytes
+    );
+    assert!(GeneralFinalizer::finalize(&exact, CompletionOutcome::Blocked).cleaned);
+
+    exact_budget.max_context_bytes = exact_bytes - 1;
+    manifest.budget = Some(exact_budget);
+    let registrations_before = git(&f.repository, &["worktree", "list", "--porcelain"]);
+    assert!(matches!(
+        f.preparer().prepare_submission(&manifest),
+        Err(PreparationError::InvalidManifest(message))
+            if message == "context byte limit exceeded"
+    ));
+    assert_eq!(
+        git(&f.repository, &["worktree", "list", "--porcelain"]),
+        registrations_before
+    );
+    assert!(
+        fs::read_dir(f.repository.join(".agent-work/scratch/general"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

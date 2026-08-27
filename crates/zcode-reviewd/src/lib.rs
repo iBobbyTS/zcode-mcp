@@ -6369,6 +6369,17 @@ sleep 10
             .unwrap();
         assert!(submitted.job.initial_prompt[..caller_marker]
             .contains("mcp__general-completion__zcode_general_complete"));
+        assert!(submitted.job.initial_prompt[..caller_marker]
+            .contains("prose-only output is not successful completion"));
+        assert!(submitted.job.initial_prompt[..caller_marker]
+            .contains("Use SUCCEEDED only when the bounded task is complete"));
+        assert!(submitted.job.initial_prompt[..caller_marker]
+            .contains("Use BLOCKED only for a truthful bounded inability to finish"));
+        assert!(submitted.job.initial_prompt[..caller_marker]
+            .contains("public result, status, or artifact content"));
+        assert!(submitted.job.initial_prompt[..caller_marker].contains(
+            "hidden reasoning, credentials, absolute host paths, or low-level tool details"
+        ));
         assert!(!submitted.job.initial_prompt[..caller_marker].contains(&manifest.prompt));
         assert!(submitted.job.initial_prompt[caller_marker..].contains(&manifest.prompt));
         assert_eq!(
