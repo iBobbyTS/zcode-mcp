@@ -2452,6 +2452,12 @@ impl Scheduler {
         deadline: Instant,
     ) -> Result<MutexGuard<'a, ()>, SchedulerError> {
         loop {
+            if check.in_flight.load(Ordering::Acquire) {
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: agent_id.into(),
+                    message: "another named check is already in flight".into(),
+                });
+            }
             if check.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                 return Err(SchedulerError::RuntimeCommand {
                     agent_id: agent_id.into(),
@@ -4255,10 +4261,12 @@ impl Scheduler {
                 "general check is not selected by a valid prepared task".into(),
             ));
         }
-        let _claim = check.claim().map_err(|_| SchedulerError::RuntimeCommand {
-            agent_id: agent_id.into(),
-            message: "another named check is already in flight".into(),
-        })?;
+        if check.in_flight.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "another named check is already in flight".into(),
+            });
+        }
         if check.cancelled.load(Ordering::Acquire) {
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: agent_id.into(),
@@ -4279,6 +4287,10 @@ impl Scheduler {
                 message: "general task already accepted completion".into(),
             });
         }
+        let _claim = check.claim().map_err(|_| SchedulerError::RuntimeCommand {
+            agent_id: agent_id.into(),
+            message: "another named check is already in flight".into(),
+        })?;
         if check.cancelled.load(Ordering::Acquire) {
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: agent_id.into(),
@@ -6457,52 +6469,60 @@ sleep 10
             .unwrap();
         let raced_id = raced.job.agent_id.clone();
         scheduler.start_ready().unwrap();
-        let operation = Arc::clone(
-            &scheduler
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .active
-                .get(&raced_id)
-                .unwrap()
-                .operation,
-        );
-        let operation_guard = operation.lock().unwrap();
-        let check_scheduler = scheduler.clone();
-        let check_id = raced_id.clone();
-        let check = thread::spawn(move || check_scheduler.run_general_check(&check_id, "race"));
-        let claim_deadline = Instant::now() + Duration::from_secs(1);
+        let (operation, submission, check_state) = {
+            let state = scheduler.inner.state.lock().unwrap();
+            let active = state.active.get(&raced_id).unwrap();
+            (
+                Arc::clone(&active.operation),
+                Arc::clone(&active.general_submission),
+                Arc::clone(&active.check),
+            )
+        };
+        let submission_guard = submission.lock().unwrap();
+        let completion_scheduler = scheduler.clone();
+        let completion_id = raced_id.clone();
+        let submit = thread::spawn(move || {
+            completion_scheduler.submit_general_completion(&completion_id, completion())
+        });
+        let operation_deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let claimed = scheduler
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .active
-                .get(&raced_id)
-                .unwrap()
-                .check
-                .in_flight
-                .load(Ordering::Acquire);
-            if claimed {
-                break;
+            match operation.try_lock() {
+                Ok(guard) => drop(guard),
+                Err(TryLockError::Poisoned(error)) => drop(error.into_inner()),
+                Err(TryLockError::WouldBlock) => break,
             }
             assert!(
-                Instant::now() < claim_deadline,
-                "racing named check did not claim its slot"
+                Instant::now() < operation_deadline,
+                "completion did not enter its operation critical section"
             );
             thread::sleep(Duration::from_millis(1));
         }
+        thread::sleep(Duration::from_millis(10));
+        assert!(
+            !submit.is_finished(),
+            "completion did not block before storage"
+        );
+        let check_scheduler = scheduler.clone();
+        let check_id = raced_id.clone();
+        let check_started = Arc::new(Barrier::new(2));
+        let runner_started = Arc::clone(&check_started);
+        let check = thread::spawn(move || {
+            runner_started.wait();
+            check_scheduler.run_general_check(&check_id, "race")
+        });
+        check_started.wait();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !check_state.in_flight.load(Ordering::Acquire),
+            "check claimed outside the completion operation critical section"
+        );
+        drop(submission_guard);
+        assert!(submit.join().unwrap().unwrap());
         assert!(matches!(
-            scheduler.submit_general_completion(&raced_id, completion()),
+            check.join().unwrap(),
             Err(SchedulerError::RuntimeCommand { .. })
         ));
-        drop(operation_guard);
-        assert!(check.join().unwrap().unwrap().succeeded);
-        assert!(scheduler
-            .submit_general_completion(&raced_id, completion())
-            .unwrap());
+        assert!(!check_state.in_flight.load(Ordering::Acquire));
         factory
             .runtime(&raced_id)
             .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
