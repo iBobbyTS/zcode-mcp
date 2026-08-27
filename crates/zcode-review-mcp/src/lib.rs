@@ -1048,7 +1048,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn s06_consumer_rejects_an_s05_v8_daemon_response() {
+    fn s08_consumer_rejects_a_v9_daemon_response() {
         use std::{
             io::{BufRead, BufReader, Write},
             os::unix::fs::PermissionsExt,
@@ -1058,7 +1058,7 @@ mod tests {
         };
         use zcode_reviewd::rpc::RpcResponse;
 
-        assert_eq!(RPC_VERSION, 9);
+        assert_eq!(RPC_VERSION, 10);
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("old-daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1073,13 +1073,13 @@ mod tests {
                 .read_line(&mut line)
                 .unwrap();
             let request: RpcRequest = serde_json::from_str(&line).unwrap();
-            assert_eq!(request.version, 9);
+            assert_eq!(request.version, 10);
             assert!(matches!(request.method, RpcMethod::SystemStatus));
             let mut response = RpcResponse::error(
                 Some(request.request_id),
                 RpcError::new(RpcErrorCode::UnsupportedVersion, "old daemon"),
             );
-            response.version = 8;
+            response.version = 9;
             serde_json::to_writer(&mut stream, &response).unwrap();
             stream.write_all(b"\n").unwrap();
         });

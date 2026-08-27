@@ -26,12 +26,12 @@ use zcode_reviewd::{
         StructuredReviewProjection, StructuredReviewSubmission,
     },
     rpc::{
-        AgentCapabilitiesView, ComponentStateView, GeneralSubmitInput, MessageDispositionView,
-        MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView, RpcClient, RpcMethod,
-        RpcOutcome, RpcRequest, RpcSuccess, SubmissionDispositionView, SystemStatusView,
-        TaskArtifactMetadataView, TaskArtifactQuery, TaskEventPage, TaskEventQuery, TaskListQuery,
-        TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES,
-        RPC_VERSION,
+        AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
+        MessageDispositionView, MessageInput, ReadinessResultView, RespondInput, ResponseDecision,
+        ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
+        SubmissionDispositionView, SystemStatusView, TaskArtifactMetadataView, TaskArtifactQuery,
+        TaskEventPage, TaskEventQuery, TaskListQuery, TaskPhaseFilter, TaskResultView, TaskView,
+        TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
     },
 };
 
@@ -161,6 +161,52 @@ pub enum PublicComponentState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicReadinessResult {
+    Ready,
+    ConfigInvalid,
+    ZcodeStartFailed,
+    RuntimeProtocolFailed,
+    ModelAuthFailed,
+    RuntimeFailed,
+    NotObservedWithinTimeout,
+    CleanupFailed,
+}
+
+impl From<ReadinessResultView> for PublicReadinessResult {
+    fn from(value: ReadinessResultView) -> Self {
+        match value {
+            ReadinessResultView::Ready => Self::Ready,
+            ReadinessResultView::ConfigInvalid => Self::ConfigInvalid,
+            ReadinessResultView::ZcodeStartFailed => Self::ZcodeStartFailed,
+            ReadinessResultView::RuntimeProtocolFailed => Self::RuntimeProtocolFailed,
+            ReadinessResultView::ModelAuthFailed => Self::ModelAuthFailed,
+            ReadinessResultView::RuntimeFailed => Self::RuntimeFailed,
+            ReadinessResultView::NotObservedWithinTimeout => Self::NotObservedWithinTimeout,
+            ReadinessResultView::CleanupFailed => Self::CleanupFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCapabilityMaturity {
+    BetaReady,
+    ExperimentalUnverifiedRuntime,
+}
+
+impl From<CapabilityMaturityView> for PublicCapabilityMaturity {
+    fn from(value: CapabilityMaturityView) -> Self {
+        match value {
+            CapabilityMaturityView::BetaReady => Self::BetaReady,
+            CapabilityMaturityView::ExperimentalUnverifiedRuntime => {
+                Self::ExperimentalUnverifiedRuntime
+            }
+        }
+    }
+}
+
 impl From<ComponentStateView> for PublicComponentState {
     fn from(value: ComponentStateView) -> Self {
         match value {
@@ -184,6 +230,7 @@ pub struct PublicAgentCapabilities {
     pub max_wait_ms: u64,
     pub max_artifact_chunk_bytes: usize,
     pub named_checks: bool,
+    pub maturity: BTreeMap<String, PublicCapabilityMaturity>,
 }
 
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
@@ -202,6 +249,11 @@ impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
             max_wait_ms: value.max_wait_ms,
             max_artifact_chunk_bytes: MAX_ARTIFACT_CHUNK_BYTES,
             named_checks: value.named_checks,
+            maturity: value
+                .maturity
+                .into_iter()
+                .map(|(name, maturity)| (name, maturity.into()))
+                .collect(),
         }
     }
 }
@@ -253,6 +305,7 @@ fn default_ready_timeout() -> u64 {
 pub struct EnsureReadyOutput {
     pub ready: bool,
     pub status: SystemStatusOutput,
+    pub probe_result: PublicReadinessResult,
     pub reason_code: Option<String>,
 }
 
@@ -1204,10 +1257,12 @@ impl SubagentMcp {
             RpcSuccess::SystemReadiness {
                 ready,
                 status,
+                probe_result,
                 reason_code,
             } => Ok(Json(EnsureReadyOutput {
                 ready,
                 status: status.into(),
+                probe_result: probe_result.into(),
                 reason_code,
             })),
             _ => Err(protocol_error()),

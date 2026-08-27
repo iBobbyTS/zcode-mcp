@@ -752,6 +752,31 @@ fn v2_stdio_discovers_only_the_exact_static_catalog() {
     }));
     assert!(!names.contains(&"zcode_review_status"));
     assert!(!names.contains(&"zcode_review_list"));
+    let ensure_ready = tools
+        .iter()
+        .find(|tool| tool["name"] == "zcode_system_ensure_ready")
+        .unwrap();
+    assert!(contains_enum(
+        &ensure_ready["outputSchema"],
+        &[
+            "READY",
+            "CONFIG_INVALID",
+            "ZCODE_START_FAILED",
+            "RUNTIME_PROTOCOL_FAILED",
+            "MODEL_AUTH_FAILED",
+            "RUNTIME_FAILED",
+            "NOT_OBSERVED_WITHIN_TIMEOUT",
+            "CLEANUP_FAILED"
+        ]
+    ));
+    let status = tools
+        .iter()
+        .find(|tool| tool["name"] == "zcode_system_status")
+        .unwrap();
+    assert!(contains_enum(
+        &status["outputSchema"],
+        &["beta_ready", "experimental_unverified_runtime"]
+    ));
 }
 
 #[test]
@@ -800,8 +825,19 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
         serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
 
     let mut first = FacadeProcess::start_mode(&socket, Some("subagent_v2"));
-    let readiness = first.tool("zcode_system_ensure_ready", json!({"timeout_ms":10}));
+    let readiness = first.tool("zcode_system_ensure_ready", json!({"timeout_ms":100}));
     assert_eq!(readiness["ready"], true);
+    assert_eq!(readiness["probe_result"], "READY");
+    assert_eq!(readiness["reason_code"], Value::Null);
+    assert_eq!(
+        readiness["status"]["capabilities"]["maturity"],
+        json!({
+            "analysis_readonly":"experimental_unverified_runtime",
+            "implementation_worktree":"experimental_unverified_runtime",
+            "structured_review":"beta_ready",
+            "test_runner":"experimental_unverified_runtime"
+        })
+    );
     let spawn_input = json!({
         "repository":manifest.repository,
         "base_ref":manifest.base_ref,
@@ -1345,14 +1381,12 @@ fn official_public_v2_configured_readiness_is_truthful_bounded_and_reaped() {
     assert_eq!(readiness["status"]["components"]["driver"], "READY");
     assert_eq!(readiness["status"]["components"]["runtime"], "READY");
     if readiness["ready"] == true {
+        assert_eq!(readiness["probe_result"], "READY");
         assert_eq!(readiness["reason_code"], Value::Null);
         assert_eq!(readiness["status"]["components"]["model_auth"], "READY");
     } else {
-        assert_eq!(readiness["reason_code"], "LOWER_LAYER_NOT_READY");
-        assert_eq!(
-            readiness["status"]["components"]["model_auth"],
-            "UNAVAILABLE"
-        );
+        assert_ne!(readiness["probe_result"], "MODEL_AUTH_FAILED");
+        assert_eq!(readiness["reason_code"], readiness["probe_result"]);
     }
     assert!(started.elapsed() < Duration::from_secs(6));
     assert!(store.list_jobs(10).unwrap().is_empty());

@@ -3,7 +3,8 @@ use crate::{
         MinimalStructuredReviewContinuation, OrchestrationError, ReviewJobOrchestrator,
         StructuredReviewContinuation, StructuredReviewProjection, StructuredReviewSubmission,
     },
-    GeneralCheckResult, MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
+    GeneralCheckResult, MessageDisposition, ResponseDisposition, RuntimePreflightResult, Scheduler,
+    SchedulerError,
 };
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
 use review_preparation::{canonical_general_repository, ReviewManifest};
@@ -30,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 9;
+pub const RPC_VERSION: u16 = 10;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
@@ -473,6 +474,7 @@ pub enum RpcSuccess {
     SystemReadiness {
         ready: bool,
         status: SystemStatusView,
+        probe_result: ReadinessResultView,
         reason_code: Option<String>,
     },
     GeneralSubmitted {
@@ -582,6 +584,59 @@ pub enum ComponentStateView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReadinessResultView {
+    Ready,
+    ConfigInvalid,
+    ZcodeStartFailed,
+    RuntimeProtocolFailed,
+    ModelAuthFailed,
+    RuntimeFailed,
+    NotObservedWithinTimeout,
+    CleanupFailed,
+}
+
+impl ReadinessResultView {
+    fn reason_code(self) -> Option<String> {
+        (!matches!(self, Self::Ready)).then(|| {
+            match self {
+                Self::Ready => unreachable!(),
+                Self::ConfigInvalid => "CONFIG_INVALID",
+                Self::ZcodeStartFailed => "ZCODE_START_FAILED",
+                Self::RuntimeProtocolFailed => "RUNTIME_PROTOCOL_FAILED",
+                Self::ModelAuthFailed => "MODEL_AUTH_FAILED",
+                Self::RuntimeFailed => "RUNTIME_FAILED",
+                Self::NotObservedWithinTimeout => "NOT_OBSERVED_WITHIN_TIMEOUT",
+                Self::CleanupFailed => "CLEANUP_FAILED",
+            }
+            .into()
+        })
+    }
+}
+
+impl From<RuntimePreflightResult> for ReadinessResultView {
+    fn from(value: RuntimePreflightResult) -> Self {
+        match value {
+            RuntimePreflightResult::Ready => Self::Ready,
+            RuntimePreflightResult::ConfigInvalid => Self::ConfigInvalid,
+            RuntimePreflightResult::ZcodeStartFailed => Self::ZcodeStartFailed,
+            RuntimePreflightResult::RuntimeProtocolFailed => Self::RuntimeProtocolFailed,
+            RuntimePreflightResult::ModelAuthFailed => Self::ModelAuthFailed,
+            RuntimePreflightResult::RuntimeFailed => Self::RuntimeFailed,
+            RuntimePreflightResult::NotObservedWithinTimeout => Self::NotObservedWithinTimeout,
+            RuntimePreflightResult::CleanupFailed => Self::CleanupFailed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityMaturityView {
+    BetaReady,
+    ExperimentalUnverifiedRuntime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionDispositionView {
     Created,
@@ -616,6 +671,7 @@ pub struct AgentCapabilitiesView {
     pub max_events: usize,
     pub max_wait_ms: u64,
     pub named_checks: bool,
+    pub maturity: BTreeMap<String, CapabilityMaturityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1182,42 +1238,19 @@ impl RpcService {
                 let preflight = self
                     .scheduler
                     .preflight_runtime(Duration::from_millis(timeout_ms));
+                let probe_result = ReadinessResultView::from(preflight.result);
                 let mut status = self.system_status();
-                status.components.insert(
-                    "driver".into(),
-                    if preflight.driver_ready {
-                        ComponentStateView::Ready
-                    } else {
-                        ComponentStateView::Unavailable
-                    },
-                );
-                status.components.insert(
-                    "runtime".into(),
-                    if preflight.runtime_ready {
-                        ComponentStateView::Ready
-                    } else {
-                        ComponentStateView::Unavailable
-                    },
-                );
-                status.components.insert(
-                    "model_auth".into(),
-                    if preflight.model_auth_ready {
-                        ComponentStateView::Ready
-                    } else {
-                        ComponentStateView::Unavailable
-                    },
-                );
-                let ready = preflight.reaped && readiness_from_status(&status);
+                let (driver, runtime, model_auth) = readiness_components(probe_result);
+                status.components.insert("driver".into(), driver);
+                status.components.insert("runtime".into(), runtime);
+                status.components.insert("model_auth".into(), model_auth);
+                let ready = matches!(probe_result, ReadinessResultView::Ready)
+                    && readiness_from_status(&status);
                 Ok(RpcSuccess::SystemReadiness {
                     ready,
                     status,
-                    reason_code: if !preflight.reaped {
-                        Some("RUNTIME_CLEANUP_FAILED".into())
-                    } else if !ready {
-                        Some("LOWER_LAYER_NOT_READY".into())
-                    } else {
-                        None
-                    },
+                    probe_result,
+                    reason_code: probe_result.reason_code(),
                 })
             }
             RpcMethod::SubmitGeneral { input } => {
@@ -2124,6 +2157,24 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
         "test_runner".into(),
         GeneralProfile::TestRunner.default_budget(),
     );
+    let maturity = BTreeMap::from([
+        (
+            "structured_review".into(),
+            CapabilityMaturityView::BetaReady,
+        ),
+        (
+            "analysis_readonly".into(),
+            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+        ),
+        (
+            "implementation_worktree".into(),
+            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+        ),
+        (
+            "test_runner".into(),
+            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+        ),
+    ]);
     AgentCapabilitiesView {
         task_kinds: vec![
             "general".into(),
@@ -2144,6 +2195,25 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
         max_events: MAX_PAGE_EVENTS,
         max_wait_ms: MAX_WAIT.as_millis() as u64,
         named_checks,
+        maturity,
+    }
+}
+
+fn readiness_components(
+    result: ReadinessResultView,
+) -> (ComponentStateView, ComponentStateView, ComponentStateView) {
+    use ComponentStateView::{Ready, Unavailable, Unknown};
+    match result {
+        ReadinessResultView::Ready => (Ready, Ready, Ready),
+        ReadinessResultView::ConfigInvalid | ReadinessResultView::ZcodeStartFailed => {
+            (Unavailable, Unknown, Unknown)
+        }
+        ReadinessResultView::RuntimeProtocolFailed | ReadinessResultView::CleanupFailed => {
+            (Ready, Unavailable, Unknown)
+        }
+        ReadinessResultView::ModelAuthFailed => (Ready, Ready, Unavailable),
+        ReadinessResultView::RuntimeFailed => (Ready, Ready, Unknown),
+        ReadinessResultView::NotObservedWithinTimeout => (Ready, Ready, Unknown),
     }
 }
 

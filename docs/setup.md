@@ -65,8 +65,19 @@ V2 entry point. It expects `zcode-review-mcp` on `PATH`, forwards the existing
 installed automatically and does not start or own the daemon.
 
 Before spawning work in V2, call `zcode_system_ensure_ready` with a bounded
-timeout. `ready=false` is an evidence-bearing result: start or repair the
-configured runtime rather than treating facade discovery as runtime readiness.
+timeout. The returned `probe_result` is evidence-bearing. In particular,
+`NOT_OBSERVED_WITHIN_TIMEOUT` means only that the bounded observation window
+closed without a success or failure signal; it does not prove an auth, runtime,
+or configuration fault and does not by itself require repair or restart.
+`CONFIG_INVALID`, `ZCODE_START_FAILED`, `RUNTIME_PROTOCOL_FAILED`,
+`RUNTIME_FAILED`, and `CLEANUP_FAILED` identify the observed layer. Production
+does not infer `MODEL_AUTH_FAILED` from runtime prose or generic remote errors.
+Every probe is stopped and reaped before the call returns.
+
+Capability maturity is a separate closed projection. Structured review is
+`beta_ready`. The `analysis_readonly`, `implementation_worktree`, and
+`test_runner` general profiles remain selectable for bounded experiments but
+are `experimental_unverified_runtime` until official-runtime evidence exists.
 
 V2 general and structured-review inputs are supplied directly as strict tool
 arguments. Repository/base/head identities are immutable commit inputs;

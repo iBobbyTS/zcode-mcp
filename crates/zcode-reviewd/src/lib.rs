@@ -1757,11 +1757,20 @@ pub struct SubmittedTask {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePreflightResult {
+    Ready,
+    ConfigInvalid,
+    ZcodeStartFailed,
+    RuntimeProtocolFailed,
+    ModelAuthFailed,
+    RuntimeFailed,
+    NotObservedWithinTimeout,
+    CleanupFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimePreflight {
-    pub driver_ready: bool,
-    pub runtime_ready: bool,
-    pub model_auth_ready: bool,
-    pub reaped: bool,
+    pub result: RuntimePreflightResult,
 }
 
 struct ReadinessSink;
@@ -1800,19 +1809,34 @@ fn readiness_job(workspace: &Path) -> Job {
     }
 }
 
-fn wait_for_probe_success(runtime: &dyn ManagedRuntime, deadline: Instant) -> Option<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeObservation {
+    Ready,
+    RuntimeFailed,
+    TimedOut,
+}
+
+fn wait_for_probe(runtime: &dyn ManagedRuntime, deadline: Instant) -> ProbeObservation {
     loop {
+        // Evidence is classified only while the observation window is open. A
+        // boundary first observed after this check is deliberately left for
+        // cleanup and cannot upgrade or reclassify the probe.
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return ProbeObservation::TimedOut;
+        };
+        if remaining.is_zero() {
+            return ProbeObservation::TimedOut;
+        }
         let turn = runtime.turn_snapshot();
         if !turn.active {
             match turn.boundary {
-                Some(TurnBoundary::Completed) => return Some(true),
-                Some(TurnBoundary::Failed) => return Some(false),
+                Some(TurnBoundary::Completed) => return ProbeObservation::Ready,
+                Some(TurnBoundary::Failed) => return ProbeObservation::RuntimeFailed,
                 None => {}
             }
         }
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        if remaining.is_zero() {
-            return None;
+        if runtime.wait_terminal(Duration::ZERO).is_some() {
+            return ProbeObservation::RuntimeFailed;
         }
         thread::sleep(remaining.min(Duration::from_millis(5)));
     }
@@ -2738,20 +2762,14 @@ impl Scheduler {
     pub fn preflight_runtime(&self, timeout: Duration) -> RuntimePreflight {
         if timeout.is_zero() {
             return RuntimePreflight {
-                driver_ready: false,
-                runtime_ready: false,
-                model_auth_ready: false,
-                reaped: true,
+                result: RuntimePreflightResult::ConfigInvalid,
             };
         }
         let deadline = ControlDeadline::new(timeout);
         let Some(probe_deadline) = deadline.readiness_probe_deadline(self.inner.config.stop_grace)
         else {
             return RuntimePreflight {
-                driver_ready: false,
-                runtime_ready: false,
-                model_auth_ready: false,
-                reaped: true,
+                result: RuntimePreflightResult::NotObservedWithinTimeout,
             };
         };
         let workspace = match tempfile::Builder::new()
@@ -2761,10 +2779,7 @@ impl Scheduler {
             Ok(workspace) => workspace,
             Err(_) => {
                 return RuntimePreflight {
-                    driver_ready: false,
-                    runtime_ready: false,
-                    model_auth_ready: false,
-                    reaped: true,
+                    result: RuntimePreflightResult::ConfigInvalid,
                 }
             }
         };
@@ -2776,20 +2791,33 @@ impl Scheduler {
             .spawn_readiness(&job, sink, probe_deadline)
         {
             Ok(runtime) => runtime,
-            Err(_) => {
+            Err(error) => {
                 return RuntimePreflight {
-                    driver_ready: false,
-                    runtime_ready: false,
-                    model_auth_ready: false,
-                    reaped: true,
+                    result: if matches!(
+                        error.kind(),
+                        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+                    ) {
+                        RuntimePreflightResult::ConfigInvalid
+                    } else {
+                        RuntimePreflightResult::ZcodeStartFailed
+                    },
                 }
             }
         };
-        let bootstrapped = remaining_runtime_time(probe_deadline)
-            .and_then(|remaining| runtime.bootstrap_session(&job, remaining))
-            .is_ok();
-        let model_auth_ready = bootstrapped
-            && wait_for_probe_success(runtime.as_ref(), probe_deadline).unwrap_or(false);
+        let bootstrap = remaining_runtime_time(probe_deadline)
+            .and_then(|remaining| runtime.bootstrap_session(&job, remaining));
+        let observed = if Instant::now() >= probe_deadline {
+            RuntimePreflightResult::NotObservedWithinTimeout
+        } else {
+            match bootstrap {
+                Ok(_) => match wait_for_probe(runtime.as_ref(), probe_deadline) {
+                    ProbeObservation::Ready => RuntimePreflightResult::Ready,
+                    ProbeObservation::RuntimeFailed => RuntimePreflightResult::RuntimeFailed,
+                    ProbeObservation::TimedOut => RuntimePreflightResult::NotObservedWithinTimeout,
+                },
+                Err(_) => RuntimePreflightResult::RuntimeProtocolFailed,
+            }
+        };
         let terminal = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
         let reaped = matches!(
             terminal,
@@ -2799,10 +2827,11 @@ impl Scheduler {
                 | RuntimeTerminal::Exited(_)
         );
         RuntimePreflight {
-            driver_ready: true,
-            runtime_ready: bootstrapped,
-            model_auth_ready,
-            reaped,
+            result: if reaped {
+                observed
+            } else {
+                RuntimePreflightResult::CleanupFailed
+            },
         }
     }
 

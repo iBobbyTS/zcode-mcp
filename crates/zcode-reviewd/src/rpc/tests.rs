@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     CommandRuntimeFactory, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeCommandError,
-    RuntimeEvent, RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady,
-    TurnBoundary, TurnSnapshot,
+    RuntimeEvent, RuntimeFactory, RuntimeLoss, RuntimeOwner, RuntimeTerminal, SchedulerConfig,
+    SessionReady, TurnBoundary, TurnSnapshot,
 };
 use review_store::{
     ArtifactKind, BudgetRequest, Job, LifecycleWrite, MessageState, NewArtifact, NewTask,
@@ -422,7 +422,7 @@ fn error(response: RpcResponse) -> RpcError {
 #[test]
 fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     let fixture = fixture();
-    assert_eq!(RPC_VERSION, 9);
+    assert_eq!(RPC_VERSION, 10);
     let first = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
         RpcSuccess::SystemStatus { status } => status,
         other => panic!("unexpected status result: {other:?}"),
@@ -454,6 +454,27 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     assert_eq!(first.capabilities.max_rpc_frame_bytes, MAX_FRAME_BYTES);
     assert_eq!(first.capabilities.max_wait_ms, MAX_WAIT.as_millis() as u64);
     assert!(!first.capabilities.named_checks);
+    assert_eq!(
+        first.capabilities.maturity,
+        BTreeMap::from([
+            (
+                "analysis_readonly".into(),
+                CapabilityMaturityView::ExperimentalUnverifiedRuntime
+            ),
+            (
+                "implementation_worktree".into(),
+                CapabilityMaturityView::ExperimentalUnverifiedRuntime
+            ),
+            (
+                "structured_review".into(),
+                CapabilityMaturityView::BetaReady
+            ),
+            (
+                "test_runner".into(),
+                CapabilityMaturityView::ExperimentalUnverifiedRuntime
+            ),
+        ])
+    );
 
     let replacement =
         RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
@@ -477,26 +498,26 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
 }
 
 #[test]
-fn s06_v9_gate_rejects_s05_v8_before_method_dispatch() {
+fn s08_v10_gate_rejects_v9_before_method_dispatch() {
     let fixture = fixture();
     let old_peer = fixture
         .service
-        .handle_bytes(br#"{"version":8,"request_id":"s05-peer","method":"missing"}"#);
-    assert_eq!(old_peer.version, 9);
-    assert_eq!(old_peer.request_id.as_deref(), Some("s05-peer"));
+        .handle_bytes(br#"{"version":9,"request_id":"v9-peer","method":"missing"}"#);
+    assert_eq!(old_peer.version, 10);
+    assert_eq!(old_peer.request_id.as_deref(), Some("v9-peer"));
     assert_eq!(error(old_peer).code, RpcErrorCode::UnsupportedVersion);
 
     let current_unknown = fixture
         .service
-        .handle_bytes(br#"{"version":9,"request_id":"s06-peer","method":"missing"}"#);
+        .handle_bytes(br#"{"version":10,"request_id":"s06-peer","method":"missing"}"#);
     assert_eq!(error(current_unknown).code, RpcErrorCode::UnknownMethod);
 
     let status = fixture
         .service
-        .handle_bytes(br#"{"version":9,"request_id":"s06-status","method":"system_status"}"#);
+        .handle_bytes(br#"{"version":10,"request_id":"s06-status","method":"system_status"}"#);
     match status.outcome {
         RpcOutcome::Success { result } => match *result {
-            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 9),
+            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 10),
             other => panic!("unexpected success: {other:?}"),
         },
         RpcOutcome::Error { error } => panic!("unexpected error: {error:?}"),
@@ -656,15 +677,17 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
     let started = Instant::now();
     match fixture
         .service
-        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 10 })
+        .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 100 })
         .unwrap()
     {
         RpcSuccess::SystemReadiness {
             ready,
             status,
+            probe_result,
             reason_code,
         } => {
             assert!(ready);
+            assert_eq!(probe_result, ReadinessResultView::Ready);
             assert_eq!(reason_code, None);
             for component in ["driver", "runtime", "model_auth"] {
                 assert_eq!(
@@ -696,10 +719,12 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
         RpcSuccess::SystemReadiness {
             ready,
             status,
+            probe_result,
             reason_code,
         } => {
             assert!(!ready);
-            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(probe_result, ReadinessResultView::RuntimeFailed);
+            assert_eq!(reason_code.as_deref(), Some("RUNTIME_FAILED"));
             assert_eq!(
                 status.components.get("driver"),
                 Some(&ComponentStateView::Ready)
@@ -710,7 +735,7 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
             );
             assert_eq!(
                 status.components.get("model_auth"),
-                Some(&ComponentStateView::Unavailable)
+                Some(&ComponentStateView::Unknown)
             );
         }
         other => panic!("unexpected failed-turn readiness: {other:?}"),
@@ -756,10 +781,12 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
         RpcSuccess::SystemReadiness {
             ready,
             status,
+            probe_result,
             reason_code,
         } => {
             assert!(!ready);
-            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(probe_result, ReadinessResultView::ZcodeStartFailed);
+            assert_eq!(reason_code.as_deref(), Some("ZCODE_START_FAILED"));
             assert_eq!(
                 status.components.get("driver"),
                 Some(&ComponentStateView::Unavailable)
@@ -869,6 +896,177 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
     );
 }
 
+#[derive(Clone, Copy)]
+enum ReadinessScenario {
+    ConfigInvalid,
+    StartFailed,
+    ProtocolFailed,
+    LateProtocolFailed,
+    RuntimeTerminalFailed,
+    CleanupFailed,
+}
+
+struct EvidenceRuntime {
+    scenario: ReadinessScenario,
+    stops: Arc<AtomicU64>,
+}
+
+impl ManagedRuntime for EvidenceRuntime {
+    fn identity(&self) -> Option<ProcessIdentity> {
+        None
+    }
+
+    fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+        self.stops.fetch_add(1, Ordering::AcqRel);
+        if matches!(self.scenario, ReadinessScenario::CleanupFailed) {
+            RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership)
+        } else {
+            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+        }
+    }
+
+    fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+        matches!(self.scenario, ReadinessScenario::RuntimeTerminalFailed)
+            .then_some(RuntimeTerminal::Exited(ChildExit::Exited(Some(1))))
+    }
+
+    fn bootstrap_session(
+        &self,
+        _job: &Job,
+        _timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        if matches!(self.scenario, ReadinessScenario::LateProtocolFailed) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        if matches!(
+            self.scenario,
+            ReadinessScenario::ProtocolFailed | ReadinessScenario::LateProtocolFailed
+        ) {
+            return Err(RuntimeCommandError::Remote(serde_json::json!({
+                "code": "generic_failure"
+            })));
+        }
+        Ok(SessionReady {
+            session_id: "readiness-evidence-session".into(),
+            initial_turn_id: Some("turn-1".into()),
+            observed_model: None,
+        })
+    }
+
+    fn turn_snapshot(&self) -> TurnSnapshot {
+        if matches!(self.scenario, ReadinessScenario::RuntimeTerminalFailed) {
+            return TurnSnapshot {
+                generation: 1,
+                active: false,
+                boundary: None,
+            };
+        }
+        TurnSnapshot {
+            generation: 1,
+            active: false,
+            boundary: Some(TurnBoundary::Completed),
+        }
+    }
+}
+
+struct EvidenceFactory {
+    scenario: ReadinessScenario,
+    stops: Arc<AtomicU64>,
+}
+
+impl RuntimeFactory for EvidenceFactory {
+    fn spawn(
+        &self,
+        _job: &Job,
+        _sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        match self.scenario {
+            ReadinessScenario::ConfigInvalid => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "structured local configuration failure",
+            )),
+            ReadinessScenario::StartFailed => {
+                Err(io::Error::new(io::ErrorKind::NotFound, "spawn failed"))
+            }
+            scenario => Ok(Arc::new(EvidenceRuntime {
+                scenario,
+                stops: Arc::clone(&self.stops),
+            })),
+        }
+    }
+}
+
+#[test]
+fn s08_readiness_uses_exact_evidence_and_cleanup_has_highest_precedence() {
+    let run = |scenario| {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path().join("readiness.sqlite3")).unwrap());
+        let stops = Arc::new(AtomicU64::new(0));
+        let scheduler = Scheduler::new(
+            "s08-readiness-evidence",
+            Arc::clone(&store),
+            Arc::new(EvidenceFactory {
+                scenario,
+                stops: Arc::clone(&stops),
+            }),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let service = RpcService::new(scheduler, store).unwrap();
+        let result = match service
+            .dispatch(RpcMethod::SystemEnsureReady { timeout_ms: 100 })
+            .unwrap()
+        {
+            RpcSuccess::SystemReadiness {
+                ready,
+                probe_result,
+                reason_code,
+                ..
+            } => {
+                assert!(!ready);
+                assert_eq!(reason_code, probe_result.reason_code());
+                probe_result
+            }
+            other => panic!("unexpected readiness result: {other:?}"),
+        };
+        (result, stops.load(Ordering::Acquire))
+    };
+
+    assert_eq!(
+        run(ReadinessScenario::ConfigInvalid),
+        (ReadinessResultView::ConfigInvalid, 0)
+    );
+    assert_eq!(
+        run(ReadinessScenario::StartFailed),
+        (ReadinessResultView::ZcodeStartFailed, 0)
+    );
+    assert_eq!(
+        run(ReadinessScenario::ProtocolFailed),
+        (ReadinessResultView::RuntimeProtocolFailed, 1)
+    );
+    assert_eq!(
+        run(ReadinessScenario::LateProtocolFailed),
+        (ReadinessResultView::NotObservedWithinTimeout, 1)
+    );
+    assert_eq!(
+        run(ReadinessScenario::RuntimeTerminalFailed),
+        (ReadinessResultView::RuntimeFailed, 1)
+    );
+    assert_eq!(
+        run(ReadinessScenario::CleanupFailed),
+        (ReadinessResultView::CleanupFailed, 1)
+    );
+
+    // The closed representation supports an authoritative structured auth
+    // discriminator, while production does not infer it from remote prose.
+    let represented = ReadinessResultView::from(RuntimePreflightResult::ModelAuthFailed);
+    assert_eq!(represented, ReadinessResultView::ModelAuthFailed);
+    assert_eq!(
+        represented.reason_code().as_deref(),
+        Some("MODEL_AUTH_FAILED")
+    );
+}
+
 #[test]
 fn s05_readiness_absolute_deadline_reaps_term_resistant_process_group() {
     let directory = tempfile::tempdir().unwrap();
@@ -906,13 +1104,15 @@ fn s05_readiness_absolute_deadline_reaps_term_resistant_process_group() {
         RpcSuccess::SystemReadiness {
             ready,
             status,
+            probe_result,
             reason_code,
         } => {
             assert!(!ready);
-            assert_eq!(reason_code.as_deref(), Some("LOWER_LAYER_NOT_READY"));
+            assert_eq!(probe_result, ReadinessResultView::NotObservedWithinTimeout);
+            assert_eq!(reason_code.as_deref(), Some("NOT_OBSERVED_WITHIN_TIMEOUT"));
             assert_eq!(
                 status.components.get("model_auth"),
-                Some(&ComponentStateView::Unavailable)
+                Some(&ComponentStateView::Unknown)
             );
         }
         other => panic!("unexpected delayed readiness: {other:?}"),
