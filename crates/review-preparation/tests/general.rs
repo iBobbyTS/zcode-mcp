@@ -1,9 +1,9 @@
 use review_preparation::{
-    AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactIntent,
-    GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
-    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
-    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, PreparedGeneralTask,
-    ValidationCommand, GENERAL_TASK_SCHEMA,
+    general_control_header, AttachmentInput, CompletionOutcome, ExternalDecision,
+    GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
+    GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
+    GeneralTaskPreparer, PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError,
+    PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -112,6 +112,80 @@ fn preparation_snapshots_immutable_context_and_uses_profile_defaults() {
         b"owner context\n"
     );
     prepared.validate_digest().unwrap();
+}
+
+#[test]
+fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
+    let f = Fixture::new();
+    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    manifest.prompt = "Analyze the bounded input without an operational reminder.".into();
+    let named = BTreeMap::from([(
+        "unit".into(),
+        GeneralNamedCommand {
+            command: ValidationCommand {
+                program: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+            },
+            readonly_safe: false,
+        },
+    )]);
+    let prepared = f
+        .preparer()
+        .prepare_named_submission(&manifest, &named)
+        .unwrap();
+    let header = general_control_header(&prepared).unwrap();
+    assert_eq!(header, general_control_header(&prepared).unwrap());
+    assert!(header.starts_with("--- BEGIN DAEMON GENERAL CONTROL"));
+    assert!(header.contains("\"profile\": \"test_runner\""));
+    assert!(header.contains("\"command_id\": \"unit\""));
+    assert!(header.contains("mcp__general-completion__zcode_general_complete"));
+    assert!(header.contains("mcp__general-completion__zcode_general_run_check"));
+    assert!(header.contains(&prepared.prompt_sha256));
+    assert!(!header.contains("changes_patch"));
+    assert!(!header.contains(&manifest.prompt));
+    assert!(!header.contains(f.repository.to_string_lossy().as_ref()));
+    assert!(!header.contains("/usr/bin/true"));
+    assert_eq!(
+        fs::read_to_string(&prepared.prompt_path).unwrap(),
+        manifest.prompt
+    );
+
+    let replay = f
+        .preparer()
+        .prepare_named_submission(&manifest, &named)
+        .unwrap();
+    assert_eq!(general_control_header(&replay).unwrap(), header);
+
+    let mut different = f.manifest(GeneralProfile::TestRunner);
+    different.task_id = "different-control".into();
+    different.idempotency_key = "different-control".into();
+    different.prompt = manifest.prompt.clone();
+    let mut changed_named = named.clone();
+    changed_named.get_mut("unit").unwrap().command.args = vec!["changed".into()];
+    let changed = f
+        .preparer()
+        .prepare_named_submission(&different, &changed_named)
+        .unwrap();
+    assert_ne!(general_control_header(&changed).unwrap(), header);
+    assert_ne!(changed.manifest_sha256, prepared.manifest_sha256);
+
+    let mut implementation = f.manifest(GeneralProfile::ImplementationWorktree);
+    implementation.task_id = "implementation-control".into();
+    implementation.idempotency_key = "implementation-control".into();
+    implementation.prompt = manifest.prompt.clone();
+    let implementation = f.preparer().prepare_submission(&implementation).unwrap();
+    let implementation_header = general_control_header(&implementation).unwrap();
+    assert!(implementation_header.contains("\"profile\": \"implementation_worktree\""));
+    assert!(implementation_header.contains("\"write_manifest\": [\n    \"src\""));
+    assert!(implementation_header.contains("changes_patch"));
+    assert_ne!(implementation.manifest_sha256, prepared.manifest_sha256);
+
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&changed, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&implementation, CompletionOutcome::Blocked).cleaned);
 }
 
 #[test]
