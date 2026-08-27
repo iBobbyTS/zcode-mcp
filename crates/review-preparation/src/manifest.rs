@@ -77,6 +77,8 @@ pub struct ValidationCommand {
     pub max_output_bytes: usize,
 }
 
+pub const MAX_VALIDATION_COMMAND_TIMEOUT_MS: u64 = 3_600_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewManifest {
@@ -433,7 +435,7 @@ fn validate_manifest_fields(manifest: &ReviewManifest) -> PreparationResult<()> 
     for (command_id, command) in &manifest.validation_commands {
         validate_identifier("validation command id", command_id, MAX_IDENTIFIER_BYTES)?;
         if command.timeout_ms == 0
-            || command.timeout_ms > 3_600_000
+            || command.timeout_ms > MAX_VALIDATION_COMMAND_TIMEOUT_MS
             || command.max_output_bytes == 0
             || command.max_output_bytes > 16 * 1024 * 1024
         {

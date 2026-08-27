@@ -69,8 +69,12 @@ pub struct PreparedCommand {
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub environment: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub readonly_safe: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,8 +2,8 @@ use review_preparation::{
     AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactIntent,
     GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
     GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
-    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, ValidationCommand,
-    GENERAL_TASK_SCHEMA,
+    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, PreparedGeneralTask,
+    ValidationCommand, GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -112,6 +112,64 @@ fn preparation_snapshots_immutable_context_and_uses_profile_defaults() {
         b"owner context\n"
     );
     prepared.validate_digest().unwrap();
+}
+
+#[test]
+fn legacy_general_command_digest_remains_valid_and_readonly_true_is_identity_bound() {
+    let f = Fixture::new();
+    let mut legacy_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    legacy_manifest.validation_commands.insert(
+        "unit".into(),
+        ValidationCommand {
+            program: PathBuf::from("/usr/bin/true"),
+            args: Vec::new(),
+            cwd: ".".into(),
+            timeout_ms: 1_000,
+            max_output_bytes: 1_024,
+        },
+    );
+    let legacy = f.preparer().prepare_submission(&legacy_manifest).unwrap();
+    let canonical = serde_json::to_string(&legacy).unwrap();
+    let encoded: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    assert!(encoded["validation_commands"]["unit"]
+        .get("readonly_safe")
+        .is_none());
+    let restored: PreparedGeneralTask = serde_json::from_str(&canonical).unwrap();
+    restored.validate_digest().unwrap();
+    assert!(GeneralFinalizer::finalize(&restored, CompletionOutcome::Blocked).cleaned);
+
+    let mut named_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    named_manifest.task_id = "task-readonly-safe".into();
+    named_manifest.idempotency_key = "task-readonly-safe".into();
+    let named = BTreeMap::from([(
+        "unit".into(),
+        GeneralNamedCommand {
+            command: ValidationCommand {
+                program: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+            },
+            readonly_safe: true,
+        },
+    )]);
+    let prepared = f
+        .preparer()
+        .prepare_named_submission(&named_manifest, &named)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&prepared).unwrap()["validation_commands"]["unit"]["readonly_safe"],
+        true
+    );
+    let mut tampered = prepared.clone();
+    tampered
+        .validation_commands
+        .get_mut("unit")
+        .unwrap()
+        .readonly_safe = false;
+    assert!(tampered.validate_digest().is_err());
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
 }
 
 #[test]

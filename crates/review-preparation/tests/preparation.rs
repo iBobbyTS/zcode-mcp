@@ -1,7 +1,7 @@
 use review_preparation::{
     CleanupRecord, ExternalDecision, NetworkPolicy, PermissionRequest, PreparationError,
-    ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, SandboxEnforcement, ScratchPolicy,
-    ValidationCommand, WorktreeManager,
+    PreparedCommand, PreparedLaunchSpec, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind,
+    SandboxEnforcement, ScratchPolicy, ValidationCommand, WorktreeManager,
 };
 use std::{
     collections::BTreeMap,
@@ -16,6 +16,31 @@ struct RepositoryFixture {
     _directory: TempDir,
     repository: PathBuf,
     head: String,
+}
+
+#[test]
+fn legacy_prepared_command_json_and_review_digest_remain_compatible() {
+    let legacy = serde_json::json!({
+        "program":"/usr/bin/true",
+        "args":[],
+        "cwd":"/tmp",
+        "timeout_ms":1000,
+        "max_output_bytes":1024,
+        "environment":{"LANG":"C"}
+    });
+    let command: PreparedCommand = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!command.readonly_safe);
+    assert_eq!(serde_json::to_value(&command).unwrap(), legacy);
+
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let canonical = prepared.canonical_json().unwrap();
+    let encoded: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+    assert!(encoded["validation_commands"]["print"]
+        .get("readonly_safe")
+        .is_none());
+    let restored: PreparedLaunchSpec = serde_json::from_str(&canonical).unwrap();
+    restored.validate_digest().unwrap();
 }
 
 impl RepositoryFixture {

@@ -14,6 +14,7 @@ pub use general::{
 pub use manifest::{
     InputArtifact, NetworkPolicy, PreparedLaunchSpec, PreparedScopePath, ReviewKind,
     ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy, ValidationCommand,
+    MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
 pub use policy::{
     ExternalDecision, PermissionDecision, PermissionRequest, PolicyCapabilities, PolicyLauncher,

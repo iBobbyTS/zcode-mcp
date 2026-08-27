@@ -43,6 +43,7 @@ use review_preparation::{
     GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
     GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher,
     PreparedGeneralTask, PreparedLaunchSpec, ValidationCommand, ValidationOutput,
+    MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1415,6 +1416,11 @@ impl GeneralCommandCatalog {
                 command: entry.command,
                 readonly_safe: entry.readonly_safe,
             };
+            if command.command.timeout_ms > MAX_VALIDATION_COMMAND_TIMEOUT_MS {
+                return Err(SchedulerError::InvalidConfig(format!(
+                    "named check timeout exceeds {MAX_VALIDATION_COMMAND_TIMEOUT_MS} ms"
+                )));
+            }
             if command.command.max_output_bytes > MAX_GENERAL_CHECK_OUTPUT_BYTES {
                 return Err(SchedulerError::InvalidConfig(format!(
                     "named check output cap exceeds {MAX_GENERAL_CHECK_OUTPUT_BYTES} bytes"
@@ -4211,7 +4217,7 @@ impl Scheduler {
                 "general check command id is invalid".into(),
             ));
         }
-        let (owner_epoch, prepared, policy, operation, check, budget) = {
+        let (owner_epoch, prepared, policy, operation, submission, check, budget) = {
             let state = self.inner.state.lock().unwrap();
             let active =
                 state
@@ -4234,6 +4240,7 @@ impl Scheduler {
                 prepared.clone(),
                 policy,
                 Arc::clone(&active.operation),
+                Arc::clone(&active.general_submission),
                 Arc::clone(&active.check),
                 active.budget.as_ref().map(Arc::clone),
             )
@@ -4266,6 +4273,18 @@ impl Scheduler {
                     SchedulerError::InvalidConfig("general attempt budget is missing".into())
                 })?;
         let _guard = self.lock_check_operation(agent_id, &operation, &check, attempt_deadline)?;
+        if submission.lock().unwrap().is_some() {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general task already accepted completion".into(),
+            });
+        }
+        if check.cancelled.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general task is already stopping".into(),
+            });
+        }
         let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
             SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
         })?;
@@ -4355,6 +4374,13 @@ impl Scheduler {
         }
         let deadline = self.control_deadline();
         let _guard = self.lock_operation(agent_id, &operation, deadline)?;
+        if check.in_flight.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general completion is unavailable while a named check is in flight"
+                    .into(),
+            });
+        }
         let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
             SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
         })?;
@@ -6240,6 +6266,31 @@ sleep 10
         )
         .unwrap();
         assert!(GeneralCommandCatalog::load(&unknown_field).is_err());
+
+        let mut maximum = command.clone();
+        maximum["command"]["timeout_ms"] = serde_json::json!(MAX_VALIDATION_COMMAND_TIMEOUT_MS);
+        let maximum_path =
+            write_general_command_catalog(directory.path(), serde_json::json!([maximum]));
+        GeneralCommandCatalog::load(&maximum_path).unwrap();
+
+        let mut over_maximum = command;
+        over_maximum["command"]["timeout_ms"] =
+            serde_json::json!(MAX_VALIDATION_COMMAND_TIMEOUT_MS + 1);
+        let over_maximum_path = directory.path().join("over-maximum-catalog.json");
+        std::fs::write(
+            &over_maximum_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema":GENERAL_COMMAND_CATALOG_SCHEMA,
+                "commands":[over_maximum]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            GeneralCommandCatalog::load(&over_maximum_path),
+            Err(SchedulerError::InvalidConfig(message))
+                if message.contains("named check timeout exceeds")
+        ));
         scheduler.stop_job(&selected.job.agent_id).unwrap();
     }
 
@@ -6324,6 +6375,317 @@ sleep 10
         assert_eq!(scheduler.active_count(), 0);
         let prepared = prepared_general(&submitted.job);
         assert_general_workspace_cleaned(&prepared);
+    }
+
+    #[test]
+    fn completion_and_named_check_claim_are_bidirectionally_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut first_manifest = general_manifest(directory.path(), "completion-first", None);
+        first_manifest.profile = GeneralProfile::TestRunner;
+        let catalog_path = write_general_command_catalog(
+            directory.path(),
+            serde_json::json!([{
+                "repository":first_manifest.repository,
+                "command_id":"race",
+                "command":{
+                    "program":"/bin/sleep","args":["0.2"],"cwd":".",
+                    "timeout_ms":1000,"max_output_bytes":1024
+                },
+                "allowed_profiles":["test_runner"],
+                "readonly_safe":false
+            }]),
+        );
+        let store = Arc::new(Store::open(directory.path().join("atomic.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "atomic-owner",
+            Arc::clone(&store),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+        .unwrap();
+        let completion = || GeneralCompletionSubmission {
+            requested_outcome: CompletionOutcome::Succeeded,
+            summary: "named-check race resolved".into(),
+            checks: Vec::new(),
+            residual_gaps: Vec::new(),
+            artifact_intents: Vec::new(),
+        };
+
+        let first = scheduler
+            .enqueue_general_with_commands(&first_manifest, "feature", "owner", &["race".into()])
+            .unwrap();
+        let first_id = first.job.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        assert!(scheduler
+            .submit_general_completion(&first_id, completion())
+            .unwrap());
+        let started = Instant::now();
+        assert!(matches!(
+            scheduler.run_general_check(&first_id, "race"),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(!scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .get(&first_id)
+            .unwrap()
+            .check
+            .in_flight
+            .load(Ordering::Acquire));
+        factory
+            .runtime(&first_id)
+            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        assert_eq!(
+            wait_for_task_result(&store, &first_id).result.outcome,
+            TaskOutcome::Succeeded
+        );
+        assert_general_workspace_cleaned(&prepared_general(&first.job));
+
+        let mut raced_manifest = general_manifest(directory.path(), "claim-race", None);
+        raced_manifest.profile = GeneralProfile::TestRunner;
+        let raced = scheduler
+            .enqueue_general_with_commands(&raced_manifest, "feature", "owner", &["race".into()])
+            .unwrap();
+        let raced_id = raced.job.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let operation = Arc::clone(
+            &scheduler
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .get(&raced_id)
+                .unwrap()
+                .operation,
+        );
+        let operation_guard = operation.lock().unwrap();
+        let check_scheduler = scheduler.clone();
+        let check_id = raced_id.clone();
+        let check = thread::spawn(move || check_scheduler.run_general_check(&check_id, "race"));
+        let claim_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let claimed = scheduler
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .get(&raced_id)
+                .unwrap()
+                .check
+                .in_flight
+                .load(Ordering::Acquire);
+            if claimed {
+                break;
+            }
+            assert!(
+                Instant::now() < claim_deadline,
+                "racing named check did not claim its slot"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            scheduler.submit_general_completion(&raced_id, completion()),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        drop(operation_guard);
+        assert!(check.join().unwrap().unwrap().succeeded);
+        assert!(scheduler
+            .submit_general_completion(&raced_id, completion())
+            .unwrap());
+        factory
+            .runtime(&raced_id)
+            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        assert_eq!(
+            wait_for_task_result(&store, &raced_id).result.outcome,
+            TaskOutcome::Succeeded
+        );
+        assert_general_workspace_cleaned(&prepared_general(&raced.job));
+        assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn task_scoped_general_mcp_runs_profile_attributed_checks_through_daemon_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let base_manifest = general_manifest(directory.path(), "mcp-base", None);
+        let repository = base_manifest.repository.clone();
+        let catalog_path = write_general_command_catalog(
+            directory.path(),
+            serde_json::json!([
+                {
+                    "repository":repository,
+                    "command_id":"implementation-check",
+                    "command":{
+                        "program":"/usr/bin/printf","args":["implementation attributed"],
+                        "cwd":".","timeout_ms":1000,"max_output_bytes":1024
+                    },
+                    "allowed_profiles":["implementation_worktree"],
+                    "readonly_safe":false
+                },
+                {
+                    "repository":repository,
+                    "command_id":"test-check",
+                    "command":{
+                        "program":"/usr/bin/printf","args":["test attributed"],
+                        "cwd":".","timeout_ms":1000,"max_output_bytes":1024
+                    },
+                    "allowed_profiles":["test_runner"],
+                    "readonly_safe":false
+                }
+            ]),
+        );
+        let store = Arc::new(Store::open(directory.path().join("mcp.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "mcp-owner",
+            Arc::clone(&store),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+        .unwrap();
+        let socket = directory.path().join("private").join("review.sock");
+        let service =
+            Arc::new(rpc::RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+        let server = rpc::RpcServer::bind(&socket, service, rpc::ServerOptions::default()).unwrap();
+
+        for (task_id, profile, command_id, expected_stdout, requested, expected) in [
+            (
+                "mcp-implementation",
+                GeneralProfile::ImplementationWorktree,
+                "implementation-check",
+                "implementation attributed",
+                CompletionOutcome::Blocked,
+                TaskOutcome::Blocked,
+            ),
+            (
+                "mcp-test",
+                GeneralProfile::TestRunner,
+                "test-check",
+                "test attributed",
+                CompletionOutcome::Succeeded,
+                TaskOutcome::Succeeded,
+            ),
+        ] {
+            let mut manifest = general_manifest(directory.path(), task_id, None);
+            manifest.profile = profile;
+            if profile == GeneralProfile::ImplementationWorktree {
+                manifest.write_manifest = vec!["src".into()];
+            }
+            let submitted = scheduler
+                .enqueue_general_with_commands(&manifest, "feature", "owner", &[command_id.into()])
+                .unwrap();
+            let agent_id = submitted.job.agent_id.clone();
+            let prepared = prepared_general(&submitted.job);
+            assert_eq!(prepared.profile, profile);
+            assert_eq!(
+                prepared
+                    .validation_commands
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec![command_id]
+            );
+            scheduler.start_ready().unwrap();
+
+            let run = serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":general_mcp::GENERAL_RUN_CHECK_TOOL,
+                    "arguments":{"command_id":command_id}}
+            });
+            let complete = serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":general_mcp::GENERAL_COMPLETE_TOOL,"arguments":{
+                    "requested_outcome":match requested {
+                        CompletionOutcome::Succeeded => "SUCCEEDED",
+                        CompletionOutcome::Blocked => "BLOCKED",
+                        _ => unreachable!(),
+                    },
+                    "summary":"profile-scoped named check completed",
+                    "checks":[command_id],"residual_gaps":[],"artifact_intents":[]
+                }}
+            });
+            let mut input = serde_json::to_vec(&run).unwrap();
+            input.push(b'\n');
+            input.extend(serde_json::to_vec(&complete).unwrap());
+            input.push(b'\n');
+            let mut output = Vec::new();
+            general_mcp::serve(&socket, &agent_id, std::io::Cursor::new(input), &mut output)
+                .unwrap();
+            let responses = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(responses.len(), 2);
+            assert_eq!(
+                responses[0]["result"]["structuredContent"]["command_id"],
+                command_id
+            );
+            assert_eq!(
+                responses[0]["result"]["structuredContent"]["stdout"],
+                expected_stdout
+            );
+            assert_eq!(
+                responses[0]["result"]["structuredContent"]["succeeded"],
+                true
+            );
+            assert_eq!(responses[0]["result"]["isError"], false);
+            assert_eq!(
+                responses[1]["result"]["structuredContent"]["accepted"],
+                true
+            );
+            assert!(!scheduler
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .get(&agent_id)
+                .unwrap()
+                .check
+                .in_flight
+                .load(Ordering::Acquire));
+            if profile == GeneralProfile::TestRunner {
+                let status = Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(&prepared.worktree.path)
+                    .output()
+                    .unwrap();
+                assert!(status.status.success());
+                assert!(
+                    status.stdout.is_empty(),
+                    "test-runner check changed the worktree"
+                );
+            }
+
+            factory
+                .runtime(&agent_id)
+                .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                )));
+            assert_eq!(
+                wait_for_task_result(&store, &agent_id).result.outcome,
+                expected
+            );
+            assert_general_workspace_cleaned(&prepared);
+            assert_eq!(scheduler.active_count(), 0);
+        }
+        server.shutdown();
+        assert!(!socket.exists());
     }
 
     fn wait_for_task_result(store: &Store, execution_id: &str) -> review_store::StoredTaskResult {

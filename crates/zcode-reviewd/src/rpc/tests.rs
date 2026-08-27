@@ -422,7 +422,7 @@ fn error(response: RpcResponse) -> RpcError {
 #[test]
 fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     let fixture = fixture();
-    assert_eq!(RPC_VERSION, 8);
+    assert_eq!(RPC_VERSION, 9);
     let first = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
         RpcSuccess::SystemStatus { status } => status,
         other => panic!("unexpected status result: {other:?}"),
@@ -477,26 +477,26 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
 }
 
 #[test]
-fn s05_v8_gate_rejects_s04_v7_before_method_dispatch() {
+fn s06_v9_gate_rejects_s05_v8_before_method_dispatch() {
     let fixture = fixture();
     let old_peer = fixture
         .service
-        .handle_bytes(br#"{"version":7,"request_id":"s04-peer","method":"missing"}"#);
-    assert_eq!(old_peer.version, 8);
-    assert_eq!(old_peer.request_id.as_deref(), Some("s04-peer"));
+        .handle_bytes(br#"{"version":8,"request_id":"s05-peer","method":"missing"}"#);
+    assert_eq!(old_peer.version, 9);
+    assert_eq!(old_peer.request_id.as_deref(), Some("s05-peer"));
     assert_eq!(error(old_peer).code, RpcErrorCode::UnsupportedVersion);
 
     let current_unknown = fixture
         .service
-        .handle_bytes(br#"{"version":8,"request_id":"s05-peer","method":"missing"}"#);
+        .handle_bytes(br#"{"version":9,"request_id":"s06-peer","method":"missing"}"#);
     assert_eq!(error(current_unknown).code, RpcErrorCode::UnknownMethod);
 
     let status = fixture
         .service
-        .handle_bytes(br#"{"version":8,"request_id":"s05-status","method":"system_status"}"#);
+        .handle_bytes(br#"{"version":9,"request_id":"s06-status","method":"system_status"}"#);
     match status.outcome {
         RpcOutcome::Success { result } => match *result {
-            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 8),
+            RpcSuccess::SystemStatus { status } => assert_eq!(status.protocol_version, 9),
             other => panic!("unexpected success: {other:?}"),
         },
         RpcOutcome::Error { error } => panic!("unexpected error: {error:?}"),
