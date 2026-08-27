@@ -173,6 +173,71 @@ fn legacy_general_command_digest_remains_valid_and_readonly_true_is_identity_bou
 }
 
 #[test]
+fn empty_named_selection_reuses_legacy_identity_and_nonempty_changes_conflict() {
+    let f = Fixture::new();
+    let legacy_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let legacy = f.preparer().prepare_submission(&legacy_manifest).unwrap();
+    let replayed = f
+        .preparer()
+        .prepare_named_submission(&legacy_manifest, &BTreeMap::new())
+        .unwrap();
+    assert_eq!(replayed, legacy);
+
+    let selected = BTreeMap::from([(
+        "unit".into(),
+        GeneralNamedCommand {
+            command: ValidationCommand {
+                program: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                cwd: ".".into(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+            },
+            readonly_safe: true,
+        },
+    )]);
+    assert!(matches!(
+        f.preparer()
+            .prepare_named_submission(&legacy_manifest, &selected),
+        Err(PreparationError::IdempotencyConflict(_))
+    ));
+    assert!(GeneralFinalizer::finalize(&legacy, CompletionOutcome::Blocked).cleaned);
+
+    let mut selected_manifest = f.manifest(GeneralProfile::TestRunner);
+    selected_manifest.task_id = "task-selected-identity".into();
+    selected_manifest.idempotency_key = "task-selected-identity".into();
+    let mut selected = selected;
+    selected.get_mut("unit").unwrap().readonly_safe = false;
+    let prepared = f
+        .preparer()
+        .prepare_named_submission(&selected_manifest, &selected)
+        .unwrap();
+    assert_eq!(
+        f.preparer()
+            .prepare_named_submission(&selected_manifest, &selected)
+            .unwrap(),
+        prepared
+    );
+
+    let mut readonly_changed = selected.clone();
+    readonly_changed.get_mut("unit").unwrap().readonly_safe = true;
+    assert!(matches!(
+        f.preparer()
+            .prepare_named_submission(&selected_manifest, &readonly_changed),
+        Err(PreparationError::IdempotencyConflict(_))
+    ));
+
+    let mut definition_changed = selected.clone();
+    definition_changed.get_mut("unit").unwrap().command.args = vec!["changed".into()];
+    assert!(matches!(
+        f.preparer()
+            .prepare_named_submission(&selected_manifest, &definition_changed),
+        Err(PreparationError::IdempotencyConflict(_))
+    ));
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+}
+
+#[test]
 fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
     let f = Fixture::new();
     let other = f._temp.path().join("other");

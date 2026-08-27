@@ -359,8 +359,10 @@ impl GeneralTaskPreparer {
         let scratch_parent = canonical_existing_parent(&repository, &manifest.scratch_root)?;
         let artifact_root = canonical_directory(&repository, &manifest.artifact_root)?;
         let manifest_sha256 = match named_commands {
-            Some(named_commands) => hash(&serde_json::to_vec(&(manifest, named_commands))?),
-            None => hash(&serde_json::to_vec(manifest)?),
+            Some(named_commands) if !named_commands.is_empty() => {
+                hash(&serde_json::to_vec(&(manifest, named_commands))?)
+            }
+            Some(_) | None => hash(&serde_json::to_vec(manifest)?),
         };
         let key = hash(format!("{}:{}", repository.display(), manifest.idempotency_key).as_bytes());
         let job_root = scratch_parent.join(&key);
