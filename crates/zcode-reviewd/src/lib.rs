@@ -1828,6 +1828,9 @@ fn wait_for_probe(runtime: &dyn ManagedRuntime, deadline: Instant) -> ProbeObser
             return ProbeObservation::TimedOut;
         }
         let turn = runtime.turn_snapshot();
+        if Instant::now() >= deadline {
+            return ProbeObservation::TimedOut;
+        }
         if !turn.active {
             match turn.boundary {
                 Some(TurnBoundary::Completed) => return ProbeObservation::Ready,
@@ -1835,10 +1838,40 @@ fn wait_for_probe(runtime: &dyn ManagedRuntime, deadline: Instant) -> ProbeObser
                 None => {}
             }
         }
-        if runtime.wait_terminal(Duration::ZERO).is_some() {
+        let terminal = runtime.wait_terminal(Duration::ZERO);
+        if Instant::now() >= deadline {
+            return ProbeObservation::TimedOut;
+        }
+        if terminal.is_some() {
             return ProbeObservation::RuntimeFailed;
         }
         thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
+}
+
+fn classify_readiness_spawn_error(
+    error: &io::Error,
+    probe_deadline: Instant,
+) -> RuntimePreflightResult {
+    if Instant::now() >= probe_deadline || error.kind() == io::ErrorKind::TimedOut {
+        RuntimePreflightResult::NotObservedWithinTimeout
+    } else if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
+    ) {
+        RuntimePreflightResult::ConfigInvalid
+    } else {
+        RuntimePreflightResult::ZcodeStartFailed
+    }
+}
+
+fn classify_readiness_runtime_error(error: &RuntimeCommandError) -> RuntimePreflightResult {
+    match error {
+        RuntimeCommandError::Timeout => RuntimePreflightResult::NotObservedWithinTimeout,
+        RuntimeCommandError::Remote(_) => RuntimePreflightResult::RuntimeFailed,
+        RuntimeCommandError::Unsupported
+        | RuntimeCommandError::Transport(_)
+        | RuntimeCommandError::InvalidSession(_) => RuntimePreflightResult::RuntimeProtocolFailed,
     }
 }
 
@@ -2793,14 +2826,7 @@ impl Scheduler {
             Ok(runtime) => runtime,
             Err(error) => {
                 return RuntimePreflight {
-                    result: if matches!(
-                        error.kind(),
-                        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
-                    ) {
-                        RuntimePreflightResult::ConfigInvalid
-                    } else {
-                        RuntimePreflightResult::ZcodeStartFailed
-                    },
+                    result: classify_readiness_spawn_error(&error, probe_deadline),
                 }
             }
         };
@@ -2815,7 +2841,7 @@ impl Scheduler {
                     ProbeObservation::RuntimeFailed => RuntimePreflightResult::RuntimeFailed,
                     ProbeObservation::TimedOut => RuntimePreflightResult::NotObservedWithinTimeout,
                 },
-                Err(_) => RuntimePreflightResult::RuntimeProtocolFailed,
+                Err(error) => classify_readiness_runtime_error(&error),
             }
         };
         let terminal = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));

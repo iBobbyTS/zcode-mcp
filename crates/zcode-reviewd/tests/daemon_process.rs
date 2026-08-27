@@ -14,8 +14,8 @@ use std::{
 };
 use zcode_driver::{observe_process, observe_process_group};
 use zcode_reviewd::rpc::{
-    JobStateView, RespondInput, ResponseDecision, RpcClient, RpcMethod, RpcOutcome, RpcRequest,
-    RpcSuccess, RPC_VERSION,
+    JobStateView, ReadinessResultView, RespondInput, ResponseDecision, RpcClient, RpcMethod,
+    RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
 };
 
 fn fake_runtime() -> PathBuf {
@@ -42,6 +42,74 @@ fn success(response: zcode_reviewd::rpc::RpcResponse) -> RpcSuccess {
     match response.outcome {
         RpcOutcome::Success { result } => *result,
         RpcOutcome::Error { error } => panic!("unexpected daemon RPC error: {error:?}"),
+    }
+}
+
+#[test]
+fn production_daemon_readiness_distinguishes_missing_config_from_spawn_failure() {
+    for configured in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("review.sqlite3");
+        let socket = directory.path().join("private/review.sock");
+        let runtime = directory
+            .path()
+            .join("configured-but-not-executable-runtime");
+        if configured {
+            std::fs::write(&runtime, b"not executable").unwrap();
+        }
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_zcode-reviewd"));
+        command
+            .env("ZCODE_REVIEWD_DATABASE", &database)
+            .env("ZCODE_REVIEWD_SOCKET", &socket)
+            .env_remove("ZCODE_RUNTIME_PATH")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if configured {
+            command.env("ZCODE_RUNTIME_PATH", &runtime);
+        }
+        let mut daemon = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !socket.exists() {
+            assert!(
+                daemon.try_wait().unwrap().is_none(),
+                "daemon exited before readiness RPC"
+            );
+            assert!(Instant::now() < deadline, "daemon socket was not created");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = success(
+            RpcClient::new(&socket, Duration::from_secs(2))
+                .call(&request(
+                    "production-readiness-classification",
+                    RpcMethod::SystemEnsureReady { timeout_ms: 100 },
+                ))
+                .unwrap(),
+        );
+        let (expected, expected_reason) = if configured {
+            (ReadinessResultView::ZcodeStartFailed, "ZCODE_START_FAILED")
+        } else {
+            (ReadinessResultView::ConfigInvalid, "CONFIG_INVALID")
+        };
+        match result {
+            RpcSuccess::SystemReadiness {
+                ready,
+                probe_result,
+                reason_code,
+                ..
+            } => {
+                assert!(!ready);
+                assert_eq!(probe_result, expected);
+                assert_eq!(reason_code.as_deref(), Some(expected_reason));
+            }
+            other => panic!("unexpected readiness response: {other:?}"),
+        }
+
+        unsafe {
+            assert_eq!(libc::kill(daemon.id() as i32, libc::SIGTERM), 0);
+        }
+        assert!(daemon.wait().unwrap().success());
     }
 }
 

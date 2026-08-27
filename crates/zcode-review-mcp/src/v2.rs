@@ -174,6 +174,45 @@ pub enum PublicReadinessResult {
     CleanupFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PublicReadinessReason {
+    ConfigInvalid,
+    ZcodeStartFailed,
+    RuntimeProtocolFailed,
+    ModelAuthFailed,
+    RuntimeFailed,
+    NotObservedWithinTimeout,
+    CleanupFailed,
+}
+
+impl PublicReadinessReason {
+    fn from_result(value: ReadinessResultView) -> Option<Self> {
+        match value {
+            ReadinessResultView::Ready => None,
+            ReadinessResultView::ConfigInvalid => Some(Self::ConfigInvalid),
+            ReadinessResultView::ZcodeStartFailed => Some(Self::ZcodeStartFailed),
+            ReadinessResultView::RuntimeProtocolFailed => Some(Self::RuntimeProtocolFailed),
+            ReadinessResultView::ModelAuthFailed => Some(Self::ModelAuthFailed),
+            ReadinessResultView::RuntimeFailed => Some(Self::RuntimeFailed),
+            ReadinessResultView::NotObservedWithinTimeout => Some(Self::NotObservedWithinTimeout),
+            ReadinessResultView::CleanupFailed => Some(Self::CleanupFailed),
+        }
+    }
+
+    fn as_wire_code(self) -> &'static str {
+        match self {
+            Self::ConfigInvalid => "CONFIG_INVALID",
+            Self::ZcodeStartFailed => "ZCODE_START_FAILED",
+            Self::RuntimeProtocolFailed => "RUNTIME_PROTOCOL_FAILED",
+            Self::ModelAuthFailed => "MODEL_AUTH_FAILED",
+            Self::RuntimeFailed => "RUNTIME_FAILED",
+            Self::NotObservedWithinTimeout => "NOT_OBSERVED_WITHIN_TIMEOUT",
+            Self::CleanupFailed => "CLEANUP_FAILED",
+        }
+    }
+}
+
 impl From<ReadinessResultView> for PublicReadinessResult {
     fn from(value: ReadinessResultView) -> Self {
         match value {
@@ -306,7 +345,7 @@ pub struct EnsureReadyOutput {
     pub ready: bool,
     pub status: SystemStatusOutput,
     pub probe_result: PublicReadinessResult,
-    pub reason_code: Option<String>,
+    pub reason_code: Option<PublicReadinessReason>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1259,12 +1298,19 @@ impl SubagentMcp {
                 status,
                 probe_result,
                 reason_code,
-            } => Ok(Json(EnsureReadyOutput {
-                ready,
-                status: status.into(),
-                probe_result: probe_result.into(),
-                reason_code,
-            })),
+            } => {
+                let public_reason = PublicReadinessReason::from_result(probe_result);
+                if reason_code.as_deref() != public_reason.map(PublicReadinessReason::as_wire_code)
+                {
+                    return Err(protocol_error());
+                }
+                Ok(Json(EnsureReadyOutput {
+                    ready,
+                    status: status.into(),
+                    probe_result: probe_result.into(),
+                    reason_code: public_reason,
+                }))
+            }
             _ => Err(protocol_error()),
         }
     }
@@ -1722,6 +1768,39 @@ pub async fn serve_stdio_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_reason_is_closed_and_correlated_with_probe_result() {
+        for (result, expected) in [
+            (ReadinessResultView::Ready, None),
+            (ReadinessResultView::ConfigInvalid, Some("CONFIG_INVALID")),
+            (
+                ReadinessResultView::ZcodeStartFailed,
+                Some("ZCODE_START_FAILED"),
+            ),
+            (
+                ReadinessResultView::RuntimeProtocolFailed,
+                Some("RUNTIME_PROTOCOL_FAILED"),
+            ),
+            (
+                ReadinessResultView::ModelAuthFailed,
+                Some("MODEL_AUTH_FAILED"),
+            ),
+            (ReadinessResultView::RuntimeFailed, Some("RUNTIME_FAILED")),
+            (
+                ReadinessResultView::NotObservedWithinTimeout,
+                Some("NOT_OBSERVED_WITHIN_TIMEOUT"),
+            ),
+            (ReadinessResultView::CleanupFailed, Some("CLEANUP_FAILED")),
+        ] {
+            let reason = PublicReadinessReason::from_result(result);
+            assert_eq!(reason.map(PublicReadinessReason::as_wire_code), expected);
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                expected.map_or(serde_json::Value::Null, |value| serde_json::json!(value))
+            );
+        }
+    }
 
     #[test]
     fn v2_inventory_schemas_and_annotations_are_exact() {

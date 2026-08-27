@@ -900,8 +900,15 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
 enum ReadinessScenario {
     ConfigInvalid,
     StartFailed,
-    ProtocolFailed,
+    TransportFailed,
+    RemoteFailed,
+    TimedOut,
     LateProtocolFailed,
+    LateTurnReady,
+    LateTurnFailed,
+    LateTerminalFailed,
+    LateSpawnFailed,
+    LateSpawnCleanupFailed,
     RuntimeTerminalFailed,
     CleanupFailed,
 }
@@ -918,7 +925,10 @@ impl ManagedRuntime for EvidenceRuntime {
 
     fn stop(&self, _grace: Duration) -> RuntimeTerminal {
         self.stops.fetch_add(1, Ordering::AcqRel);
-        if matches!(self.scenario, ReadinessScenario::CleanupFailed) {
+        if matches!(
+            self.scenario,
+            ReadinessScenario::CleanupFailed | ReadinessScenario::LateSpawnCleanupFailed
+        ) {
             RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership)
         } else {
             RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
@@ -926,6 +936,10 @@ impl ManagedRuntime for EvidenceRuntime {
     }
 
     fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+        if matches!(self.scenario, ReadinessScenario::LateTerminalFailed) {
+            thread::sleep(Duration::from_millis(100));
+            return Some(RuntimeTerminal::Exited(ChildExit::Exited(Some(1))));
+        }
         matches!(self.scenario, ReadinessScenario::RuntimeTerminalFailed)
             .then_some(RuntimeTerminal::Exited(ChildExit::Exited(Some(1))))
     }
@@ -938,13 +952,23 @@ impl ManagedRuntime for EvidenceRuntime {
         if matches!(self.scenario, ReadinessScenario::LateProtocolFailed) {
             thread::sleep(Duration::from_millis(100));
         }
-        if matches!(
-            self.scenario,
-            ReadinessScenario::ProtocolFailed | ReadinessScenario::LateProtocolFailed
-        ) {
+        if matches!(self.scenario, ReadinessScenario::TransportFailed) {
+            return Err(RuntimeCommandError::Transport(
+                "structured transport failure".into(),
+            ));
+        }
+        if matches!(self.scenario, ReadinessScenario::RemoteFailed) {
             return Err(RuntimeCommandError::Remote(serde_json::json!({
                 "code": "generic_failure"
             })));
+        }
+        if matches!(self.scenario, ReadinessScenario::TimedOut) {
+            return Err(RuntimeCommandError::Timeout);
+        }
+        if matches!(self.scenario, ReadinessScenario::LateProtocolFailed) {
+            return Err(RuntimeCommandError::InvalidSession(
+                "late malformed bootstrap response".into(),
+            ));
         }
         Ok(SessionReady {
             session_id: "readiness-evidence-session".into(),
@@ -954,7 +978,27 @@ impl ManagedRuntime for EvidenceRuntime {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        if matches!(self.scenario, ReadinessScenario::RuntimeTerminalFailed) {
+        if matches!(
+            self.scenario,
+            ReadinessScenario::LateTurnReady | ReadinessScenario::LateTurnFailed
+        ) {
+            thread::sleep(Duration::from_millis(100));
+            return TurnSnapshot {
+                generation: 1,
+                active: false,
+                boundary: Some(
+                    if matches!(self.scenario, ReadinessScenario::LateTurnReady) {
+                        TurnBoundary::Completed
+                    } else {
+                        TurnBoundary::Failed
+                    },
+                ),
+            };
+        }
+        if matches!(
+            self.scenario,
+            ReadinessScenario::RuntimeTerminalFailed | ReadinessScenario::LateTerminalFailed
+        ) {
             return TurnSnapshot {
                 generation: 1,
                 active: false,
@@ -980,6 +1024,12 @@ impl RuntimeFactory for EvidenceFactory {
         _job: &Job,
         _sink: Arc<dyn LifecycleSink>,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        if matches!(
+            self.scenario,
+            ReadinessScenario::LateSpawnFailed | ReadinessScenario::LateSpawnCleanupFailed
+        ) {
+            thread::sleep(Duration::from_millis(100));
+        }
         match self.scenario {
             ReadinessScenario::ConfigInvalid => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -988,6 +1038,10 @@ impl RuntimeFactory for EvidenceFactory {
             ReadinessScenario::StartFailed => {
                 Err(io::Error::new(io::ErrorKind::NotFound, "spawn failed"))
             }
+            ReadinessScenario::LateSpawnFailed => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "late spawn failure",
+            )),
             scenario => Ok(Arc::new(EvidenceRuntime {
                 scenario,
                 stops: Arc::clone(&self.stops),
@@ -1041,8 +1095,16 @@ fn s08_readiness_uses_exact_evidence_and_cleanup_has_highest_precedence() {
         (ReadinessResultView::ZcodeStartFailed, 0)
     );
     assert_eq!(
-        run(ReadinessScenario::ProtocolFailed),
+        run(ReadinessScenario::TransportFailed),
         (ReadinessResultView::RuntimeProtocolFailed, 1)
+    );
+    assert_eq!(
+        run(ReadinessScenario::RemoteFailed),
+        (ReadinessResultView::RuntimeFailed, 1)
+    );
+    assert_eq!(
+        run(ReadinessScenario::TimedOut),
+        (ReadinessResultView::NotObservedWithinTimeout, 1)
     );
     assert_eq!(
         run(ReadinessScenario::LateProtocolFailed),
@@ -1055,6 +1117,26 @@ fn s08_readiness_uses_exact_evidence_and_cleanup_has_highest_precedence() {
     assert_eq!(
         run(ReadinessScenario::CleanupFailed),
         (ReadinessResultView::CleanupFailed, 1)
+    );
+    for scenario in [
+        ReadinessScenario::LateTurnReady,
+        ReadinessScenario::LateTurnFailed,
+        ReadinessScenario::LateTerminalFailed,
+    ] {
+        assert_eq!(
+            run(scenario),
+            (ReadinessResultView::NotObservedWithinTimeout, 1),
+            "late evidence must not classify the readiness probe"
+        );
+    }
+    assert_eq!(
+        run(ReadinessScenario::LateSpawnFailed),
+        (ReadinessResultView::NotObservedWithinTimeout, 0)
+    );
+    assert_eq!(
+        run(ReadinessScenario::LateSpawnCleanupFailed),
+        (ReadinessResultView::CleanupFailed, 1),
+        "cleanup failure retains precedence after a late spawn result"
     );
 
     // The closed representation supports an authoritative structured auth

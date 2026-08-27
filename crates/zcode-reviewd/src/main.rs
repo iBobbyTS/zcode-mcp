@@ -305,7 +305,10 @@ fn run_general_mcp() -> io::Result<()> {
 
 fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {
     let runtime = runtime.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "ZCODE_RUNTIME_PATH is unavailable")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ZCODE_RUNTIME_PATH is unavailable",
+        )
     })?;
     if matches!(
         runtime.extension().and_then(|value| value.to_str()),
