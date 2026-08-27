@@ -183,6 +183,7 @@ pub struct PublicAgentCapabilities {
     pub max_events: usize,
     pub max_wait_ms: u64,
     pub max_artifact_chunk_bytes: usize,
+    pub named_checks: bool,
 }
 
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
@@ -200,6 +201,7 @@ impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
             max_events: value.max_events,
             max_wait_ms: value.max_wait_ms,
             max_artifact_chunk_bytes: MAX_ARTIFACT_CHUNK_BYTES,
+            named_checks: value.named_checks,
         }
     }
 }
@@ -283,6 +285,8 @@ pub struct AgentSpawnInput {
     pub budget: Option<PublicBudget>,
     #[serde(default)]
     pub retain_partial: bool,
+    #[serde(default)]
+    pub command_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -953,6 +957,20 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
     if !repository.is_absolute() {
         return Err("validation: repository must be absolute".into());
     }
+    if input.command_ids.len() > 128 {
+        return Err("validation: command_ids exceeds the selection cap".into());
+    }
+    let mut seen_commands = std::collections::HashSet::new();
+    for command_id in &input.command_ids {
+        validate_text(command_id, "command_id", 256)?;
+        if !command_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            || !seen_commands.insert(command_id)
+        {
+            return Err("validation: command_ids must be exact and unique".into());
+        }
+    }
     let task_id = "daemon-prepared".to_owned();
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
@@ -1216,6 +1234,7 @@ impl SubagentMcp {
                 manifest,
                 feature_id: input.feature_id,
                 ownership_token: input.ownership_token,
+                command_ids: input.command_ids,
             },
         })? {
             RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
@@ -1696,6 +1715,7 @@ mod tests {
             );
         }
         let schemas = serde_json::to_string(&tools).unwrap();
+        assert!(schemas.contains("command_ids"));
         for forbidden in [
             "workspace_path",
             "runtime_agent_id",
@@ -1708,6 +1728,11 @@ mod tests {
             "environment",
             "credentials",
             "reasoning",
+            "validation_commands",
+            "program",
+            "args",
+            "cwd",
+            "shell",
         ] {
             assert!(
                 !schemas.contains(forbidden),
@@ -1805,6 +1830,7 @@ mod tests {
             attachments: Vec::new(),
             budget: None,
             retain_partial: false,
+            command_ids: Vec::new(),
         };
         let manifest = general_manifest(&input).unwrap();
         assert_eq!(manifest.task_id, "daemon-prepared");
@@ -1815,5 +1841,39 @@ mod tests {
         assert!(prepared.task_id.starts_with("ztask-"));
         assert_ne!(prepared.task_id, manifest.task_id);
         assert_eq!(prepared.repository, repository);
+    }
+
+    #[test]
+    fn public_general_command_selection_is_id_only_and_unique() {
+        let base = serde_json::json!({
+            "repository":"/tmp/repository",
+            "base_ref":"a".repeat(40),
+            "profile":"test_runner",
+            "prompt":"run checks",
+            "feature_id":"feature",
+            "ownership_token":"owner",
+            "idempotency_key":"key",
+            "command_ids":["unit"]
+        });
+        let parsed: AgentSpawnInput = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(parsed.command_ids, vec!["unit"]);
+        for forbidden in [
+            serde_json::json!({"validation_commands":{"unit":{"program":"cargo"}}}),
+            serde_json::json!({"program":"cargo"}),
+            serde_json::json!({"args":["test"]}),
+            serde_json::json!({"cwd":"."}),
+            serde_json::json!({"env":{"RUST_LOG":"debug"}}),
+            serde_json::json!({"shell":"cargo test"}),
+        ] {
+            let mut injected = base.clone();
+            injected
+                .as_object_mut()
+                .unwrap()
+                .extend(forbidden.as_object().unwrap().clone());
+            assert!(serde_json::from_value::<AgentSpawnInput>(injected).is_err());
+        }
+        let mut duplicate: AgentSpawnInput = serde_json::from_value(base).unwrap();
+        duplicate.command_ids.push("unit".into());
+        assert!(general_manifest(&duplicate).is_err());
     }
 }

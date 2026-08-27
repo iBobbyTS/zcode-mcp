@@ -340,6 +340,7 @@ fn submit_general_fixture(
                 },
                 feature_id: feature_id.into(),
                 ownership_token: ownership_token.into(),
+                command_ids: Vec::new(),
             },
         })
         .unwrap();
@@ -452,6 +453,7 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     );
     assert_eq!(first.capabilities.max_rpc_frame_bytes, MAX_FRAME_BYTES);
     assert_eq!(first.capabilities.max_wait_ms, MAX_WAIT.as_millis() as u64);
+    assert!(!first.capabilities.named_checks);
 
     let replacement =
         RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
@@ -1266,6 +1268,7 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
                 },
                 feature_id: "feature".into(),
                 ownership_token: "owner-group".into(),
+                command_ids: Vec::new(),
             },
         },
         RpcMethod::GeneralComplete(GeneralCompleteInput {
@@ -1277,6 +1280,10 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
                 residual_gaps: Vec::new(),
                 artifact_intents: Vec::new(),
             },
+        }),
+        RpcMethod::GeneralRunCheck(GeneralRunCheckInput {
+            agent_id: "general-1".into(),
+            command_id: "check".into(),
         }),
         RpcMethod::TaskStatus {
             agent_id: "general-1".into(),

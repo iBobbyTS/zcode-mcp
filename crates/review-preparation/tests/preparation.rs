@@ -444,6 +444,16 @@ fn launcher_sanitizes_environment_bounds_output_and_times_out() {
                 max_output_bytes: 32,
             },
         ),
+        (
+            "timeout".into(),
+            ValidationCommand {
+                program: executable("sleep"),
+                args: vec!["1".into()],
+                cwd: ".".into(),
+                timeout_ms: 25,
+                max_output_bytes: 32,
+            },
+        ),
     ]);
     let prepared = ReviewPreparer.prepare(&manifest).unwrap();
     let launcher = prepared.launcher().unwrap();
@@ -453,9 +463,12 @@ fn launcher_sanitizes_environment_bounds_output_and_times_out() {
     assert!(environment.stdout.contains("HOME="));
     assert!(!environment.stdout.contains("CARGO_MANIFEST_DIR"));
     let bounded = launcher.run("bounded").unwrap();
-    assert!(bounded.timed_out);
+    assert!(!bounded.timed_out);
     assert!(bounded.stdout_truncated);
     assert_eq!(bounded.stdout.len(), 32);
+    let timeout = launcher.run("timeout").unwrap();
+    assert!(timeout.timed_out);
+    assert!(!timeout.cancelled);
     assert!(launcher.run("not-allowed").is_err());
 }
 

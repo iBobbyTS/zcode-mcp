@@ -9,6 +9,10 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -65,6 +69,8 @@ pub struct PreparedCommand {
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub readonly_safe: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +107,7 @@ pub enum PermissionRequest {
     CredentialRead(PathBuf),
     InternalReviewLedger,
     InternalGeneralCompletion,
+    InternalGeneralRunCheck(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +116,7 @@ pub struct PermissionDecision {
     pub reason: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationOutput {
     pub status_code: Option<i32>,
     pub stdout: String,
@@ -117,6 +124,7 @@ pub struct ValidationOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +259,8 @@ impl PolicyLauncher {
         let input = params.get("input").unwrap_or(&serde_json::Value::Null);
         let request = if tool_name == "mcp__general-completion__zcode_general_complete" {
             Some(PermissionRequest::InternalGeneralCompletion)
+        } else if tool_name == "mcp__general-completion__zcode_general_run_check" {
+            exact_command_id_input(input).map(PermissionRequest::InternalGeneralRunCheck)
         } else if matches!(
             tool_name,
             "mcp__review-ledger__review_checkpoint"
@@ -337,11 +347,35 @@ impl PolicyLauncher {
     }
 
     pub fn run(&self, command_id: &str) -> PreparationResult<ValidationOutput> {
+        let cancellation = AtomicBool::new(false);
+        self.run_cancellable(
+            command_id,
+            Instant::now() + Duration::from_secs(86_400),
+            &cancellation,
+        )
+    }
+
+    pub fn run_cancellable(
+        &self,
+        command_id: &str,
+        attempt_deadline: Instant,
+        cancellation: &AtomicBool,
+    ) -> PreparationResult<ValidationOutput> {
         let prepared = self.commands.get(command_id).ok_or_else(|| {
             PreparationError::Policy(format!(
                 "command {command_id} is not in the exact allowlist"
             ))
         })?;
+        if fs::canonicalize(&self.worktree)? != self.worktree
+            || fs::canonicalize(&prepared.cwd)? != prepared.cwd
+            || !prepared.cwd.starts_with(&self.worktree)
+            || fs::canonicalize(&prepared.program)? != prepared.program
+            || !prepared.program.is_file()
+        {
+            return Err(PreparationError::Policy(
+                "named command path identity is no longer valid".into(),
+            ));
+        }
         let request = PermissionRequest::Execute {
             program: prepared.program.clone(),
             args: prepared.args.clone(),
@@ -351,7 +385,7 @@ impl PolicyLauncher {
         if !decision.allowed {
             return Err(PreparationError::Policy(decision.reason.into()));
         }
-        execute(prepared)
+        execute(prepared, attempt_deadline, cancellation)
     }
 
     fn hard_deny_reason(&self, request: &PermissionRequest) -> Option<&'static str> {
@@ -374,6 +408,20 @@ impl PolicyLauncher {
                 | PolicyMode::GeneralTest
                 | PolicyMode::GeneralImplementation { .. } => None,
             },
+            PermissionRequest::InternalGeneralRunCheck(command_id) => {
+                let Some(command) = self.commands.get(command_id) else {
+                    return Some("general_check_command_not_selected");
+                };
+                match self.mode {
+                    PolicyMode::ReviewReadonly => Some("general_check_unavailable_for_review_task"),
+                    PolicyMode::GeneralReadonly if !command.readonly_safe => {
+                        Some("general_check_not_readonly_safe")
+                    }
+                    PolicyMode::GeneralReadonly
+                    | PolicyMode::GeneralTest
+                    | PolicyMode::GeneralImplementation { .. } => None,
+                }
+            }
             PermissionRequest::Read(path) => {
                 if is_credential_path(path) {
                     return Some("credential_read_denied");
@@ -631,7 +679,25 @@ pub(crate) fn prepare_command(
         timeout_ms,
         max_output_bytes,
         environment,
+        readonly_safe: false,
     })
+}
+
+fn exact_command_id_input(input: &serde_json::Value) -> Option<String> {
+    let object = input.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let command_id = object.get("command_id")?.as_str()?;
+    if command_id.is_empty()
+        || command_id.len() > 256
+        || !command_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(command_id.to_owned())
 }
 
 fn validate_program_and_args(
@@ -941,7 +1007,11 @@ fn validate_git_path_value(
     Ok(())
 }
 
-fn execute(prepared: &PreparedCommand) -> PreparationResult<ValidationOutput> {
+fn execute(
+    prepared: &PreparedCommand,
+    attempt_deadline: Instant,
+    cancellation: &AtomicBool,
+) -> PreparationResult<ValidationOutput> {
     let mut command = Command::new(&prepared.program);
     command
         .args(&prepared.args)
@@ -966,19 +1036,31 @@ fn execute(prepared: &PreparedCommand) -> PreparationResult<ValidationOutput> {
     let stderr = child.stderr.take().expect("piped validation stderr");
     let max_stdout = prepared.max_output_bytes;
     let max_stderr = prepared.max_output_bytes;
-    let stdout_reader = spawn_reader(stdout, max_stdout);
-    let stderr_reader = spawn_reader(stderr, max_stderr);
-    let deadline = Instant::now() + Duration::from_millis(prepared.timeout_ms);
-    let (status, timed_out) = loop {
+    let output_limited = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_reader(stdout, max_stdout, Arc::clone(&output_limited));
+    let stderr_reader = spawn_reader(stderr, max_stderr, Arc::clone(&output_limited));
+    let command_deadline = Instant::now()
+        .checked_add(Duration::from_millis(prepared.timeout_ms))
+        .unwrap_or(attempt_deadline);
+    let deadline = command_deadline.min(attempt_deadline);
+    let (status, timed_out, cancelled) = loop {
         if let Some(status) = child.try_wait()? {
-            break (status, false);
+            break (status, false, false);
+        }
+        if cancellation.load(Ordering::Acquire) {
+            signal_group(pid, libc::SIGKILL)?;
+            let status = child.wait()?;
+            break (status, false, true);
+        }
+        if output_limited.load(Ordering::Acquire) {
+            signal_group(pid, libc::SIGKILL)?;
+            let status = child.wait()?;
+            break (status, false, false);
         }
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            signal_group(pid, libc::SIGKILL)?;
             let status = child.wait()?;
-            break (status, true);
+            break (status, true, false);
         }
         thread::sleep(Duration::from_millis(2));
     };
@@ -992,16 +1074,18 @@ fn execute(prepared: &PreparedCommand) -> PreparationResult<ValidationOutput> {
         stdout_truncated,
         stderr_truncated,
         timed_out,
+        cancelled,
     })
 }
 
 fn spawn_reader(
     reader: impl Read + Send + 'static,
     max_bytes: usize,
+    output_limited: Arc<AtomicBool>,
 ) -> mpsc::Receiver<std::io::Result<(Vec<u8>, bool)>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = sender.send(read_bounded(reader, max_bytes));
+        let _ = sender.send(read_bounded(reader, max_bytes, &output_limited));
     });
     receiver
 }
@@ -1080,7 +1164,11 @@ fn signal_group(pgid: i32, signal: i32) -> PreparationResult<()> {
     }
 }
 
-fn read_bounded(mut reader: impl Read, max_bytes: usize) -> std::io::Result<(Vec<u8>, bool)> {
+fn read_bounded(
+    mut reader: impl Read,
+    max_bytes: usize,
+    output_limited: &AtomicBool,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut retained = Vec::with_capacity(max_bytes.min(8192));
     let mut buffer = [0u8; 8192];
     let mut truncated = false;
@@ -1092,6 +1180,9 @@ fn read_bounded(mut reader: impl Read, max_bytes: usize) -> std::io::Result<(Vec
         let remaining = max_bytes.saturating_sub(retained.len());
         retained.extend_from_slice(&buffer[..count.min(remaining)]);
         truncated |= count > remaining;
+        if truncated {
+            output_limited.store(true, Ordering::Release);
+        }
     }
 }
 

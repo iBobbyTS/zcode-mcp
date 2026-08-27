@@ -4,11 +4,11 @@ mod policy;
 mod worktree;
 
 pub use general::{
-    canonical_general_repository, ArtifactMetadata, AttachmentInput, BudgetLimits,
-    CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion,
-    GeneralCompletionSubmission, GeneralFinalizer, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PreparedAttachment, PreparedContext, PreparedGeneralTask,
-    PublicAttachment, GENERAL_TASK_SCHEMA,
+    canonical_general_repository, validate_general_named_command, ArtifactMetadata,
+    AttachmentInput, BudgetLimits, CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind,
+    GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer, GeneralNamedCommand,
+    GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PreparedAttachment, PreparedContext,
+    PreparedGeneralTask, PublicAttachment, GENERAL_TASK_SCHEMA,
 };
 
 pub use manifest::{

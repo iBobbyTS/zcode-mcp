@@ -3,7 +3,7 @@ use crate::{
         MinimalStructuredReviewContinuation, OrchestrationError, ReviewJobOrchestrator,
         StructuredReviewContinuation, StructuredReviewProjection, StructuredReviewSubmission,
     },
-    MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
+    GeneralCheckResult, MessageDisposition, ResponseDisposition, Scheduler, SchedulerError,
 };
 use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
 use review_preparation::{canonical_general_repository, ReviewManifest};
@@ -71,6 +71,7 @@ pub enum RpcMethod {
         input: GeneralSubmitInput,
     },
     GeneralComplete(GeneralCompleteInput),
+    GeneralRunCheck(GeneralRunCheckInput),
     TaskStatus {
         agent_id: String,
     },
@@ -152,6 +153,7 @@ impl RpcMethod {
                 | "system_ensure_ready"
                 | "submit_general"
                 | "general_complete"
+                | "general_run_check"
                 | "task_status"
                 | "task_list"
                 | "task_pending"
@@ -249,6 +251,8 @@ pub struct GeneralSubmitInput {
     pub manifest: GeneralTaskManifest,
     pub feature_id: String,
     pub ownership_token: String,
+    #[serde(default)]
+    pub command_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +260,13 @@ pub struct GeneralSubmitInput {
 pub struct GeneralCompleteInput {
     pub agent_id: String,
     pub submission: GeneralCompletionSubmission,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneralRunCheckInput {
+    pub agent_id: String,
+    pub command_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +482,9 @@ pub enum RpcSuccess {
     GeneralCompletionAccepted {
         accepted: bool,
     },
+    GeneralCheckCompleted {
+        result: GeneralCheckResultView,
+    },
     TaskStatus {
         task: TaskView,
     },
@@ -601,6 +615,34 @@ pub struct AgentCapabilitiesView {
     pub max_rpc_frame_bytes: usize,
     pub max_events: usize,
     pub max_wait_ms: u64,
+    pub named_checks: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralCheckResultView {
+    pub command_id: String,
+    pub succeeded: bool,
+    pub status_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub timed_out: bool,
+}
+
+impl From<GeneralCheckResult> for GeneralCheckResultView {
+    fn from(value: GeneralCheckResult) -> Self {
+        Self {
+            command_id: value.command_id,
+            succeeded: value.succeeded,
+            status_code: value.output.status_code,
+            stdout: value.output.stdout,
+            stderr: value.output.stderr,
+            stdout_truncated: value.output.stdout_truncated,
+            stderr_truncated: value.output.stderr_truncated,
+            timed_out: value.output.timed_out,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1183,7 +1225,12 @@ impl RpcService {
                 validate_text(&input.ownership_token, "ownership_token", 512)?;
                 let submitted = self
                     .scheduler
-                    .enqueue_general(&input.manifest, &input.feature_id, &input.ownership_token)
+                    .enqueue_general_with_commands(
+                        &input.manifest,
+                        &input.feature_id,
+                        &input.ownership_token,
+                        &input.command_ids,
+                    )
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted.job, submitted.task),
@@ -1197,6 +1244,17 @@ impl RpcService {
                     .submit_general_completion(&input.agent_id, input.submission)
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralCompletionAccepted { accepted })
+            }
+            RpcMethod::GeneralRunCheck(input) => {
+                validate_id(&input.agent_id, "agent_id")?;
+                validate_text(&input.command_id, "command_id", 256)?;
+                let result = self
+                    .scheduler
+                    .run_general_check(&input.agent_id, &input.command_id)
+                    .map_err(map_scheduler)?;
+                Ok(RpcSuccess::GeneralCheckCompleted {
+                    result: result.into(),
+                })
             }
             RpcMethod::TaskStatus { agent_id } => {
                 let (job, task) = self.require_task(&agent_id)?;
@@ -1641,7 +1699,7 @@ impl RpcService {
             protocol_version: RPC_VERSION,
             service_generation: self.service_generation.clone(),
             components,
-            capabilities: agent_capabilities(),
+            capabilities: agent_capabilities(self.scheduler.named_checks_enabled()),
         }
     }
 
@@ -2052,7 +2110,7 @@ fn opaque_generation() -> Result<String, RpcServiceConfigError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn agent_capabilities() -> AgentCapabilitiesView {
+fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
     let mut profile_defaults = BTreeMap::new();
     profile_defaults.insert(
         "analysis_readonly".into(),
@@ -2085,6 +2143,7 @@ fn agent_capabilities() -> AgentCapabilitiesView {
         max_rpc_frame_bytes: MAX_FRAME_BYTES,
         max_events: MAX_PAGE_EVENTS,
         max_wait_ms: MAX_WAIT.as_millis() as u64,
+        named_checks,
     }
 }
 

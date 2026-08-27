@@ -1,7 +1,8 @@
 use review_preparation::{
     AttachmentInput, CompletionOutcome, ExternalDecision, GeneralArtifactIntent,
     GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
-    GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PreparationError,
+    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
+    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, ValidationCommand,
     GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
@@ -370,6 +371,89 @@ fn internal_general_completion_permission_is_exact_and_general_profile_scoped() 
         );
         assert!(!execute.allowed);
         assert_eq!(execute.reason, "command_not_allowlisted");
+    }
+}
+
+#[test]
+fn internal_named_check_permission_is_exact_selected_and_profile_scoped() {
+    const TOOL: &str = "mcp__general-completion__zcode_general_run_check";
+    let f = Fixture::new();
+    for (profile, readonly_safe, expected) in [
+        (GeneralProfile::AnalysisReadonly, true, true),
+        (GeneralProfile::AnalysisReadonly, false, false),
+        (GeneralProfile::TestRunner, false, true),
+        (GeneralProfile::ImplementationWorktree, false, true),
+    ] {
+        let manifest = f.manifest(profile);
+        let named = BTreeMap::from([(
+            "unit".into(),
+            GeneralNamedCommand {
+                command: ValidationCommand {
+                    program: PathBuf::from("/usr/bin/true"),
+                    args: Vec::new(),
+                    cwd: ".".into(),
+                    timeout_ms: 1_000,
+                    max_output_bytes: 1_024,
+                },
+                readonly_safe,
+            },
+        )]);
+        let prepared = f
+            .preparer()
+            .prepare_named_submission(&manifest, &named)
+            .unwrap();
+        let launcher = prepared.launcher().unwrap();
+        let request = serde_json::json!({
+            "toolName":TOOL,
+            "input":{"command_id":"unit"}
+        });
+        assert_eq!(
+            launcher
+                .decide_zcode_permission(&request, ExternalDecision::Allow)
+                .allowed,
+            expected,
+            "{profile:?} readonly_safe={readonly_safe}"
+        );
+        assert!(
+            !launcher
+                .decide_zcode_permission(&request, ExternalDecision::Deny)
+                .allowed
+        );
+        for denied in [
+            serde_json::json!({"toolName":TOOL,"input":{"command_id":"unknown"}}),
+            serde_json::json!({"toolName":TOOL,"input":{"command_id":"unit","args":[]}}),
+            serde_json::json!({"toolName":"mcp__general-completion__zcode_general_run_check_extra","input":{"command_id":"unit"}}),
+            serde_json::json!({"toolName":"mcp__general-completion__Zcode_general_run_check","input":{"command_id":"unit"}}),
+        ] {
+            assert!(
+                !launcher
+                    .decide_zcode_permission(&denied, ExternalDecision::Allow)
+                    .allowed
+            );
+        }
+        if expected {
+            let output = launcher.run("unit").unwrap();
+            assert_eq!(output.status_code, Some(0));
+            assert!(!output.timed_out);
+            assert!(!output.cancelled);
+        }
+        let review = PolicyLauncher::new(
+            prepared.worktree.path.clone(),
+            prepared.scratch_root.clone(),
+            prepared.artifact_root.join("result.json"),
+            vec![prepared.prompt_path.clone()],
+            prepared.validation_commands.clone(),
+            false,
+            PolicyCapabilities::default(),
+        )
+        .unwrap();
+        assert!(
+            !review
+                .decide_zcode_permission(&request, ExternalDecision::Allow)
+                .allowed
+        );
+        let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked);
+        assert!(completion.cleaned);
     }
 }
 

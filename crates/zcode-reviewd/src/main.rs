@@ -15,13 +15,14 @@ use std::{
 use std::{io::Write, os::unix::net::UnixStream};
 use zcode_reviewd::{
     general_mcp, ledger_mcp, rpc::ServerOptions, CommandRuntimeFactory, Daemon,
-    InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
+    GeneralCommandCatalog, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 
 struct Config {
     database: PathBuf,
     socket: PathBuf,
     runtime: Option<PathBuf>,
+    command_catalog: Option<PathBuf>,
 }
 
 const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -53,12 +54,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move |_job: &review_store::Job| runtime_command(runtime.as_deref()),
     ));
     let runtime_factory: Arc<dyn RuntimeFactory> = factory;
+    let command_catalog = config
+        .command_catalog
+        .as_deref()
+        .map(GeneralCommandCatalog::load)
+        .transpose()?
+        .unwrap_or_default();
     let scheduler = Scheduler::new(
         format!("reviewd-{}", std::process::id()),
         store,
         runtime_factory,
         production_scheduler_config(),
     )?
+    .with_general_command_catalog(command_catalog)?
     .with_ledger(
         ledger,
         InternalLedgerMcpConfig {
@@ -129,6 +137,7 @@ fn parse_config() -> io::Result<Config> {
     let mut database = env::var_os("ZCODE_REVIEWD_DATABASE").map(PathBuf::from);
     let mut socket = env::var_os("ZCODE_REVIEWD_SOCKET").map(PathBuf::from);
     let mut runtime = env::var_os("ZCODE_RUNTIME_PATH").map(PathBuf::from);
+    let mut command_catalog = env::var_os("ZCODE_REVIEWD_COMMAND_CATALOG").map(PathBuf::from);
     let mut arguments = env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         let value = arguments.next().ok_or_else(|| {
@@ -141,6 +150,7 @@ fn parse_config() -> io::Result<Config> {
             "--database" => database = Some(PathBuf::from(value)),
             "--socket" => socket = Some(PathBuf::from(value)),
             "--runtime" => runtime = Some(PathBuf::from(value)),
+            "--command-catalog" => command_catalog = Some(PathBuf::from(value)),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -168,10 +178,25 @@ fn parse_config() -> io::Result<Config> {
             "runtime path is not a regular file",
         ));
     }
+    let command_catalog = command_catalog
+        .map(absolute_path)
+        .transpose()?
+        .map(|path| {
+            let canonical = fs::canonicalize(&path)?;
+            if canonical != path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command catalog path must already be canonical",
+                ));
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
     Ok(Config {
         database,
         socket,
         runtime,
+        command_catalog,
     })
 }
 

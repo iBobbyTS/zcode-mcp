@@ -5,9 +5,10 @@ use review_store::{
     ResultArtifact, Store, StoreError, StoredMessage, StoredProcessIdentity, TaskKind, TaskOutcome,
     TaskRecord, TaskResult, TaskSubmissionDisposition, TerminalUpdate, TurnState,
 };
+use serde::Deserialize;
 use std::{
-    collections::HashMap,
-    fmt, io,
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt, fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -38,9 +39,10 @@ pub mod rpc;
 
 use budget::AttemptBudget;
 use review_preparation::{
-    CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
-    GeneralFinalizer, GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher,
-    PreparedGeneralTask, PreparedLaunchSpec,
+    canonical_general_repository, validate_general_named_command, CompletionOutcome,
+    GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission, GeneralFinalizer,
+    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher,
+    PreparedGeneralTask, PreparedLaunchSpec, ValidationCommand, ValidationOutput,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1318,6 +1320,181 @@ where
     }
 }
 
+pub const GENERAL_COMMAND_CATALOG_SCHEMA: &str = "zcode-general-command-catalog/v1";
+const MAX_GENERAL_COMMAND_CATALOG_BYTES: u64 = 1024 * 1024;
+const MAX_GENERAL_CHECK_OUTPUT_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneralCommandCatalogFile {
+    schema: String,
+    commands: Vec<GeneralCommandCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneralCommandCatalogEntry {
+    repository: PathBuf,
+    command_id: String,
+    command: ValidationCommand,
+    allowed_profiles: Vec<GeneralProfile>,
+    readonly_safe: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PublishedGeneralCommand {
+    command: GeneralNamedCommand,
+    allowed_profiles: Vec<GeneralProfile>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GeneralCommandCatalog {
+    commands: BTreeMap<(PathBuf, String), PublishedGeneralCommand>,
+}
+
+impl GeneralCommandCatalog {
+    pub fn load(path: &Path) -> Result<Self, SchedulerError> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            SchedulerError::InvalidConfig(format!("command catalog is unavailable: {error}"))
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_GENERAL_COMMAND_CATALOG_BYTES
+        {
+            return Err(SchedulerError::InvalidConfig(
+                "command catalog must be a bounded regular file".into(),
+            ));
+        }
+        let bytes = fs::read(path).map_err(|error| {
+            SchedulerError::InvalidConfig(format!("command catalog could not be read: {error}"))
+        })?;
+        let parsed: GeneralCommandCatalogFile =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                SchedulerError::InvalidConfig(format!("command catalog is invalid: {error}"))
+            })?;
+        if parsed.schema != GENERAL_COMMAND_CATALOG_SCHEMA {
+            return Err(SchedulerError::InvalidConfig(
+                "command catalog schema is unsupported".into(),
+            ));
+        }
+        let mut commands = BTreeMap::new();
+        for entry in parsed.commands {
+            let canonical = canonical_general_repository(&entry.repository)
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+            if canonical != entry.repository {
+                return Err(SchedulerError::InvalidConfig(
+                    "command catalog repository must already be canonical".into(),
+                ));
+            }
+            if !valid_general_command_id(&entry.command_id) {
+                return Err(SchedulerError::InvalidConfig(
+                    "command catalog contains an invalid command id".into(),
+                ));
+            }
+            if entry.allowed_profiles.is_empty()
+                || entry
+                    .allowed_profiles
+                    .iter()
+                    .enumerate()
+                    .any(|(index, profile)| entry.allowed_profiles[..index].contains(profile))
+            {
+                return Err(SchedulerError::InvalidConfig(
+                    "command catalog profiles must be non-empty and unique".into(),
+                ));
+            }
+            if entry.readonly_safe
+                && !entry
+                    .allowed_profiles
+                    .contains(&GeneralProfile::AnalysisReadonly)
+            {
+                return Err(SchedulerError::InvalidConfig(
+                    "readonly-safe command must be published for analysis_readonly".into(),
+                ));
+            }
+            let command = GeneralNamedCommand {
+                command: entry.command,
+                readonly_safe: entry.readonly_safe,
+            };
+            if command.command.max_output_bytes > MAX_GENERAL_CHECK_OUTPUT_BYTES {
+                return Err(SchedulerError::InvalidConfig(format!(
+                    "named check output cap exceeds {MAX_GENERAL_CHECK_OUTPUT_BYTES} bytes"
+                )));
+            }
+            let scratch = tempfile::tempdir().map_err(|error| {
+                SchedulerError::InvalidConfig(format!(
+                    "command catalog validation scratch is unavailable: {error}"
+                ))
+            })?;
+            validate_general_named_command(&canonical, scratch.path(), &command)
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+            let key = (canonical, entry.command_id);
+            if commands
+                .insert(
+                    key,
+                    PublishedGeneralCommand {
+                        command,
+                        allowed_profiles: entry.allowed_profiles,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SchedulerError::InvalidConfig(
+                    "command catalog contains a duplicate repository and command id".into(),
+                ));
+            }
+        }
+        Ok(Self { commands })
+    }
+
+    fn resolve(
+        &self,
+        repository: &Path,
+        profile: GeneralProfile,
+        command_ids: &[String],
+    ) -> Result<BTreeMap<String, GeneralNamedCommand>, SchedulerError> {
+        let repository = canonical_general_repository(repository)
+            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        let mut seen = HashSet::new();
+        let mut resolved = BTreeMap::new();
+        for command_id in command_ids {
+            if !valid_general_command_id(command_id) || !seen.insert(command_id.as_str()) {
+                return Err(SchedulerError::InvalidConfig(
+                    "general command ids must be valid and unique".into(),
+                ));
+            }
+            let published = self
+                .commands
+                .get(&(repository.clone(), command_id.clone()))
+                .ok_or_else(|| {
+                    SchedulerError::InvalidConfig(format!(
+                        "general command {command_id} is not published for this repository"
+                    ))
+                })?;
+            if !published.allowed_profiles.contains(&profile)
+                || (profile == GeneralProfile::AnalysisReadonly && !published.command.readonly_safe)
+            {
+                return Err(SchedulerError::InvalidConfig(format!(
+                    "general command {command_id} is unavailable for this profile"
+                )));
+            }
+            resolved.insert(command_id.clone(), published.command.clone());
+        }
+        Ok(resolved)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
+fn valid_general_command_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
     pub global_max_agents: usize,
@@ -1440,6 +1617,7 @@ struct SchedulerInner {
     ledger: Option<Arc<LedgerManager>>,
     ledger_mcp: Option<InternalLedgerMcpConfig>,
     review_completion: Option<Arc<orchestration::ReviewCompletionGate>>,
+    general_commands: Arc<GeneralCommandCatalog>,
     #[cfg(test)]
     preflight_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<SchedulerState>,
@@ -1461,6 +1639,35 @@ struct ActiveRuntime {
     task: Option<TaskRecord>,
     policy: Option<Arc<PolicyLauncher>>,
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
+    check: Arc<ActiveCheck>,
+    budget: Option<Arc<AttemptBudget>>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveCheck {
+    in_flight: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl ActiveCheck {
+    fn claim(self: &Arc<Self>) -> Result<ActiveCheckClaim, ()> {
+        self.in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ())?;
+        Ok(ActiveCheckClaim(Arc::clone(self)))
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct ActiveCheckClaim(Arc<ActiveCheck>);
+
+impl Drop for ActiveCheckClaim {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+    }
 }
 
 struct TerminalTarget<'a> {
@@ -1489,6 +1696,7 @@ struct MonitorContext {
     task: Option<TaskRecord>,
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     budget: Option<Arc<AttemptBudget>>,
+    check: Arc<ActiveCheck>,
 }
 
 type ActiveSession = (u64, Arc<dyn ManagedRuntime>, String, Arc<Mutex<()>>);
@@ -1516,6 +1724,13 @@ pub struct ResponseOutcome {
     pub effective_decision: String,
     pub policy_overrode: bool,
     pub policy_reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneralCheckResult {
+    pub command_id: String,
+    pub succeeded: bool,
+    pub output: ValidationOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2223,6 +2438,28 @@ impl Scheduler {
         }
     }
 
+    fn lock_check_operation<'a>(
+        &self,
+        agent_id: &str,
+        operation: &'a Mutex<()>,
+        check: &ActiveCheck,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'a, ()>, SchedulerError> {
+        loop {
+            if check.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: agent_id.into(),
+                    message: "named check was cancelled or exceeded the attempt deadline".into(),
+                });
+            }
+            match operation.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+
     fn runtime_phase_timeout(
         &self,
         agent_id: &str,
@@ -2267,11 +2504,25 @@ impl Scheduler {
                 ledger: None,
                 ledger_mcp: None,
                 review_completion: None,
+                general_commands: Arc::new(GeneralCommandCatalog::default()),
                 #[cfg(test)]
                 preflight_hook: None,
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
+    }
+
+    pub fn with_general_command_catalog(
+        mut self,
+        catalog: GeneralCommandCatalog,
+    ) -> Result<Self, SchedulerError> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
+            SchedulerError::InvalidConfig(
+                "general command catalog must attach before scheduler cloning".into(),
+            )
+        })?;
+        inner.general_commands = Arc::new(catalog);
+        Ok(self)
     }
 
     pub fn with_ledger(
@@ -2321,6 +2572,10 @@ impl Scheduler {
 
     pub(crate) fn review_completion_enabled(&self) -> bool {
         self.inner.review_completion.is_some()
+    }
+
+    pub(crate) fn named_checks_enabled(&self) -> bool {
+        !self.inner.general_commands.is_empty()
     }
 
     pub fn store(&self) -> Arc<Store> {
@@ -2390,6 +2645,16 @@ impl Scheduler {
         feature_id: &str,
         ownership_token: &str,
     ) -> Result<SubmittedTask, SchedulerError> {
+        self.enqueue_general_with_commands(manifest, feature_id, ownership_token, &[])
+    }
+
+    pub fn enqueue_general_with_commands(
+        &self,
+        manifest: &GeneralTaskManifest,
+        feature_id: &str,
+        ownership_token: &str,
+        command_ids: &[String],
+    ) -> Result<SubmittedTask, SchedulerError> {
         if feature_id.is_empty() || ownership_token.is_empty() {
             return Err(SchedulerError::InvalidConfig(
                 "general submission requires feature_id and ownership_token".into(),
@@ -2400,8 +2665,13 @@ impl Scheduler {
             .iter()
             .map(|attachment| attachment.allowed_root.clone())
             .collect();
+        let named_commands = self.inner.general_commands.resolve(
+            &manifest.repository,
+            manifest.profile,
+            command_ids,
+        )?;
         let prepared = GeneralTaskPreparer::new(attachment_roots)
-            .and_then(|preparer| preparer.prepare_submission(manifest))
+            .and_then(|preparer| preparer.prepare_named_submission(manifest, &named_commands))
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         let prepared_json = serde_json::to_string(&prepared)
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
@@ -2821,6 +3091,7 @@ impl Scheduler {
         });
         let operation = Arc::new(Mutex::new(()));
         let general_submission = Arc::new(Mutex::new(None));
+        let check = Arc::new(ActiveCheck::default());
         let ready_turn_state = match runtime.turn_snapshot() {
             TurnSnapshot { active: true, .. } => TurnState::Active,
             TurnSnapshot {
@@ -2843,6 +3114,8 @@ impl Scheduler {
                     task: task.clone(),
                     policy: policy.clone(),
                     general_submission: Arc::clone(&general_submission),
+                    check: Arc::clone(&check),
+                    budget: budget.as_ref().map(Arc::clone),
                 },
             );
         }
@@ -2967,6 +3240,7 @@ impl Scheduler {
             task,
             general_submission,
             budget,
+            check,
         });
         Ok(true)
     }
@@ -3092,6 +3366,16 @@ impl Scheduler {
         failure: Option<(&str, String)>,
         stop_grace: Duration,
     ) -> Result<JobState, SchedulerError> {
+        {
+            let state = self.inner.state.lock().unwrap();
+            if let Some(active) = state
+                .active
+                .get(agent_id)
+                .filter(|active| active.owner_epoch == owner_epoch)
+            {
+                active.check.cancel();
+            }
+        }
         let route_and_submission = {
             let state = self.inner.state.lock().unwrap();
             state.active.get(agent_id).and_then(|active| {
@@ -3517,12 +3801,14 @@ impl Scheduler {
             task,
             general_submission,
             budget,
+            check,
         } = context;
         let scheduler = self.clone();
         thread::spawn(move || {
             let mut handled_generation = 0;
             loop {
                 if let Some(violation) = budget.as_ref().and_then(|budget| budget.violation()) {
+                    check.cancel();
                     let _guard = operation.lock().unwrap();
                     if budget.as_ref().and_then(|budget| budget.violation()) != Some(violation) {
                         continue;
@@ -3556,6 +3842,7 @@ impl Scheduler {
                     return;
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
+                    check.cancel();
                     let _guard = operation.lock().unwrap();
                     let natural = matches!(terminal, RuntimeTerminal::Completed(_));
                     let submission = general_submission.lock().unwrap().take();
@@ -3580,6 +3867,7 @@ impl Scheduler {
                     return;
                 }
                 if sink.error().is_some() {
+                    check.cancel();
                     let _guard = operation.lock().unwrap();
                     let Some(error) = sink.error() else {
                         continue;
@@ -3625,6 +3913,7 @@ impl Scheduler {
                     {
                         Ok(Some(_)) => {}
                         Ok(None) => {
+                            check.cancel();
                             let terminal = runtime.finish_turn(
                                 boundary,
                                 deadline.cleanup_grace(scheduler.inner.config.stop_grace),
@@ -3651,6 +3940,7 @@ impl Scheduler {
                             return;
                         }
                         Err(error) => {
+                            check.cancel();
                             scheduler.record_failure(&agent_id, error.to_string());
                             let terminal = runtime.finish_turn(
                                 TurnBoundary::Failed,
@@ -3911,12 +4201,130 @@ impl Scheduler {
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
     }
 
+    pub fn run_general_check(
+        &self,
+        agent_id: &str,
+        command_id: &str,
+    ) -> Result<GeneralCheckResult, SchedulerError> {
+        if !valid_general_command_id(command_id) {
+            return Err(SchedulerError::InvalidConfig(
+                "general check command id is invalid".into(),
+            ));
+        }
+        let (owner_epoch, prepared, policy, operation, check, budget) = {
+            let state = self.inner.state.lock().unwrap();
+            let active =
+                state
+                    .active
+                    .get(agent_id)
+                    .ok_or_else(|| SchedulerError::RuntimeCommand {
+                        agent_id: agent_id.into(),
+                        message: "runtime is not active".into(),
+                    })?;
+            let TaskRoute::General(prepared) = &active.route else {
+                return Err(SchedulerError::InvalidConfig(
+                    "general checks are unavailable for review tasks".into(),
+                ));
+            };
+            let policy = active.policy.as_ref().map(Arc::clone).ok_or_else(|| {
+                SchedulerError::InvalidConfig("active general policy is unavailable".into())
+            })?;
+            (
+                active.owner_epoch,
+                prepared.clone(),
+                policy,
+                Arc::clone(&active.operation),
+                Arc::clone(&active.check),
+                active.budget.as_ref().map(Arc::clone),
+            )
+        };
+        let repository_valid = canonical_general_repository(&prepared.repository)
+            .is_ok_and(|repository| repository == prepared.repository);
+        if !prepared.validation_commands.contains_key(command_id)
+            || prepared.validate_digest().is_err()
+            || !repository_valid
+        {
+            return Err(SchedulerError::InvalidConfig(
+                "general check is not selected by a valid prepared task".into(),
+            ));
+        }
+        let _claim = check.claim().map_err(|_| SchedulerError::RuntimeCommand {
+            agent_id: agent_id.into(),
+            message: "another named check is already in flight".into(),
+        })?;
+        if check.cancelled.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general task is already stopping".into(),
+            });
+        }
+        let attempt_deadline =
+            budget
+                .as_ref()
+                .map(|budget| budget.deadline())
+                .ok_or_else(|| {
+                    SchedulerError::InvalidConfig("general attempt budget is missing".into())
+                })?;
+        let _guard = self.lock_check_operation(agent_id, &operation, &check, attempt_deadline)?;
+        let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+        })?;
+        if current.owner_epoch != owner_epoch
+            || current.state != JobState::Running
+            || current.stop_requested
+            || current.close_requested
+            || check.cancelled.load(Ordering::Acquire)
+        {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general task no longer accepts named check results".into(),
+            });
+        }
+        let output = policy
+            .run_cancellable(command_id, attempt_deadline, &check.cancelled)
+            .map_err(|error| SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: error.to_string(),
+            })?;
+        let still_owned = {
+            let state = self.inner.state.lock().unwrap();
+            state.active.get(agent_id).is_some_and(|active| {
+                active.owner_epoch == owner_epoch && Arc::ptr_eq(&active.check, &check)
+            })
+        };
+        let current = self.inner.store.get_job(agent_id)?;
+        if output.cancelled
+            || check.cancelled.load(Ordering::Acquire)
+            || !still_owned
+            || current.as_ref().is_none_or(|job| {
+                job.owner_epoch != owner_epoch
+                    || job.state != JobState::Running
+                    || job.stop_requested
+                    || job.close_requested
+            })
+        {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "late named check result was discarded".into(),
+            });
+        }
+        let succeeded = output.status_code == Some(0)
+            && !output.timed_out
+            && !output.stdout_truncated
+            && !output.stderr_truncated;
+        Ok(GeneralCheckResult {
+            command_id: command_id.into(),
+            succeeded,
+            output,
+        })
+    }
+
     pub fn submit_general_completion(
         &self,
         agent_id: &str,
         submission: GeneralCompletionSubmission,
     ) -> Result<bool, SchedulerError> {
-        let (route, slot, operation) = {
+        let (route, slot, operation, check) = {
             let state = self.inner.state.lock().unwrap();
             let active =
                 state
@@ -3930,6 +4338,7 @@ impl Scheduler {
                 active.route.clone(),
                 Arc::clone(&active.general_submission),
                 Arc::clone(&active.operation),
+                Arc::clone(&active.check),
             )
         };
         let TaskRoute::General(prepared) = route else {
@@ -3937,6 +4346,13 @@ impl Scheduler {
                 "general completion is unavailable for review tasks".into(),
             ));
         };
+        if check.in_flight.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "general completion is unavailable while a named check is in flight"
+                    .into(),
+            });
+        }
         let deadline = self.control_deadline();
         let _guard = self.lock_operation(agent_id, &operation, deadline)?;
         let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
@@ -4283,6 +4699,12 @@ impl Scheduler {
         close_session: bool,
         deadline: ControlDeadline,
     ) -> Result<JobState, SchedulerError> {
+        {
+            let state = self.inner.state.lock().unwrap();
+            if let Some(active) = state.active.get(agent_id) {
+                active.check.cancel();
+            }
+        }
         let active = self.active_session(agent_id);
         let operation = active
             .as_ref()
@@ -5702,6 +6124,206 @@ sleep 10
             retain_partial: false,
             idempotency_key: format!("idempotency-{task_id}"),
         }
+    }
+
+    fn write_general_command_catalog(root: &Path, commands: serde_json::Value) -> PathBuf {
+        let path = root.join("general-commands.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": GENERAL_COMMAND_CATALOG_SCHEMA,
+                "commands": commands
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn strict_catalog_resolves_unique_profile_scoped_named_commands_before_enqueue() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = general_manifest(directory.path(), "catalog", None);
+        let repository = manifest.repository.clone();
+        let command = serde_json::json!({
+            "repository":repository,
+            "command_id":"unit",
+            "command":{
+                "program":"/usr/bin/true","args":[],"cwd":".",
+                "timeout_ms":1000,"max_output_bytes":1024
+            },
+            "allowed_profiles":["analysis_readonly","test_runner"],
+            "readonly_safe":true
+        });
+        let path =
+            write_general_command_catalog(directory.path(), serde_json::json!([command.clone()]));
+        let catalog = GeneralCommandCatalog::load(&path).unwrap();
+        let store = Arc::new(Store::open(directory.path().join("catalog.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "catalog-owner",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(catalog)
+        .unwrap();
+        let selected = scheduler
+            .enqueue_general_with_commands(&manifest, "feature", "owner", &["unit".into()])
+            .unwrap();
+        let prepared = prepared_general(&selected.job);
+        assert_eq!(prepared.validation_commands.len(), 1);
+        assert!(prepared.validation_commands["unit"].readonly_safe);
+        assert!(scheduler.named_checks_enabled());
+        scheduler.start_ready().unwrap();
+        let service = rpc::RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
+        let checked = service
+            .dispatch(rpc::RpcMethod::GeneralRunCheck(rpc::GeneralRunCheckInput {
+                agent_id: selected.job.agent_id.clone(),
+                command_id: "unit".into(),
+            }))
+            .unwrap();
+        let rpc::RpcSuccess::GeneralCheckCompleted { result } = checked else {
+            panic!("private RPC must return a named-check result");
+        };
+        assert!(result.succeeded);
+        assert_eq!(result.command_id, "unit");
+        assert_eq!(result.status_code, Some(0));
+
+        let duplicate = scheduler.enqueue_general_with_commands(
+            &general_manifest(directory.path(), "duplicate-selection", None),
+            "feature",
+            "owner",
+            &["unit".into(), "unit".into()],
+        );
+        assert!(matches!(duplicate, Err(SchedulerError::InvalidConfig(_))));
+        let unknown = scheduler.enqueue_general_with_commands(
+            &general_manifest(directory.path(), "unknown-selection", None),
+            "feature",
+            "owner",
+            &["unknown".into()],
+        );
+        assert!(matches!(unknown, Err(SchedulerError::InvalidConfig(_))));
+        let mut disallowed_manifest = general_manifest(directory.path(), "profile-selection", None);
+        disallowed_manifest.profile = GeneralProfile::ImplementationWorktree;
+        disallowed_manifest.write_manifest = vec!["src".into()];
+        let disallowed = scheduler.enqueue_general_with_commands(
+            &disallowed_manifest,
+            "feature",
+            "owner",
+            &["unit".into()],
+        );
+        assert!(matches!(disallowed, Err(SchedulerError::InvalidConfig(_))));
+
+        let duplicate_path = directory.path().join("duplicate-catalog.json");
+        std::fs::write(
+            &duplicate_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema":GENERAL_COMMAND_CATALOG_SCHEMA,
+                "commands":[command.clone(),command]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            GeneralCommandCatalog::load(&duplicate_path),
+            Err(SchedulerError::InvalidConfig(_))
+        ));
+        let unknown_field = directory.path().join("unknown-field-catalog.json");
+        std::fs::write(
+            &unknown_field,
+            serde_json::to_vec(&serde_json::json!({
+                "schema":GENERAL_COMMAND_CATALOG_SCHEMA,"commands":[],"extra":true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(GeneralCommandCatalog::load(&unknown_field).is_err());
+        scheduler.stop_job(&selected.job.agent_id).unwrap();
+    }
+
+    #[test]
+    fn active_attempt_owns_one_cancellable_named_check_and_discards_late_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = general_manifest(directory.path(), "cancel-check", None);
+        manifest.profile = GeneralProfile::TestRunner;
+        let catalog_path = write_general_command_catalog(
+            directory.path(),
+            serde_json::json!([{
+                "repository":manifest.repository,
+                "command_id":"slow",
+                "command":{
+                    "program":"/bin/sleep","args":["5"],"cwd":".",
+                    "timeout_ms":10000,"max_output_bytes":1024
+                },
+                "allowed_profiles":["test_runner"],
+                "readonly_safe":false
+            }]),
+        );
+        let store = Arc::new(Store::open(directory.path().join("check.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "check-owner",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_commands(&manifest, "feature", "owner", &["slow".into()])
+            .unwrap();
+        let agent_id = submitted.job.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let runner = scheduler.clone();
+        let runner_id = agent_id.clone();
+        let check = thread::spawn(move || runner.run_general_check(&runner_id, "slow"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let in_flight = scheduler
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .get(&agent_id)
+                .is_some_and(|active| active.check.in_flight.load(Ordering::Acquire));
+            if in_flight {
+                break;
+            }
+            assert!(Instant::now() < deadline, "named check did not start");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(
+            scheduler.run_general_check(&agent_id, "slow"),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        assert!(matches!(
+            scheduler.submit_general_completion(
+                &agent_id,
+                GeneralCompletionSubmission {
+                    requested_outcome: CompletionOutcome::Succeeded,
+                    summary: "premature".into(),
+                    checks: Vec::new(),
+                    residual_gaps: Vec::new(),
+                    artifact_intents: Vec::new(),
+                },
+            ),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        let started = Instant::now();
+        let terminal = scheduler.stop_job(&agent_id).unwrap();
+        assert!(terminal.is_terminal());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            check.join().unwrap(),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        assert_eq!(scheduler.active_count(), 0);
+        let prepared = prepared_general(&submitted.job);
+        assert_general_workspace_cleaned(&prepared);
     }
 
     fn wait_for_task_result(store: &Store, execution_id: &str) -> review_store::StoredTaskResult {

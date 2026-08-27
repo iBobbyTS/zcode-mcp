@@ -116,6 +116,13 @@ pub struct GeneralTaskManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneralNamedCommand {
+    pub command: crate::ValidationCommand,
+    pub readonly_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedAttachment {
     pub logical_name: String,
     pub prepared_path: PathBuf,
@@ -277,6 +284,30 @@ impl GeneralTaskPreparer {
         &self,
         manifest: &GeneralTaskManifest,
     ) -> PreparationResult<PreparedGeneralTask> {
+        self.prepare_internal(manifest, None)
+    }
+
+    fn prepare_internal(
+        &self,
+        manifest: &GeneralTaskManifest,
+        named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        let mut resolved_manifest;
+        let manifest = if let Some(named_commands) = named_commands {
+            if !manifest.validation_commands.is_empty() {
+                return Err(PreparationError::InvalidManifest(
+                    "caller validation command definitions are forbidden for named tasks".into(),
+                ));
+            }
+            resolved_manifest = manifest.clone();
+            resolved_manifest.validation_commands = named_commands
+                .iter()
+                .map(|(id, named)| (id.clone(), named.command.clone()))
+                .collect();
+            &resolved_manifest
+        } else {
+            manifest
+        };
         let _guard = GENERAL_PREPARATION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -327,7 +358,10 @@ impl GeneralTaskPreparer {
         }
         let scratch_parent = canonical_existing_parent(&repository, &manifest.scratch_root)?;
         let artifact_root = canonical_directory(&repository, &manifest.artifact_root)?;
-        let manifest_sha256 = hash(&serde_json::to_vec(manifest)?);
+        let manifest_sha256 = match named_commands {
+            Some(named_commands) => hash(&serde_json::to_vec(&(manifest, named_commands))?),
+            None => hash(&serde_json::to_vec(manifest)?),
+        };
         let key = hash(format!("{}:{}", repository.display(), manifest.idempotency_key).as_bytes());
         let job_root = scratch_parent.join(&key);
         fs::create_dir_all(&job_root)?;
@@ -416,15 +450,18 @@ impl GeneralTaskPreparer {
                 .iter()
                 .map(|(id, c)| {
                     let cwd = worktree.path.join(confined_relative(&c.cwd)?);
-                    crate::policy::prepare_command(
+                    let mut prepared = crate::policy::prepare_command(
                         &c.program,
                         &c.args,
                         &cwd,
                         &worktree.path,
                         &scratch_root,
                         (c.timeout_ms, c.max_output_bytes, false),
-                    )
-                    .map(|v| (id.clone(), v))
+                    )?;
+                    prepared.readonly_safe = named_commands
+                        .and_then(|commands| commands.get(id))
+                        .is_some_and(|command| command.readonly_safe);
+                    Ok((id.clone(), prepared))
                 })
                 .collect::<PreparationResult<BTreeMap<_, _>>>()?;
             let mut prepared = PreparedGeneralTask {
@@ -475,6 +512,22 @@ impl GeneralTaskPreparer {
         &self,
         manifest: &GeneralTaskManifest,
     ) -> PreparationResult<PreparedGeneralTask> {
+        self.prepare_submission_internal(manifest, None)
+    }
+
+    pub fn prepare_named_submission(
+        &self,
+        manifest: &GeneralTaskManifest,
+        named_commands: &BTreeMap<String, GeneralNamedCommand>,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        self.prepare_submission_internal(manifest, Some(named_commands))
+    }
+
+    fn prepare_submission_internal(
+        &self,
+        manifest: &GeneralTaskManifest,
+        named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
+    ) -> PreparationResult<PreparedGeneralTask> {
         let repository = canonical_general_repository(&manifest.repository)?;
         let task_id = format!(
             "ztask-{}",
@@ -487,8 +540,30 @@ impl GeneralTaskPreparer {
         canonical.repository = repository;
         canonical.task_id = task_id.clone();
         canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(task_id);
-        self.prepare(&canonical)
+        self.prepare_internal(&canonical, named_commands)
     }
+}
+
+pub fn validate_general_named_command(
+    repository: &Path,
+    scratch_root: &Path,
+    named: &GeneralNamedCommand,
+) -> PreparationResult<()> {
+    let relative_cwd = confined_relative(&named.command.cwd)?;
+    let mut prepared = crate::policy::prepare_command(
+        &named.command.program,
+        &named.command.args,
+        &repository.join(relative_cwd),
+        repository,
+        scratch_root,
+        (
+            named.command.timeout_ms,
+            named.command.max_output_bytes,
+            false,
+        ),
+    )?;
+    prepared.readonly_safe = named.readonly_safe;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

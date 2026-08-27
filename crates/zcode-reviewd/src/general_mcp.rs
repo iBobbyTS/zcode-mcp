@@ -1,7 +1,9 @@
 use crate::rpc::{
-    GeneralCompleteInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
+    GeneralCompleteInput, GeneralRunCheckInput, RpcClient, RpcMethod, RpcOutcome, RpcRequest,
+    RpcSuccess, RPC_VERSION,
 };
 use review_preparation::GeneralCompletionSubmission;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, Write},
@@ -10,6 +12,7 @@ use std::{
 };
 
 pub const GENERAL_COMPLETE_TOOL: &str = "zcode_general_complete";
+pub const GENERAL_RUN_CHECK_TOOL: &str = "zcode_general_run_check";
 const MAX_MCP_FRAME_BYTES: usize = 64 * 1024;
 
 pub fn serve<R: BufRead, W: Write>(
@@ -18,7 +21,7 @@ pub fn serve<R: BufRead, W: Write>(
     mut reader: R,
     mut writer: W,
 ) -> io::Result<()> {
-    let client = RpcClient::new(socket, Duration::from_secs(5));
+    let client = RpcClient::new(socket, Duration::from_secs(3_605));
     let mut sequence = 0u64;
     loop {
         let line = match read_frame(&mut reader, MAX_MCP_FRAME_BYTES)? {
@@ -57,7 +60,7 @@ pub fn serve<R: BufRead, W: Write>(
             }),
             Some("ping") => json!({"jsonrpc":"2.0","id":id,"result":{}}),
             Some("tools/list") => json!({
-                "jsonrpc":"2.0","id":id,"result":{"tools":[tool_definition()]}
+                "jsonrpc":"2.0","id":id,"result":{"tools":[completion_tool_definition(), run_check_tool_definition()]}
             }),
             Some("tools/call") => {
                 sequence = sequence.saturating_add(1);
@@ -84,23 +87,42 @@ fn call_tool(
     let Some(params) = request.get("params").and_then(Value::as_object) else {
         return invalid_params(id);
     };
-    if params.get("name").and_then(Value::as_str) != Some(GENERAL_COMPLETE_TOOL) {
-        return invalid_params(id);
-    }
-    let submission =
-        match params.get("arguments").cloned().and_then(|arguments| {
-            serde_json::from_value::<GeneralCompletionSubmission>(arguments).ok()
-        }) {
-            Some(submission) => submission,
-            None => return invalid_params(id),
+    let (request_id, method) =
+        match params.get("name").and_then(Value::as_str) {
+            Some(GENERAL_COMPLETE_TOOL) => {
+                let Some(submission) = params.get("arguments").cloned().and_then(|arguments| {
+                    serde_json::from_value::<GeneralCompletionSubmission>(arguments).ok()
+                }) else {
+                    return invalid_params(id);
+                };
+                (
+                    format!("general-completion-{sequence}"),
+                    RpcMethod::GeneralComplete(GeneralCompleteInput {
+                        agent_id: agent_id.to_owned(),
+                        submission,
+                    }),
+                )
+            }
+            Some(GENERAL_RUN_CHECK_TOOL) => {
+                let Some(arguments) = params.get("arguments").cloned().and_then(|arguments| {
+                    serde_json::from_value::<RunCheckArguments>(arguments).ok()
+                }) else {
+                    return invalid_params(id);
+                };
+                (
+                    format!("general-check-{sequence}"),
+                    RpcMethod::GeneralRunCheck(GeneralRunCheckInput {
+                        agent_id: agent_id.to_owned(),
+                        command_id: arguments.command_id,
+                    }),
+                )
+            }
+            _ => return invalid_params(id),
         };
     let request = RpcRequest {
         version: RPC_VERSION,
-        request_id: format!("general-completion-{sequence}"),
-        method: RpcMethod::GeneralComplete(GeneralCompleteInput {
-            agent_id: agent_id.to_owned(),
-            submission,
-        }),
+        request_id,
+        method,
     };
     match client.call(&request) {
         Ok(response) => match response.outcome {
@@ -111,6 +133,13 @@ fn call_tool(
                         "structuredContent":{"accepted":accepted},"isError":false
                     }
                 }),
+                RpcSuccess::GeneralCheckCompleted { result } => json!({
+                    "jsonrpc":"2.0","id":id,"result":{
+                        "content":[{"type":"text","text":if result.succeeded {"named check passed"} else {"named check failed"}}],
+                        "structuredContent":result,
+                        "isError":!result.succeeded
+                    }
+                }),
                 _ => tool_error(id, "daemon returned an unexpected result"),
             },
             RpcOutcome::Error { error } => tool_error(id, &error.message),
@@ -119,7 +148,13 @@ fn call_tool(
     }
 }
 
-fn tool_definition() -> Value {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunCheckArguments {
+    command_id: String,
+}
+
+fn completion_tool_definition() -> Value {
     json!({
         "name":GENERAL_COMPLETE_TOOL,
         "description":"Submit the final bounded result for this general task.",
@@ -139,6 +174,20 @@ fn tool_definition() -> Value {
                         "size_bytes":{"type":"integer","minimum":1}
                     }
                 }}
+            }
+        }
+    })
+}
+
+fn run_check_tool_definition() -> Value {
+    json!({
+        "name":GENERAL_RUN_CHECK_TOOL,
+        "description":"Run one daemon-published validation command selected for this task.",
+        "inputSchema":{
+            "type":"object","additionalProperties":false,
+            "required":["command_id"],
+            "properties":{
+                "command_id":{"type":"string","minLength":1,"maxLength":256,"pattern":"^[A-Za-z0-9_.:-]+$"}
             }
         }
     })
@@ -213,7 +262,7 @@ mod tests {
 
     #[test]
     fn completion_tool_schema_is_closed_and_bounded() {
-        let schema = &tool_definition()["inputSchema"];
+        let schema = &completion_tool_definition()["inputSchema"];
         jsonschema::draft202012::meta::validate(schema).unwrap();
         let validator = jsonschema::draft202012::options().build(schema).unwrap();
         assert!(validator.is_valid(&json!({
@@ -223,5 +272,24 @@ mod tests {
         assert!(!validator.is_valid(&json!({
             "requested_outcome":"SUCCEEDED","summary":"done","unexpected":true
         })));
+    }
+
+    #[test]
+    fn run_check_tool_schema_accepts_only_exact_command_id() {
+        let schema = &run_check_tool_definition()["inputSchema"];
+        jsonschema::draft202012::meta::validate(schema).unwrap();
+        let validator = jsonschema::draft202012::options().build(schema).unwrap();
+        assert!(validator.is_valid(&json!({"command_id":"cargo-test"})));
+        for invalid in [
+            json!({"command_id":"cargo-test","args":["--all"]}),
+            json!({"command_id":"cargo test"}),
+            json!({"program":"cargo"}),
+        ] {
+            assert!(!validator.is_valid(&invalid), "accepted {invalid}");
+        }
+        assert!(serde_json::from_value::<RunCheckArguments>(json!({
+            "command_id":"cargo-test","cwd":"."
+        }))
+        .is_err());
     }
 }
