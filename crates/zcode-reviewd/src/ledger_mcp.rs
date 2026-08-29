@@ -20,22 +20,32 @@ pub fn serve<R: BufRead, W: Write>(
     reader: R,
     writer: W,
 ) -> io::Result<()> {
-    serve_routed(socket, agent_id, false, reader, writer)
+    serve_routed(socket, agent_id, false, None, reader, writer)
 }
 
 pub fn serve_task<R: BufRead, W: Write>(
     socket: &Path,
     agent_id: &str,
+    attempt_sequence: u64,
+    run_idempotency_key: &str,
     reader: R,
     writer: W,
 ) -> io::Result<()> {
-    serve_routed(socket, agent_id, true, reader, writer)
+    serve_routed(
+        socket,
+        agent_id,
+        true,
+        Some((attempt_sequence, run_idempotency_key)),
+        reader,
+        writer,
+    )
 }
 
 fn serve_routed<R: BufRead, W: Write>(
     socket: &Path,
     agent_id: &str,
     task_scoped: bool,
+    progress_identity: Option<(u64, &str)>,
     mut reader: R,
     mut writer: W,
 ) -> io::Result<()> {
@@ -89,11 +99,19 @@ fn serve_routed<R: BufRead, W: Write>(
             "tools/list" => json!({
                 "jsonrpc":"2.0",
                 "id":id,
-                "result":{"tools": tool_definitions()}
+                "result":{"tools": tool_definitions(task_scoped)}
             }),
             "tools/call" => {
                 sequence = sequence.saturating_add(1);
-                call_tool(&client, agent_id, task_scoped, sequence, &value, id)
+                call_tool(
+                    &client,
+                    agent_id,
+                    task_scoped,
+                    progress_identity,
+                    sequence,
+                    &value,
+                    id,
+                )
             }
             _ => json!({
                 "jsonrpc":"2.0",
@@ -152,6 +170,7 @@ fn call_tool(
     client: &RpcClient,
     agent_id: &str,
     task_scoped: bool,
+    progress_identity: Option<(u64, &str)>,
     sequence: u64,
     request: &Value,
     id: Value,
@@ -172,10 +191,20 @@ fn call_tool(
     ) {
         return invalid_params(id);
     }
-    let arguments = params
+    let mut arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if name == REVIEW_PROGRESS {
+        let Some((attempt_sequence, run_idempotency_key)) = progress_identity else {
+            return invalid_params(id);
+        };
+        let Some(object) = arguments.as_object_mut() else {
+            return invalid_params(id);
+        };
+        object.insert("attempt_sequence".into(), json!(attempt_sequence));
+        object.insert("run_idempotency_key".into(), json!(run_idempotency_key));
+    }
     let input = ReviewToolInput {
         agent_id: agent_id.to_owned(),
         tool: name.to_owned(),
@@ -237,7 +266,7 @@ fn write_response(writer: &mut impl Write, response: &Value) -> io::Result<()> {
     writer.flush()
 }
 
-fn tool_definitions() -> Value {
+fn tool_definitions(task_scoped: bool) -> Value {
     let id = || {
         json!({
             "type":"string",
@@ -262,7 +291,7 @@ fn tool_definitions() -> Value {
         })
     };
     let text_array = || json!({"type":"array","maxItems":MAX_TOOL_ITEMS,"items":text()});
-    json!([
+    let mut tools = json!([
         {
             "name": REVIEW_CHECKPOINT,
             "description": "Record one observable evidence checkpoint.",
@@ -348,17 +377,22 @@ fn tool_definitions() -> Value {
             "description": "Record bounded semantic progress for the current review attempt.",
             "inputSchema": {
                 "type":"object","additionalProperties":false,
-                "required":["attempt_sequence","run_idempotency_key","stage","summary"],
+                "required":["stage","summary"],
                 "properties":{
-                    "attempt_sequence":{"type":"integer","minimum":1,"maximum":18446744073709551615u64},
-                    "run_idempotency_key":id(),
                     "stage":{"enum":["scope","inspection","validation","synthesis"]},
                     "summary":text(),
                     "counters":{"type":"object","maxProperties":16,"additionalProperties":{"type":"integer","minimum":0,"maximum":1000000000}}
                 }
             }
         }
-    ])
+    ]);
+    if !task_scoped {
+        tools
+            .as_array_mut()
+            .expect("tool inventory is an array")
+            .retain(|tool| tool["name"] != REVIEW_PROGRESS);
+    }
+    tools
 }
 
 #[cfg(all(test, unix))]
@@ -431,7 +465,7 @@ mod tests {
 
     #[test]
     fn advertised_tool_schemas_match_rust_shape_constraints() {
-        let definitions = tool_definitions();
+        let definitions = tool_definitions(true);
         let definitions = definitions.as_array().unwrap();
         let cases = [
             (
@@ -698,8 +732,7 @@ mod tests {
                 REVIEW_CHECKPOINT,
                 REVIEW_FINDING_UPSERT,
                 REVIEW_VALIDATION_RECORD,
-                REVIEW_FINALIZE,
-                REVIEW_PROGRESS
+                REVIEW_FINALIZE
             ]
         );
         assert_eq!(responses[2]["result"]["isError"], false);

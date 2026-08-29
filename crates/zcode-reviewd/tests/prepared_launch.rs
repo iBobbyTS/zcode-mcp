@@ -272,6 +272,8 @@ fn v2_review_attempt_enforces_effective_turn_budget_and_releases_slot() {
         &prepared,
         BudgetRequest::Limits(EffectiveBudget {
             wall_time_ms: 10_000,
+            semantic_soft_timeout_ms: 300_000,
+            semantic_hard_timeout_ms: 600_000,
             max_turns: 1,
             max_tool_calls: 10,
             max_context_bytes: 1_048_576,

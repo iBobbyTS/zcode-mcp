@@ -1183,6 +1183,8 @@ fn store_budget(budget: Option<&BudgetLimits>) -> BudgetRequest {
     budget.map_or(BudgetRequest::Omitted, |budget| {
         BudgetRequest::Limits(EffectiveBudget {
             wall_time_ms: budget.wall_time_ms,
+            semantic_soft_timeout_ms: budget.semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms: budget.semantic_hard_timeout_ms,
             max_turns: budget.max_turns,
             max_tool_calls: budget.max_tool_calls,
             max_context_bytes: budget.max_context_bytes,

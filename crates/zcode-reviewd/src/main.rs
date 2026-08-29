@@ -225,6 +225,8 @@ fn file_sha256(path: &Path) -> io::Result<String> {
 fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
     let mut socket = None;
     let mut agent_id = None;
+    let mut attempt_sequence = None;
+    let mut run_idempotency_key = None;
     let mut arguments = env::args_os().skip(2);
     while let Some(argument) = arguments.next() {
         let value = arguments.next().ok_or_else(|| {
@@ -237,9 +239,12 @@ fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
             "--socket" => socket = Some(PathBuf::from(value)),
             "--agent-id" => agent_id = Some(value.to_string_lossy().into_owned()),
             "--attempt-sequence" => {
-                value.to_string_lossy().parse::<u64>().map_err(|_| {
+                attempt_sequence = Some(value.to_string_lossy().parse::<u64>().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "attempt sequence is invalid")
-                })?;
+                })?);
+            }
+            "--run-idempotency-key" => {
+                run_idempotency_key = Some(value.to_string_lossy().into_owned())
             }
             _ => {
                 return Err(io::Error::new(
@@ -259,6 +264,18 @@ fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
         ledger_mcp::serve_task(
             &socket,
             &agent_id,
+            attempt_sequence.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--attempt-sequence is required",
+                )
+            })?,
+            run_idempotency_key.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--run-idempotency-key is required",
+                )
+            })?,
             BufReader::new(stdin.lock()),
             stdout.lock(),
         )

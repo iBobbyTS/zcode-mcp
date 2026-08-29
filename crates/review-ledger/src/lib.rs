@@ -401,43 +401,9 @@ impl LedgerManager {
                     .finalize_review(agent_id, input.signal.as_str(), &json, &hash)?
             }
             REVIEW_PROGRESS => {
-                let input: ProgressInput = serde_json::from_value(arguments)?;
-                validate_progress(&input)?;
-                let counters_json = input
-                    .counters
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()?;
-                let mutation =
-                    self.store
-                        .record_review_progress(&review_store::ReviewProgressWrite {
-                            agent_id: agent_id.to_owned(),
-                            attempt_sequence: input.attempt_sequence,
-                            run_idempotency_key: input.run_idempotency_key,
-                            stage: checkpoint_stage_name(&input.stage).into(),
-                            summary: input.summary,
-                            counters_json,
-                        })?;
-                return Ok(ToolResult {
-                    tool: tool.to_owned(),
-                    disposition: match mutation.disposition {
-                        review_store::ReviewProgressDisposition::Applied => {
-                            ToolDisposition::Applied
-                        }
-                        review_store::ReviewProgressDisposition::Duplicate => {
-                            ToolDisposition::Duplicate
-                        }
-                    },
-                    report_revision: self
-                        .store
-                        .review_report_state(agent_id)?
-                        .map(|state| state.current_revision)
-                        .unwrap_or_default(),
-                    finalized: self
-                        .store
-                        .review_report_state(agent_id)?
-                        .is_some_and(|state| state.finalized),
-                });
+                return Err(LedgerError::InvalidInput(
+                    "review progress requires daemon task routing".into(),
+                ));
             }
             _ => {
                 return Err(LedgerError::InvalidInput(
@@ -452,6 +418,13 @@ impl LedgerManager {
             report_revision: report.current_revision,
             finalized: report.finalized,
         })
+    }
+
+    pub fn validate_progress_input(arguments: &Value) -> LedgerResult<ProgressInput> {
+        validate_payload(arguments)?;
+        let input: ProgressInput = serde_json::from_value(arguments.clone())?;
+        validate_progress(&input)?;
+        Ok(input)
     }
 
     pub fn recover(&self, agent_id: &str) -> LedgerResult<ReviewReportState> {
@@ -696,15 +669,6 @@ fn validate_progress(input: &ProgressInput) -> LedgerResult<()> {
         }
     }
     Ok(())
-}
-
-fn checkpoint_stage_name(stage: &CheckpointStage) -> &'static str {
-    match stage {
-        CheckpointStage::Scope => "scope",
-        CheckpointStage::Inspection => "inspection",
-        CheckpointStage::Validation => "validation",
-        CheckpointStage::Synthesis => "synthesis",
-    }
 }
 
 fn validate_payload(value: &Value) -> LedgerResult<()> {

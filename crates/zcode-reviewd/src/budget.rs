@@ -164,6 +164,8 @@ mod tests {
     fn limits() -> BudgetLimits {
         BudgetLimits {
             wall_time_ms: 10_000,
+            semantic_soft_timeout_ms: 300_000,
+            semantic_hard_timeout_ms: 600_000,
             max_turns: 2,
             max_tool_calls: 1,
             max_context_bytes: 1,

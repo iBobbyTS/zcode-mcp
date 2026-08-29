@@ -35,6 +35,10 @@ pub enum GeneralProfile {
 #[serde(deny_unknown_fields)]
 pub struct BudgetLimits {
     pub wall_time_ms: u64,
+    #[serde(default = "default_semantic_soft_timeout_ms")]
+    pub semantic_soft_timeout_ms: u64,
+    #[serde(default = "default_semantic_hard_timeout_ms")]
+    pub semantic_hard_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
@@ -42,11 +46,21 @@ pub struct BudgetLimits {
     pub max_artifact_bytes: u64,
 }
 
+pub const fn default_semantic_soft_timeout_ms() -> u64 {
+    300_000
+}
+
+pub const fn default_semantic_hard_timeout_ms() -> u64 {
+    600_000
+}
+
 impl GeneralProfile {
     pub fn default_budget(self) -> BudgetLimits {
         match self {
             Self::AnalysisReadonly => BudgetLimits {
                 wall_time_ms: 600_000,
+                semantic_soft_timeout_ms: default_semantic_soft_timeout_ms(),
+                semantic_hard_timeout_ms: default_semantic_hard_timeout_ms(),
                 max_turns: 12,
                 max_tool_calls: 80,
                 max_context_bytes: 2_000_000,
@@ -55,6 +69,8 @@ impl GeneralProfile {
             },
             Self::ImplementationWorktree => BudgetLimits {
                 wall_time_ms: 1_800_000,
+                semantic_soft_timeout_ms: default_semantic_soft_timeout_ms(),
+                semantic_hard_timeout_ms: default_semantic_hard_timeout_ms(),
                 max_turns: 32,
                 max_tool_calls: 240,
                 max_context_bytes: 4_000_000,
@@ -63,6 +79,8 @@ impl GeneralProfile {
             },
             Self::TestRunner => BudgetLimits {
                 wall_time_ms: 900_000,
+                semantic_soft_timeout_ms: default_semantic_soft_timeout_ms(),
+                semantic_hard_timeout_ms: default_semantic_hard_timeout_ms(),
                 max_turns: 16,
                 max_tool_calls: 120,
                 max_context_bytes: 2_000_000,
@@ -76,6 +94,8 @@ impl GeneralProfile {
 fn hard_budget_cap() -> BudgetLimits {
     BudgetLimits {
         wall_time_ms: 86_400_000,
+        semantic_soft_timeout_ms: 86_399_999,
+        semantic_hard_timeout_ms: 86_400_000,
         max_turns: 1_024,
         max_tool_calls: 4_096,
         max_context_bytes: 16_777_216,

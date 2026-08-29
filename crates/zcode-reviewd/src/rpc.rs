@@ -2204,6 +2204,8 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
         profile_defaults,
         hard_budget_caps: BudgetLimits {
             wall_time_ms: 86_400_000,
+            semantic_soft_timeout_ms: 86_399_999,
+            semantic_hard_timeout_ms: 86_400_000,
             max_turns: 1_024,
             max_tool_calls: 4_096,
             max_context_bytes: 16_777_216,

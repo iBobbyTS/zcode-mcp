@@ -16,7 +16,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Barrier},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Barrier,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,8 +35,25 @@ use zcode_reviewd::{
         ReviewToolInput, RpcErrorCode, RpcMethod, RpcServer, RpcService, RpcSuccess, ServerOptions,
         TaskArtifactQuery,
     },
-    CommandRuntimeFactory, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
+    CommandRuntimeFactory, InternalLedgerMcpConfig, MonotonicClock, RuntimeFactory, Scheduler,
+    SchedulerConfig,
 };
+
+#[derive(Default)]
+struct TestClock(AtomicU64);
+
+impl TestClock {
+    fn advance(&self, duration: Duration) {
+        self.0
+            .fetch_add(duration.as_millis() as u64, Ordering::AcqRel);
+    }
+}
+
+impl MonotonicClock for TestClock {
+    fn now(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Acquire))
+    }
+}
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -44,6 +64,8 @@ struct Fixture {
     service: RpcService,
     _server: RpcServer,
     _policy_env: Option<PolicyEnvGuard>,
+    semantic_timeouts: Option<(Duration, Duration)>,
+    monotonic_clock: Option<Arc<TestClock>>,
 }
 
 static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -150,6 +172,7 @@ impl Fixture {
         _policy_env: Option<PolicyEnvGuard>,
         semantic_timeouts: Option<(Duration, Duration)>,
     ) -> Self {
+        let monotonic_clock = semantic_timeouts.map(|_| Arc::new(TestClock::default()));
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         fs::create_dir_all(repository.join("src")).unwrap();
@@ -246,9 +269,9 @@ impl Fixture {
             },
         )
         .unwrap();
-        if let Some((soft_stale, hard_timeout)) = semantic_timeouts {
+        if let Some(clock) = monotonic_clock.as_ref() {
             scheduler = scheduler
-                .with_semantic_timeouts(soft_stale, hard_timeout)
+                .with_monotonic_clock(Arc::clone(clock) as Arc<dyn MonotonicClock>)
                 .unwrap();
         }
         let scheduler = scheduler
@@ -273,6 +296,8 @@ impl Fixture {
             service,
             _server: server,
             _policy_env,
+            semantic_timeouts,
+            monotonic_clock,
         }
     }
 
@@ -306,6 +331,9 @@ impl Fixture {
     }
 
     fn structured_submission(&self, suffix: &str) -> StructuredReviewSubmission {
+        let (soft, hard) = self
+            .semantic_timeouts
+            .unwrap_or((Duration::from_secs(300), Duration::from_secs(600)));
         StructuredReviewSubmission {
             review_kind: StructuredReviewKind::InitialBounded,
             manifest: self.manifest(suffix, "S04"),
@@ -313,6 +341,8 @@ impl Fixture {
             read_only: true,
             budget: Some(BudgetLimits {
                 wall_time_ms: 5_000,
+                semantic_soft_timeout_ms: soft.as_millis() as u64,
+                semantic_hard_timeout_ms: hard.as_millis() as u64,
                 max_turns: 8,
                 max_tool_calls: 32,
                 max_context_bytes: 1_048_576,
@@ -339,6 +369,8 @@ impl Fixture {
             read_only: true,
             budget: Some(BudgetLimits {
                 wall_time_ms: 7_000,
+                semantic_soft_timeout_ms: 300_000,
+                semantic_hard_timeout_ms: 600_000,
                 max_turns: 12,
                 max_tool_calls: 48,
                 max_context_bytes: 1_048_576,
@@ -583,6 +615,13 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
         fixture.scheduler.start_ready().unwrap(),
         vec![execution_id.to_owned()]
     );
+    let run_id = fixture
+        .store
+        .get_job(execution_id)
+        .unwrap()
+        .unwrap()
+        .runtime_agent_id
+        .unwrap();
     let progress = fixture
         .service
         .dispatch(RpcMethod::TaskReviewTool(ReviewToolInput {
@@ -590,7 +629,7 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
             tool: REVIEW_PROGRESS.into(),
             arguments: serde_json::json!({
                 "attempt_sequence": 1,
-                "run_idempotency_key": "fake-runtime-run",
+                "run_idempotency_key": run_id,
                 "stage": "inspection",
                 "summary": "inspected fixture",
                 "counters": {"files": 2}
@@ -686,6 +725,21 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
         fixture.scheduler.start_ready().unwrap(),
         vec![execution.clone()]
     );
+    let running = fixture.store.get_job(&execution).unwrap().unwrap();
+    let identity = running.process_identity.clone().unwrap();
+    let worktree = PathBuf::from(&running.workspace_path);
+    let clock = fixture.monotonic_clock.as_ref().unwrap();
+    clock.advance(Duration::from_millis(31));
+    wait_until(|| {
+        fixture
+            .store
+            .review_progress(&execution)
+            .unwrap()
+            .filter(|progress| progress.nudge_sent)
+    });
+    // A much larger than 900s logical duration is represented with the
+    // injected monotonic clock; no wall-clock sleep is involved.
+    clock.advance(Duration::from_secs(901));
     let terminal = fixture.wait_terminal(&execution);
     assert_eq!(terminal.state, JobState::Failed);
     assert_eq!(terminal.failure_code.as_deref(), Some("TIMEOUT"));
@@ -696,6 +750,72 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
         .residual_gaps
         .contains(&"SEMANTIC_PROGRESS_TIMEOUT".into()));
     assert_eq!(fixture.scheduler.active_count(), 0);
+    assert!(observe_process_group(identity.process_group_id)
+        .unwrap()
+        .is_empty());
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn semantic_progress_spans_over_900_logical_seconds_without_timeout() {
+    let fixture =
+        Fixture::new_with_semantic_timeouts(Duration::from_secs(300), Duration::from_secs(600));
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission("semantic-timeout"),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let task = fixture.store.get_task(&review.agent_id).unwrap().unwrap();
+    let execution = task.execution_agent_id;
+    fixture.scheduler.start_ready().unwrap();
+    let run_id = fixture
+        .store
+        .get_job(&execution)
+        .unwrap()
+        .unwrap()
+        .runtime_agent_id
+        .unwrap();
+    let clock = fixture.monotonic_clock.as_ref().unwrap();
+    for (stage, summary) in [
+        ("inspection", "inspection advanced"),
+        ("validation", "validation advanced"),
+        ("synthesis", "synthesis advanced"),
+    ] {
+        clock.advance(Duration::from_secs(299));
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskReviewTool(ReviewToolInput {
+                agent_id: execution.clone(),
+                tool: REVIEW_PROGRESS.into(),
+                arguments: serde_json::json!({
+                    "attempt_sequence": task.attempt_sequence,
+                    "run_idempotency_key": run_id,
+                    "stage": stage,
+                    "summary": summary
+                }),
+            }))
+            .unwrap();
+    }
+    clock.advance(Duration::from_secs(5));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fixture.store.get_job(&execution).unwrap().unwrap().state,
+        JobState::Running
+    );
+    assert!(
+        !fixture
+            .store
+            .review_progress(&execution)
+            .unwrap()
+            .unwrap()
+            .nudge_sent
+    );
+    fixture.scheduler.close_job(&execution).unwrap();
 }
 
 #[test]
@@ -1087,6 +1207,8 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         attachments: Vec::new(),
         budget: Some(BudgetLimits {
             wall_time_ms: 7_000,
+            semantic_soft_timeout_ms: 300_000,
+            semantic_hard_timeout_ms: 600_000,
             max_turns: 12,
             max_tool_calls: 48,
             max_context_bytes: 1_048_576,

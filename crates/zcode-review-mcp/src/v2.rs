@@ -106,6 +106,10 @@ impl From<PublicProfile> for GeneralProfile {
 #[schemars(deny_unknown_fields)]
 pub struct PublicBudget {
     pub wall_time_ms: u64,
+    #[serde(default = "review_preparation::default_semantic_soft_timeout_ms")]
+    pub semantic_soft_timeout_ms: u64,
+    #[serde(default = "review_preparation::default_semantic_hard_timeout_ms")]
+    pub semantic_hard_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
@@ -117,6 +121,8 @@ impl From<PublicBudget> for BudgetLimits {
     fn from(value: PublicBudget) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
+            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -130,6 +136,8 @@ impl From<BudgetLimits> for PublicBudget {
     fn from(value: BudgetLimits) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
+            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -143,6 +151,8 @@ impl From<EffectiveBudget> for PublicBudget {
     fn from(value: EffectiveBudget) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
+            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -1801,6 +1811,8 @@ mod tests {
             attempt_sequence: 1,
             effective_budget: EffectiveBudget {
                 wall_time_ms: 1,
+                semantic_soft_timeout_ms: 300_000,
+                semantic_hard_timeout_ms: 600_000,
                 max_turns: 1,
                 max_tool_calls: 1,
                 max_context_bytes: 1,

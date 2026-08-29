@@ -2,12 +2,10 @@ use review_ledger::{LedgerError, LedgerManager, ToolResult, VerifiedArtifact, RE
 use review_store::{
     ArtifactKind, BudgetRequest, DeliveryClaim, EffectiveBudget, Job, JobClaim, JobState,
     LifecycleWrite, MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
-    ResultArtifact, ReviewProgressState, Store, StoreError, StoredMessage, StoredProcessIdentity,
-    TaskKind, TaskOutcome, TaskRecord, TaskResult, TaskSubmissionDisposition, TerminalUpdate,
-    TurnState,
+    ResultArtifact, Store, StoreError, StoredMessage, StoredProcessIdentity, TaskKind, TaskOutcome,
+    TaskRecord, TaskResult, TaskSubmissionDisposition, TerminalUpdate, TurnState,
 };
 use serde::Deserialize;
-use serde_json::json;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io,
@@ -18,7 +16,7 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard, TryLockError,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use zcode_driver::{
     observe_process, observe_process_group, ChildExit, Driver, Inbound, ProcessIdentity,
@@ -160,7 +158,12 @@ impl InternalLedgerMcpConfig {
         }
     }
 
-    pub fn task_server_for(&self, agent_id: &str, attempt_sequence: u64) -> StdioMcpServer {
+    pub fn task_server_for(
+        &self,
+        agent_id: &str,
+        attempt_sequence: u64,
+        run_idempotency_key: &str,
+    ) -> StdioMcpServer {
         StdioMcpServer {
             name: "review-ledger".into(),
             command: self.command.to_string_lossy().into_owned(),
@@ -172,6 +175,8 @@ impl InternalLedgerMcpConfig {
                 agent_id.into(),
                 "--attempt-sequence".into(),
                 attempt_sequence.to_string(),
+                "--run-idempotency-key".into(),
+                run_idempotency_key.into(),
             ],
             env: Vec::new(),
         }
@@ -1524,8 +1529,19 @@ pub struct SchedulerConfig {
     pub control_timeout: Duration,
 }
 
-pub const DEFAULT_SEMANTIC_SOFT_STALE: Duration = Duration::from_secs(300);
-pub const DEFAULT_SEMANTIC_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+pub trait MonotonicClock: Send + Sync + 'static {
+    fn now(&self) -> Duration;
+}
+
+struct ProcessMonotonicClock {
+    origin: Instant,
+}
+
+impl MonotonicClock for ProcessMonotonicClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -1637,8 +1653,7 @@ struct SchedulerInner {
     store: Arc<Store>,
     factory: Arc<dyn RuntimeFactory>,
     config: SchedulerConfig,
-    semantic_soft_stale: Duration,
-    semantic_hard_timeout: Duration,
+    monotonic_clock: Arc<dyn MonotonicClock>,
     ledger: Option<Arc<LedgerManager>>,
     ledger_mcp: Option<InternalLedgerMcpConfig>,
     review_completion: Option<Arc<orchestration::ReviewCompletionGate>>,
@@ -1666,6 +1681,11 @@ struct ActiveRuntime {
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     check: Arc<ActiveCheck>,
     budget: Option<Arc<AttemptBudget>>,
+    semantic_progress: Option<Arc<Mutex<SemanticProgressClock>>>,
+}
+
+struct SemanticProgressClock {
+    last_advanced: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -1722,6 +1742,7 @@ struct MonitorContext {
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     budget: Option<Arc<AttemptBudget>>,
     check: Arc<ActiveCheck>,
+    semantic_progress: Option<Arc<Mutex<SemanticProgressClock>>>,
 }
 
 type ActiveSession = (u64, Arc<dyn ManagedRuntime>, String, Arc<Mutex<()>>);
@@ -1965,42 +1986,6 @@ impl StoreLifecycleSink {
             .get_job(&self.agent_id)?
             .map(|job| job.state)
             .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()))
-    }
-
-    fn record_progress(&self, state: &ReviewProgressState) -> Result<(), StoreError> {
-        let mut write_state = self.write_state.lock().unwrap();
-        if write_state.first_error.is_some() || write_state.terminal_written {
-            return Err(StoreError::Conflict(
-                "review progress arrived after lifecycle termination".into(),
-            ));
-        }
-        // Runtime driver sequences start at one and are independent of the
-        // semantic ingress. Keep progress source ids in a disjoint range so a
-        // concurrent driver event can never be mistaken for a duplicate.
-        let source_sequence = (1u64 << 62).saturating_add(write_state.progress_source_sequence);
-        write_state.progress_source_sequence =
-            write_state.progress_source_sequence.saturating_add(1);
-        let payload_json = json!({
-            "stage": state.stage,
-            "summary": state.summary,
-            "counters": state.counters_json.as_deref().and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()),
-            "attempt_sequence": state.attempt_sequence,
-            "updated_at": state.updated_at,
-        })
-        .to_string();
-        self.store.append_lifecycle(&LifecycleWrite {
-            agent_id: self.agent_id.clone(),
-            runtime_agent_id: self.runtime_agent_id.clone(),
-            owner_epoch: self.owner_epoch,
-            source_sequence,
-            event_type: "review.progress".into(),
-            turn_id: None,
-            payload_json,
-            redaction_level: "allowlisted".into(),
-            terminal: None,
-            turn_state: None,
-        })?;
-        Ok(())
     }
 
     fn finish_general(
@@ -2485,14 +2470,6 @@ fn runtime_loss_redaction(loss: &RuntimeLoss) -> &'static str {
     }
 }
 
-fn semantic_progress_age(updated_at: i64) -> Duration {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(updated_at);
-    Duration::from_millis(now.saturating_sub(updated_at).max(0) as u64)
-}
-
 fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
     match terminal {
         RuntimeTerminal::Stopped(_) => TerminalUpdate {
@@ -2634,8 +2611,9 @@ impl Scheduler {
                 store,
                 factory,
                 config,
-                semantic_soft_stale: DEFAULT_SEMANTIC_SOFT_STALE,
-                semantic_hard_timeout: DEFAULT_SEMANTIC_HARD_TIMEOUT,
+                monotonic_clock: Arc::new(ProcessMonotonicClock {
+                    origin: Instant::now(),
+                }),
                 ledger: None,
                 ledger_mcp: None,
                 review_completion: None,
@@ -2660,26 +2638,16 @@ impl Scheduler {
         Ok(self)
     }
 
-    /// Test/embedding seam for bounded semantic-timeout profiles. Production
-    /// uses the 300s/600s defaults; this remains on the existing scheduler
-    /// owner and does not add a new service or public protocol.
-    pub fn with_semantic_timeouts(
+    pub fn with_monotonic_clock(
         mut self,
-        soft_stale: Duration,
-        hard_timeout: Duration,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Result<Self, SchedulerError> {
-        if soft_stale.is_zero() || hard_timeout <= soft_stale {
-            return Err(SchedulerError::InvalidConfig(
-                "semantic timeout profile must be positive with hard > soft".into(),
-            ));
-        }
         let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
             SchedulerError::InvalidConfig(
-                "semantic timeout profile must attach before scheduler cloning".into(),
+                "monotonic clock must attach before scheduler cloning".into(),
             )
         })?;
-        inner.semantic_soft_stale = soft_stale;
-        inner.semantic_hard_timeout = hard_timeout;
+        inner.monotonic_clock = clock;
         Ok(self)
     }
 
@@ -2845,6 +2813,8 @@ impl Scheduler {
         job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
         let budget = EffectiveBudget {
             wall_time_ms: prepared.effective_budget.wall_time_ms,
+            semantic_soft_timeout_ms: prepared.effective_budget.semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms: prepared.effective_budget.semantic_hard_timeout_ms,
             max_turns: prepared.effective_budget.max_turns,
             max_tool_calls: prepared.effective_budget.max_tool_calls,
             max_context_bytes: prepared.effective_budget.max_context_bytes,
@@ -3151,6 +3121,7 @@ impl Scheduler {
                     vec![config.task_server_for(
                         &claim.job.agent_id,
                         task.as_ref().map(|task| task.attempt_sequence).unwrap_or(1),
+                        &runtime_agent_id,
                     )]
                 }
                 TaskRoute::Review(_) => vec![config.server_for(&claim.job.agent_id)],
@@ -3250,6 +3221,17 @@ impl Scheduler {
             start_token: identity.start_token,
         });
         let operation = Arc::new(Mutex::new(()));
+        let semantic_progress = task.as_ref().and_then(|task| {
+            matches!(
+                task.task_kind,
+                TaskKind::Review | TaskKind::ReviewContinuation
+            )
+            .then(|| {
+                Arc::new(Mutex::new(SemanticProgressClock {
+                    last_advanced: self.inner.monotonic_clock.now(),
+                }))
+            })
+        });
         let general_submission = Arc::new(Mutex::new(None));
         let check = Arc::new(ActiveCheck::default());
         let ready_turn_state = match runtime.turn_snapshot() {
@@ -3276,6 +3258,7 @@ impl Scheduler {
                     general_submission: Arc::clone(&general_submission),
                     check: Arc::clone(&check),
                     budget: budget.as_ref().map(Arc::clone),
+                    semantic_progress: semantic_progress.as_ref().map(Arc::clone),
                 },
             );
         }
@@ -3363,11 +3346,11 @@ impl Scheduler {
                 return Err(SchedulerError::InvalidConfig(error.to_string()));
             }
             if let Some(task) = task.as_ref() {
-                if let Err(error) = self
-                    .inner
-                    .store
-                    .initialize_review_progress(&claim.job.agent_id, task.attempt_sequence)
-                {
+                if let Err(error) = self.inner.store.initialize_review_progress(
+                    &claim.job.agent_id,
+                    task.attempt_sequence,
+                    &runtime_agent_id,
+                ) {
                     let _ = self.cleanup_registered_runtime(
                         &claim.job.agent_id,
                         claim.owner_epoch,
@@ -3417,6 +3400,7 @@ impl Scheduler {
             general_submission,
             budget,
             check,
+            semantic_progress,
         });
         Ok(true)
     }
@@ -3978,6 +3962,7 @@ impl Scheduler {
             general_submission,
             budget,
             check,
+            semantic_progress,
         } = context;
         let scheduler = self.clone();
         thread::spawn(move || {
@@ -4017,66 +4002,81 @@ impl Scheduler {
                     }
                     return;
                 }
-                if task.as_ref().is_some_and(|task| {
-                    matches!(
-                        task.task_kind,
-                        TaskKind::Review | TaskKind::ReviewContinuation
-                    )
-                }) {
-                    match scheduler.inner.store.review_progress(&agent_id) {
-                        Ok(Some(progress)) => {
-                            let age = semantic_progress_age(progress.updated_at);
-                            if age >= scheduler.inner.semantic_hard_timeout {
-                                check.cancel();
-                                let _guard = operation.lock().unwrap();
-                                let terminal = runtime.stop(scheduler.inner.config.stop_grace);
-                                if let Err(error) = scheduler.finish_locked_monitor_terminal(
-                                    &agent_id,
-                                    owner_epoch,
-                                    &runtime,
-                                    &sink,
-                                    &route,
-                                    task.as_ref(),
-                                    terminal,
-                                    false,
-                                    None,
-                                    Some((
-                                        CompletionOutcome::TimedOut,
-                                        "SEMANTIC_PROGRESS_TIMEOUT".into(),
-                                    )),
-                                ) {
-                                    scheduler.record_failure(&agent_id, error.to_string());
-                                }
-                                scheduler.release_active(&agent_id, owner_epoch);
-                                if let Err(error) = scheduler.start_ready() {
-                                    scheduler.record_failure(&agent_id, error.to_string());
-                                }
-                                return;
-                            }
-                            if age >= scheduler.inner.semantic_soft_stale && !progress.nudge_sent {
-                                let _guard = operation.lock().unwrap();
-                                if !runtime.turn_snapshot().active {
-                                    match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
-                                        Ok(true) => {
-                                            if let Err(error) = runtime.send_turn(
-                                                &session_id,
-                                                "Provide one bounded semantic progress update via review_progress.",
-                                                scheduler.inner.config.control_timeout,
-                                            ) {
-                                                scheduler.record_failure(
-                                                    &agent_id,
-                                                    format!("semantic progress nudge failed: {error}"),
-                                                );
-                                            }
-                                        }
-                                        Ok(false) => {}
-                                        Err(error) => scheduler.record_failure(&agent_id, error.to_string()),
-                                    }
-                                }
-                            }
+                if let (Some(task), Some(semantic_progress)) =
+                    (task.as_ref(), semantic_progress.as_ref())
+                {
+                    let now = scheduler.inner.monotonic_clock.now();
+                    let elapsed =
+                        now.saturating_sub(semantic_progress.lock().unwrap().last_advanced);
+                    let soft =
+                        Duration::from_millis(task.effective_budget.semantic_soft_timeout_ms);
+                    let hard =
+                        Duration::from_millis(task.effective_budget.semantic_hard_timeout_ms);
+                    if elapsed >= soft {
+                        let _guard = operation.lock().unwrap();
+                        let current = scheduler.inner.store.get_job(&agent_id);
+                        let latest_elapsed = scheduler
+                            .inner
+                            .monotonic_clock
+                            .now()
+                            .saturating_sub(semantic_progress.lock().unwrap().last_advanced);
+                        let still_current = current
+                            .as_ref()
+                            .ok()
+                            .and_then(|job| job.as_ref())
+                            .is_some_and(|job| {
+                                job.owner_epoch == owner_epoch
+                                    && job.state == JobState::Running
+                                    && !job.stop_requested
+                                    && !job.close_requested
+                            });
+                        if !still_current || latest_elapsed < soft {
+                            continue;
                         }
-                        Ok(None) => {}
-                        Err(error) => scheduler.record_failure(&agent_id, error.to_string()),
+                        if latest_elapsed >= hard {
+                            check.cancel();
+                            let terminal = runtime.stop(scheduler.inner.config.stop_grace);
+                            if let Err(error) = scheduler.finish_locked_monitor_terminal(
+                                &agent_id,
+                                owner_epoch,
+                                &runtime,
+                                &sink,
+                                &route,
+                                Some(task),
+                                terminal,
+                                false,
+                                None,
+                                Some((
+                                    CompletionOutcome::TimedOut,
+                                    "SEMANTIC_PROGRESS_TIMEOUT".into(),
+                                )),
+                            ) {
+                                scheduler.record_failure(&agent_id, error.to_string());
+                            }
+                            scheduler.release_active(&agent_id, owner_epoch);
+                            if let Err(error) = scheduler.start_ready() {
+                                scheduler.record_failure(&agent_id, error.to_string());
+                            }
+                            return;
+                        }
+                        match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
+                            Ok(true) => {
+                                let nudge_timeout = scheduler.inner.config.control_timeout / 2;
+                                let stopped = runtime.stop_turn(&session_id, nudge_timeout);
+                                if let Err(error) = stopped.and_then(|_| runtime.send_turn(
+                                    &session_id,
+                                    "Provide one bounded semantic progress update via review_progress.",
+                                    nudge_timeout,
+                                )) {
+                                    scheduler.record_failure(
+                                        &agent_id,
+                                        format!("semantic progress nudge failed: {error}"),
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => scheduler.record_failure(&agent_id, error.to_string()),
+                        }
                     }
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
@@ -4303,7 +4303,7 @@ impl Scheduler {
             ));
         }
         let deadline = self.control_deadline();
-        let (owner_epoch, runtime, sink, operation, route, task) = {
+        let (owner_epoch, runtime, sink, operation, route, task, semantic_clock) = {
             let state = self.inner.state.lock().unwrap();
             let active =
                 state
@@ -4332,6 +4332,7 @@ impl Scheduler {
                 Arc::clone(&active.operation),
                 active.route.clone(),
                 active.task.clone(),
+                active.semantic_progress.as_ref().map(Arc::clone),
             )
         };
         let _guard = self.lock_operation(agent_id, &operation, deadline)?;
@@ -4356,37 +4357,77 @@ impl Scheduler {
         let ledger = self.inner.ledger.as_ref().ok_or_else(|| {
             SchedulerError::InvalidConfig("internal review ledger is unavailable".into())
         })?;
-        let progress_input = if tool == review_ledger::REVIEW_PROGRESS {
-            Some(
-                serde_json::from_value::<review_ledger::ProgressInput>(arguments.clone())
-                    .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?,
-            )
-        } else {
-            None
-        };
-        match ledger.call_tool(agent_id, tool, arguments) {
-            Ok(result) => {
-                if matches!(result.disposition, review_ledger::ToolDisposition::Applied) {
-                    if let Some(input) = progress_input {
-                        if let Some(progress) = self.inner.store.review_progress(agent_id)? {
-                            // Duplicate/rate-limited heartbeats are intentionally
-                            // not projected as new lifecycle events.
-                            if progress.run_idempotency_key == input.run_idempotency_key
-                                && progress.stage
-                                    == match input.stage {
-                                        review_ledger::CheckpointStage::Scope => "scope",
-                                        review_ledger::CheckpointStage::Inspection => "inspection",
-                                        review_ledger::CheckpointStage::Validation => "validation",
-                                        review_ledger::CheckpointStage::Synthesis => "synthesis",
-                                    }
-                            {
-                                let _ = sink.record_progress(&progress);
-                            }
-                        }
-                    }
-                }
-                Ok(result)
+        if tool == review_ledger::REVIEW_PROGRESS {
+            let input = review_ledger::LedgerManager::validate_progress_input(&arguments)
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+            if input.attempt_sequence != durable_task.attempt_sequence
+                || current.runtime_agent_id.as_deref() != Some(input.run_idempotency_key.as_str())
+            {
+                return Err(SchedulerError::InvalidConfig(
+                    "review progress identity does not match the current execution".into(),
+                ));
             }
+            let counters_json = input
+                .counters
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+            let stage = match input.stage {
+                review_ledger::CheckpointStage::Scope => "scope",
+                review_ledger::CheckpointStage::Inspection => "inspection",
+                review_ledger::CheckpointStage::Validation => "validation",
+                review_ledger::CheckpointStage::Synthesis => "synthesis",
+            };
+            let source_sequence = (1u64 << 62)
+                .saturating_add(sink.write_state.lock().unwrap().progress_source_sequence);
+            let mutation = self.inner.store.record_review_progress_event(
+                &review_store::ReviewProgressWrite {
+                    agent_id: agent_id.into(),
+                    attempt_sequence: durable_task.attempt_sequence,
+                    run_idempotency_key: current.runtime_agent_id.clone().ok_or_else(|| {
+                        SchedulerError::InvalidConfig(
+                            "active review run identity is missing".into(),
+                        )
+                    })?,
+                    stage: stage.into(),
+                    summary: input.summary,
+                    counters_json,
+                },
+                current.runtime_agent_id.as_deref().unwrap(),
+                owner_epoch,
+                source_sequence,
+            )?;
+            if matches!(
+                mutation.disposition,
+                review_store::ReviewProgressDisposition::Applied
+            ) {
+                let mut state = sink.write_state.lock().unwrap();
+                state.progress_source_sequence = state.progress_source_sequence.saturating_add(1);
+                if let Some(clock) = semantic_clock {
+                    clock.lock().unwrap().last_advanced = self.inner.monotonic_clock.now();
+                }
+            }
+            let report = self.inner.store.review_report_state(agent_id)?;
+            return Ok(ToolResult {
+                tool: tool.into(),
+                disposition: if matches!(
+                    mutation.disposition,
+                    review_store::ReviewProgressDisposition::Applied
+                ) {
+                    review_ledger::ToolDisposition::Applied
+                } else {
+                    review_ledger::ToolDisposition::Duplicate
+                },
+                report_revision: report
+                    .as_ref()
+                    .map(|state| state.current_revision)
+                    .unwrap_or(0),
+                finalized: report.is_some_and(|state| state.finalized),
+            });
+        }
+        match ledger.call_tool(agent_id, tool, arguments) {
+            Ok(result) => Ok(result),
             Err(error) => {
                 let failure =
                     if tool == REVIEW_FINALIZE && matches!(&error, LedgerError::Conflict(_)) {

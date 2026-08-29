@@ -219,11 +219,6 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     let task_scoped = args
         .iter()
         .any(|value| value.as_str() == Some("--task-ledger-mcp"));
-    let attempt_sequence = args
-        .windows(2)
-        .find(|pair| pair[0].as_str() == Some("--attempt-sequence"))
-        .and_then(|pair| pair[1].as_str())
-        .unwrap_or("1");
     let env = server
         .get("env")
         .and_then(Value::as_array)
@@ -279,7 +274,12 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    if names != LEDGER_TOOLS {
+    let expected_tools = if task_scoped {
+        LEDGER_TOOLS.as_slice()
+    } else {
+        &LEDGER_TOOLS[..4]
+    };
+    if names != expected_tools {
         return Err(io::Error::other("ledger MCP tool list is not exact"));
     }
 
@@ -291,9 +291,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             next_id,
             LEDGER_TOOLS[4],
             json!({
-                "attempt_sequence":attempt_sequence.parse::<u64>().unwrap_or(1),
-                "run_idempotency_key":"fake-runtime-run",
-                "stage":"scope",
+                "stage":"inspection",
                 "summary":"fake runtime started semantic review",
                 "counters":{"files":0}
             }),

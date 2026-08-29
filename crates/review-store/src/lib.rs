@@ -427,11 +427,23 @@ impl TaskKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveBudget {
     pub wall_time_ms: u64,
+    #[serde(default = "default_semantic_soft_timeout_ms")]
+    pub semantic_soft_timeout_ms: u64,
+    #[serde(default = "default_semantic_hard_timeout_ms")]
+    pub semantic_hard_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
     pub max_result_bytes: u64,
     pub max_artifact_bytes: u64,
+}
+
+const fn default_semantic_soft_timeout_ms() -> u64 {
+    300_000
+}
+
+const fn default_semantic_hard_timeout_ms() -> u64 {
+    600_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +592,8 @@ pub struct EnqueuedTask {
 
 const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
     wall_time_ms: 3_600_000,
+    semantic_soft_timeout_ms: default_semantic_soft_timeout_ms(),
+    semantic_hard_timeout_ms: default_semantic_hard_timeout_ms(),
     max_turns: 32,
     max_tool_calls: 128,
     max_context_bytes: 1_048_576,
@@ -588,6 +602,8 @@ const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
 };
 const MAX_BUDGET: EffectiveBudget = EffectiveBudget {
     wall_time_ms: 86_400_000,
+    semantic_soft_timeout_ms: 86_399_999,
+    semantic_hard_timeout_ms: 86_400_000,
     max_turns: 1024,
     max_tool_calls: 4096,
     max_context_bytes: 16_777_216,
@@ -1852,6 +1868,7 @@ impl Store {
         &self,
         agent_id: &str,
         attempt_sequence: u64,
+        run_idempotency_key: &str,
     ) -> StoreResult<ReviewProgressState> {
         if attempt_sequence == 0 {
             return Err(StoreError::InvalidState(
@@ -1862,8 +1879,8 @@ impl Store {
         let now = now_millis();
         connection.execute(
             "INSERT INTO review_progress
-             (agent_id, attempt_sequence, run_idempotency_key, stage, summary, updated_at)
-             VALUES (?1, ?2, '', 'scope', 'review started', ?3)
+            (agent_id, attempt_sequence, run_idempotency_key, stage, summary, updated_at)
+             VALUES (?1, ?2, ?3, 'scope', 'review started', ?4)
              ON CONFLICT(agent_id) DO UPDATE SET
                  attempt_sequence = excluded.attempt_sequence,
                  run_idempotency_key = excluded.run_idempotency_key,
@@ -1872,7 +1889,12 @@ impl Store {
                  counters_json = NULL,
                  updated_at = excluded.updated_at,
                  nudge_sent = 0",
-            params![agent_id, u64_to_i64(attempt_sequence)?, now],
+            params![
+                agent_id,
+                u64_to_i64(attempt_sequence)?,
+                run_idempotency_key,
+                now
+            ],
         )?;
         query_review_progress(&connection, agent_id)?
             .ok_or_else(|| StoreError::InvalidState("review progress was not initialized".into()))
@@ -1920,9 +1942,7 @@ impl Store {
                     "review progress belongs to a different attempt".into(),
                 ));
             }
-            if !existing.run_idempotency_key.is_empty()
-                && existing.run_idempotency_key != write.run_idempotency_key
-            {
+            if existing.run_idempotency_key != write.run_idempotency_key {
                 return Err(StoreError::Conflict(
                     "review progress run idempotency key changed".into(),
                 ));
@@ -1931,6 +1951,20 @@ impl Store {
                 && existing.summary == write.summary
                 && existing.counters_json == write.counters_json;
             if same_semantics && existing.run_idempotency_key == write.run_idempotency_key {
+                transaction.commit()?;
+                return Ok(ReviewProgressMutation {
+                    disposition: ReviewProgressDisposition::Duplicate,
+                    state: existing,
+                });
+            }
+            let old_rank = progress_stage_rank(&existing.stage)?;
+            let new_rank = progress_stage_rank(&write.stage)?;
+            if new_rank < old_rank {
+                return Err(StoreError::Conflict(
+                    "review progress stage regressed".into(),
+                ));
+            }
+            if new_rank == old_rank {
                 transaction.commit()?;
                 return Ok(ReviewProgressMutation {
                     disposition: ReviewProgressDisposition::Duplicate,
@@ -1968,9 +2002,136 @@ impl Store {
         })
     }
 
+    /// Applies a semantic advancement and its high-level event as one SQLite
+    /// transaction. Duplicate/cosmetic updates return without changing either
+    /// the semantic clock or event cursor.
+    pub fn record_review_progress_event(
+        &self,
+        write: &ReviewProgressWrite,
+        runtime_agent_id: &str,
+        owner_epoch: u64,
+        source_sequence: u64,
+    ) -> StoreResult<ReviewProgressMutation> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (state, epoch, _, _) = query_guard(&transaction, &write.agent_id)?;
+        if state.is_terminal() || state != JobState::Running || epoch != owner_epoch {
+            return Err(StoreError::Conflict(
+                "review progress arrived outside the active execution".into(),
+            ));
+        }
+        let (expected_attempt, task_kind): (i64, String) = transaction.query_row(
+            "SELECT attempt_sequence, task_kind FROM task_attempts WHERE execution_agent_id=?1",
+            [&write.agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if expected_attempt != u64_to_i64(write.attempt_sequence)?
+            || !matches!(task_kind.as_str(), "REVIEW" | "REVIEW_CONTINUATION")
+        {
+            return Err(StoreError::Conflict(
+                "review progress identity mismatch".into(),
+            ));
+        }
+        let existing = query_review_progress(&transaction, &write.agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("review progress is not initialized".into()))?;
+        if existing.run_idempotency_key != write.run_idempotency_key {
+            return Err(StoreError::Conflict(
+                "review progress run identity mismatch".into(),
+            ));
+        }
+        let old_rank = progress_stage_rank(&existing.stage)?;
+        let new_rank = progress_stage_rank(&write.stage)?;
+        if new_rank < old_rank {
+            return Err(StoreError::Conflict(
+                "review progress stage regressed".into(),
+            ));
+        }
+        if new_rank == old_rank {
+            transaction.commit()?;
+            return Ok(ReviewProgressMutation {
+                disposition: ReviewProgressDisposition::Duplicate,
+                state: existing,
+            });
+        }
+        let now = now_millis();
+        transaction.execute(
+            "UPDATE review_progress SET stage=?1, summary=?2, counters_json=?3,
+                    updated_at=?4 WHERE agent_id=?5",
+            params![
+                write.stage,
+                write.summary,
+                write.counters_json,
+                now,
+                write.agent_id
+            ],
+        )?;
+        let last_seq: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(e.seq),0) FROM events e JOIN task_attempts t
+             ON t.execution_agent_id=e.agent_id WHERE t.public_agent_id=(SELECT public_agent_id
+             FROM task_attempts WHERE execution_agent_id=?1)",
+            [&write.agent_id],
+            |row| row.get(0),
+        )?;
+        let sequence = last_seq
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidState("event sequence overflow".into()))?;
+        let payload_json = serde_json::json!({
+            "stage": write.stage,
+            "summary": write.summary,
+            "counters": write.counters_json.as_deref().and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()),
+            "attempt_sequence": write.attempt_sequence,
+            "updated_at": now,
+        })
+        .to_string();
+        transaction.execute(
+            "INSERT INTO events (agent_id,runtime_agent_id,seq,source_seq,timestamp,event_type,
+                 turn_id,payload_json,redaction_level,attempt_sequence)
+             VALUES (?1,?2,?3,?4,?5,'review.progress',NULL,?6,'allowlisted',?7)",
+            params![
+                write.agent_id,
+                runtime_agent_id,
+                sequence,
+                u64_to_i64(source_sequence)?,
+                now,
+                payload_json,
+                expected_attempt
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_cursors (agent_id,runtime_agent_id,last_seq) VALUES (?1,?2,?3)
+             ON CONFLICT(agent_id,runtime_agent_id) DO UPDATE SET last_seq=excluded.last_seq",
+            params![write.agent_id, runtime_agent_id, sequence],
+        )?;
+        transaction.execute(
+            "UPDATE agents SET last_event_seq=MAX(last_event_seq,?1) WHERE agent_id=?2",
+            params![sequence, write.agent_id],
+        )?;
+        let updated = query_review_progress(&transaction, &write.agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("review progress disappeared".into()))?;
+        transaction.commit()?;
+        Ok(ReviewProgressMutation {
+            disposition: ReviewProgressDisposition::Applied,
+            state: updated,
+        })
+    }
+
     pub fn review_progress(&self, agent_id: &str) -> StoreResult<Option<ReviewProgressState>> {
         let connection = self.connection.lock().unwrap();
         query_review_progress(&connection, agent_id)
+    }
+
+    #[cfg(test)]
+    pub fn set_review_progress_updated_at_for_test(
+        &self,
+        agent_id: &str,
+        updated_at: i64,
+    ) -> StoreResult<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "UPDATE review_progress SET updated_at=?1 WHERE agent_id=?2",
+            params![updated_at, agent_id],
+        )?;
+        Ok(())
     }
 
     /// Atomically claims the one allowed stale-progress nudge.
@@ -3387,6 +3548,16 @@ impl Store {
     }
 }
 
+fn progress_stage_rank(stage: &str) -> StoreResult<u8> {
+    match stage {
+        "scope" => Ok(0),
+        "inspection" => Ok(1),
+        "validation" => Ok(2),
+        "synthesis" => Ok(3),
+        _ => Err(StoreError::InvalidState("unknown progress stage".into())),
+    }
+}
+
 struct StoredReviewInitialization {
     report: ReviewReportState,
     manifest_sha256: String,
@@ -3846,6 +4017,14 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
     };
     let pairs = [
         (value.wall_time_ms, MAX_BUDGET.wall_time_ms),
+        (
+            value.semantic_soft_timeout_ms,
+            MAX_BUDGET.semantic_soft_timeout_ms,
+        ),
+        (
+            value.semantic_hard_timeout_ms,
+            MAX_BUDGET.semantic_hard_timeout_ms,
+        ),
         (value.max_turns, MAX_BUDGET.max_turns),
         (value.max_tool_calls, MAX_BUDGET.max_tool_calls),
         (value.max_context_bytes, MAX_BUDGET.max_context_bytes),
@@ -3855,6 +4034,11 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
     if pairs.iter().any(|(value, cap)| *value == 0 || value > cap) {
         return Err(StoreError::InvalidState(
             "budget limit is zero or above hard cap".into(),
+        ));
+    }
+    if value.semantic_hard_timeout_ms <= value.semantic_soft_timeout_ms {
+        return Err(StoreError::InvalidState(
+            "semantic hard timeout must exceed soft timeout".into(),
         ));
     }
     Ok(value)
@@ -5794,13 +5978,13 @@ mod tests {
         task.job.review_kind = Some("code".into());
         store.enqueue_task(&task).unwrap();
         store
-            .initialize_review_progress("progress-exec", 1)
+            .initialize_review_progress("progress-exec", 1, "runtime")
             .unwrap();
 
         let write = ReviewProgressWrite {
             agent_id: "progress-exec".into(),
             attempt_sequence: 1,
-            run_idempotency_key: "run-1".into(),
+            run_idempotency_key: "runtime".into(),
             stage: "inspection".into(),
             summary: "inspected policy".into(),
             counters_json: Some(r#"{"files":2}"#.into()),
@@ -5817,7 +6001,7 @@ mod tests {
         rapid.summary = "inspected another policy".into();
         assert_eq!(
             store.record_review_progress(&rapid).unwrap().disposition,
-            ReviewProgressDisposition::Applied
+            ReviewProgressDisposition::Duplicate
         );
         assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
         // A queued attempt cannot claim a nudge; once running, exactly one
@@ -5829,6 +6013,7 @@ mod tests {
         assert!(store.claim_review_progress_nudge("progress-exec").unwrap());
         assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
         let mut later = write;
+        later.stage = "validation".into();
         later.summary = "semantic progress advanced".into();
         store.record_review_progress(&later).unwrap();
         assert!(
@@ -5838,6 +6023,54 @@ mod tests {
                 .unwrap()
                 .nudge_sent
         );
+    }
+
+    #[test]
+    fn semantic_progress_event_write_is_failure_atomic() {
+        let (_directory, _path, store) = file_store();
+        let mut task = general_task("atomic-progress", "atomic-public", "atomic-key");
+        task.task_kind = TaskKind::Review;
+        task.review_id = Some("atomic-review".into());
+        task.job.review_kind = Some("code".into());
+        store.enqueue_task(&task).unwrap();
+        let claim = claim(&store, "atomic-progress");
+        store
+            .mark_running("atomic-progress", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        store
+            .initialize_review_progress("atomic-progress", 1, "runtime")
+            .unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_progress_event BEFORE INSERT ON events
+                 WHEN NEW.event_type='review.progress'
+                 BEGIN SELECT RAISE(FAIL, 'scripted progress event failure'); END;",
+            )
+            .unwrap();
+        let result = store.record_review_progress_event(
+            &ReviewProgressWrite {
+                agent_id: "atomic-progress".into(),
+                attempt_sequence: 1,
+                run_idempotency_key: "runtime".into(),
+                stage: "inspection".into(),
+                summary: "must roll back".into(),
+                counters_json: None,
+            },
+            "runtime",
+            claim.owner_epoch,
+            1u64 << 62,
+        );
+        assert!(result.is_err());
+        let progress = store.review_progress("atomic-progress").unwrap().unwrap();
+        assert_eq!(progress.stage, "scope");
+        assert_eq!(progress.summary, "review started");
+        assert!(store
+            .task_events_after("atomic-public", 0, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -251,7 +251,6 @@ fn validate_dynamic_header_and_instructions(
         }
     }
     let required_instructions = [
-        "review_progress",
         "review_checkpoint",
         "review_finding_upsert",
         "review_validation_record",
@@ -300,7 +299,7 @@ mod tests {
     fn validator_rejects_hidden_and_caller_owned_language() {
         let base = format!(
             "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nROUND_KIND: INITIAL_BOUNDED\nFRESH_SESSION_REQUIRED: true\n\
-PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_progress review_checkpoint review_finding_upsert \
+PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_checkpoint review_finding_upsert \
 review_validation_record review_finalize exactly once observable repository covered scope, gaps, \
 uncertainty one legal final signal"
         );

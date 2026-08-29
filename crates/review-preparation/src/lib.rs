@@ -262,7 +262,8 @@ pub fn review_bash_policy_sha256() -> String {
 }
 
 pub use general::{
-    canonical_general_repository, general_control_header, general_launch_prompt,
+    canonical_general_repository, default_semantic_hard_timeout_ms,
+    default_semantic_soft_timeout_ms, general_control_header, general_launch_prompt,
     validate_general_named_command, ArtifactMetadata, AttachmentInput, BudgetLimits,
     CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion,
     GeneralCompletionSubmission, GeneralFinalizer, GeneralNamedCommand, GeneralProfile,
