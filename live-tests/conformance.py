@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,9 +79,14 @@ class LaunchLedger:
         self.path = Path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_path = self.path.with_name(self.path.name + ".lock")
+        self._last_reservation: str | None = None
+        self._reservations: dict[str, bool] = {}
         if self.path.exists():
             state = _read_json(self.path)
             self.count, self.retries = int(state.get("count", 0)), int(state.get("retries", 0))
+            reservations = state.get("reservations", {})
+            if isinstance(reservations, Mapping):
+                self._reservations = {str(token): bool(is_retry) for token, is_retry in reservations.items()}
         self._validate_state()
 
     def _validate_state(self) -> None:
@@ -107,8 +113,8 @@ class LaunchLedger:
                 pass
             lock_stream.close()
 
-    def _persist(self, count: int, retries: int) -> None:
-        payload = json.dumps({"count": count, "limit": self.limit, "retries": retries}, sort_keys=True) + "\n"
+    def _persist(self, count: int, retries: int, reservations: Mapping[str, bool] | None = None) -> None:
+        payload = json.dumps({"count": count, "limit": self.limit, "retries": retries, "reservations": dict(reservations or {})}, sort_keys=True) + "\n"
         fd, temporary = tempfile.mkstemp(dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp", text=True)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -129,14 +135,21 @@ class LaunchLedger:
                 os.unlink(temporary)
 
     def reserve(self, *, retry: bool = False) -> int:
+        _, count = self.reserve_with_token(retry=retry)
+        return count
+
+    def reserve_with_token(self, *, retry: bool = False) -> tuple[str, int]:
         # Re-read while holding the lock so stale instances cannot permit a ninth
         # launch when several workers reserve concurrently.
         with self._locked():
             if self.path.exists():
                 state = _read_json(self.path)
                 count, retries = int(state.get("count", 0)), int(state.get("retries", 0))
+                raw_reservations = state.get("reservations", {})
+                reservations = {str(token): bool(is_retry) for token, is_retry in raw_reservations.items()} if isinstance(raw_reservations, Mapping) else {}
             else:
                 count, retries = 0, 0
+                reservations = {}
             if count >= self.limit:
                 raise LaunchBudgetExceeded(f"official launch budget exhausted ({self.limit})")
             retry_limit = min(MAX_RETRY_LAUNCHES, max(0, self.limit - NOMINAL_OFFICIAL_LAUNCHES))
@@ -145,9 +158,61 @@ class LaunchLedger:
             count += 1
             if retry:
                 retries += 1
-            self._persist(count, retries)
+            token = f"{os.getpid()}-{uuid.uuid4().hex}"
+            reservations[token] = retry
+            self._persist(count, retries, reservations)
             self.count, self.retries = count, retries
-            return count
+            self._last_reservation = token
+            self._reservations = reservations
+            return token, count
+
+    def commit(self, token: str | None = None) -> None:
+        """Mark an observable launch complete without changing its count."""
+        token = token or self._last_reservation
+        if token is None:
+            return
+        with self._locked():
+            if not self.path.exists():
+                return
+            state = _read_json(self.path)
+            count, retries = int(state.get("count", 0)), int(state.get("retries", 0))
+            raw = state.get("reservations", {})
+            reservations = {str(key): bool(value) for key, value in raw.items()} if isinstance(raw, Mapping) else {}
+            if token not in reservations:
+                return
+            reservations.pop(token, None)
+            self._persist(count, retries, reservations)
+            self._reservations = reservations
+
+    def rollback(self, *, retry: bool = False, token: str | None = None) -> None:
+        """Release a reservation when no child launch was observable.
+
+        The public MCP transport can fail before returning a response (for
+        example, a broken pipe or bounded read timeout).  In that situation
+        the harness must not claim that an official child launch happened.
+        Rollback addresses an explicit reservation token, so one failed
+        process cannot consume another worker's successful launch. The lock
+        and on-disk reread keep concurrent ledgers consistent.
+        """
+        token = token or self._last_reservation
+        with self._locked():
+            if not self.path.exists():
+                return
+            state = _read_json(self.path)
+            count, retries = int(state.get("count", 0)), int(state.get("retries", 0))
+            raw = state.get("reservations", {})
+            reservations = {str(key): bool(value) for key, value in raw.items()} if isinstance(raw, Mapping) else {}
+            if token is None or token not in reservations:
+                return
+            reservation_retry = reservations.pop(token)
+            if count <= 0 or (reservation_retry and retries <= 0):
+                return
+            count -= 1
+            if reservation_retry:
+                retries -= 1
+            self._persist(count, retries, reservations)
+            self.count, self.retries = count, retries
+            self._reservations = reservations
 
 
 def _tool_payload(value: Any) -> Any:
@@ -172,16 +237,37 @@ class PublicV2Client:
         launches: bool = False,
         retry: bool = False,
     ) -> Any:
+        reservation_token: str | None = None
         if launches:
             if self.ledger is None:
                 raise RuntimeError("LaunchLedger is mandatory for official launch paths")
-            self.ledger.reserve(retry=retry)
-        result = self.transport.call(tool, dict(args or {}))
+            reservation_token, _ = self.ledger.reserve_with_token(retry=retry)
+        try:
+            result = self.transport.call(tool, dict(args or {}))
+        except (TimeoutError, OSError, RuntimeError):
+            # No response means no observable child launch.  Release the
+            # reservation so an identical infrastructure failure may consume
+            # the one permitted retry slot truthfully.
+            if reservation_token is not None and self.ledger is not None:
+                self.ledger.rollback(token=reservation_token)
+            raise
         if isinstance(result, Mapping) and result.get("isError") is True:
+            if reservation_token is not None and self.ledger is not None:
+                self.ledger.rollback(token=reservation_token)
+            error = result.get("error")
+            if isinstance(error, Mapping):
+                raise FatalConformanceError(f"MCP error from {tool}: {error.get('code', 'UNKNOWN')}: {error.get('message', '')}")
             raise FatalConformanceError(f"MCP error from {tool}")
         result = _tool_payload(result)
         if isinstance(result, Mapping) and result.get("isError") is True:
+            if reservation_token is not None and self.ledger is not None:
+                self.ledger.rollback(token=reservation_token)
+            error = result.get("error")
+            if isinstance(error, Mapping):
+                raise FatalConformanceError(f"MCP error from {tool}: {error.get('code', 'UNKNOWN')}: {error.get('message', '')}")
             raise FatalConformanceError(f"MCP error from {tool}")
+        if reservation_token is not None and self.ledger is not None:
+            self.ledger.commit(reservation_token)
         return result
 
     def catalog(self) -> dict[str, Any]:
@@ -193,7 +279,13 @@ class PublicV2Client:
             raw = self.transport.call("zcode_system_status", {})
         else:
             raw = self.transport.call("tools/list", {})
+        if isinstance(raw, Mapping) and raw.get("isError") is True:
+            error = raw.get("error")
+            detail = f": {error.get('code', 'UNKNOWN')}: {error.get('message', '')}" if isinstance(error, Mapping) else ""
+            raise FatalConformanceError(f"MCP error from tools/list{detail}")
         raw = _tool_payload(raw)
+        if isinstance(raw, Mapping) and raw.get("isError") is True:
+            raise FatalConformanceError("MCP error from tools/list")
         tools_value = raw.get("tools", []) if isinstance(raw, Mapping) else []
         names: list[str] = []
         if isinstance(tools_value, list):
@@ -211,14 +303,17 @@ class PublicV2Client:
                     for item in (candidate if isinstance(candidate, list) else [])
                     if isinstance(item, str) or isinstance(item, Mapping) and isinstance(item.get("name"), str)
                 ]
-        tools = sorted(set(names))
-        missing = sorted(REQUIRED_TOOLS - set(tools))
-        unexpected = sorted(set(tools) - REQUIRED_TOOLS)
+        tools = sorted(names)
+        unique_tools = set(tools)
+        duplicate_names = sorted({name for name in tools if tools.count(name) > 1})
+        missing = sorted(REQUIRED_TOOLS - unique_tools)
+        unexpected = sorted(unique_tools - REQUIRED_TOOLS)
         return {
             "tools": tools,
+            "duplicate_names": duplicate_names,
             "missing": missing,
             "unexpected": unexpected,
-            "exact": not missing and not unexpected and len(tools) == 14,
+            "exact": not missing and not unexpected and not duplicate_names and len(tools) == 14,
             "sha256": hashlib.sha256(json.dumps(tools, separators=(",", ":")).encode()).hexdigest(),
         }
 
@@ -312,6 +407,8 @@ class StdioMCPTransport:
             raise RuntimeError("MCP emitted invalid JSON") from exc
         if not isinstance(message, Mapping):
             raise RuntimeError("MCP emitted a non-object response")
+        if message.get("jsonrpc") != "2.0":
+            raise RuntimeError("MCP emitted an incompatible JSON-RPC version")
         self._record("response", message)
         return message
 
@@ -328,7 +425,9 @@ class StdioMCPTransport:
                 continue
             if "error" in message:
                 return {"isError": True, "error": message["error"]}
-            return message.get("result", {})
+            if "result" not in message:
+                raise RuntimeError("MCP response omitted result/error")
+            return message["result"]
 
     def list_tools(self) -> Any:
         return self._request("tools/list", {})
@@ -420,13 +519,24 @@ def normalize(case: str, observations: Mapping[str, Any]) -> dict[str, Any]:
     if "events" in out:
         events = out.get("events") or []
         retained = []
+        public_fields = {
+            "sequence", "attempt_sequence", "event_type", "redaction_level",
+            "pending_request_id", "stage", "summary", "counters",
+            "last_progress_at", "semantic_idle_ms", "nudge_sent",
+        }
+        projection_valid = True
         for event in events if isinstance(events, list) else []:
             if not isinstance(event, Mapping):
                 continue
             event_type = event.get("event_type", event.get("kind"))
             if event_type in PUBLIC_EVENT_TYPES:
-                normalized_event = dict(event)
+                # Keep precisely the public projection.  Private Store/event
+                # payload keys must never become part of normalized evidence.
+                normalized_event = {key: value for key, value in event.items() if key in public_fields}
                 normalized_event["event_type"] = event_type
+                if event_type == "review_progress":
+                    required = ("stage", "summary", "counters", "last_progress_at", "semantic_idle_ms", "nudge_sent")
+                    projection_valid = projection_valid and all(key in event for key in required)
                 retained.append(normalized_event)
         out["events"] = retained
         sequences = [event.get("sequence") for event in retained]
@@ -436,6 +546,7 @@ def normalize(case: str, observations: Mapping[str, Any]) -> dict[str, Any]:
             for a, b in zip(sequences, sequences[1:])
         )
         out["event_count"] = len(retained)
+        out["public_projection_valid"] = projection_valid
     return out
 
 
@@ -457,28 +568,41 @@ class FakeRuntime:
     def _events(self, attempt_sequence: int = 1) -> list[dict[str, Any]]:
         if self.mode == "no-progress":
             return []
-        self._sequence += 1
-        events = [{"sequence": self._sequence, "attempt_sequence": attempt_sequence, "event_type": "attempt_started"}]
+        sequence = 1
+        events = [{"sequence": sequence, "attempt_sequence": attempt_sequence, "event_type": "attempt_started"}]
         if self.mode in {"progress", "case-c"}:
-            self._sequence += 1
+            sequence += 1
             events.append({
-                "sequence": self._sequence,
+                "sequence": sequence,
                 "attempt_sequence": attempt_sequence,
                 "event_type": "pending_request",
-                "pending_request_id": "fake-request-1",
+                "pending_request_id": f"fake-request-{attempt_sequence}",
             })
-            self._pending["fake-request-1"] = {"request_id": "fake-request-1", "responded": False}
+            request_id = f"fake-request-{attempt_sequence}"
+            self._pending[request_id] = {
+                "request_id": request_id,
+                "kind": "permission",
+                "state": "pending",
+                "respondable": True,
+                "tool_name": "bash",
+                "operation": "command",
+                "summary": "run bounded read-only check",
+                "policy_preview": "externally_decidable",
+                "responded": False,
+            }
         if self.mode in {"progress", "case-c"}:
-            for stage in ("inspection", "analysis", "finalization"):
-                self._sequence += 1
+            for stage in ("inspection", "validation", "synthesis"):
+                sequence += 1
                 events.append({
-                    "sequence": self._sequence,
+                    "sequence": sequence,
                     "attempt_sequence": attempt_sequence,
-                    "event_type": "review_progress",
-                    "stage": stage,
-                    "semantic_stage": stage,
-                    "lease_refreshed": True,
-                    "nudge": False,
+                "event_type": "review_progress",
+                "stage": stage,
+                    "summary": f"fake {stage} progress",
+                    "counters": {"checkpoints": 1},
+                    "last_progress_at": int(time.time() * 1000),
+                    "semantic_idle_ms": 0,
+                    "nudge_sent": False,
                 })
         return events
 
@@ -582,9 +706,13 @@ class FakeRuntime:
                 return {"task": {"phase": "RUNNING"}, "events": [], "next_sequence": after, "has_more": False, "timed_out": True, "status": "timeout", "progress": []}
             agent_id = str(args.get("agent_id"))
             task = self.agents.get(agent_id, {})
+            current_events = task.get("events", [])
+            terminal_sequence = (current_events[-1]["sequence"] if current_events else after) + 1
             task["phase"] = "TERMINAL"
             self._terminal.add(agent_id)
-            return {"task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)}, "events": [], "next_sequence": after, "has_more": False, "timed_out": False}
+            terminal = {"sequence": terminal_sequence, "attempt_sequence": task.get("attempt_sequence", 1), "event_type": "terminal"}
+            task["events"] = [*current_events, terminal]
+            return {"task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)}, "events": [terminal] if terminal_sequence > after else [], "next_sequence": terminal_sequence, "has_more": False, "timed_out": False}
         if tool == "zcode_agent_respond":
             request_id = str(args.get("request_id"))
             request = self._pending.get(request_id)
@@ -598,6 +726,20 @@ class FakeRuntime:
             agent_id = str(args.get("agent_id"))
             attempt = self.agents.get(agent_id, {}).get("attempt_sequence", 1)
             return {"disposition": disposition, "requested_decision": args.get("decision", "deny"), "effective_decision": "deny", "policy_overrode": False, "policy_reason_code": None, "attempt_sequence": attempt}
+        if tool == "zcode_agent_message":
+            agent_id = str(args.get("agent_id"))
+            message_id = str(args.get("message_id"))
+            task = self.agents.get(agent_id, {})
+            delivered = task.setdefault("messages", {})
+            if message_id in delivered:
+                disposition = "already_delivered"
+            else:
+                delivered[message_id] = {
+                    "mode": args.get("mode"),
+                    "content": args.get("content"),
+                }
+                disposition = "queued"
+            return {"disposition": disposition, "attempt_sequence": task.get("attempt_sequence", 1)}
         if tool == "zcode_agent_result":
             agent_id = str(args.get("agent_id"))
             task = self.agents.get(agent_id, {})
@@ -608,6 +750,10 @@ class FakeRuntime:
             chunk = None
             if args.get("offset_bytes") is not None and args.get("limit_bytes") is not None:
                 offset, limit = int(args["offset_bytes"]), int(args["limit_bytes"])
+                if limit <= 0 or limit > MAX_ARTIFACT_CHUNK_BYTES:
+                    return {"isError": True, "error": {"code": "VALIDATION", "message": "artifact chunk size is outside the allowed range"}}
+                if offset < 0 or offset >= len(artifact):
+                    return {"isError": True, "error": {"code": "VALIDATION", "message": "artifact offset does not permit non-empty progress"}}
                 data = artifact[offset : offset + limit]
                 chunk = {"artifact_id": artifact_id, "offset_bytes": offset, "returned_bytes": len(data), "eof": offset + len(data) == len(artifact), "sha256": digest, "size_bytes": len(artifact), "bytes_base64": base64.b64encode(data).decode()}
             return {
@@ -652,11 +798,14 @@ def validate_artifact_chunk(
         chunk = chunk["artifact_chunk"]  # type: ignore[assignment]
     if offset < 0 or limit <= 0 or limit > MAX_ARTIFACT_CHUNK_BYTES or offset >= size:
         raise ValueError("INVALID_ARTIFACT_RANGE")
+    required_fields = {"artifact_id", "offset_bytes", "returned_bytes", "eof", "sha256", "size_bytes", "bytes_base64"}
+    if not required_fields.issubset(chunk):
+        raise ValueError("INVALID_ARTIFACT_CHUNK")
     if chunk.get("artifact_id") != artifact_id or chunk.get("sha256") != sha256:
         raise ValueError("ARTIFACT_METADATA_MISMATCH")
-    if int(chunk.get("size_bytes", size)) != size or int(chunk.get("offset_bytes", chunk.get("offset", -1))) != offset:
+    if int(chunk.get("size_bytes", -1)) != size or int(chunk.get("offset_bytes", -1)) != offset:
         raise ValueError("INVALID_ARTIFACT_PROGRESS")
-    encoded = chunk.get("bytes_base64", chunk.get("data", ""))
+    encoded = chunk.get("bytes_base64", "")
     try:
         data = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError) as exc:
@@ -792,6 +941,8 @@ def _pack_members(source: Path) -> list[Path]:
         else:
             _check_pack_filename(relative)
         data = path.read_bytes()
+        if len(relative.parts) == 1 and not data.strip():
+            raise ValueError(f"empty rendered pack report: {relative}")
         _check_pack_content(path, data)
         members.append(path)
     return members

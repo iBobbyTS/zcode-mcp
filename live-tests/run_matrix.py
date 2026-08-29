@@ -32,6 +32,8 @@ try:
         normalize,
         redact,
         collect_artifact,
+        validate_artifact_chunk,
+        PUBLIC_EVENT_TYPES,
     )
 except ImportError:  # script execution from live-tests/
     from conformance import (  # type: ignore
@@ -44,6 +46,8 @@ except ImportError:  # script execution from live-tests/
         normalize,
         redact,
         collect_artifact,
+        validate_artifact_chunk,
+        PUBLIC_EVENT_TYPES,
     )
 
 
@@ -61,6 +65,8 @@ CASE_C_BUDGET = {
     "max_result_bytes": 1_000_000,
     "max_artifact_bytes": 4_000_000,
 }
+DEFAULT_LIFECYCLE_TIMEOUT_S = 300.0
+MAX_LIFECYCLE_TIMEOUT_S = 1800.0
 
 
 def _sha256(path: Path) -> str | None:
@@ -133,6 +139,9 @@ def _pending_requests(client: PublicV2Client, agent_id: str, evidence: dict[str,
     for request in pending if isinstance(pending, list) else []:
         if not isinstance(request, Mapping) or request.get("respondable") is False:
             continue
+        required = ("request_id", "kind", "state", "respondable", "tool_name", "operation", "summary", "policy_preview")
+        if any(field not in request for field in required) or request.get("kind") != "permission":
+            raise FatalConformanceError("pending request omitted typed public permission fields")
         request_id = request.get("request_id")
         if not isinstance(request_id, str):
             raise FatalConformanceError("pending request omitted request_id")
@@ -152,7 +161,7 @@ def _pending_requests(client: PublicV2Client, agent_id: str, evidence: dict[str,
         evidence.setdefault("permission_replays", []).append(replay)
 
 
-def _poll_terminal(client: PublicV2Client, agent_id: str, evidence: dict[str, Any], *, timeout_s: float = 30.0) -> Mapping[str, Any]:
+def _poll_terminal(client: PublicV2Client, agent_id: str, evidence: dict[str, Any], *, timeout_s: float = DEFAULT_LIFECYCLE_TIMEOUT_S) -> Mapping[str, Any]:
     """Poll ordered events and wait until a terminal task state is observed."""
     cursor = 0
     deadline = time.monotonic() + timeout_s
@@ -200,15 +209,100 @@ def _assert_case_c_progress(evidence: Mapping[str, Any]) -> None:
     for page in evidence.get("waits", []) if isinstance(evidence.get("waits"), list) else []:
         if isinstance(page, Mapping) and isinstance(page.get("events"), list):
             events.extend(event for event in page["events"] if isinstance(event, Mapping))
-    stages = {str(event.get("semantic_stage", event.get("stage"))) for event in events if event.get("event_type") == "review_progress"}
+    progress_events = [event for event in events if event.get("event_type") == "review_progress"]
+    required = ("stage", "summary", "counters", "last_progress_at", "semantic_idle_ms", "nudge_sent")
+    if any(not all(field in event for field in required) for event in progress_events):
+        raise FatalConformanceError("Case C review_progress omitted a required public field")
+    if any(key in event for event in progress_events for key in ("semantic_stage", "lease_refreshed", "nudge")):
+        raise FatalConformanceError("Case C event leaked non-public progress fields")
+    stages = {str(event.get("stage")) for event in progress_events}
     if len(stages) < 3:
         raise FatalConformanceError("Case C did not expose three semantic progress stages")
-    nudges = [event for event in events if event.get("nudge") is True]
+    nudges = [event for event in progress_events if event.get("nudge_sent") is True]
     if len(nudges) > 1:
         raise FatalConformanceError("Case C emitted more than one soft-timeout nudge")
+    if any(not isinstance(event.get("semantic_idle_ms"), int) for event in progress_events):
+        raise FatalConformanceError("Case C progress event did not carry read-time semantic idle snapshot")
+
+
+def _public_events(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    events: list[Mapping[str, Any]] = []
+    for key in ("event_pages", "waits"):
+        pages = evidence.get(key)
+        if not isinstance(pages, list):
+            continue
+        for page in pages:
+            if isinstance(page, Mapping) and isinstance(page.get("events"), list):
+                events.extend(event for event in page["events"] if isinstance(event, Mapping))
+    return events
+
+
+def _assert_event_contract(evidence: Mapping[str, Any]) -> None:
+    events = _public_events(evidence)
+    if len(events) > 500:
+        raise FatalConformanceError("public event rate exceeded 500 events per bounded run")
+    grouped: dict[Any, list[int]] = {}
+    seen: dict[Any, dict[int, Mapping[str, Any]]] = {}
     for event in events:
-        if event.get("event_type") == "review_progress" and event.get("lease_refreshed") is not True:
-            raise FatalConformanceError("Case C progress event did not carry lease semantics")
+        sequence = event.get("sequence")
+        attempt = event.get("attempt_sequence")
+        if not isinstance(sequence, int) or not isinstance(attempt, int):
+            raise FatalConformanceError("public event sequence/attempt is invalid")
+        previous = seen.setdefault(attempt, {}).get(sequence)
+        if previous is not None:
+            if previous != event:
+                raise FatalConformanceError("public event sequence was reused with different content")
+            continue
+        seen[attempt][sequence] = event
+        grouped.setdefault(attempt, []).append(sequence)
+    if any(any(a >= b for a, b in zip(sequences, sequences[1:])) for sequences in grouped.values()):
+        raise FatalConformanceError("public event sequence is not strictly monotonic within an attempt")
+    for event in events:
+        if event.get("event_type") not in PUBLIC_EVENT_TYPES:
+            raise FatalConformanceError("public event type is outside the closed V2 set")
+    for wait in evidence.get("waits", []) if isinstance(evidence.get("waits"), list) else []:
+        if not isinstance(wait, Mapping):
+            continue
+        if not wait.get("events") and _task_phase(wait) not in {"TERMINAL", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"} and wait.get("timed_out") is not True:
+            raise FatalConformanceError("no-change public wait did not report timed_out=true")
+
+
+def _assert_terminal_result(result: Any) -> None:
+    """Require the public result projection to carry terminal review evidence."""
+    if not isinstance(result, Mapping):
+        raise FatalConformanceError("agent_result response is not an object")
+    task = result.get("task")
+    if not isinstance(task, Mapping) or task.get("phase") not in {"TERMINAL", "CLOSED"}:
+        raise FatalConformanceError("terminal result did not expose a terminal task phase")
+    public_result = result.get("result")
+    if not isinstance(public_result, Mapping):
+        raise FatalConformanceError("terminal result omitted result projection")
+    required = ("outcome", "summary", "result_sha256", "review_evidence")
+    if any(field not in public_result for field in required):
+        raise FatalConformanceError("terminal result omitted required public fields")
+    evidence = public_result.get("review_evidence")
+    if not isinstance(evidence, Mapping):
+        raise FatalConformanceError("terminal result omitted review evidence")
+    for field in ("final_signal", "finalized", "report_revision", "finalization_revision", "artifact", "counts", "independence"):
+        if field not in evidence:
+            raise FatalConformanceError(f"terminal review evidence omitted {field}")
+    if not isinstance(evidence.get("final_signal"), str) or not evidence["final_signal"] or evidence.get("finalized") is not True:
+        raise FatalConformanceError("terminal review evidence is not finalized")
+    if not isinstance(evidence.get("report_revision"), int) or not isinstance(evidence.get("finalization_revision"), int):
+        raise FatalConformanceError("terminal review evidence revisions are invalid")
+    counts = evidence.get("counts")
+    independence = evidence.get("independence")
+    if not isinstance(counts, Mapping) or any(not isinstance(counts.get(field), int) for field in ("checkpoints", "findings", "open_findings", "validations")):
+        raise FatalConformanceError("terminal review evidence counts are incomplete")
+    if not isinstance(independence, Mapping) or any(field not in independence for field in ("independent_evidence", "fresh_session_observed", "counts_as_independent")):
+        raise FatalConformanceError("terminal review evidence independence is incomplete")
+    artifact = evidence.get("artifact")
+    artifacts = result.get("artifacts")
+    if not isinstance(artifact, Mapping) or not isinstance(artifacts, list):
+        raise FatalConformanceError("terminal artifact metadata is incomplete")
+    match = next((item for item in artifacts if isinstance(item, Mapping) and item.get("artifact_id") == artifact.get("artifact_id")), None)
+    if match is None or any(match.get(key) != artifact.get(key) for key in ("sha256", "size_bytes")):
+        raise FatalConformanceError("terminal artifact metadata disagrees with result evidence")
 
 
 def _runtime_version(path: Path) -> str | None:
@@ -223,6 +317,39 @@ def _runtime_version(path: Path) -> str | None:
     return str(value) if value is not None else None
 
 
+def _effective_home_identity() -> dict[str, Any]:
+    """Capture hashes for the effective normal-HOME configuration only.
+
+    We record provenance and digests, never copy configuration bytes.  An
+    explicit environment override is useful in CI; otherwise the normal
+    ``~/.codex``/``~/.zcode`` locations are observed read-only.
+    """
+    home = Path.home()
+    config_candidates = [
+        Path(os.environ["ZCODE_EFFECTIVE_MCP_CONFIG"])
+        if os.environ.get("ZCODE_EFFECTIVE_MCP_CONFIG") else None,
+        home / ".codex/config.toml",
+        REPOSITORY_ROOT / "config/codex-zcode-subagent-mcp-v2.toml",
+    ]
+    config = next((path for path in config_candidates if path is not None and path.is_file()), None)
+    hook_candidates = [
+        Path(os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"])
+        if os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE") else None,
+        home / ".zcode/hooks/check-bash-status.mjs",
+    ]
+    hook = next((path for path in hook_candidates if path is not None and path.is_file()), None)
+    zcode_config = home / ".zcode/cli/config.json"
+    return {
+        "home_mode": "normal",
+        "mcp_config_source": "normal-home" if config and config != REPOSITORY_ROOT / "config/codex-zcode-subagent-mcp-v2.toml" else "repository-fallback",
+        "mcp_config_sha256": _sha256(config) if config else None,
+        "zcode_cli_config_sha256": _sha256(zcode_config),
+        "hook_source": "normal-home" if hook else "not-observed",
+        "hook_sha256": _sha256(hook) if hook else None,
+        "hook_provenance_sha256": _sha256(Path(os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"])) if os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE") and Path(os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"]).is_file() else None,
+    }
+
+
 def _collect_result_artifacts(client: PublicV2Client, agent_id: str, result: Any, *, attempt: int | None = None) -> list[dict[str, Any]]:
     artifacts = result.get("artifacts", []) if isinstance(result, Mapping) else []
     collected: list[dict[str, Any]] = []
@@ -233,7 +360,40 @@ def _collect_result_artifacts(client: PublicV2Client, agent_id: str, result: Any
         if not isinstance(artifact_id, str) or not isinstance(digest, str) or not isinstance(size, int) or size <= 0:
             raise FatalConformanceError("artifact metadata is incomplete")
         reconstructed = collect_artifact(client, agent_id, artifact_id=artifact_id, sha256=digest, size=size, attempt_sequence=attempt)
-        collected.append({"artifact_id": artifact_id, "size_bytes": len(reconstructed), "sha256": hashlib.sha256(reconstructed).hexdigest(), "reconstructed": True, "attempt_sequence": attempt})
+        samples: list[dict[str, Any]] = []
+        sample_offsets = {0, size // 2, max(0, size - min(4096, size))}
+        for offset in sorted(sample_offsets):
+            limit = min(8192, size - offset)
+            sample_args: dict[str, Any] = {
+                "agent_id": agent_id, "artifact_id": artifact_id,
+                "offset_bytes": offset, "limit_bytes": limit,
+            }
+            if attempt is not None:
+                sample_args["attempt_sequence"] = attempt
+            sample_result = client.call("zcode_agent_result", sample_args)
+            chunk = sample_result.get("artifact_chunk") if isinstance(sample_result, Mapping) else None
+            if not isinstance(chunk, Mapping):
+                raise FatalConformanceError("artifact sample omitted artifact_chunk")
+            data = validate_artifact_chunk(chunk, artifact_id=artifact_id, sha256=digest, size=size, offset=offset, limit=limit)
+            samples.append({"offset_bytes": offset, "returned_bytes": len(data), "eof": bool(chunk.get("eof"))})
+        range_errors: list[dict[str, str]] = []
+        for label, invalid_args, expected in (
+            ("zero_limit", {"offset_bytes": 0, "limit_bytes": 0}, "outside the allowed range"),
+            ("over_limit", {"offset_bytes": 0, "limit_bytes": 8193}, "outside the allowed range"),
+            ("offset_eof", {"offset_bytes": size, "limit_bytes": 1}, "does not permit non-empty progress"),
+        ):
+            probe_args: dict[str, Any] = {"agent_id": agent_id, "artifact_id": artifact_id, **invalid_args}
+            if attempt is not None:
+                probe_args["attempt_sequence"] = attempt
+            try:
+                client.call("zcode_agent_result", probe_args)
+            except FatalConformanceError as error:
+                if expected not in str(error):
+                    raise FatalConformanceError(f"artifact {label} returned unstable public error: {error}") from error
+                range_errors.append({"kind": label, "error": str(error)})
+            else:
+                raise FatalConformanceError(f"artifact {label} was accepted unexpectedly")
+        collected.append({"artifact_id": artifact_id, "size_bytes": len(reconstructed), "sha256": hashlib.sha256(reconstructed).hexdigest(), "reconstructed": True, "attempt_sequence": attempt, "samples": samples, "invalid_range_errors": range_errors})
     return collected
 
 
@@ -260,10 +420,31 @@ def _call_case(client: PublicV2Client, case_dir: Path, manifest: Mapping[str, An
         # unrelated lifecycle calls.  Later pending events are drained by the
         # polling helper as soon as they appear.
         _pending_requests(client, agent_id, evidence)
+        if manifest.get("case_id") == "case-03-agent-control-lifecycle":
+            # Exercise the public message path while the attempt is running;
+            # the identical message id must be idempotent and not create a
+            # second semantic request.
+            message_args = {
+                "agent_id": agent_id,
+                "message_id": f"{agent_id}-s02-message",
+                "mode": "queue",
+                "content": "bounded continuation context",
+            }
+            evidence["message"] = client.call("zcode_agent_message", message_args)
+            evidence["message_replay"] = client.call("zcode_agent_message", message_args)
+            if evidence["message"].get("disposition") not in {"queued", "delivered", "interrupted_then_delivered"}:
+                raise FatalConformanceError("Case C message was not accepted")
+            if evidence["message_replay"].get("disposition") != "already_delivered":
+                raise FatalConformanceError("Case C message replay was not idempotent")
         evidence["list"] = client.call("zcode_agent_list", {"feature_id": "official-runtime-conformance", "limit": 100})
-        terminal = _poll_terminal(client, agent_id, evidence)
+        effective_budget = spawned.get("effective_budget", {}) if isinstance(spawned, Mapping) else {}
+        wall_ms = effective_budget.get("wall_time_ms") if isinstance(effective_budget, Mapping) else None
+        lifecycle_timeout = min(MAX_LIFECYCLE_TIMEOUT_S, max(DEFAULT_LIFECYCLE_TIMEOUT_S, float(wall_ms) / 1000.0)) if isinstance(wall_ms, (int, float)) and wall_ms > 0 else DEFAULT_LIFECYCLE_TIMEOUT_S
+        terminal = _poll_terminal(client, agent_id, evidence, timeout_s=lifecycle_timeout)
         evidence["terminal"] = terminal
+        _assert_event_contract(evidence)
         result_before = client.call("zcode_agent_result", {"agent_id": agent_id})
+        _assert_terminal_result(result_before)
         result_before_copy = deepcopy(result_before)
         evidence["result_before_continuation"] = result_before_copy
         if manifest.get("case_id") == "case-03-agent-control-lifecycle":
@@ -295,8 +476,9 @@ def _call_case(client: PublicV2Client, case_dir: Path, manifest: Mapping[str, An
                 raise FatalConformanceError("Case C continuation lacks fresh session provenance")
             if provenance.get("zcode_session_id") == (spawned.get("provenance", {}) if isinstance(spawned, Mapping) else {}).get("zcode_session_id"):
                 raise FatalConformanceError("Case C continuation reused session provenance")
-            _poll_terminal(client, agent_id, evidence)
+            _poll_terminal(client, agent_id, evidence, timeout_s=lifecycle_timeout)
             result_after = client.call("zcode_agent_result", {"agent_id": agent_id, "attempt_sequence": continuation["attempt_sequence"]})
+            _assert_terminal_result(result_after)
             old_result_recheck = client.call("zcode_agent_result", {"agent_id": agent_id, "attempt_sequence": spawned["attempt_sequence"]})
             if old_result_recheck != result_before_copy:
                 raise FatalConformanceError("previous result mutated during continuation")
@@ -313,6 +495,16 @@ def _call_case(client: PublicV2Client, case_dir: Path, manifest: Mapping[str, An
         evidence["artifact_chunks"] = _collect_result_artifacts(client, agent_id, result_value, attempt=final_attempt)
         evidence["close"] = client.call("zcode_agent_close", {"agent_id": agent_id})
         evidence["close_replay"] = client.call("zcode_agent_close", {"agent_id": agent_id})
+        close_task = evidence["close"].get("task") if isinstance(evidence.get("close"), Mapping) else None
+        replay_task = evidence["close_replay"].get("task") if isinstance(evidence.get("close_replay"), Mapping) else None
+        if not isinstance(close_task, Mapping) or close_task.get("phase") != "CLOSED" or close_task.get("closed") is not True or close_task.get("resources_reaped") is not True:
+            raise FatalConformanceError("close did not report closed/reaped resources")
+        if not isinstance(replay_task, Mapping) or replay_task.get("phase") != "CLOSED" or replay_task.get("closed") is not True or replay_task.get("resources_reaped") is not True:
+            raise FatalConformanceError("close replay did not preserve idempotent cleanup state")
+        evidence["restart_reads"] = {
+            "agent_get_after_close": client.call("zcode_agent_get", {"agent_id": agent_id}),
+            "system_status_after_close": client.call("zcode_system_status", {}),
+        }
     except (FatalConformanceError, LaunchBudgetExceeded, TimeoutError, OSError, RuntimeError) as exc:
         evidence["error"] = {"class": type(exc).__name__, "message": str(exc)}
         evidence["conclusion"] = "FAIL" if isinstance(exc, FatalConformanceError) else "NOT_EXERCISED"
@@ -351,6 +543,9 @@ def _copy_pack_inputs(root: Path, output: Path) -> Path:
                     relative = item.relative_to(source_dir)
                     (target / relative).parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(item, target / relative)
+        if directory == "fixtures" and not any(target.iterdir()):
+            for manifest_path in sorted(root.glob("case-*/fixture-manifest.json")):
+                shutil.copyfile(manifest_path, target / f"{manifest_path.parent.name}-manifest.json")
     return source
 
 
@@ -422,6 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         "public_api_mode": env["ZCODE_PUBLIC_API_MODE"],
         "runtime_env_exported": env["ZCODE_RUNTIME_PATH"],
     }
+    identity["effective_normal_home"] = _effective_home_identity()
     _write_json(output / "normalized/identity.json", identity)
 
     transport: StdioMCPTransport | None = None
@@ -439,7 +635,16 @@ def main(argv: list[str] | None = None) -> int:
         _write_json(output / "normalized/identity.json", identity)
         if identity["runtime_version_match"] is not True:
             raise FatalConformanceError(f"official runtime version is not {EXPECTED_RUNTIME_VERSION}")
-        readiness = client.call("zcode_system_ensure_ready", {"timeout_ms": min(5000, max(1, int(args.timeout * 1000)))}, launches=True)
+        readiness_args = {"timeout_ms": min(5000, max(1, int(args.timeout * 1000)))}
+        try:
+            readiness = client.call("zcode_system_ensure_ready", readiness_args, launches=True)
+        except (TimeoutError, OSError, RuntimeError):
+            # A transport/observation failure is infrastructure evidence.  It
+            # may consume exactly one retry slot, unlike a typed runtime or
+            # configuration failure returned by the public tool.
+            readiness = client.call("zcode_system_ensure_ready", readiness_args, launches=True, retry=True)
+        if isinstance(readiness, Mapping) and readiness.get("ready") is not True and readiness.get("probe_result") == "NOT_OBSERVED_WITHIN_TIMEOUT":
+            readiness = client.call("zcode_system_ensure_ready", readiness_args, launches=True, retry=True)
         _write_json(output / "normalized/readiness.json", {"status": status, "readiness": readiness})
         if isinstance(readiness, Mapping) and readiness.get("ready") is not True:
             raise FatalConformanceError("official runtime did not report READY")
