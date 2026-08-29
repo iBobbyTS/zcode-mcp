@@ -4,8 +4,9 @@ import unittest
 from pathlib import Path
 
 from conformance import (FakeRuntime, LaunchBudgetExceeded, LaunchLedger,
-                         PublicV2Client, REQUIRED_TOOLS, finalize_pack, normalize,
-                         redact, validate_artifact_chunk)
+                         PublicV2Client, REQUIRED_TOOLS, collect_artifact,
+                         finalize_pack, normalize, redact, validate_artifact_chunk)
+from run_matrix import CASE_C_BUDGET, _call_case
 
 
 class S02Tests(unittest.TestCase):
@@ -69,6 +70,55 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(validate_artifact_chunk(chunk, artifact_id="a", sha256="h", size=1, offset=0, limit=1), b"x")
         with self.assertRaisesRegex(ValueError, "INVALID_ARTIFACT_RANGE"):
             validate_artifact_chunk(chunk, artifact_id="a", sha256="h", size=1, offset=0, limit=0)
+
+    def test_fake_case_c_continuation_and_full_artifact_reconstruction(self):
+        runtime = FakeRuntime("case-c")
+        client = PublicV2Client(runtime, LaunchLedger(Path(tempfile.mkdtemp()) / "ledger.json"))
+        manifest = json.loads((Path(__file__).parents[1] / "case-03-agent-control-lifecycle/fixture-manifest.json").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            evidence = _call_case(client, Path(__file__).parents[1] / "case-03-agent-control-lifecycle", manifest, Path(d))
+        self.assertEqual(evidence["spawn"]["effective_budget"], CASE_C_BUDGET)
+        self.assertEqual(evidence["continuation"]["agent_id"], evidence["spawn"]["agent_id"])
+        self.assertEqual(evidence["continuation"]["review_id"], evidence["spawn"]["review_id"])
+        self.assertFalse(evidence["continuation"]["counts_as_independent"])
+        self.assertNotEqual(evidence["continuation"]["provenance"]["zcode_session_id"], evidence["spawn"]["provenance"]["zcode_session_id"])
+        self.assertTrue(all(item["reconstructed"] for item in evidence["artifact_chunks"]))
+        self.assertTrue(evidence["permissions"])
+        self.assertEqual(evidence["permissions"][0]["response"]["effective_decision"], "deny")
+        self.assertEqual(evidence["close"]["task"]["phase"], "CLOSED")
+        self.assertEqual(evidence["close_replay"]["task"]["phase"], "CLOSED")
+
+    def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / "pack"
+            source.mkdir()
+            for name in ("SUMMARY.md", "SYSTEM-IDENTITY.md", "SCENARIO-MATRIX.md", "PERMISSION-MATRIX.md",
+                         "PROGRESS-TIMELINE.md", "EVENT-METRICS.md", "RESULT-ARTIFACT-MATRIX.md",
+                         "RESTART-CLEANUP.md", "KNOWN-GAPS.md"):
+                (source / name).write_text("redacted\n")
+            normalized = source / "normalized"
+            normalized.mkdir()
+            (normalized / "arbitrary.txt").write_text("safe\n")
+            with self.assertRaisesRegex(ValueError, "unexpected pack filename"):
+                finalize_pack(source, Path(d) / "pack.zip")
+            (normalized / "arbitrary.txt").unlink()
+            (normalized / "case-a.json").write_text("token leaked-value\n")
+            with self.assertRaisesRegex(ValueError, "unredacted secret"):
+                finalize_pack(source, Path(d) / "pack.zip")
+
+    def test_fatal_case_error_propagates_and_freezes_matrix(self):
+        class FailingRuntime(FakeRuntime):
+            def call(self, tool, args):
+                if tool == "zcode_agent_events":
+                    return {"isError": True, "error": {"code": "PROTOCOL", "message": "fatal"}}
+                return super().call(tool, args)
+        runtime = FailingRuntime()
+        client = PublicV2Client(runtime, LaunchLedger(Path(tempfile.mkdtemp()) / "ledger.json"))
+        manifest = json.loads((Path(__file__).parents[1] / "case-01-user-fuzzy-search/fixture-manifest.json").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(Exception):
+                _call_case(client, Path(__file__).parents[1] / "case-01-user-fuzzy-search", manifest, Path(d))
+            self.assertTrue((Path(d) / "case-01-user-fuzzy-search.json").is_file())
 
 
 if __name__ == "__main__":

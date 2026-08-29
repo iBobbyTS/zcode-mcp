@@ -449,16 +449,37 @@ class FakeRuntime:
     idempotencies: dict[str, str] = field(default_factory=dict)
     service_generation: str = "fake-generation-1"
     _sequence: int = 0
+    _pending: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _closed: set[str] = field(default_factory=set)
+    _terminal: set[str] = field(default_factory=set)
+    _results: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
 
-    def _events(self) -> list[dict[str, Any]]:
+    def _events(self, attempt_sequence: int = 1) -> list[dict[str, Any]]:
         if self.mode == "no-progress":
             return []
         self._sequence += 1
-        events = [{"sequence": self._sequence, "attempt_sequence": 1, "event_type": "attempt_started"}]
+        events = [{"sequence": self._sequence, "attempt_sequence": attempt_sequence, "event_type": "attempt_started"}]
+        if self.mode in {"progress", "case-c"}:
+            self._sequence += 1
+            events.append({
+                "sequence": self._sequence,
+                "attempt_sequence": attempt_sequence,
+                "event_type": "pending_request",
+                "pending_request_id": "fake-request-1",
+            })
+            self._pending["fake-request-1"] = {"request_id": "fake-request-1", "responded": False}
         if self.mode in {"progress", "case-c"}:
             for stage in ("inspection", "analysis", "finalization"):
                 self._sequence += 1
-                events.append({"sequence": self._sequence, "attempt_sequence": 1, "event_type": "review_progress", "stage": stage})
+                events.append({
+                    "sequence": self._sequence,
+                    "attempt_sequence": attempt_sequence,
+                    "event_type": "review_progress",
+                    "stage": stage,
+                    "semantic_stage": stage,
+                    "lease_refreshed": True,
+                    "nudge": False,
+                })
         return events
 
     def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -484,17 +505,72 @@ class FakeRuntime:
             key = str(args.get("idempotency_key", ""))
             if key in self.idempotencies:
                 agent_id = self.idempotencies[key]
-                return {"agent_id": agent_id, "review_id": f"review-{agent_id}", "submission_disposition": "existing", "phase": "QUEUED", "attempt_sequence": 1}
+                task = self.agents.get(agent_id, {})
+                return {
+                    "agent_id": agent_id,
+                    "review_id": f"review-{agent_id}",
+                    "submission_disposition": "existing",
+                    "phase": task.get("phase", "RUNNING"),
+                    "attempt_sequence": task.get("attempt_sequence", 1),
+                    "effective_budget": task.get("effective_budget", {}),
+                    "provenance": {"fresh_session_observed": True, "zcode_session_id": task.get("session_id")},
+                    "counts_as_independent": True,
+                }
             agent_id = f"fake-agent-{len(self.agents) + 1}"
             self.idempotencies[key] = agent_id
-            self.agents[agent_id] = {"attempt_sequence": 1, "closed": False, "events": self._events()}
-            return {"agent_id": agent_id, "review_id": f"review-{agent_id}", "submission_disposition": "created", "phase": "QUEUED", "attempt_sequence": 1}
+            self.agents[agent_id] = {
+                "attempt_sequence": 1,
+                "closed": False,
+                "phase": "RUNNING",
+                "review_id": f"review-{agent_id}",
+                "session_id": f"fake-session-{agent_id}-1",
+                "events": self._events(),
+                "responded_requests": set(),
+                "nudge_count": 0,
+            }
+            budget = args.get("budget") or {
+                "wall_time_ms": 300000,
+                "semantic_soft_timeout_ms": 120000,
+                "semantic_hard_timeout_ms": 300000,
+                "max_turns": 10,
+                "max_tool_calls": 100,
+                "max_context_bytes": 4000000,
+                "max_result_bytes": 1000000,
+                "max_artifact_bytes": 4000000,
+            }
+            self.agents[agent_id]["effective_budget"] = budget
+            return {
+                "agent_id": agent_id,
+                "review_id": f"review-{agent_id}",
+                "submission_disposition": "created",
+                "phase": "RUNNING",
+                "attempt_sequence": 1,
+                "effective_budget": budget,
+                "provenance": {
+                    "fresh_session_observed": True,
+                    "zcode_session_id": f"fake-session-{agent_id}-1",
+                },
+                "counts_as_independent": True,
+            }
         if tool == "zcode_review_continue":
             agent_id = str(args.get("agent_id"))
             task = self.agents.setdefault(agent_id, {"attempt_sequence": 1, "closed": False, "events": []})
+            if task.get("closed"):
+                return {"isError": True, "error": {"code": "CONFLICT", "message": "agent is closed"}}
             task["attempt_sequence"] += 1
-            task["events"] = self._events()
-            return {"agent_id": agent_id, "review_id": str(args.get("review_id")), "submission_disposition": "created", "phase": "QUEUED", "attempt_sequence": task["attempt_sequence"], "counts_as_independent": False}
+            task["phase"] = "RUNNING"
+            task["session_id"] = f"fake-session-{agent_id}-{task['attempt_sequence']}"
+            task["events"] = self._events(task["attempt_sequence"])
+            return {
+                "agent_id": agent_id,
+                "review_id": str(args.get("review_id")),
+                "submission_disposition": "created",
+                "phase": "RUNNING",
+                "attempt_sequence": task["attempt_sequence"],
+                "counts_as_independent": False,
+                "fresh_session_observed": True,
+                "provenance": {"fresh_session_observed": True, "zcode_session_id": task["session_id"]},
+            }
         if tool == "zcode_agent_events":
             task = self.agents.setdefault(str(args.get("agent_id")), {"attempt_sequence": 1, "closed": False, "events": []})
             after = int(args.get("after_sequence", 0))
@@ -504,22 +580,59 @@ class FakeRuntime:
             after = int(args.get("after_sequence", 0))
             if self.mode == "no-progress":
                 return {"task": {"phase": "RUNNING"}, "events": [], "next_sequence": after, "has_more": False, "timed_out": True, "status": "timeout", "progress": []}
-            return {"task": {"phase": "TERMINAL"}, "events": [], "next_sequence": after, "has_more": False, "timed_out": False}
+            agent_id = str(args.get("agent_id"))
+            task = self.agents.get(agent_id, {})
+            task["phase"] = "TERMINAL"
+            self._terminal.add(agent_id)
+            return {"task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)}, "events": [], "next_sequence": after, "has_more": False, "timed_out": False}
         if tool == "zcode_agent_respond":
-            return {"disposition": "responded", "requested_decision": "deny", "effective_decision": "deny", "policy_overrode": False, "policy_reason_code": None, "attempt_sequence": 1}
+            request_id = str(args.get("request_id"))
+            request = self._pending.get(request_id)
+            if request is None:
+                return {"isError": True, "error": {"code": "NOT_FOUND", "message": "request not found"}}
+            if request.get("responded"):
+                disposition = "already_responded"
+            else:
+                request["responded"] = True
+                disposition = "responded"
+            agent_id = str(args.get("agent_id"))
+            attempt = self.agents.get(agent_id, {}).get("attempt_sequence", 1)
+            return {"disposition": disposition, "requested_decision": args.get("decision", "deny"), "effective_decision": "deny", "policy_overrode": False, "policy_reason_code": None, "attempt_sequence": attempt}
         if tool == "zcode_agent_result":
-            artifact = b"fake report\n"
+            agent_id = str(args.get("agent_id"))
+            task = self.agents.get(agent_id, {})
+            attempt = int(args.get("attempt_sequence") or task.get("attempt_sequence", 1))
+            artifact = (f"fake report attempt {attempt}\n").encode()
+            artifact_id = f"fake-artifact-{attempt}"
             digest = hashlib.sha256(artifact).hexdigest()
             chunk = None
             if args.get("offset_bytes") is not None and args.get("limit_bytes") is not None:
                 offset, limit = int(args["offset_bytes"]), int(args["limit_bytes"])
                 data = artifact[offset : offset + limit]
-                chunk = {"artifact_id": "fake-artifact", "offset_bytes": offset, "returned_bytes": len(data), "eof": offset + len(data) == len(artifact), "sha256": digest, "size_bytes": len(artifact), "bytes_base64": base64.b64encode(data).decode()}
-            return {"task": {"phase": "TERMINAL", "attempt_sequence": 1}, "result": {"outcome": "SUCCEEDED", "summary": "fake", "review_evidence": {"artifact": {"artifact_id": "fake-artifact", "sha256": digest, "size_bytes": len(artifact)}}}, "artifacts": [{"artifact_id": "fake-artifact", "kind": "report_markdown", "sha256": digest, "size_bytes": len(artifact)}], "artifact_chunk": chunk}
+                chunk = {"artifact_id": artifact_id, "offset_bytes": offset, "returned_bytes": len(data), "eof": offset + len(data) == len(artifact), "sha256": digest, "size_bytes": len(artifact), "bytes_base64": base64.b64encode(data).decode()}
+            return {
+                "task": {"phase": "TERMINAL", "attempt_sequence": attempt, "effective_budget": task.get("effective_budget", {})},
+                "result": {"outcome": "SUCCEEDED", "summary": "fake", "result_sha256": digest, "review_evidence": {
+                    "final_signal": "PASS", "finalized": True, "report_revision": attempt,
+                    "finalization_revision": attempt, "artifact": {"artifact_id": artifact_id, "sha256": digest, "size_bytes": len(artifact)},
+                    "counts": {"checkpoints": 1, "findings": 0, "open_findings": 0, "validations": 1},
+                    "independence": {"independent_evidence": attempt == 1, "fresh_session_observed": True, "counts_as_independent": attempt == 1},
+                }},
+                "artifacts": [{"artifact_id": artifact_id, "kind": "report_markdown", "sha256": digest, "size_bytes": len(artifact)}],
+                "artifact_chunk": chunk,
+            }
         if tool == "zcode_agent_close":
-            return {"task": {"phase": "TERMINAL", "closed": True, "resources_reaped": True}}
+            agent_id = str(args.get("agent_id"))
+            task = self.agents.setdefault(agent_id, {"attempt_sequence": 1, "closed": False, "events": []})
+            task["closed"] = True
+            task["phase"] = "CLOSED"
+            self._closed.add(agent_id)
+            return {"task": {"phase": "CLOSED", "closed": True, "resources_reaped": True}}
         if tool == "zcode_agent_get":
-            return {"task": {"phase": "RUNNING", "attempt_sequence": 1}, "result": None, "artifacts": [], "pending_requests": []}
+            agent_id = str(args.get("agent_id"))
+            task = self.agents.get(agent_id, {"phase": "RUNNING", "attempt_sequence": 1, "closed": False, "events": []})
+            pending = [dict(value, respondable=not value.get("responded", False)) for value in self._pending.values() if not value.get("responded")]
+            return {"task": {"phase": task.get("phase", "RUNNING"), "attempt_sequence": task.get("attempt_sequence", 1), "closed": task.get("closed", False), "resources_reaped": task.get("closed", False)}, "result": None, "artifacts": [], "pending_requests": pending}
         if tool == "zcode_agent_list":
             return {"tasks": [], "next_cursor": None}
         return {"ok": True}
@@ -609,7 +722,21 @@ PACK_FILES = (
 )
 PACK_DIRECTORIES = ("fixtures", "normalized", "raw-transcripts", "redacted-logs")
 _BENIGN_EXCLUDED_NAMES = {".DS_Store", "__MACOSX", "__pycache__"}
-_FORBIDDEN_CONTENT = re.compile(r"(?i)(?:password|secret|api[_-]?key|authorization|bearer\s+[A-Za-z0-9._~+/=-]{8,})\s*[:=]")
+_FORBIDDEN_CONTENT = re.compile(
+    r"(?ix)(?:password|secret|api[_-]?key|authorization|cookie|credential)\s*[:=]"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}\b"
+    r"|\b(?:token|password|secret|api[_-]?key|authorization)\s+[A-Za-z0-9._~+/=-]{8,}\b"
+    r"|-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"
+)
+
+# Pack roots are intentionally narrow.  This prevents a collector from
+# silently smuggling arbitrary files into an otherwise valid evidence pack.
+_PACK_ROOT_FILES: dict[str, tuple[re.Pattern[str], ...]] = {
+    "fixtures": (re.compile(r"case-[0-9a-z-]+(?:-manifest)?\.json$"),),
+    "normalized": (re.compile(r"(?:identity|catalog|readiness|case-[0-9a-z-]+)\.json$"),),
+    "raw-transcripts": (re.compile(r"mcp\.jsonl$"),),
+    "redacted-logs": (re.compile(r"(?:fatal|case-[0-9a-z-]+)\.json$"),),
+}
 
 
 def _check_pack_content(path: Path, data: bytes) -> None:
@@ -619,6 +746,19 @@ def _check_pack_content(path: Path, data: bytes) -> None:
         return
     if _FORBIDDEN_CONTENT.search(text) or _ABS.search(text) or _ANY_ABS.search(text):
         raise ValueError(f"unredacted secret or path in pack content: {path}")
+
+
+def _check_pack_filename(relative: Path) -> None:
+    if len(relative.parts) < 2:
+        return
+    root = relative.parts[0]
+    patterns = _PACK_ROOT_FILES.get(root)
+    if patterns is None:
+        raise ValueError(f"unexpected pack root: {root}")
+    if len(relative.parts) != 2:
+        raise ValueError(f"nested pack path is not allowed: {relative}")
+    if not any(pattern.fullmatch(relative.name) for pattern in patterns):
+        raise ValueError(f"unexpected pack filename: {relative}")
 
 
 def _pack_members(source: Path) -> list[Path]:
@@ -633,6 +773,8 @@ def _pack_members(source: Path) -> list[Path]:
         if path.is_symlink():
             raise ValueError(f"symlink is not allowed in pack: {relative}")
         if path.name in _BENIGN_EXCLUDED_NAMES or any(part in _BENIGN_EXCLUDED_NAMES for part in relative.parts):
+            if len(relative.parts) > 1:
+                raise ValueError(f"cache entry is not allowed in pack: {relative}")
             continue
         if path.is_dir():
             if len(relative.parts) == 1 and relative.name in PACK_DIRECTORIES:
@@ -647,6 +789,8 @@ def _pack_members(source: Path) -> list[Path]:
                 raise ValueError(f"unexpected pack file: {relative}")
         elif relative.parts[0] not in PACK_DIRECTORIES:
             raise ValueError(f"unexpected pack path: {relative}")
+        else:
+            _check_pack_filename(relative)
         data = path.read_bytes()
         _check_pack_content(path, data)
         members.append(path)
@@ -678,6 +822,8 @@ def verify_pack(destination: Path, expected_digest: str | None = None) -> str:
                 raise ValueError(f"pack contains unexpected root directory: {name}")
             if len(pure.parts) > 1 and pure.parts[0] not in PACK_DIRECTORIES:
                 raise ValueError(f"pack contains unexpected path: {name}")
+            if len(pure.parts) > 1:
+                _check_pack_filename(pure)
             if not name.endswith("/"):
                 _check_pack_content(Path(name), archive.read(name))
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
