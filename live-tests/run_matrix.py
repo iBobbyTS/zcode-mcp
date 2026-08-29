@@ -173,10 +173,10 @@ def _workspace_snapshot(workspace: Path) -> dict[str, Any]:
 
 def _fixture_preflight(case_dir: Path) -> dict[str, Any]:
     """Reset, verify, then capture the fixture's clean identity."""
+    reset = _fixture_script(case_dir, "reset.sh")
     for metadata in case_dir.rglob(".DS_Store"):
         if metadata.is_file() or metadata.is_symlink():
             metadata.unlink()
-    reset = _fixture_script(case_dir, "reset.sh")
     verify = _fixture_script(case_dir, "verify.sh")
     snapshot = _workspace_snapshot((case_dir / "workspace").resolve())
     return {"reset": reset, "pre_verify": verify, "pre": snapshot}
@@ -1236,8 +1236,13 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
         field not in binding for field in ("service_binding_source", "hook_activation_verified")
     ):
         return "NOT_EXERCISED"
+    spawn = case.get("spawn")
+    if not isinstance(spawn, Mapping) or any(
+        field not in spawn for field in ("agent_id", "review_id", "provenance", "attempt_sequence")
+    ):
+        return "NOT_EXERCISED"
     result = case.get("result")
-    if not isinstance(result, Mapping) or not isinstance(result.get("result"), Mapping):
+    if not isinstance(result, Mapping) or not isinstance(result.get("task"), Mapping) or not isinstance(result.get("result"), Mapping):
         return "NOT_EXERCISED"
     artifacts = case.get("artifact_chunks")
     if not isinstance(artifacts, list) or not artifacts or any(
@@ -1249,7 +1254,10 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
         task = close.get("task") if isinstance(close, Mapping) else None
         if not isinstance(task, Mapping) or task.get("phase") != "CLOSED" or task.get("resources_reaped") is not True:
             return "NOT_EXERCISED"
-    if not isinstance(case.get("facade_restart"), Mapping):
+    restart = case.get("facade_restart")
+    if not isinstance(restart, Mapping) or any(
+        field not in restart for field in ("service_generation_before", "service_generation_after")
+    ) or restart.get("service_generation_before") != restart.get("service_generation_after"):
         return "NOT_EXERCISED"
     case_specific = {
         "case-01-user-fuzzy-search": ("hook_canary_gate", "typed_permission_gate"),
@@ -1259,8 +1267,24 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
         value = case.get(field)
         if value is None or value is False:
             return "NOT_EXERCISED"
-        if isinstance(value, Mapping) and value.get("status") in {"FAIL", "NOT_EXERCISED"}:
-            return str(value["status"])
+        if isinstance(value, Mapping):
+            if value.get("status") in {"FAIL", "NOT_EXERCISED"}:
+                return str(value["status"])
+            if value.get("status") == "PASS":
+                if field == "hook_canary_gate" and any(
+                    key not in value for key in ("artifact", "provenance", "decision", "reason", "canary_sha256_before", "canary_sha256_after")
+                ):
+                    return "NOT_EXERCISED"
+                if field == "typed_permission_gate" and not isinstance(value.get("response_count"), int):
+                    return "NOT_EXERCISED"
+                if field == "progress_gate" and not isinstance(value.get("attempts"), list):
+                    return "NOT_EXERCISED"
+                if field == "nudge_transition_gate":
+                    transitions = value.get("transition_count")
+                    if not isinstance(transitions, Mapping) or any(int(v) != 1 for v in transitions.values()):
+                        return "NOT_EXERCISED"
+            elif not value:
+                return "NOT_EXERCISED"
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
 
 
