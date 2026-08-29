@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +12,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("case-01-user-fuzzy-search", "case-02-shared-group-members", "case-03-agent-control-lifecycle")
+SOURCE_ROOT = Path("/Users/ibobby/Projects/zcode-mcp-agent-live-test-workspace")
+
+
+def readonly_snapshot(root: Path) -> str:
+    """Hash source paths/content without copying or mutating evaluator material."""
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            kind, payload = "L", os.readlink(path).encode()
+        elif path.is_dir():
+            kind, payload = "D", b""
+        elif path.is_file():
+            kind, payload = "F", path.read_bytes()
+        else:
+            kind, payload = "?", b""
+        digest.update(kind.encode() + b"\0" + relative.encode() + b"\0")
+        digest.update(str(stat.S_IMODE(path.lstat().st_mode)).encode() + b"\0")
+        digest.update(str(len(payload)).encode() + b"\0" + payload + b"\0")
+    return digest.hexdigest()
 
 
 class FixtureContractTests(unittest.TestCase):
@@ -88,6 +111,13 @@ class FixtureContractTests(unittest.TestCase):
                 self.assert_verify_rejects(case, "workspace/__MACOSX/injected")
                 self.assert_verify_rejects(case, "workspace/credentials.txt", b"-----BEGIN RSA PRIVATE KEY-----")
                 self.assert_verify_rejects(case, "workspace/inventory-injected.txt")
+                empty = case / "workspace" / "empty-directory"
+                empty.mkdir()
+                try:
+                    result = subprocess.run([str(case / "scripts" / "verify.sh")], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                finally:
+                    empty.rmdir()
                 link = case / "workspace" / "injected-link"
                 link.symlink_to(tempfile.gettempdir())
                 try:
@@ -95,6 +125,13 @@ class FixtureContractTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                 finally:
                     link.unlink(missing_ok=True)
+                git_cache = case / "workspace" / ".git" / "audit-cache"
+                git_cache.mkdir(parents=True)
+                try:
+                    result = subprocess.run([str(case / "scripts" / "verify.sh")], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                finally:
+                    git_cache.rmdir()
 
     def test_source_inventory_digest_is_immutable_across_verify(self) -> None:
         for name in CASES:
@@ -104,6 +141,14 @@ class FixtureContractTests(unittest.TestCase):
                 before = self.run_script(case, "verify")["workspace_sha256"]
                 after = self.run_script(case, "verify")["workspace_sha256"]
                 self.assertEqual(before, after)
+
+    def test_source_snapshot_is_read_only_and_unchanged(self) -> None:
+        self.assertTrue(SOURCE_ROOT.is_dir(), SOURCE_ROOT)
+        before = readonly_snapshot(SOURCE_ROOT)
+        for name in CASES:
+            subprocess.run([str(ROOT / name / "scripts" / "reset.sh")], check=True, capture_output=True, text=True)
+        after = readonly_snapshot(SOURCE_ROOT)
+        self.assertEqual(before, after)
 
     def test_manifest_and_context_checksums_reject_regression(self) -> None:
         for name in CASES:
