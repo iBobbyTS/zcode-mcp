@@ -791,7 +791,6 @@ class FakeRuntime:
                 "operation": "find canary -delete",
                 "summary": "find canary -delete",
                 "policy_preview": "externally_decidable",
-                "canary_exists_after": True,
                 "responded": False,
             }
         return events
@@ -980,8 +979,6 @@ class FakeRuntime:
                 "reason": args.get("reason", "bounded conformance"),
                 "attempt_sequence": attempt,
             }
-            if request.get("operation") == "find canary -delete":
-                result["canary_exists_after"] = True
             return result
         if tool == "zcode_agent_message":
             agent_id = str(args.get("agent_id"))

@@ -14,8 +14,12 @@ from conformance import (FakeRuntime, FatalConformanceError,
 from run_matrix import (
     CASE_C_BUDGET,
     _assert_case_a_canary,
+    _assert_typed_permission_gate,
+    _computed_case_conclusion,
     _fixture_postflight,
     _fixture_preflight,
+    _overall_result,
+    _run_case_a_hook_canary,
     _assert_event_contract,
     _call_case,
     _poll_terminal,
@@ -232,14 +236,19 @@ class S02Tests(unittest.TestCase):
         }
         result = _assert_case_a_canary({"permissions": [permission], "canary": {"exists_after": True}})
         self.assertEqual(result["command"], "find canary -delete")
+        # The public response cannot attest filesystem survival; only the
+        # verified Hook artifact gate may establish that fact.
+        self.assertEqual(
+            _assert_case_a_canary({"permissions": [permission], "canary": {"exists_after": False}})["command"],
+            "find canary -delete",
+        )
 
         for broken in (
             {"permissions": []},
             {"permissions": [dict(permission, request={"operation": "rm -rf canary"})]},
             {"permissions": [dict(permission, request={"operation": "find canary -delete --force"})]},
-            {"permissions": [dict(permission, effective_decision="allow")]},
-            {"permissions": [dict(permission, reason="")]},
-            {"permissions": [dict(permission, canary_exists_after=False)]},
+            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "allow", "disposition": "responded", "policy_overrode": False, "reason": "policy", "policy_reason_code": None})]},
+            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "deny", "disposition": "responded", "policy_overrode": False, "reason": "", "policy_reason_code": None})]},
         ):
             with self.assertRaises(FatalConformanceError):
                 _assert_case_a_canary(broken)
@@ -314,6 +323,61 @@ class S02Tests(unittest.TestCase):
                 return {"requested_decision": "deny", "effective_decision": "deny", "policy_overrode": False, "reason": "policy"}
         with self.assertRaises(FatalConformanceError):
             _pending_requests(Client(), "agent", {})
+
+    def test_hook_canary_uses_verified_artifact_and_not_public_survival_field(self):
+        provenance = FakeRuntime()._review_provenance(1)
+        gate = _run_case_a_hook_canary(provenance)
+        self.assertEqual(gate["status"], "PASS")
+        self.assertEqual(gate["decision"], "deny")
+        self.assertEqual(gate["canary_sha256_before"], gate["canary_sha256_after"])
+        self.assertNotIn("exists_after", gate)
+        missing = dict(provenance)
+        missing.pop("effective_hook_path")
+        with self.assertRaises(InfrastructureConformanceError):
+            _run_case_a_hook_canary(missing)
+        tampered = dict(provenance, effective_hook_sha256="0" * 64)
+        with self.assertRaises(FatalConformanceError):
+            _run_case_a_hook_canary(tampered)
+
+    def test_nudge_true_false_after_transition_is_fatal(self):
+        from run_matrix import _assert_case_c_progress
+        events = [{"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"}]
+        for sequence, stage in enumerate(("inspection", "validation", "synthesis"), start=2):
+            events.append({"sequence": sequence, "attempt_sequence": 1, "event_type": "review_progress",
+                           "stage": stage, "summary": stage, "last_progress_at": 1,
+                           "semantic_idle_ms": 1, "nudge_sent": False})
+        events.extend([
+            {"sequence": 5, "attempt_sequence": 1, "event_type": "review_progress", "stage": "synthesis", "summary": "synthesis", "last_progress_at": 1, "semantic_idle_ms": 120001, "nudge_sent": True},
+            {"sequence": 6, "attempt_sequence": 1, "event_type": "review_progress", "stage": "synthesis", "summary": "synthesis", "last_progress_at": 1, "semantic_idle_ms": 120002, "nudge_sent": False},
+        ])
+        with self.assertRaises(FatalConformanceError):
+            _assert_case_c_progress({"event_snapshots": [{"events": events}]}, {1})
+
+    def test_mandatory_gate_failures_and_identity_gaps_are_not_ready(self):
+        self.assertEqual(_computed_case_conclusion({"case_id": "case-01-user-fuzzy-search", "error": {"class": "FatalConformanceError"}}), "FAIL")
+        self.assertEqual(_computed_case_conclusion({"case_id": "case-01-user-fuzzy-search", "error": {"class": "InfrastructureConformanceError"}}), "NOT_EXERCISED")
+        self.assertEqual(_overall_result({"case-01-user-fuzzy-search": "PASS"}, ["active daemon identity was not bound"]), "INSUFFICIENT_EVIDENCE")
+
+    def test_typed_permission_gate_does_not_synthesize_missing_reason(self):
+        evidence = {"permissions": [{"response": {
+            "requested_decision": "deny", "effective_decision": "deny", "disposition": "responded",
+            "policy_overrode": False, "reason": None, "policy_reason_code": None,
+        }}]}
+        with self.assertRaises(FatalConformanceError):
+            _assert_typed_permission_gate(evidence)
+
+    def test_typed_permission_gate_rejects_invalid_decision_and_disposition_types(self):
+        base = {
+            "requested_decision": "deny", "effective_decision": "deny", "disposition": "responded",
+            "policy_overrode": False, "reason": "policy denied", "policy_reason_code": None,
+        }
+        for changes in (
+            {"requested_decision": None},
+            {"effective_decision": "unknown"},
+            {"disposition": None},
+        ):
+            with self.assertRaises(FatalConformanceError):
+                _assert_typed_permission_gate({"permissions": [{"response": dict(base, **changes)}]})
 
     def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
         with tempfile.TemporaryDirectory() as d:
@@ -483,14 +547,14 @@ class S02Tests(unittest.TestCase):
                     "--pack", str(pack_path),
                     "--timeout", "0.1",
                 ])
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(len(FakeFacadeTransport.instances), 1)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(FakeFacadeTransport.instances), 2)
             self.assertTrue(FakeFacadeTransport.instances[0].closed)
             self.assertTrue(pack_path.is_file())
             import zipfile
             with zipfile.ZipFile(pack_path) as archive:
                 summary = archive.read("SUMMARY.md").decode()
-                self.assertIn("OFFICIAL_RUNTIME_NOT_READY", summary)
+                self.assertIn("INSUFFICIENT_EVIDENCE", summary)
 
     def test_main_runner_freezes_after_typed_fatal_without_next_case(self):
         class StatusFacade:

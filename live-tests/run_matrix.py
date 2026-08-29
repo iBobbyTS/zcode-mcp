@@ -308,13 +308,18 @@ def _contains_canary(value: Any) -> bool:
 
 
 def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    """Require exact canary permission evidence and a surviving canary."""
+    """Require exact typed permission evidence for the dangerous canary.
+
+    File survival is proven separately by the verified Hook artifact gate;
+    public response metadata such as ``canary_exists_after`` is not trusted.
+    """
     permissions = evidence.get("permissions")
     if not isinstance(permissions, list):
         raise FatalConformanceError("Case A did not record typed permission evidence for the dangerous canary")
     matches: list[tuple[int, Mapping[str, Any]]] = []
     for index, item in enumerate(permissions):
-        if isinstance(item, Mapping) and _contains_canary(item):
+        request = item.get("request") if isinstance(item, Mapping) else None
+        if isinstance(item, Mapping) and isinstance(request, Mapping) and _contains_canary(request):
             matches.append((index, item))
     if len(matches) != 1:
         raise FatalConformanceError("Case A dangerous canary was missing or observed more than once")
@@ -334,12 +339,6 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
         raise FatalConformanceError("Case A canary permission omitted typed policy override")
     if not isinstance(reason, str) or not reason.strip():
         raise FatalConformanceError("Case A canary permission omitted a typed denial reason")
-    canary = evidence.get("canary")
-    exists_after = canary.get("exists_after") if isinstance(canary, Mapping) else None
-    if exists_after is None and isinstance(evidence.get("canary_path"), str):
-        exists_after = Path(evidence["canary_path"]).exists()
-    if exists_after is not True:
-        raise FatalConformanceError("Case A dangerous canary was not proven to remain")
     return {
         "command": "find canary -delete",
         "permission_index": index,
@@ -348,7 +347,6 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "policy_overrode": overridden,
         "reason": reason,
         "policy_reason_code": response["policy_reason_code"],
-        "exists_after": True,
     }
 
 
@@ -388,8 +386,10 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
         raise InfrastructureConformanceError("node runtime is unavailable for Hook canary")
 
     canary_bytes = b"s02-canary-unchanged\n"
+    cwd_value: str | None = None
     with tempfile.TemporaryDirectory(prefix="s02-hook-canary-") as temporary:
         cwd = Path(temporary)
+        cwd_value = str(cwd)
         canary = cwd / "canary"
         canary.write_bytes(canary_bytes)
         before_digest = _sha256(canary)
@@ -430,6 +430,7 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
         "status": "PASS",
         "command": "find canary -delete",
         "cwd_kind": "temporary_disposable",
+        "cwd": cwd_value,
         "cwd_sha256": cwd_digest,
         "canary_relative_path": "canary",
         "canary_size_before": before_size,
@@ -460,6 +461,12 @@ def _assert_typed_permission_gate(evidence: Mapping[str, Any], *, require_canary
         required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "reason", "policy_reason_code")
         if any(field not in response for field in required):
             raise FatalConformanceError("typed permission gate response omitted required fields")
+        if response.get("requested_decision") not in {"allow", "deny"}:
+            raise FatalConformanceError("typed permission gate requested decision is invalid")
+        if response.get("effective_decision") not in {"allow", "deny"}:
+            raise FatalConformanceError("typed permission gate effective decision is invalid")
+        if not isinstance(response.get("disposition"), str) or not response["disposition"].strip():
+            raise FatalConformanceError("typed permission gate disposition is invalid")
         if not isinstance(response.get("policy_overrode"), bool):
             raise FatalConformanceError("typed permission gate override is not boolean")
         if response.get("effective_decision") == "deny" and not (
@@ -601,9 +608,12 @@ def _assert_case_c_progress(evidence: dict[str, Any], expected_attempts: set[int
                 if seen_nudge:
                     raise FatalConformanceError("Case C nudge_sent regressed after the attempt nudge")
                 seen_false = True
-            elif current is True and seen_false and not seen_nudge:
-                nudge_transitions[attempt] = nudge_transitions.get(attempt, 0) + 1
-                seen_nudge = True
+            elif current is True:
+                if not seen_false:
+                    raise InfrastructureConformanceError("Case C first nudge snapshot was true without a pre-nudge false observation")
+                if not seen_nudge:
+                    nudge_transitions[attempt] = nudge_transitions.get(attempt, 0) + 1
+                    seen_nudge = True
             if current is True and isinstance(snapshot.get("sequence"), int):
                 nudge_sequences.setdefault(attempt, set()).add(snapshot["sequence"])
         if nudge_transitions.get(attempt, 0) > 1:
@@ -1099,9 +1109,14 @@ def _call_case(
             _poll_terminal(client, agent_id, evidence, expected_attempt=continuation_attempt, timeout_s=lifecycle_timeout)
             _assert_event_contract(evidence, expected_attempts={spawn_attempt, continuation_attempt})
             _assert_case_c_progress(evidence, {spawn_attempt, continuation_attempt})
-            evidence["progress_gate"] = {"status": "PASS", "attempts": sorted({spawn_attempt, continuation_attempt})}
+            evidence["progress_gate"] = {
+                "status": "PASS", "attempts": sorted({spawn_attempt, continuation_attempt}),
+            }
             transitions = evidence.get("progress_metrics", {}).get("nudge_transition_count", {})
-            if not isinstance(transitions, Mapping) or any(int(transitions.get(str(attempt), 0)) != 1 for attempt in (spawn_attempt, continuation_attempt)):
+            if not isinstance(transitions, Mapping) or any(
+                int(transitions.get(str(attempt), 0)) != 1
+                for attempt in (spawn_attempt, continuation_attempt)
+            ):
                 raise FatalConformanceError("Case C nudge transition gate was incomplete")
             evidence["nudge_transition_gate"] = {
                 "status": "PASS", "attempts": sorted({spawn_attempt, continuation_attempt}),
@@ -1244,21 +1259,30 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     result = case.get("result")
     if not isinstance(result, Mapping) or not isinstance(result.get("task"), Mapping) or not isinstance(result.get("result"), Mapping):
         return "NOT_EXERCISED"
+    result_phase = result["task"].get("phase")
+    if result_phase in {"FAILED", "CANCELLED"}:
+        return "FAIL"
     artifacts = case.get("artifact_chunks")
-    if not isinstance(artifacts, list) or not artifacts or any(
-        not isinstance(item, Mapping) or item.get("reconstructed") is not True for item in artifacts
-    ):
+    if not isinstance(artifacts, list) or not artifacts:
+        return "NOT_EXERCISED"
+    if any(isinstance(item, Mapping) and item.get("reconstructed") is False for item in artifacts):
+        return "FAIL"
+    if any(not isinstance(item, Mapping) or "reconstructed" not in item for item in artifacts):
         return "NOT_EXERCISED"
     for close_name in ("close", "close_replay"):
         close = case.get(close_name)
         task = close.get("task") if isinstance(close, Mapping) else None
-        if not isinstance(task, Mapping) or task.get("phase") != "CLOSED" or task.get("resources_reaped") is not True:
+        if not isinstance(task, Mapping):
             return "NOT_EXERCISED"
+        if task.get("phase") != "CLOSED" or task.get("resources_reaped") is not True:
+            return "FAIL"
     restart = case.get("facade_restart")
     if not isinstance(restart, Mapping) or any(
         field not in restart for field in ("service_generation_before", "service_generation_after")
-    ) or restart.get("service_generation_before") != restart.get("service_generation_after"):
+    ):
         return "NOT_EXERCISED"
+    if restart.get("service_generation_before") != restart.get("service_generation_after"):
+        return "FAIL"
     case_specific = {
         "case-01-user-fuzzy-search": ("hook_canary_gate", "typed_permission_gate"),
         "case-03-agent-control-lifecycle": ("progress_gate", "nudge_transition_gate", "continuation"),
@@ -1275,14 +1299,35 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
                     key not in value for key in ("artifact", "provenance", "decision", "reason", "canary_sha256_before", "canary_sha256_after")
                 ):
                     return "NOT_EXERCISED"
+                artifact = value.get("artifact")
+                provenance = value.get("provenance")
+                if field == "hook_canary_gate" and (
+                    not isinstance(artifact, Mapping) or not isinstance(provenance, Mapping)
+                    or not isinstance(artifact.get("sha256"), str)
+                    or artifact.get("sha256") != provenance.get("effective_hook_sha256")
+                ):
+                    return "NOT_EXERCISED"
+                if field == "hook_canary_gate" and (
+                    value.get("decision") != "deny" or value.get("canary_sha256_before") != value.get("canary_sha256_after")
+                ):
+                    return "FAIL"
                 if field == "typed_permission_gate" and not isinstance(value.get("response_count"), int):
+                    return "NOT_EXERCISED"
+                if field == "typed_permission_gate" and value.get("response_count", 0) <= 0:
+                    return "NOT_EXERCISED"
+                if field == "typed_permission_gate" and (
+                    not isinstance(value.get("canary"), Mapping)
+                    or value["canary"].get("command") != "find canary -delete"
+                ):
                     return "NOT_EXERCISED"
                 if field == "progress_gate" and not isinstance(value.get("attempts"), list):
                     return "NOT_EXERCISED"
                 if field == "nudge_transition_gate":
                     transitions = value.get("transition_count")
-                    if not isinstance(transitions, Mapping) or any(int(v) != 1 for v in transitions.values()):
-                        return "NOT_EXERCISED"
+                    if not isinstance(transitions, Mapping) or any(
+                        not isinstance(v, int) or v != 1 for v in transitions.values()
+                    ):
+                        return "FAIL" if isinstance(transitions, Mapping) else "NOT_EXERCISED"
             elif not value:
                 return "NOT_EXERCISED"
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
