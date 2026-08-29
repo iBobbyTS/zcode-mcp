@@ -589,6 +589,19 @@ fn submit_only_returns_stable_job_before_runtime_bootstrap() {
 }
 
 #[test]
+fn unverified_structured_submission_fails_closed_before_enqueue() {
+    let fixture = Fixture::new();
+    let input = fixture.structured_submission("unverified-policy");
+    let error = fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview { input })
+        .unwrap_err();
+    assert_eq!(error.code, RpcErrorCode::Validation);
+    assert_eq!(error.message, "REVIEW_BASH_POLICY_UNVERIFIED");
+    assert!(fixture.store.list_jobs(10).unwrap().is_empty());
+}
+
+#[test]
 fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
     let fixture = Fixture::new();
     let expected_runtime = "f".repeat(64);

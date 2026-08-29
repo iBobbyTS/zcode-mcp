@@ -9,6 +9,7 @@ const corpus = JSON.parse(fs.readFileSync(new URL('../policy-corpus.json', impor
 
 function reasonClass(result, command) {
   if (result.decision === 'allow') return 'allow';
+  if (result.code === 'git_operand_sensitive_path') return 'path';
   if (result.code.startsWith('git_')) return 'git';
   if (result.code.startsWith('shell_')) return 'shell';
   if (command.startsWith('git ')) return 'git';

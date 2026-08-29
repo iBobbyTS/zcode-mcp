@@ -1078,16 +1078,16 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
     fn reason_class(reason: &str) -> &'static str {
         if reason == "review_bash_allowlisted" {
             "allow"
-        } else if reason.contains("git_") {
-            "git"
-        } else if reason.contains("shell_") {
-            "shell"
         } else if reason.contains("credential")
             || reason.contains("prior_review")
             || reason.contains("path")
             || reason.contains("find_")
         {
             "path"
+        } else if reason.contains("git_") {
+            "git"
+        } else if reason.contains("shell_") {
+            "shell"
         } else {
             "stdin"
         }

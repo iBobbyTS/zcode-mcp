@@ -24,6 +24,15 @@ use std::{
 };
 use zcode_driver::{observe_process_group, ChildExit, Inbound, ProcessIdentity, StopOutcome};
 
+#[test]
+fn unverified_review_bash_policy_preserves_the_fail_closed_rpc_code() {
+    let error = map_orchestration(OrchestrationError::Contract(
+        "REVIEW_BASH_POLICY_UNVERIFIED",
+    ));
+    assert_eq!(error.code, RpcErrorCode::Validation);
+    assert_eq!(error.message, "REVIEW_BASH_POLICY_UNVERIFIED");
+}
+
 struct FakeRuntime {
     sink: Arc<dyn LifecycleSink>,
     next_sequence: AtomicU64,

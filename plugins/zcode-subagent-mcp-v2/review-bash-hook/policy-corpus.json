@@ -42,6 +42,8 @@
     { "command": "git diff --ext-diff", "reason_class": "git" },
     { "command": "git show --textconv HEAD", "reason_class": "git" },
     { "command": "git diff --no-index README.md /etc/passwd", "reason_class": "git" },
+    { "command": "git diff HEAD~1 .env", "reason_class": "path" },
+    { "command": "git log -p .env", "reason_class": "path" },
     { "command": "git -C /tmp status --short", "reason_class": "git" },
     { "command": "git -c core.pager=cat status", "reason_class": "git" },
     { "command": "cat .env", "reason_class": "path" },

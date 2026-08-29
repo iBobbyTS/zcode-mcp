@@ -1349,12 +1349,51 @@ fn cleanup_prepared(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationEr
 
 fn require_verified_hook_policy() -> Result<(), OrchestrationError> {
     let current = review_preparation::review_bash_hook_provenance();
+    require_verified_hook_policy_record(&current)
+}
+
+fn require_verified_hook_policy_record(
+    current: &review_preparation::ReviewHookProvenance,
+) -> Result<(), OrchestrationError> {
     if !current.hook_activation_verified {
         return Err(OrchestrationError::Contract(
             "REVIEW_BASH_POLICY_UNVERIFIED",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hook_policy_tests {
+    use super::*;
+
+    #[test]
+    fn unverified_hook_policy_fails_closed_before_structured_review_start() {
+        let current = review_preparation::ReviewHookProvenance {
+            daemon_policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
+            daemon_policy_sha256: review_preparation::review_bash_daemon_policy_sha256(),
+            expected_hook_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
+            expected_hook_sha256: review_preparation::review_bash_hook_sha256(),
+            effective_hook_version: None,
+            effective_hook_sha256: None,
+            effective_hook_path: None,
+            effective_config_path: None,
+            effective_config_sha256: None,
+            effective_guard_wrapper_path: None,
+            effective_guard_wrapper_sha256: None,
+            effective_audit_wrapper_path: None,
+            effective_audit_wrapper_sha256: None,
+            hook_activation_verified: false,
+            activation_method: None,
+            activation_generation: None,
+        };
+        assert!(matches!(
+            require_verified_hook_policy_record(&current),
+            Err(OrchestrationError::Contract(
+                "REVIEW_BASH_POLICY_UNVERIFIED"
+            ))
+        ));
+    }
 }
 
 fn cleanup_prepared_job_root(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationError> {

@@ -1154,7 +1154,10 @@ impl RpcService {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
         let orchestrator = ReviewJobOrchestrator::new(scheduler.clone()).ok();
-        let service_generation = opaque_generation()?;
+        let service_generation = std::env::var("ZCODE_REVIEW_SERVICE_GENERATION")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(opaque_generation()?);
         Ok(Self {
             scheduler,
             store,
@@ -2657,6 +2660,9 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
 
 fn map_orchestration(error: OrchestrationError) -> RpcError {
     match error {
+        OrchestrationError::Contract("REVIEW_BASH_POLICY_UNVERIFIED") => {
+            RpcError::new(RpcErrorCode::Validation, "REVIEW_BASH_POLICY_UNVERIFIED")
+        }
         OrchestrationError::Contract(_) => RpcError::new(
             RpcErrorCode::Validation,
             "structured review fields are invalid",

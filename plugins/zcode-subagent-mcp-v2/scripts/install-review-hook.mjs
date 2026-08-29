@@ -53,7 +53,12 @@ for (const [event, { script }] of Object.entries(events)) {
 }
 atomicWrite(configPath, next);
 
-const hookSource = fs.readFileSync(path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs'));
+const effectiveConfigPath = path.resolve(configPath);
+const effectiveHookPath = path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs');
+const guardWrapperPath = path.join(hookRoot, 'hooks', 'check-bash-readonly.mjs');
+const auditWrapperPath = path.join(hookRoot, 'hooks', 'audit-bash-result.mjs');
+const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const hookSource = fs.readFileSync(effectiveHookPath);
 const hookSha256 = crypto.createHash('sha256').update(hookSource).digest('hex');
 const daemonSource = fs.readFileSync(path.join(pluginRoot, '..', '..', 'crates', 'review-preparation', 'src', 'policy.rs'));
 const daemonSha256 = crypto.createHash('sha256').update(daemonSource).digest('hex');
@@ -64,7 +69,13 @@ atomicWrite(provenancePath, {
   expected_hook_sha256: hookSha256,
   effective_hook_version: 'zcode-readonly-bash/v1.0.0',
   effective_hook_sha256: hookSha256,
-  effective_hook_path: path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs'),
+  effective_hook_path: effectiveHookPath,
+  effective_config_path: effectiveConfigPath,
+  effective_config_sha256: hashFile(effectiveConfigPath),
+  effective_guard_wrapper_path: guardWrapperPath,
+  effective_guard_wrapper_sha256: hashFile(guardWrapperPath),
+  effective_audit_wrapper_path: auditWrapperPath,
+  effective_audit_wrapper_sha256: hashFile(auditWrapperPath),
   hook_activation_verified: false,
   activation_method: 'outer-plugin-install',
   activation_generation: `${Date.now()}-${hookSha256.slice(0, 12)}`,

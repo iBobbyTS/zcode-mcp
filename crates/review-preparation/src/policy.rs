@@ -429,6 +429,16 @@ impl PolicyLauncher {
                 reason: "sed_form_not_bounded",
             };
         }
+        if program == "git"
+            && argv[2..].iter().any(|arg| {
+                is_credential_path(Path::new(arg)) || is_prior_review_artifact(Path::new(arg))
+            })
+        {
+            return PermissionDecision {
+                allowed: false,
+                reason: "git_sensitive_path_denied",
+            };
+        }
         if program == "git" && !valid_review_git(&argv[1..]) {
             return PermissionDecision {
                 allowed: false,
@@ -798,6 +808,8 @@ fn safe_review_git_operand(arg: &str) -> bool {
         && !arg
             .split('/')
             .any(|component| component.is_empty() || component == "..")
+        && !is_credential_path(Path::new(arg))
+        && !is_prior_review_artifact(Path::new(arg))
         && !unsafe_review_git_object_path(arg)
 }
 

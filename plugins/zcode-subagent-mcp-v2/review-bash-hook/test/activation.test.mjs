@@ -32,6 +32,26 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   assert.equal(preflight.status, 0, preflight.stderr);
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 0);
 
+  const driftedConfig = JSON.parse(fs.readFileSync(config, 'utf8'));
+  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
+    const entry = driftedConfig.hooks.events[event].find((candidate) => candidate.description === `review-bash-hook:${event}`);
+    entry.hooks[0].args = ['/usr/bin/true'];
+  }
+  fs.writeFileSync(config, JSON.stringify(driftedConfig));
+  assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 1);
+  assert.notEqual(run(preflightScript, ['--config', config, '--provenance', provenance]).status, 0);
+
+  assert.equal(run(installScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.equal(run(preflightScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 0);
+
+  const disabledConfig = JSON.parse(fs.readFileSync(config, 'utf8'));
+  disabledConfig.hooks.enabled = false;
+  fs.writeFileSync(config, JSON.stringify(disabledConfig));
+  assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 1);
+  assert.equal(run(installScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.equal(run(preflightScript, ['--config', config, '--provenance', provenance]).status, 0);
+
   const tampered = JSON.parse(fs.readFileSync(provenance, 'utf8'));
   tampered.effective_hook_sha256 = '0'.repeat(64);
   fs.writeFileSync(provenance, JSON.stringify(tampered));

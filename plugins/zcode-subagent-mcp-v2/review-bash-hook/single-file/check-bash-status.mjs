@@ -879,6 +879,8 @@ function gitOperandSafety(token) {
     const secret = secretPathReason(objectPath);
     if (secret) return hardDeny('git_object_sensitive_path', secret);
   }
+  const directSecret = secretPathReason(token);
+  if (directSecret) return hardDeny('git_operand_sensitive_path', directSecret);
   return null;
 }
 

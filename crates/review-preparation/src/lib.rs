@@ -5,7 +5,10 @@ mod worktree;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, fs, path::PathBuf};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+};
 
 /// Version and descriptor digest of the plugin-supplied conservative review Bash policy.
 /// The daemon exposes these alongside review provenance so policy decisions are auditable.
@@ -21,6 +24,18 @@ pub struct ReviewHookProvenance {
     pub effective_hook_sha256: Option<String>,
     #[serde(default)]
     pub effective_hook_path: Option<String>,
+    #[serde(default)]
+    pub effective_config_path: Option<String>,
+    #[serde(default)]
+    pub effective_config_sha256: Option<String>,
+    #[serde(default)]
+    pub effective_guard_wrapper_path: Option<String>,
+    #[serde(default)]
+    pub effective_guard_wrapper_sha256: Option<String>,
+    #[serde(default)]
+    pub effective_audit_wrapper_path: Option<String>,
+    #[serde(default)]
+    pub effective_audit_wrapper_sha256: Option<String>,
     pub hook_activation_verified: bool,
     pub activation_method: Option<String>,
     pub activation_generation: Option<String>,
@@ -59,6 +74,12 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
         effective_hook_version: None,
         effective_hook_sha256: None,
         effective_hook_path: None,
+        effective_config_path: None,
+        effective_config_sha256: None,
+        effective_guard_wrapper_path: None,
+        effective_guard_wrapper_sha256: None,
+        effective_audit_wrapper_path: None,
+        effective_audit_wrapper_sha256: None,
         hook_activation_verified: false,
         activation_method: None,
         activation_generation: None,
@@ -73,11 +94,10 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
         return unverified();
     };
     let service_generation = std::env::var("ZCODE_REVIEW_SERVICE_GENERATION").ok();
-    let artifact_matches = record
-        .effective_hook_path
-        .as_deref()
-        .and_then(|path| fs::read(path).ok())
-        .is_some_and(|bytes| Some(sha256_bytes(&bytes)) == record.effective_hook_sha256);
+    let artifact_matches = file_hash_matches(
+        record.effective_hook_path.as_deref(),
+        record.effective_hook_sha256.as_deref(),
+    );
     let verified = record.hook_activation_verified
         && record.daemon_policy_version == daemon_policy_version
         && record.daemon_policy_sha256 == daemon_policy_sha256
@@ -86,6 +106,7 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
         && record.effective_hook_version.as_deref() == Some(expected_hook_version.as_str())
         && record.effective_hook_sha256.as_deref() == Some(expected_hook_sha256.as_str())
         && artifact_matches
+        && effective_config_references_hook(&record)
         && record
             .activation_method
             .as_deref()
@@ -100,6 +121,118 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
     } else {
         unverified()
     }
+}
+
+fn file_hash_matches(path: Option<&str>, expected: Option<&str>) -> bool {
+    match (path, expected) {
+        (Some(path), Some(expected)) => fs::read(path)
+            .ok()
+            .is_some_and(|bytes| sha256_bytes(&bytes) == expected),
+        _ => false,
+    }
+}
+
+fn effective_config_references_hook(record: &ReviewHookProvenance) -> bool {
+    let (
+        Some(config_path),
+        Some(config_sha256),
+        Some(guard_path),
+        Some(guard_sha256),
+        Some(audit_path),
+        Some(audit_sha256),
+    ) = (
+        record.effective_config_path.as_deref(),
+        record.effective_config_sha256.as_deref(),
+        record.effective_guard_wrapper_path.as_deref(),
+        record.effective_guard_wrapper_sha256.as_deref(),
+        record.effective_audit_wrapper_path.as_deref(),
+        record.effective_audit_wrapper_sha256.as_deref(),
+    )
+    else {
+        return false;
+    };
+    if !file_hash_matches(Some(config_path), Some(config_sha256))
+        || !file_hash_matches(Some(guard_path), Some(guard_sha256))
+        || !file_hash_matches(Some(audit_path), Some(audit_sha256))
+    {
+        return false;
+    }
+    let Some(hook_root) = PathBuf::from(guard_path)
+        .parent()
+        .and_then(|path| path.parent())
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    if Path::new(audit_path) != hook_root.join("hooks/audit-bash-result.mjs")
+        || record.effective_hook_path.as_deref()
+            != hook_root.join("lib/readonly-bash-policy.mjs").to_str()
+    {
+        return false;
+    }
+    let Ok(config) = fs::read(config_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .ok_or(())
+    else {
+        return false;
+    };
+    if config
+        .pointer("/hooks/enabled")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return false;
+    }
+    [
+        ("PreToolUse", guard_path),
+        ("PostToolUse", audit_path),
+        ("PostToolUseFailure", audit_path),
+    ]
+    .into_iter()
+    .all(|(event, expected_path)| config_event_references(&config, event, expected_path))
+}
+
+fn config_event_references(config: &serde_json::Value, event: &str, expected_path: &str) -> bool {
+    config
+        .pointer(&format!("/hooks/events/{event}"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                let hook = entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|hooks| hooks.len() == 1)
+                    .and_then(|hooks| hooks.first());
+                let command = hook
+                    .and_then(|hook| hook.get("command"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|command| {
+                        PathBuf::from(command)
+                            .file_name()
+                            .map(|name| name.to_owned())
+                    });
+                entry.get("matcher").and_then(serde_json::Value::as_str) == Some("Bash")
+                    && entry.get("description").and_then(serde_json::Value::as_str)
+                        == Some(&format!("review-bash-hook:{event}"))
+                    && hook
+                        .and_then(|hook| hook.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("process")
+                    && hook
+                        .and_then(|hook| hook.get("timeoutMs"))
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(5_000)
+                    && command.as_deref().is_some_and(|name| name == "node")
+                    && hook
+                        .and_then(|hook| hook.get("args"))
+                        .and_then(serde_json::Value::as_array)
+                        .filter(|args| args.len() == 1)
+                        .and_then(|args| args.first())
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected_path)
+            })
+        })
 }
 
 /// Digest of both decision owners that make up the shipped review Bash policy.
