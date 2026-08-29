@@ -201,11 +201,12 @@ class LaunchLedger:
             self._reservations = reservations
 
     def mark_retry(self, token: str) -> None:
-        """Consume one retry allowance without reserving a second launch.
+        """Consume one retry allowance on an existing reservation token.
 
         An ambiguous transport failure may already have launched the child.  A
         retry of the same idempotent public submission therefore reuses the
-        original conservative reservation instead of claiming a second launch.
+        original reservation token, while still consuming a second total launch
+        slot because the retry may have started another child.
         """
         with self._locked():
             state = _read_json(self.path)
@@ -220,6 +221,13 @@ class LaunchLedger:
             if retries >= retry_limit:
                 raise LaunchBudgetExceeded(f"retry slots exhausted ({retry_limit})")
             reservations[token] = True
+            # ``count`` is the total number of launch attempts, including
+            # ambiguous retries.  Keeping the retry marker separately lets the
+            # nominal/retry policy remain inspectable while enforcing the hard
+            # total cap on ``count``.
+            if count >= self.limit:
+                raise LaunchBudgetExceeded(f"official launch budget exhausted ({self.limit})")
+            count += 1
             retries += 1
             self._persist(count, retries, reservations)
             self.count, self.retries = count, retries
@@ -644,12 +652,33 @@ def normalize(case: str, observations: Mapping[str, Any]) -> dict[str, Any]:
                     )
                 retained.append(normalized_event)
         out["events"] = retained
-        sequences = [event.get("sequence") for event in retained]
+        # Public event sequence numbers are scoped to a review attempt.  A
+        # continuation may legitimately restart at sequence 1, so validate
+        # each attempt independently while retaining every observed event.
+        # Repeated pages may replay an already-seen sequence; equal values are
+        # accepted as rereads, while a lower value in the same attempt is not.
+        sequences_by_attempt: dict[int, list[Any]] = {}
+        for event in retained:
+            attempt = event.get("attempt_sequence")
+            if isinstance(attempt, int):
+                sequences_by_attempt.setdefault(attempt, []).append(event.get("sequence"))
         out["event_types"] = [event.get("event_type") for event in retained]
-        out["event_sequence_monotonic"] = all(
-            isinstance(a, int) and isinstance(b, int) and a < b
-            for a, b in zip(sequences, sequences[1:])
-        )
+        monotonic_by_attempt: dict[str, bool] = {}
+        for attempt, sequences in sequences_by_attempt.items():
+            previous: int | None = None
+            monotonic = True
+            for sequence in sequences:
+                if not isinstance(sequence, int):
+                    monotonic = False
+                    continue
+                if previous is not None and sequence < previous:
+                    monotonic = False
+                previous = max(previous, sequence) if previous is not None else sequence
+            monotonic_by_attempt[str(attempt)] = monotonic
+        out["event_sequence_monotonic"] = all(monotonic_by_attempt.values())
+        out["event_sequence_monotonic_by_attempt"] = {
+            attempt: monotonic for attempt, monotonic in monotonic_by_attempt.items()
+        }
         out["event_count"] = len(retained)
         out["public_projection_valid"] = projection_valid
     return out

@@ -11,7 +11,14 @@ from conformance import (FakeRuntime, FatalConformanceError,
                          PACK_DIRECTORIES, PACK_FILES, PublicV2Client, REQUIRED_TOOLS, collect_artifact,
                          finalize_pack, normalize, redact, validate_artifact_chunk,
                          StdioMCPTransport)
-from run_matrix import CASE_C_BUDGET, _call_case, _poll_terminal, _public_events, main
+from run_matrix import (
+    CASE_C_BUDGET,
+    _assert_event_contract,
+    _call_case,
+    _poll_terminal,
+    _public_events,
+    main,
+)
 
 
 class S02Tests(unittest.TestCase):
@@ -88,6 +95,40 @@ class S02Tests(unittest.TestCase):
         self.assertFalse(out["public_projection_valid"])
         self.assertNotIn("/Users", json.dumps(out))
 
+    def test_event_sequences_are_attempt_local_and_duplicate_pages_remain_observable(self):
+        attempt_one = [
+            {"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"},
+            {"sequence": 2, "attempt_sequence": 1, "event_type": "terminal"},
+        ]
+        attempt_two = [
+            {"sequence": 1, "attempt_sequence": 2, "event_type": "attempt_started"},
+            {"sequence": 2, "attempt_sequence": 2, "event_type": "terminal"},
+        ]
+        evidence = {
+            "event_pages": [
+                {"events": attempt_one + attempt_two},
+                # A reread of the same page is valid and must remain in the
+                # observation stream for duplicate-page evidence.
+                {"events": attempt_two},
+            ],
+            "waits": [],
+        }
+        _assert_event_contract(evidence, expected_attempts={1, 2})
+        self.assertEqual(len(evidence["event_pages"][1]["events"]), 2)
+        self.assertEqual([event["sequence"] for event in _public_events(evidence)], [1, 2, 1, 2])
+
+    def test_event_sequence_regression_within_one_attempt_is_rejected(self):
+        evidence = {
+            "event_pages": [{"events": [
+                {"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"},
+                {"sequence": 3, "attempt_sequence": 1, "event_type": "review_progress"},
+                {"sequence": 2, "attempt_sequence": 1, "event_type": "terminal"},
+            ]}],
+            "waits": [],
+        }
+        with self.assertRaisesRegex(Exception, "within an attempt"):
+            _assert_event_contract(evidence, expected_attempts={1})
+
     def test_fake_negative_paths_do_not_use_ledger(self):
         runtime = FakeRuntime("no-progress")
         with tempfile.TemporaryDirectory() as d:
@@ -153,6 +194,26 @@ class S02Tests(unittest.TestCase):
         self.assertTrue(evidence["progress_metrics"]["soft_threshold_crossings"])
         self.assertTrue(evidence["progress_metrics"]["non_refresh_sequences"])
 
+    def test_hook_binding_gap_changes_case_conclusion_and_is_renderable(self):
+        class UnverifiedHookRuntime(FakeRuntime):
+            def _review_provenance(self, attempt_sequence: int) -> dict[str, object]:
+                provenance = super()._review_provenance(attempt_sequence)
+                provenance["hook_activation_verified"] = False
+                provenance["effective_hook_version"] = None
+                provenance["effective_hook_sha256"] = None
+                provenance["activation_method"] = None
+                provenance["activation_generation"] = None
+                return provenance
+
+        runtime = UnverifiedHookRuntime()
+        manifest = json.loads((Path(__file__).parents[1] / "case-01-user-fuzzy-search/fixture-manifest.json").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            client = PublicV2Client(runtime, LaunchLedger(Path(d) / "ledger.json"))
+            evidence = _call_case(client, Path(__file__).parents[1] / "case-01-user-fuzzy-search", manifest, Path(d))
+        self.assertEqual(evidence["conclusion"], "PASS_WITH_GAPS")
+        self.assertIn("Hook activation was not publicly verified", evidence["gaps"])
+        self.assertIn("Hook activation was not publicly verified", evidence["spawn_identity_binding"]["gaps"])
+
     def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
         with tempfile.TemporaryDirectory() as d:
             source = self._valid_pack_source(Path(d))
@@ -211,9 +272,40 @@ class S02Tests(unittest.TestCase):
             with self.assertRaises(InfrastructureConformanceError):
                 client.call("zcode_review_spawn", {}, launches=True, retry_infrastructure=True)
             self.assertEqual(transport.calls, 2)
-            self.assertEqual(ledger.count, 1)
+            # The retry reuses the same reservation token, but conservatively
+            # consumes a second total launch slot because the first call may
+            # already have started a child.
+            self.assertEqual(ledger.count, 2)
             self.assertEqual(ledger.retries, 1)
             self.assertTrue(json.loads(ledger.path.read_text())["reservations"])
+
+    def test_ambiguous_ensure_ready_retry_consumes_total_launch_cap(self):
+        class ReadinessTransport:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, tool, args):
+                self.calls += 1
+                if self.calls == 1:
+                    raise InfrastructureConformanceError("ensure-ready response was ambiguous")
+                return {"ready": True, "status": {"components": {"daemon": "READY"}}}
+
+        with tempfile.TemporaryDirectory() as d:
+            ledger = LaunchLedger(Path(d) / "ledger.json")
+            transport = ReadinessTransport()
+            result = PublicV2Client(transport, ledger).call(
+                "zcode_system_ensure_ready", {}, launches=True, retry_infrastructure=True,
+            )
+            self.assertTrue(result["ready"])
+            self.assertEqual(transport.calls, 2)
+            self.assertEqual(ledger.count, 2)
+            self.assertEqual(ledger.retries, 1)
+            # Six further nominal reservations would exceed the eight-launch
+            # hard cap after the ambiguous retry has consumed two slots.
+            for _ in range(6):
+                ledger.reserve()
+            with self.assertRaises(LaunchBudgetExceeded):
+                ledger.reserve()
 
     def test_existing_submission_does_not_reserve_a_new_launch(self):
         class ExistingTransport:

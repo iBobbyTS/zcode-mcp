@@ -31,3 +31,20 @@
 - 仅对本地 facade 做了 `tools/list` 协议冒烟；本轮未调用 official runtime。
 
 Wave 4 final validation: 20/20 stdlib tests passed; py_compile, diff-check, and CodeGraph sync passed; official calls remained 0.
+
+## Repair wave 5 closure (R2b/R6b/R7b)
+
+- Event sequence validation is attempt-local. Continuation attempts may restart
+  at sequence `1`; duplicate page rereads remain in the observation stream and
+  only the latest snapshot is used for the unique public projection.
+- Public Hook binding gaps from both initial spawn and continuation are copied
+  into case `evidence.gaps`, so computed conclusions and `KNOWN-GAPS.md` report
+  `PASS_WITH_GAPS` truthfully instead of implying verified Hook activation.
+- An ambiguous infrastructure retry reuses its reservation token but consumes
+  a second total launch slot (`count` includes the retry; `retries` remains the
+  retry subset). Proven idempotent `existing` replay still reserves no slot.
+- Scope remained S02 live tests and handoff documentation only; no product,
+  S01, or official-runtime calls were made.
+
+Wave 5 validation: 24/24 stdlib tests passed; py_compile, diff-check, and
+CodeGraph sync passed; official calls remained 0.

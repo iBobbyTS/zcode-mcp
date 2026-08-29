@@ -309,12 +309,20 @@ def _public_event_observations(evidence: Mapping[str, Any]) -> list[Mapping[str,
 
 
 def _public_events(evidence: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    # Pages and waits can repeat the same event.  Keep the newest snapshot for
+    # each attempt-local sequence (so semantic_idle_ms/nudge_sent can advance)
+    # while preserving the first-observed page order.  Sequence values are not
+    # compared across continuation attempts.
     latest: dict[tuple[int, int], Mapping[str, Any]] = {}
+    order: list[tuple[int, int]] = []
     for event in _public_event_observations(evidence):
         attempt, sequence = event.get("attempt_sequence"), event.get("sequence")
         if isinstance(attempt, int) and isinstance(sequence, int):
-            latest[(attempt, sequence)] = event
-    return [latest[key] for key in sorted(latest, key=lambda item: item[1])]
+            key = (attempt, sequence)
+            if key not in latest:
+                order.append(key)
+            latest[key] = event
+    return [latest[key] for key in order]
 
 
 def _assert_event_contract(evidence: Mapping[str, Any], *, expected_attempts: set[int]) -> None:
@@ -323,6 +331,7 @@ def _assert_event_contract(evidence: Mapping[str, Any], *, expected_attempts: se
     if len(events) > 500:
         raise FatalConformanceError("public event rate exceeded 500 events per bounded run")
     seen: dict[tuple[int, int], Mapping[str, Any]] = {}
+    observed_sequences_by_attempt: dict[int, list[int]] = {}
     for event in observations:
         sequence = event.get("sequence")
         attempt = event.get("attempt_sequence")
@@ -342,9 +351,12 @@ def _assert_event_contract(evidence: Mapping[str, Any], *, expected_attempts: se
             seen[key] = event
             continue
         seen[key] = event
-    sequences = [event.get("sequence") for event in events]
-    if any(a >= b for a, b in zip(sequences, sequences[1:])):
-        raise FatalConformanceError("public event sequence is not strictly monotonic")
+        observed_sequences_by_attempt.setdefault(attempt, []).append(sequence)
+    if any(
+        any(a >= b for a, b in zip(sequences, sequences[1:]))
+        for sequences in observed_sequences_by_attempt.values()
+    ):
+        raise FatalConformanceError("public event sequence is not strictly monotonic within an attempt")
     observed_attempts = {event.get("attempt_sequence") for event in events}
     if not expected_attempts.issubset(observed_attempts):
         raise FatalConformanceError("public event stream omitted an expected attempt")
@@ -494,6 +506,27 @@ def _validate_review_submission(
     }
 
 
+def _propagate_binding_gaps(evidence: dict[str, Any], binding: Mapping[str, Any] | None) -> None:
+    """Carry unverifiable public identity claims into case evidence.
+
+    A binding gap is an evidence limitation, not proof that the Hook is active.
+    Keeping it on the case makes the computed conclusion and rendered
+    KNOWN-GAPS report truthful for both initial spawn and continuation.
+    """
+    if not isinstance(binding, Mapping):
+        return
+    gaps = binding.get("gaps")
+    if not isinstance(gaps, list):
+        return
+    target = evidence.setdefault("gaps", [])
+    if not isinstance(target, list):
+        target = []
+        evidence["gaps"] = target
+    for gap in gaps:
+        if isinstance(gap, str) and gap and gap not in target:
+            target.append(gap)
+
+
 def _runtime_version(path: Path) -> str | None:
     # Standard app layout: ZCode.app/Contents/Resources/glm/zcode.cjs.
     info = path.parents[2] / "Info.plist" if len(path.parents) > 2 else None
@@ -605,6 +638,7 @@ def _call_case(
         spawned = client.call("zcode_review_spawn", args, launches=True, retry_infrastructure=True)
         evidence["spawn"] = spawned
         evidence["spawn_identity_binding"] = _validate_review_submission(spawned)
+        _propagate_binding_gaps(evidence, evidence["spawn_identity_binding"])
         # Same idempotency key must return the original durable submission and
         # must not consume another official launch slot.
         evidence["idempotency_replay"] = client.call("zcode_review_spawn", args)
@@ -690,6 +724,7 @@ def _call_case(
                 expected_review_id=review_id,
                 expected_attempt=continuation_attempt,
             )
+            _propagate_binding_gaps(evidence, evidence["continuation_identity_binding"])
             spawn_provenance = spawned.get("provenance", {}) if isinstance(spawned, Mapping) else {}
             continuation_provenance = continuation.get("provenance", {})
             if continuation_provenance.get("prompt_sha256") == spawn_provenance.get("prompt_sha256"):
@@ -792,6 +827,22 @@ def _load_object(path: Path) -> dict[str, Any] | None:
     return value
 
 
+def _case_gaps(case: Mapping[str, Any]) -> list[str]:
+    """Return all evidence gaps, including binding gaps from older packs."""
+    gaps: list[str] = []
+    raw = case.get("gaps")
+    if isinstance(raw, list):
+        gaps.extend(item for item in raw if isinstance(item, str) and item)
+    for binding_name in ("spawn_identity_binding", "continuation_identity_binding"):
+        binding = case.get(binding_name)
+        binding_gaps = binding.get("gaps") if isinstance(binding, Mapping) else None
+        if isinstance(binding_gaps, list):
+            for gap in binding_gaps:
+                if isinstance(gap, str) and gap and gap not in gaps:
+                    gaps.append(gap)
+    return gaps
+
+
 def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     if case is None:
         return "NOT_EXERCISED"
@@ -801,7 +852,7 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     required = ("spawn", "result", "artifact_chunks", "close", "close_replay", "facade_restart")
     if any(field not in case for field in required):
         return "NOT_EXERCISED"
-    return "PASS_WITH_GAPS" if case.get("gaps") else "PASS"
+    return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
 
 
 def _overall_result(conclusions: Mapping[str, str], identity_gaps: list[str]) -> str:
@@ -897,7 +948,7 @@ def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, An
             "close_replay": case.get("close_replay"),
             "restart_reads": case.get("restart_reads"),
         }
-        gaps.extend(f"{case_id}: {item}" for item in case.get("gaps", []) if isinstance(item, str))
+        gaps.extend(f"{case_id}: {item}" for item in _case_gaps(case))
     gaps.append("Finding-quality judgment is outside this conformance harness")
 
     reports.update({
