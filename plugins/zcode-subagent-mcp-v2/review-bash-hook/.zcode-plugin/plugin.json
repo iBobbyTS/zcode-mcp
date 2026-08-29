@@ -1,0 +1,5 @@
+{
+  "name": "zcode-readonly-bash-guard",
+  "version": "1.0.0",
+  "description": "Conservative read-only Bash policy for ZCode review sessions"
+}

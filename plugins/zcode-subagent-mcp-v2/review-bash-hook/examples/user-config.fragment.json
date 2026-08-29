@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["/ABSOLUTE/PATH/TO/check-bash-status.mjs"],
+              "enabled": true,
+              "timeoutMs": 5000
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -18,5 +18,12 @@
       "Start a structured section review."
     ]
   },
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "reviewPolicy": {
+    "version": "zcode-readonly-bash/v1.0.0",
+    "resource": "./review-bash-hook/lib/readonly-bash-policy.mjs",
+    "postToolUseAudit": true,
+    "activation": "./hooks/hooks.json"
+  }
 }

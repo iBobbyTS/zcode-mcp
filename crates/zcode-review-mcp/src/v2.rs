@@ -859,6 +859,17 @@ pub struct PublicReviewProvenance {
     pub head_sha: String,
     pub requested_model: Option<String>,
     pub fresh_session_observed: bool,
+    pub policy_version: String,
+    pub policy_sha256: String,
+    pub daemon_policy_version: String,
+    pub daemon_policy_sha256: String,
+    pub expected_hook_version: String,
+    pub expected_hook_sha256: String,
+    pub effective_hook_version: Option<String>,
+    pub effective_hook_sha256: Option<String>,
+    pub hook_activation_verified: bool,
+    pub activation_method: Option<String>,
+    pub activation_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -920,6 +931,17 @@ fn project_review(value: StructuredReviewProjection) -> ReviewSubmissionOutput {
             head_sha: value.provenance.head_sha,
             requested_model: value.provenance.requested_model,
             fresh_session_observed: value.provenance.fresh_session_observed,
+            policy_version: value.provenance.policy_version,
+            policy_sha256: value.provenance.policy_sha256,
+            daemon_policy_version: value.provenance.hook_provenance.daemon_policy_version,
+            daemon_policy_sha256: value.provenance.hook_provenance.daemon_policy_sha256,
+            expected_hook_version: value.provenance.hook_provenance.expected_hook_version,
+            expected_hook_sha256: value.provenance.hook_provenance.expected_hook_sha256,
+            effective_hook_version: value.provenance.hook_provenance.effective_hook_version,
+            effective_hook_sha256: value.provenance.hook_provenance.effective_hook_sha256,
+            hook_activation_verified: value.provenance.hook_provenance.hook_activation_verified,
+            activation_method: value.provenance.hook_provenance.activation_method,
+            activation_generation: value.provenance.hook_provenance.activation_generation,
         },
     }
 }
@@ -1768,6 +1790,49 @@ pub async fn serve_stdio_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn structured_review_projection_preserves_unverified_policy_provenance() {
+        let output = project_review(StructuredReviewProjection {
+            agent_id: "agent".into(),
+            review_id: "review".into(),
+            submission_disposition: ReviewSubmissionDisposition::Created,
+            phase: "RUNNING".into(),
+            attempt_sequence: 1,
+            effective_budget: EffectiveBudget {
+                wall_time_ms: 1,
+                max_turns: 1,
+                max_tool_calls: 1,
+                max_context_bytes: 1,
+                max_result_bytes: 1,
+                max_artifact_bytes: 1,
+            },
+            counts_as_independent: true,
+            provenance: zcode_reviewd::orchestration::StructuredReviewProvenance {
+                review_kind: StructuredReviewKind::InitialBounded,
+                manifest_sha256: "manifest".into(),
+                prepared_sha256: "prepared".into(),
+                prompt_sha256: "prompt".into(),
+                base_sha: "base".into(),
+                head_sha: "head".into(),
+                requested_model: None,
+                fresh_session_observed: true,
+                policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
+                policy_sha256: String::new(),
+                hook_provenance: review_preparation::ReviewHookProvenance::default(),
+            },
+        });
+        assert!(output.provenance.policy_sha256.is_empty());
+        assert!(!output.provenance.hook_activation_verified);
+        assert_eq!(
+            output.provenance.policy_version,
+            review_preparation::REVIEW_BASH_POLICY_VERSION
+        );
+        assert_eq!(
+            output.provenance.expected_hook_sha256,
+            review_preparation::review_bash_hook_sha256()
+        );
+    }
 
     #[test]
     fn readiness_reason_is_closed_and_correlated_with_probe_result() {

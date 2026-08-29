@@ -618,6 +618,16 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
     );
     assert_eq!(first.provenance.base_sha, fixture.head);
     assert_eq!(first.provenance.head_sha, fixture.head);
+    assert_eq!(
+        first.provenance.policy_version,
+        review_preparation::REVIEW_BASH_POLICY_VERSION
+    );
+    assert_eq!(first.provenance.policy_sha256, "");
+    assert!(!first.provenance.hook_provenance.hook_activation_verified);
+    assert_eq!(
+        first.provenance.hook_provenance.expected_hook_sha256,
+        review_preparation::review_bash_hook_sha256()
+    );
     assert_eq!(first.effective_budget.wall_time_ms, 5_000);
     let replayed_first = match fixture
         .service

@@ -1,0 +1,72 @@
+#!/usr/bin/env node
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const pluginRoot = path.resolve(new URL('..', import.meta.url).pathname);
+const hookRoot = path.join(pluginRoot, 'review-bash-hook');
+const configPath = process.argv[process.argv.indexOf('--config') + 1];
+if (!configPath || configPath.startsWith('--')) {
+  console.error('usage: node install-review-hook.mjs --config /absolute/config.json [--provenance /absolute/provenance.json]');
+  process.exit(2);
+}
+const provenanceIndex = process.argv.indexOf('--provenance');
+const provenancePath = provenanceIndex >= 0
+  ? process.argv[provenanceIndex + 1]
+  : path.join(path.dirname(configPath), 'review-bash-hook-provenance.json');
+
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+    if (error?.code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+function atomicWrite(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, file);
+}
+
+const config = readJson(configPath, {});
+if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('config must be a JSON object');
+const next = structuredClone(config);
+next.hooks ??= {};
+next.hooks.enabled = true;
+next.hooks.events ??= {};
+const events = {
+  PreToolUse: { script: 'check-bash-readonly.mjs' },
+  PostToolUse: { script: 'audit-bash-result.mjs' },
+  PostToolUseFailure: { script: 'audit-bash-result.mjs' },
+};
+for (const [event, { script }] of Object.entries(events)) {
+  const existing = Array.isArray(next.hooks.events[event]) ? next.hooks.events[event] : [];
+  const marker = `review-bash-hook:${event}`;
+  const entry = {
+    matcher: 'Bash',
+    hooks: [{ type: 'process', command: process.execPath, args: [path.join(hookRoot, 'hooks', script)], timeoutMs: 5000 }],
+    description: marker,
+  };
+  const withoutMarker = existing.filter((candidate) => candidate?.description !== marker);
+  next.hooks.events[event] = [...withoutMarker, entry];
+}
+atomicWrite(configPath, next);
+
+const hookSource = fs.readFileSync(path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs'));
+const hookSha256 = crypto.createHash('sha256').update(hookSource).digest('hex');
+const daemonSource = fs.readFileSync(path.join(pluginRoot, '..', '..', 'crates', 'review-preparation', 'src', 'policy.rs'));
+const daemonSha256 = crypto.createHash('sha256').update(daemonSource).digest('hex');
+atomicWrite(provenancePath, {
+  daemon_policy_version: 'zcode-readonly-bash/v1.0.0',
+  daemon_policy_sha256: daemonSha256,
+  expected_hook_version: 'zcode-readonly-bash/v1.0.0',
+  expected_hook_sha256: hookSha256,
+  effective_hook_version: 'zcode-readonly-bash/v1.0.0',
+  effective_hook_sha256: hookSha256,
+  effective_hook_path: path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs'),
+  hook_activation_verified: false,
+  activation_method: 'outer-plugin-install',
+  activation_generation: `${Date.now()}-${hookSha256.slice(0, 12)}`,
+});
+console.log(JSON.stringify({ config: path.resolve(configPath), provenance: path.resolve(provenancePath), hook_sha256: hookSha256 }));

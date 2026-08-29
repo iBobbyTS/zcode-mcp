@@ -124,6 +124,9 @@ pub struct StructuredReviewProvenance {
     pub head_sha: String,
     pub requested_model: Option<String>,
     pub fresh_session_observed: bool,
+    pub policy_version: String,
+    pub policy_sha256: String,
+    pub hook_provenance: review_preparation::ReviewHookProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +452,10 @@ impl ReviewJobOrchestrator {
         }
         self.ensure_structured_idempotency_unclaimed(&input.manifest.idempotency_key)?;
         let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
+        if let Err(error) = require_verified_hook_policy() {
+            self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
+            return Err(error);
+        }
         let prompt = match build_review_prompt(&prepared) {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -537,6 +544,10 @@ impl ReviewJobOrchestrator {
             return Ok(existing);
         }
         let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
+        if let Err(error) = require_verified_hook_policy() {
+            self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
+            return Err(error);
+        }
         if let Err(error) = validate_continuation_prepared(&context, &prepared) {
             self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
@@ -595,6 +606,7 @@ impl ReviewJobOrchestrator {
                 "idempotency identity is not a structured review attempt",
             ))?;
         let prepared = prepared_from_job(&job)?;
+        require_verified_hook_policy()?;
         let expected_manifest_sha = manifest_sha256(manifest)?;
         let expected_budget =
             resolve_effective_budget(budget).map_err(OrchestrationError::Store)?;
@@ -1335,6 +1347,16 @@ fn cleanup_prepared(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationEr
         .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))
 }
 
+fn require_verified_hook_policy() -> Result<(), OrchestrationError> {
+    let current = review_preparation::review_bash_hook_provenance();
+    if !current.hook_activation_verified {
+        return Err(OrchestrationError::Contract(
+            "REVIEW_BASH_POLICY_UNVERIFIED",
+        ));
+    }
+    Ok(())
+}
+
 fn cleanup_prepared_job_root(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationError> {
     let job_root = prepared.worktree.scratch_worktrees_root.parent().ok_or(
         OrchestrationError::Unavailable("prepared review has no cleanup owner"),
@@ -1361,6 +1383,7 @@ fn structured_projection(
     review_kind: StructuredReviewKind,
     disposition: ReviewSubmissionDisposition,
 ) -> StructuredReviewProjection {
+    let hook_provenance = review_preparation::review_bash_hook_provenance();
     let fresh_session_observed = job
         .zcode_session_id
         .as_deref()
@@ -1392,6 +1415,12 @@ fn structured_projection(
             head_sha: prepared.head_sha.clone(),
             requested_model: prepared.model.clone(),
             fresh_session_observed,
+            policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
+            policy_sha256: hook_provenance
+                .effective_hook_sha256
+                .clone()
+                .unwrap_or_default(),
+            hook_provenance,
         },
     }
 }

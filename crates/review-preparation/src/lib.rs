@@ -3,6 +3,128 @@ mod manifest;
 mod policy;
 mod worktree;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{fmt, fs, path::PathBuf};
+
+/// Version and descriptor digest of the plugin-supplied conservative review Bash policy.
+/// The daemon exposes these alongside review provenance so policy decisions are auditable.
+pub const REVIEW_BASH_POLICY_VERSION: &str = "zcode-readonly-bash/v1.0.0";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewHookProvenance {
+    pub daemon_policy_version: String,
+    pub daemon_policy_sha256: String,
+    pub expected_hook_version: String,
+    pub expected_hook_sha256: String,
+    pub effective_hook_version: Option<String>,
+    pub effective_hook_sha256: Option<String>,
+    #[serde(default)]
+    pub effective_hook_path: Option<String>,
+    pub hook_activation_verified: bool,
+    pub activation_method: Option<String>,
+    pub activation_generation: Option<String>,
+}
+
+impl Default for ReviewHookProvenance {
+    fn default() -> Self {
+        review_bash_hook_provenance()
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn review_bash_daemon_policy_sha256() -> String {
+    sha256_bytes(include_bytes!("policy.rs"))
+}
+
+pub fn review_bash_hook_sha256() -> String {
+    sha256_bytes(include_bytes!(
+        "../../../plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+    ))
+}
+
+pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
+    let daemon_policy_version = REVIEW_BASH_POLICY_VERSION.to_owned();
+    let daemon_policy_sha256 = review_bash_daemon_policy_sha256();
+    let expected_hook_version = REVIEW_BASH_POLICY_VERSION.to_owned();
+    let expected_hook_sha256 = review_bash_hook_sha256();
+    let unverified = || ReviewHookProvenance {
+        daemon_policy_version: daemon_policy_version.clone(),
+        daemon_policy_sha256: daemon_policy_sha256.clone(),
+        expected_hook_version: expected_hook_version.clone(),
+        expected_hook_sha256: expected_hook_sha256.clone(),
+        effective_hook_version: None,
+        effective_hook_sha256: None,
+        effective_hook_path: None,
+        hook_activation_verified: false,
+        activation_method: None,
+        activation_generation: None,
+    };
+    let Some(path) = std::env::var_os("ZCODE_REVIEW_HOOK_PROVENANCE") else {
+        return unverified();
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return unverified();
+    };
+    let Ok(record) = serde_json::from_slice::<ReviewHookProvenance>(&bytes) else {
+        return unverified();
+    };
+    let artifact_matches = record
+        .effective_hook_path
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
+        .is_some_and(|bytes| Some(sha256_bytes(&bytes)) == record.effective_hook_sha256);
+    let verified = record.hook_activation_verified
+        && record.daemon_policy_version == daemon_policy_version
+        && record.daemon_policy_sha256 == daemon_policy_sha256
+        && record.expected_hook_version == expected_hook_version
+        && record.expected_hook_sha256 == expected_hook_sha256
+        && record.effective_hook_version.as_deref() == Some(expected_hook_version.as_str())
+        && record.effective_hook_sha256.as_deref() == Some(expected_hook_sha256.as_str())
+        && artifact_matches
+        && record
+            .activation_method
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && record
+            .activation_generation
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if verified {
+        record
+    } else {
+        unverified()
+    }
+}
+
+/// Digest of both decision owners that make up the shipped review Bash policy.
+///
+/// The Rust source governs daemon permission preview/effective decisions, while
+/// the plugin JavaScript governs the ZCode hook. Embedding both source files
+/// prevents provenance from silently identifying only one half of the policy.
+pub fn review_bash_policy_sha256() -> String {
+    let mut digest = Sha256::new();
+    for (label, source) in [
+        ("daemon-rust-policy", include_bytes!("policy.rs").as_slice()),
+        (
+            "plugin-js-policy",
+            include_bytes!(
+                "../../../plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+            )
+            .as_slice(),
+        ),
+    ] {
+        digest.update((label.len() as u64).to_be_bytes());
+        digest.update(label.as_bytes());
+        digest.update((source.len() as u64).to_be_bytes());
+        digest.update(source);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 pub use general::{
     canonical_general_repository, general_control_header, general_launch_prompt,
     validate_general_named_command, ArtifactMetadata, AttachmentInput, BudgetLimits,
@@ -23,8 +145,6 @@ pub use policy::{
     PolicyMode, PreparedCommand, SandboxEnforcement, ValidationOutput,
 };
 pub use worktree::{CleanupRecord, IntegrityDiagnostics, PreparedWorktree, WorktreeManager};
-
-use std::{fmt, path::PathBuf};
 
 #[derive(Debug)]
 pub enum PreparationError {

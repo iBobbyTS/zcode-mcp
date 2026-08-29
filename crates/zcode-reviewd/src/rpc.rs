@@ -977,6 +977,9 @@ pub struct ReviewProvenanceView {
     pub base_sha: String,
     pub head_sha: String,
     pub requested_model: Option<String>,
+    pub policy_version: String,
+    pub policy_sha256: String,
+    pub hook_provenance: review_preparation::ReviewHookProvenance,
 }
 
 impl From<Job> for JobView {
@@ -999,12 +1002,21 @@ impl From<Job> for JobView {
         let round_kind = prepared
             .as_ref()
             .map(|prepared| prepared.round_kind.as_str().to_owned());
-        let provenance = prepared.as_ref().map(|prepared| ReviewProvenanceView {
-            manifest_sha256: prepared.manifest_sha256.clone(),
-            prepared_sha256: prepared.prepared_sha256.clone(),
-            base_sha: prepared.base_sha.clone(),
-            head_sha: prepared.head_sha.clone(),
-            requested_model: prepared.model.clone(),
+        let provenance = prepared.as_ref().map(|prepared| {
+            let hook_provenance = review_preparation::review_bash_hook_provenance();
+            ReviewProvenanceView {
+                manifest_sha256: prepared.manifest_sha256.clone(),
+                prepared_sha256: prepared.prepared_sha256.clone(),
+                base_sha: prepared.base_sha.clone(),
+                head_sha: prepared.head_sha.clone(),
+                requested_model: prepared.model.clone(),
+                policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
+                policy_sha256: hook_provenance
+                    .effective_hook_sha256
+                    .clone()
+                    .unwrap_or_default(),
+                hook_provenance,
+            }
         });
         let prompt_sha256 = format!("{:x}", Sha256::digest(value.initial_prompt.as_bytes()));
         let capabilities = ReviewCapabilitiesView {

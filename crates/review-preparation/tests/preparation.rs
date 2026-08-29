@@ -3,6 +3,7 @@ use review_preparation::{
     PreparedCommand, PreparedLaunchSpec, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind,
     SandboxEnforcement, ScratchPolicy, ValidationCommand, WorktreeManager,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -48,6 +49,8 @@ impl RepositoryFixture {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         fs::create_dir_all(repository.join("src")).unwrap();
+        fs::create_dir_all(repository.join(".agent-work/reviews")).unwrap();
+        fs::write(repository.join("README.md"), "needle\n").unwrap();
         fs::write(
             repository.join("src/lib.rs"),
             "pub fn value() -> u8 { 1 }\n",
@@ -60,7 +63,7 @@ impl RepositoryFixture {
             &["config", "user.email", "s04@example.invalid"],
         )
         .unwrap();
-        git(&repository, &["add", "src/lib.rs"]).unwrap();
+        git(&repository, &["add", "src/lib.rs", "README.md"]).unwrap();
         git(&repository, &["commit", "-m", "fixture"]).unwrap();
         let head = git(&repository, &["rev-parse", "HEAD"]).unwrap();
         fs::create_dir_all(repository.join(".agent-work/context")).unwrap();
@@ -89,7 +92,7 @@ impl RepositoryFixture {
             head_ref: self.head.clone(),
             plan_path: ".agent-work/PLAN.md".into(),
             context_paths: vec![".agent-work/context/S04.md".into()],
-            scope_paths: vec!["src".into()],
+            scope_paths: vec!["src".into(), "README.md".into()],
             forbidden_input_globs: vec![".agent-work/reviews/*".into()],
             validation_commands: BTreeMap::from([(
                 "print".into(),
@@ -602,7 +605,7 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
         ExternalDecision::Allow,
     );
     assert!(!bash.allowed);
-    assert_eq!(bash.reason, "permission_request_unrecognized");
+    assert_eq!(bash.reason, "bash_command_missing");
 
     let mut network_allowed = fixture.manifest();
     network_allowed.idempotency_key = "feature:S04:network-allow".into();
@@ -992,6 +995,218 @@ fn write_permissions_resolve_symlinks_and_validate_move_endpoints() {
             .decide_zcode_permission(&zcode_external_write, ExternalDecision::Deny)
             .reason,
         "write_outside_artifact_roots_denied"
+    );
+}
+
+#[test]
+fn review_bash_policy_is_parser_based_and_deny_first() {
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let launcher = prepared.launcher().unwrap();
+    let decide = |command: &str| {
+        launcher.decide_zcode_permission(
+            &serde_json::json!({"toolName":"Bash","input":{"command":command}}),
+            ExternalDecision::Allow,
+        )
+    };
+    for command in [
+        "find . -delete",
+        "find . -print",
+        "find . -printf %p",
+        "find . -exec rm -rf {} +",
+        "git branch -D victim",
+        "git branch --delete victim",
+        "git branch -M victim",
+        "git branch victim",
+        "git diff --output=x",
+        "git diff --no-index README.md /etc/passwd",
+        "git diff --output=x --no-ext-diff --no-textconv",
+        "git diff -- .env",
+        "git show HEAD -- .env",
+        "git show HEAD:.env",
+        "git cat-file -p HEAD:.git/config",
+        "git --git-dir=/tmp/repo status",
+        "git -C/tmp/repo status",
+        "openssl x -out x",
+        "git status && pwd",
+        "rg x | head",
+        "rg --pre rm needle src/lib.rs",
+        "cat /etc/passwd",
+        "cat ../secret",
+        "cd /tmp",
+        "cat .env",
+    ] {
+        assert!(!decide(command).allowed, "must deny {command}");
+    }
+    assert!(
+        !launcher
+            .decide_zcode_permission(
+                &serde_json::json!({"toolName":"Bash","input":{"command":"pwd","cwd":"/tmp"}}),
+                ExternalDecision::Allow,
+            )
+            .allowed
+    );
+    assert!(!decide("sed -n 1,2d src/lib.rs").allowed);
+    assert!(decide("git --no-pager status --short").allowed);
+    for command in [
+        "pwd",
+        "ls .",
+        "rg x src/lib.rs",
+        "sed -n 1,2p src/lib.rs",
+        "git status --short",
+        "git log --oneline",
+        "git branch --show-current",
+        "git branch --list main",
+    ] {
+        assert!(decide(command).allowed, "must allow {command}");
+    }
+}
+
+#[test]
+fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        command: String,
+        reason_class: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Corpus {
+        allow: Vec<Case>,
+        deny: Vec<Case>,
+    }
+
+    fn reason_class(reason: &str) -> &'static str {
+        if reason == "review_bash_allowlisted" {
+            "allow"
+        } else if reason.contains("git_") {
+            "git"
+        } else if reason.contains("shell_") {
+            "shell"
+        } else if reason.contains("credential")
+            || reason.contains("prior_review")
+            || reason.contains("path")
+            || reason.contains("find_")
+        {
+            "path"
+        } else {
+            "stdin"
+        }
+    }
+
+    let corpus: Corpus = serde_json::from_slice(include_bytes!(
+        "../../../plugins/zcode-subagent-mcp-v2/review-bash-hook/policy-corpus.json"
+    ))
+    .unwrap();
+    let fixture = RepositoryFixture::new();
+    fs::write(
+        fixture.repository.join(".agent-work/reviews/old.md"),
+        "old\n",
+    )
+    .unwrap();
+    let launcher = ReviewPreparer
+        .prepare(&fixture.manifest())
+        .unwrap()
+        .launcher()
+        .unwrap();
+    let decide = |command: &str| {
+        launcher.decide_zcode_permission(
+            &serde_json::json!({"toolName":"Bash","input":{"command":command}}),
+            ExternalDecision::Allow,
+        )
+    };
+    for case in corpus.allow {
+        let decision = decide(&case.command);
+        assert!(
+            decision.allowed,
+            "allow corpus denied {}: {}",
+            case.command, decision.reason
+        );
+        assert_eq!(
+            reason_class(decision.reason),
+            case.reason_class,
+            "{}",
+            case.command
+        );
+    }
+    for case in corpus.deny {
+        let decision = decide(&case.command);
+        assert!(!decision.allowed, "deny corpus allowed {}", case.command);
+        assert_eq!(
+            reason_class(decision.reason),
+            case.reason_class,
+            "{}: {}",
+            case.command,
+            decision.reason
+        );
+    }
+}
+
+#[test]
+fn review_bash_rechecks_canonical_symlink_targets_for_secrets_and_prior_reviews() {
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let launcher = prepared.launcher().unwrap();
+    let root = &prepared.worktree.path;
+    fs::write(root.join(".env"), "SECRET=x\n").unwrap();
+    fs::create_dir_all(root.join(".agent-work/reviews")).unwrap();
+    fs::write(root.join(".agent-work/reviews/old.md"), "old\n").unwrap();
+    fs::write(root.join("private.pem"), "key\n").unwrap();
+    fs::write(root.join("id_ed25519"), "key\n").unwrap();
+    fs::create_dir_all(root.join("metadata/.git")).unwrap();
+    fs::write(root.join("metadata/.git/config"), "[core]\n").unwrap();
+    for (alias, target) in [
+        ("safe-env", ".env"),
+        ("safe-git", "metadata/.git/config"),
+        ("safe-review", ".agent-work/reviews/old.md"),
+        ("safe-pem", "private.pem"),
+        ("safe-ed", "id_ed25519"),
+    ] {
+        symlink(target, root.join(alias)).unwrap();
+        let decision = launcher.decide_zcode_permission(
+            &serde_json::json!({"toolName":"Bash","input":{"command":format!("cat {alias}")}}),
+            ExternalDecision::Allow,
+        );
+        assert!(
+            !decision.allowed,
+            "canonical sensitive target must deny: {alias}"
+        );
+    }
+    fs::write(root.join("ordinary.txt"), "safe\n").unwrap();
+    symlink("ordinary.txt", root.join("safe-alias")).unwrap();
+    let safe = launcher.decide_zcode_permission(
+        &serde_json::json!({"toolName":"Bash","input":{"command":"cat safe-alias"}}),
+        ExternalDecision::Allow,
+    );
+    assert!(
+        safe.allowed,
+        "ordinary in-root symlink should remain readable"
+    );
+}
+
+#[test]
+fn review_bash_policy_provenance_binds_rust_and_javascript_sources() {
+    let mut expected = Sha256::new();
+    for (label, source) in [
+        (
+            "daemon-rust-policy",
+            include_bytes!("../src/policy.rs").as_slice(),
+        ),
+        (
+            "plugin-js-policy",
+            include_bytes!(
+                "../../../plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+            )
+            .as_slice(),
+        ),
+    ] {
+        expected.update((label.len() as u64).to_be_bytes());
+        expected.update(label.as_bytes());
+        expected.update((source.len() as u64).to_be_bytes());
+        expected.update(source);
+    }
+    assert_eq!(
+        review_preparation::review_bash_policy_sha256(),
+        format!("{:x}", expected.finalize())
     );
 }
 
