@@ -118,6 +118,20 @@ class FixtureContractTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                 finally:
                     empty.rmdir()
+                outer = case / "future-fix-empty"
+                outer.mkdir()
+                try:
+                    result = subprocess.run([str(case / "scripts" / "verify.sh")], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                finally:
+                    outer.rmdir()
+                singular = case / "workspace" / "selected-fix-empty"
+                singular.mkdir()
+                try:
+                    result = subprocess.run([str(case / "scripts" / "verify.sh")], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                finally:
+                    singular.rmdir()
                 link = case / "workspace" / "injected-link"
                 link.symlink_to(tempfile.gettempdir())
                 try:
