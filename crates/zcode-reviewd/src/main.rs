@@ -236,6 +236,11 @@ fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
         match argument.to_string_lossy().as_ref() {
             "--socket" => socket = Some(PathBuf::from(value)),
             "--agent-id" => agent_id = Some(value.to_string_lossy().into_owned()),
+            "--attempt-sequence" => {
+                value.to_string_lossy().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "attempt sequence is invalid")
+                })?;
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,

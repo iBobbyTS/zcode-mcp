@@ -4,11 +4,12 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-const LEDGER_TOOLS: [&str; 4] = [
+const LEDGER_TOOLS: [&str; 5] = [
     "review_checkpoint",
     "review_finding_upsert",
     "review_validation_record",
     "review_finalize",
+    "review_progress",
 ];
 
 fn write_value(out: &mut impl Write, value: Value) -> io::Result<()> {
@@ -215,6 +216,14 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         .get("args")
         .and_then(Value::as_array)
         .ok_or_else(|| io::Error::other("ledger MCP args are missing"))?;
+    let task_scoped = args
+        .iter()
+        .any(|value| value.as_str() == Some("--task-ledger-mcp"));
+    let attempt_sequence = args
+        .windows(2)
+        .find(|pair| pair[0].as_str() == Some("--attempt-sequence"))
+        .and_then(|pair| pair[1].as_str())
+        .unwrap_or("1");
     let env = server
         .get("env")
         .and_then(Value::as_array)
@@ -274,10 +283,27 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         return Err(io::Error::other("ledger MCP tool list is not exact"));
     }
 
+    let mut next_id = 3;
+    if task_scoped {
+        ledger_tool_call(
+            &mut input,
+            &mut output,
+            next_id,
+            LEDGER_TOOLS[4],
+            json!({
+                "attempt_sequence":attempt_sequence.parse::<u64>().unwrap_or(1),
+                "run_idempotency_key":"fake-runtime-run",
+                "stage":"scope",
+                "summary":"fake runtime started semantic review",
+                "counters":{"files":0}
+            }),
+        )?;
+        next_id += 1;
+    }
     ledger_tool_call(
         &mut input,
         &mut output,
-        3,
+        next_id,
         LEDGER_TOOLS[0],
         json!({
             "checkpoint_id":"scope-1","stage":"inspection","summary":"bounded evidence observed",
@@ -288,7 +314,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     ledger_tool_call(
         &mut input,
         &mut output,
-        4,
+        next_id + 1,
         LEDGER_TOOLS[1],
         json!({
             "finding_id":"S06-F1","severity":"P2","confidence":"medium",
@@ -300,7 +326,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     ledger_tool_call(
         &mut input,
         &mut output,
-        5,
+        next_id + 2,
         LEDGER_TOOLS[1],
         json!({
             "finding_id":"S06-F1","severity":"P2","confidence":"high",
@@ -312,7 +338,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     ledger_tool_call(
         &mut input,
         &mut output,
-        6,
+        next_id + 3,
         LEDGER_TOOLS[2],
         json!({
             "validation_id":"validation-1","command":"cargo test -p fixture","cwd":".",
@@ -324,7 +350,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         ledger_tool_call(
             &mut input,
             &mut output,
-            7,
+            next_id + 4,
             LEDGER_TOOLS[3],
             json!({
                 "signal":"no_findings_observed","summary":"bounded review complete",
@@ -421,7 +447,11 @@ fn main() {
                 if object.get("result") != Some(&expected_response) {
                     continue;
                 }
-                if is_review_flow(&mode) && mode != "review-flow-no-ledger" && !ledger_completed {
+                if is_review_flow(&mode)
+                    && mode != "review-flow-no-ledger"
+                    && mode != "review-flow-no-progress"
+                    && !ledger_completed
+                {
                     let Some(server) = ledger_server.as_ref() else {
                         std::process::exit(23);
                     };
@@ -592,7 +622,10 @@ fn main() {
                     );
                 }
                 if content.contains("auto_complete") {
-                    if is_review_flow(&mode) && mode != "review-flow-no-ledger" && !ledger_completed
+                    if is_review_flow(&mode)
+                        && mode != "review-flow-no-ledger"
+                        && mode != "review-flow-no-progress"
+                        && !ledger_completed
                     {
                         let Some(server) = ledger_server.as_ref() else {
                             std::process::exit(23);

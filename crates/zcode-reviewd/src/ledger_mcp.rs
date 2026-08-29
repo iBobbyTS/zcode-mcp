@@ -3,7 +3,7 @@ use crate::rpc::{
 };
 use review_ledger::{
     MAX_TOOL_ID_BYTES, MAX_TOOL_ITEMS, MAX_TOOL_TEXT_CHARS, REVIEW_CHECKPOINT, REVIEW_FINALIZE,
-    REVIEW_FINDING_UPSERT, REVIEW_VALIDATION_RECORD,
+    REVIEW_FINDING_UPSERT, REVIEW_PROGRESS, REVIEW_VALIDATION_RECORD,
 };
 use serde_json::{json, Value};
 use std::{
@@ -164,7 +164,11 @@ fn call_tool(
     };
     if !matches!(
         name,
-        REVIEW_CHECKPOINT | REVIEW_FINDING_UPSERT | REVIEW_VALIDATION_RECORD | REVIEW_FINALIZE
+        REVIEW_CHECKPOINT
+            | REVIEW_FINDING_UPSERT
+            | REVIEW_VALIDATION_RECORD
+            | REVIEW_FINALIZE
+            | REVIEW_PROGRESS
     ) {
         return invalid_params(id);
     }
@@ -336,6 +340,21 @@ fn tool_definitions() -> Value {
                     },
                     "uncertainties":text_array(),
                     "recommended_next_actions":text_array()
+                }
+            }
+        },
+        {
+            "name": REVIEW_PROGRESS,
+            "description": "Record bounded semantic progress for the current review attempt.",
+            "inputSchema": {
+                "type":"object","additionalProperties":false,
+                "required":["attempt_sequence","run_idempotency_key","stage","summary"],
+                "properties":{
+                    "attempt_sequence":{"type":"integer","minimum":1,"maximum":18446744073709551615u64},
+                    "run_idempotency_key":id(),
+                    "stage":{"enum":["scope","inspection","validation","synthesis"]},
+                    "summary":text(),
+                    "counters":{"type":"object","maxProperties":16,"additionalProperties":{"type":"integer","minimum":0,"maximum":1000000000}}
                 }
             }
         }
@@ -679,7 +698,8 @@ mod tests {
                 REVIEW_CHECKPOINT,
                 REVIEW_FINDING_UPSERT,
                 REVIEW_VALIDATION_RECORD,
-                REVIEW_FINALIZE
+                REVIEW_FINALIZE,
+                REVIEW_PROGRESS
             ]
         );
         assert_eq!(responses[2]["result"]["isError"], false);

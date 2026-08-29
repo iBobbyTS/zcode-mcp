@@ -1,6 +1,6 @@
 use review_ledger::{
     ArtifactIntegrity, LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_FINDING_UPSERT,
-    REVIEW_VALIDATION_RECORD,
+    REVIEW_PROGRESS, REVIEW_VALIDATION_RECORD,
 };
 use review_preparation::{
     BudgetLimits, NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind,
@@ -139,6 +139,17 @@ impl Fixture {
     }
 
     fn new_with_policy(_policy_env: Option<PolicyEnvGuard>) -> Self {
+        Self::new_with_policy_and_timeouts(_policy_env, None)
+    }
+
+    fn new_with_semantic_timeouts(soft_stale: Duration, hard_timeout: Duration) -> Self {
+        Self::new_with_policy_and_timeouts(Some(policy_env(true)), Some((soft_stale, hard_timeout)))
+    }
+
+    fn new_with_policy_and_timeouts(
+        _policy_env: Option<PolicyEnvGuard>,
+        semantic_timeouts: Option<(Duration, Duration)>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         fs::create_dir_all(repository.join("src")).unwrap();
@@ -188,6 +199,7 @@ impl Fixture {
             ) {
                 ("CRASH", _) => "crash",
                 ("SEND-FAIL", _) => "review-flow-send-failure",
+                (_, key) if key.ends_with("semantic-timeout") => "review-flow-no-progress",
                 (_, key) if key.ends_with("missing-final") => "review-flow-no-finalize",
                 (_, key)
                     if [
@@ -221,7 +233,7 @@ impl Fixture {
         fs::create_dir(&socket_root).unwrap();
         fs::set_permissions(&socket_root, fs::Permissions::from_mode(0o700)).unwrap();
         let socket = socket_root.join("private.sock");
-        let scheduler = Scheduler::new(
+        let mut scheduler = Scheduler::new(
             "s06-fixture",
             Arc::clone(&store),
             runtime_factory,
@@ -233,16 +245,22 @@ impl Fixture {
                 control_timeout: Duration::from_secs(2),
             },
         )
-        .unwrap()
-        .with_ledger(
-            ledger,
-            InternalLedgerMcpConfig {
-                command: fs::canonicalize(env!("CARGO_BIN_EXE_zcode-reviewd")).unwrap(),
-                socket: socket.clone(),
-                runtime_sha256: Some("f".repeat(64)),
-            },
-        )
         .unwrap();
+        if let Some((soft_stale, hard_timeout)) = semantic_timeouts {
+            scheduler = scheduler
+                .with_semantic_timeouts(soft_stale, hard_timeout)
+                .unwrap();
+        }
+        let scheduler = scheduler
+            .with_ledger(
+                ledger,
+                InternalLedgerMcpConfig {
+                    command: fs::canonicalize(env!("CARGO_BIN_EXE_zcode-reviewd")).unwrap(),
+                    socket: socket.clone(),
+                    runtime_sha256: Some("f".repeat(64)),
+                },
+            )
+            .unwrap();
         let service = RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
         let server =
             RpcServer::bind(&socket, Arc::new(service.clone()), ServerOptions::default()).unwrap();
@@ -565,6 +583,25 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
         fixture.scheduler.start_ready().unwrap(),
         vec![execution_id.to_owned()]
     );
+    let progress = fixture
+        .service
+        .dispatch(RpcMethod::TaskReviewTool(ReviewToolInput {
+            agent_id: execution_id.into(),
+            tool: REVIEW_PROGRESS.into(),
+            arguments: serde_json::json!({
+                "attempt_sequence": 1,
+                "run_idempotency_key": "fake-runtime-run",
+                "stage": "inspection",
+                "summary": "inspected fixture",
+                "counters": {"files": 2}
+            }),
+        }))
+        .unwrap();
+    assert!(matches!(progress, RpcSuccess::ReviewTool { .. }));
+    let progress_events = fixture.store.task_events_after(public_id, 0, 100).unwrap();
+    assert!(progress_events
+        .iter()
+        .any(|event| event.event_type == "review.progress"));
     let legacy_error = fixture
         .service
         .dispatch(RpcMethod::ReviewTool(ReviewToolInput {
@@ -623,6 +660,42 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
         fixture.store.task_result(execution_id).unwrap().unwrap(),
         result
     );
+}
+
+#[test]
+fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
+    let fixture =
+        Fixture::new_with_semantic_timeouts(Duration::from_millis(30), Duration::from_millis(100));
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission("semantic-timeout"),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let execution = fixture
+        .store
+        .get_task(&review.agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![execution.clone()]
+    );
+    let terminal = fixture.wait_terminal(&execution);
+    assert_eq!(terminal.state, JobState::Failed);
+    assert_eq!(terminal.failure_code.as_deref(), Some("TIMEOUT"));
+    let result = fixture.store.task_result(&execution).unwrap().unwrap();
+    assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
+    assert!(result
+        .result
+        .residual_gaps
+        .contains(&"SEMANTIC_PROGRESS_TIMEOUT".into()));
+    assert_eq!(fixture.scheduler.active_count(), 0);
 }
 
 #[test]

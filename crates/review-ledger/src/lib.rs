@@ -23,6 +23,18 @@ pub const REVIEW_CHECKPOINT: &str = "review_checkpoint";
 pub const REVIEW_FINDING_UPSERT: &str = "review_finding_upsert";
 pub const REVIEW_VALIDATION_RECORD: &str = "review_validation_record";
 pub const REVIEW_FINALIZE: &str = "review_finalize";
+pub const REVIEW_PROGRESS: &str = "review_progress";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressInput {
+    pub attempt_sequence: u64,
+    pub run_idempotency_key: String,
+    pub stage: CheckpointStage,
+    pub summary: String,
+    #[serde(default)]
+    pub counters: Option<std::collections::BTreeMap<String, u64>>,
+}
 
 #[derive(Debug)]
 pub enum LedgerError {
@@ -388,6 +400,45 @@ impl LedgerManager {
                 self.store
                     .finalize_review(agent_id, input.signal.as_str(), &json, &hash)?
             }
+            REVIEW_PROGRESS => {
+                let input: ProgressInput = serde_json::from_value(arguments)?;
+                validate_progress(&input)?;
+                let counters_json = input
+                    .counters
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?;
+                let mutation =
+                    self.store
+                        .record_review_progress(&review_store::ReviewProgressWrite {
+                            agent_id: agent_id.to_owned(),
+                            attempt_sequence: input.attempt_sequence,
+                            run_idempotency_key: input.run_idempotency_key,
+                            stage: checkpoint_stage_name(&input.stage).into(),
+                            summary: input.summary,
+                            counters_json,
+                        })?;
+                return Ok(ToolResult {
+                    tool: tool.to_owned(),
+                    disposition: match mutation.disposition {
+                        review_store::ReviewProgressDisposition::Applied => {
+                            ToolDisposition::Applied
+                        }
+                        review_store::ReviewProgressDisposition::Duplicate => {
+                            ToolDisposition::Duplicate
+                        }
+                    },
+                    report_revision: self
+                        .store
+                        .review_report_state(agent_id)?
+                        .map(|state| state.current_revision)
+                        .unwrap_or_default(),
+                    finalized: self
+                        .store
+                        .review_report_state(agent_id)?
+                        .is_some_and(|state| state.finalized),
+                });
+            }
             _ => {
                 return Err(LedgerError::InvalidInput(
                     "unknown internal ledger tool".into(),
@@ -541,6 +592,10 @@ pub fn validate_tool_arguments(tool: &str, arguments: &Value) -> LedgerResult<()
             let input: FinalizeInput = serde_json::from_value(arguments.clone())?;
             validate_finalize(&input)
         }
+        REVIEW_PROGRESS => {
+            let input: ProgressInput = serde_json::from_value(arguments.clone())?;
+            validate_progress(&input)
+        }
         _ => Err(LedgerError::InvalidInput(
             "unknown internal ledger tool".into(),
         )),
@@ -615,6 +670,41 @@ fn validate_finalize(input: &FinalizeInput) -> LedgerResult<()> {
     validate_strings(&input.uncertainties, "uncertainties")?;
     validate_strings(&input.recommended_next_actions, "recommended_next_actions")?;
     Ok(())
+}
+
+fn validate_progress(input: &ProgressInput) -> LedgerResult<()> {
+    if input.attempt_sequence == 0 {
+        return Err(LedgerError::InvalidInput(
+            "attempt_sequence must be positive".into(),
+        ));
+    }
+    validate_id(&input.run_idempotency_key, "run_idempotency_key")?;
+    validate_text(&input.summary, "summary")?;
+    if let Some(counters) = &input.counters {
+        if counters.len() > 16 {
+            return Err(LedgerError::InvalidInput(
+                "too many progress counters".into(),
+            ));
+        }
+        for (key, value) in counters {
+            validate_id(key, "counter name")?;
+            if *value > 1_000_000_000 {
+                return Err(LedgerError::InvalidInput(
+                    "progress counter is too large".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_stage_name(stage: &CheckpointStage) -> &'static str {
+    match stage {
+        CheckpointStage::Scope => "scope",
+        CheckpointStage::Inspection => "inspection",
+        CheckpointStage::Validation => "validation",
+        CheckpointStage::Synthesis => "synthesis",
+    }
 }
 
 fn validate_payload(value: &Value) -> LedgerResult<()> {

@@ -284,9 +284,20 @@ CREATE TABLE IF NOT EXISTS task_results (
     completed_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS review_progress (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
+    attempt_sequence INTEGER NOT NULL,
+    run_idempotency_key TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    counters_json TEXT,
+    updated_at INTEGER NOT NULL,
+    nudge_sent INTEGER NOT NULL DEFAULT 0
+);
+
 "#;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -772,6 +783,40 @@ pub struct WaitSnapshot {
     pub job: Option<Job>,
     pub runtime_agent_id: Option<String>,
     pub events: Vec<StoredEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewProgressWrite {
+    pub agent_id: String,
+    pub attempt_sequence: u64,
+    pub run_idempotency_key: String,
+    pub stage: String,
+    pub summary: String,
+    pub counters_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewProgressState {
+    pub agent_id: String,
+    pub attempt_sequence: u64,
+    pub run_idempotency_key: String,
+    pub stage: String,
+    pub summary: String,
+    pub counters_json: Option<String>,
+    pub updated_at: i64,
+    pub nudge_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewProgressDisposition {
+    Applied,
+    Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewProgressMutation {
+    pub disposition: ReviewProgressDisposition,
+    pub state: ReviewProgressState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1798,6 +1843,146 @@ impl Store {
         }
         transaction.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Starts the semantic-progress clock for a running review attempt. This
+    /// is intentionally separate from lifecycle heartbeats: transport churn
+    /// must not reset the semantic no-progress deadline.
+    pub fn initialize_review_progress(
+        &self,
+        agent_id: &str,
+        attempt_sequence: u64,
+    ) -> StoreResult<ReviewProgressState> {
+        if attempt_sequence == 0 {
+            return Err(StoreError::InvalidState(
+                "review attempt sequence must be positive".into(),
+            ));
+        }
+        let connection = self.connection.lock().unwrap();
+        let now = now_millis();
+        connection.execute(
+            "INSERT INTO review_progress
+             (agent_id, attempt_sequence, run_idempotency_key, stage, summary, updated_at)
+             VALUES (?1, ?2, '', 'scope', 'review started', ?3)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 attempt_sequence = excluded.attempt_sequence,
+                 run_idempotency_key = excluded.run_idempotency_key,
+                 stage = excluded.stage,
+                 summary = excluded.summary,
+                 counters_json = NULL,
+                 updated_at = excluded.updated_at,
+                 nudge_sent = 0",
+            params![agent_id, u64_to_i64(attempt_sequence)?, now],
+        )?;
+        query_review_progress(&connection, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("review progress was not initialized".into()))
+    }
+
+    pub fn record_review_progress(
+        &self,
+        write: &ReviewProgressWrite,
+    ) -> StoreResult<ReviewProgressMutation> {
+        if write.agent_id.is_empty()
+            || write.run_idempotency_key.is_empty()
+            || write.stage.is_empty()
+            || write.summary.is_empty()
+            || write.attempt_sequence == 0
+        {
+            return Err(StoreError::InvalidState(
+                "review progress identity and bounded fields are required".into(),
+            ));
+        }
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (expected_attempt, task_kind): (i64, String) = transaction
+            .query_row(
+                "SELECT attempt_sequence, task_kind FROM task_attempts WHERE execution_agent_id=?1",
+                [&write.agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::InvalidState("unknown review task".into()))?;
+        if expected_attempt != u64_to_i64(write.attempt_sequence)? {
+            return Err(StoreError::Conflict(
+                "review progress attempt does not match the active execution".into(),
+            ));
+        }
+        if !matches!(task_kind.as_str(), "REVIEW" | "REVIEW_CONTINUATION") {
+            return Err(StoreError::Conflict(
+                "semantic progress is only available to review attempts".into(),
+            ));
+        }
+        let existing = query_review_progress(&transaction, &write.agent_id)?;
+        let now = now_millis();
+        if let Some(existing) = existing {
+            if existing.attempt_sequence != write.attempt_sequence {
+                return Err(StoreError::Conflict(
+                    "review progress belongs to a different attempt".into(),
+                ));
+            }
+            if !existing.run_idempotency_key.is_empty()
+                && existing.run_idempotency_key != write.run_idempotency_key
+            {
+                return Err(StoreError::Conflict(
+                    "review progress run idempotency key changed".into(),
+                ));
+            }
+            let same_semantics = existing.stage == write.stage
+                && existing.summary == write.summary
+                && existing.counters_json == write.counters_json;
+            if same_semantics && existing.run_idempotency_key == write.run_idempotency_key {
+                transaction.commit()?;
+                return Ok(ReviewProgressMutation {
+                    disposition: ReviewProgressDisposition::Duplicate,
+                    state: existing,
+                });
+            }
+        }
+        transaction.execute(
+            "INSERT INTO review_progress
+             (agent_id, attempt_sequence, run_idempotency_key, stage, summary, counters_json, updated_at, nudge_sent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 attempt_sequence = excluded.attempt_sequence,
+                 run_idempotency_key = excluded.run_idempotency_key,
+                 stage = excluded.stage,
+                 summary = excluded.summary,
+                 counters_json = excluded.counters_json,
+                 updated_at = excluded.updated_at",
+            params![
+                write.agent_id,
+                u64_to_i64(write.attempt_sequence)?,
+                write.run_idempotency_key,
+                write.stage,
+                write.summary,
+                write.counters_json,
+                now,
+            ],
+        )?;
+        let state = query_review_progress(&transaction, &write.agent_id)?
+            .ok_or_else(|| StoreError::InvalidState("review progress disappeared".into()))?;
+        transaction.commit()?;
+        Ok(ReviewProgressMutation {
+            disposition: ReviewProgressDisposition::Applied,
+            state,
+        })
+    }
+
+    pub fn review_progress(&self, agent_id: &str) -> StoreResult<Option<ReviewProgressState>> {
+        let connection = self.connection.lock().unwrap();
+        query_review_progress(&connection, agent_id)
+    }
+
+    /// Atomically claims the one allowed stale-progress nudge.
+    pub fn claim_review_progress_nudge(&self, agent_id: &str) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        Ok(connection.execute(
+            "UPDATE review_progress SET nudge_sent=1
+             WHERE agent_id=?1 AND nudge_sent=0
+               AND EXISTS (SELECT 1 FROM agents WHERE agent_id=?1
+                           AND state IN ('STARTING','RUNNING','STOPPING'))",
+            [agent_id],
+        )? == 1)
     }
 
     pub fn append_lifecycle(&self, write: &LifecycleWrite) -> StoreResult<u64> {
@@ -3816,6 +4001,45 @@ fn query_task_record(connection: &Connection, id: &str) -> StoreResult<Option<Ta
     connection.query_row("SELECT execution_agent_id,public_agent_id,task_kind,phase,review_id,review_kind,continuation_of,attempt_sequence,repository,feature_id,ownership_token,effective_budget_json,independent_evidence,retain_partial FROM task_attempts WHERE execution_agent_id=?1",[id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,i64>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,String>(11)?,row.get::<_,i64>(12)?,row.get::<_,i64>(13)?))).optional()?.map(|r| Ok(TaskRecord { execution_agent_id:r.0,public_agent_id:r.1,task_kind:TaskKind::parse(&r.2)?,phase:TaskPhase::parse(&r.3)?,review_id:r.4,review_kind:r.5,continuation_of:r.6,attempt_sequence:i64_to_u64(r.7)?,repository:r.8,feature_id:r.9,ownership_token:r.10,effective_budget:serde_json::from_str(&r.11).map_err(|e| StoreError::InvalidState(format!("invalid effective budget: {e}")))?,independent_evidence:r.12 != 0,retain_partial:r.13 != 0 })).transpose()
 }
 
+fn query_review_progress(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<ReviewProgressState>> {
+    connection
+        .query_row(
+            "SELECT agent_id, attempt_sequence, run_idempotency_key, stage,
+                    summary, counters_json, updated_at, nudge_sent
+             FROM review_progress WHERE agent_id=?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|row| {
+            Ok(ReviewProgressState {
+                agent_id: row.0,
+                attempt_sequence: i64_to_u64(row.1)?,
+                run_idempotency_key: row.2,
+                stage: row.3,
+                summary: row.4,
+                counters_json: row.5,
+                updated_at: row.6,
+                nudge_sent: row.7 != 0,
+            })
+        })
+        .transpose()
+}
+
 fn query_latest_task_scoped(
     connection: &Connection,
     public_id: &str,
@@ -5559,6 +5783,61 @@ mod tests {
         let owner = store.submission_by_idempotency("v2-key").unwrap().unwrap();
         assert_eq!(owner.execution_agent_id, "queued-v2-owner");
         assert_eq!(owner.task_kind, Some(TaskKind::Review));
+    }
+
+    #[test]
+    fn semantic_review_progress_is_bounded_idempotent_and_single_nudge() {
+        let (_directory, _path, store) = file_store();
+        let mut task = general_task("progress-exec", "progress-public", "progress-key");
+        task.task_kind = TaskKind::Review;
+        task.review_id = Some("progress-review".into());
+        task.job.review_kind = Some("code".into());
+        store.enqueue_task(&task).unwrap();
+        store
+            .initialize_review_progress("progress-exec", 1)
+            .unwrap();
+
+        let write = ReviewProgressWrite {
+            agent_id: "progress-exec".into(),
+            attempt_sequence: 1,
+            run_idempotency_key: "run-1".into(),
+            stage: "inspection".into(),
+            summary: "inspected policy".into(),
+            counters_json: Some(r#"{"files":2}"#.into()),
+        };
+        assert_eq!(
+            store.record_review_progress(&write).unwrap().disposition,
+            ReviewProgressDisposition::Applied
+        );
+        assert_eq!(
+            store.record_review_progress(&write).unwrap().disposition,
+            ReviewProgressDisposition::Duplicate
+        );
+        let mut rapid = write.clone();
+        rapid.summary = "inspected another policy".into();
+        assert_eq!(
+            store.record_review_progress(&rapid).unwrap().disposition,
+            ReviewProgressDisposition::Applied
+        );
+        assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
+        // A queued attempt cannot claim a nudge; once running, exactly one
+        // claim is allowed.
+        let claim = claim(&store, "progress-exec");
+        store
+            .mark_running("progress-exec", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        assert!(store.claim_review_progress_nudge("progress-exec").unwrap());
+        assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
+        let mut later = write;
+        later.summary = "semantic progress advanced".into();
+        store.record_review_progress(&later).unwrap();
+        assert!(
+            store
+                .review_progress("progress-exec")
+                .unwrap()
+                .unwrap()
+                .nudge_sent
+        );
     }
 
     #[test]
