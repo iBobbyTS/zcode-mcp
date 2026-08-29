@@ -40,6 +40,7 @@ pub const MAX_PAGE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_PREVIEW_BYTES: usize = 8 * 1024;
 pub const MAX_PENDING_REQUESTS: usize = 100;
 pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION: usize = 64 * 1024;
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 pub const RPC_TRANSPORT_SUPPORTED: bool = cfg!(unix);
 
@@ -731,6 +732,54 @@ pub struct TaskResultView {
     pub residual_gaps: Vec<String>,
     pub artifacts: Vec<review_store::ResultArtifact>,
     pub result_sha256: String,
+    pub review_evidence: Option<TaskReviewEvidenceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReviewEvidenceView {
+    pub final_signal: String,
+    pub finalized: bool,
+    pub report_revision: u64,
+    pub finalization_revision: u64,
+    pub artifact: TaskArtifactMetadataView,
+    pub counts: TaskReviewEvidenceCountsView,
+    pub independence: TaskReviewIndependenceView,
+    pub validation_provenance: TaskValidationProvenanceView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReviewEvidenceCountsView {
+    pub checkpoints: u64,
+    pub findings: u64,
+    pub open_findings: u64,
+    pub validations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskReviewIndependenceView {
+    pub independent_evidence: bool,
+    pub fresh_session_observed: bool,
+    pub counts_as_independent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskValidationProvenanceView {
+    pub daemon_verification: TaskDaemonVerificationView,
+    pub model_attestation: TaskModelAttestationView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDaemonVerificationView {
+    pub source_integrity_verified: bool,
+    pub finalized_report_verified: bool,
+    pub artifact_digest_verified: bool,
+    pub validation_records_structurally_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskModelAttestationView {
+    pub present: bool,
+    pub validation_record_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1463,12 +1512,13 @@ impl RpcService {
                 attempt_sequence,
             } => {
                 let (job, task) = self.require_task_attempt(&agent_id, attempt_sequence)?;
+                let artifacts = self.task_artifact_metadata(&task)?;
                 let result = self
                     .store
                     .task_result(&task.execution_agent_id)
                     .map_err(map_store)?
-                    .map(TaskResultView::from);
-                let artifacts = self.task_artifact_metadata(&task)?;
+                    .map(|stored| self.task_result_view(&job, &task, stored, &artifacts))
+                    .transpose()?;
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(job, task),
                     result,
@@ -1847,6 +1897,9 @@ impl RpcService {
             else {
                 return Ok(Vec::new());
             };
+            if expected_bytes == 0 || !valid_sha256(&expected_sha256) {
+                return Ok(Vec::new());
+            }
             let artifact = self
                 .store
                 .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
@@ -1902,6 +1955,107 @@ impl RpcService {
         Ok(projected)
     }
 
+    fn task_result_view(
+        &self,
+        job: &Job,
+        task: &TaskRecord,
+        stored: StoredTaskResult,
+        artifacts: &[TaskArtifactMetadataView],
+    ) -> Result<TaskResultView, RpcError> {
+        let mut view = TaskResultView::from(stored);
+        if !matches!(
+            task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        ) || view.outcome != TaskOutcome::Succeeded
+        {
+            return Ok(view);
+        }
+
+        let Some(snapshot) = self
+            .store
+            .review_snapshot(&task.execution_agent_id)
+            .map_err(map_store)?
+        else {
+            return Ok(view);
+        };
+        let Some(finalization) = snapshot.finalization.as_ref() else {
+            return Ok(view);
+        };
+        let Some(final_signal) = snapshot.report.final_signal.as_deref() else {
+            return Ok(view);
+        };
+        if !snapshot.report.finalized
+            || finalization.status.as_deref() != Some(final_signal)
+            || snapshot.report.published_revision != Some(snapshot.report.current_revision)
+            || snapshot.checkpoints.is_empty()
+            || snapshot.validations.is_empty()
+        {
+            return Ok(view);
+        }
+        let [artifact] = artifacts else {
+            return Ok(view);
+        };
+        if artifact.kind != "report_markdown"
+            || artifact.size_bytes == 0
+            || !valid_sha256(&artifact.sha256)
+        {
+            return Ok(view);
+        }
+        let fresh_session_observed = job
+            .zcode_session_id
+            .as_deref()
+            .is_some_and(|session| !session.trim().is_empty());
+        let Ok(validations) = u64::try_from(snapshot.validations.len()) else {
+            return Ok(view);
+        };
+        let Ok(checkpoints) = u64::try_from(snapshot.checkpoints.len()) else {
+            return Ok(view);
+        };
+        let Ok(findings) = u64::try_from(snapshot.findings.len()) else {
+            return Ok(view);
+        };
+        let Ok(open_findings) = u64::try_from(
+            snapshot
+                .findings
+                .iter()
+                .filter(|finding| finding.status.as_deref() == Some("open"))
+                .count(),
+        ) else {
+            return Ok(view);
+        };
+        view.review_evidence = Some(TaskReviewEvidenceView {
+            final_signal: final_signal.to_owned(),
+            finalized: true,
+            report_revision: snapshot.report.current_revision,
+            finalization_revision: finalization.revision,
+            artifact: artifact.clone(),
+            counts: TaskReviewEvidenceCountsView {
+                checkpoints,
+                findings,
+                open_findings,
+                validations,
+            },
+            independence: TaskReviewIndependenceView {
+                independent_evidence: task.independent_evidence,
+                fresh_session_observed,
+                counts_as_independent: task.independent_evidence && fresh_session_observed,
+            },
+            validation_provenance: TaskValidationProvenanceView {
+                daemon_verification: TaskDaemonVerificationView {
+                    source_integrity_verified: true,
+                    finalized_report_verified: true,
+                    artifact_digest_verified: true,
+                    validation_records_structurally_verified: true,
+                },
+                model_attestation: TaskModelAttestationView {
+                    present: true,
+                    validation_record_count: validations,
+                },
+            },
+        });
+        Ok(view)
+    }
+
     fn task_artifact_chunk(
         &self,
         task: &TaskRecord,
@@ -1919,10 +2073,10 @@ impl RpcService {
             .into_iter()
             .find(|artifact| artifact.artifact_id == query.artifact_id)
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "artifact was not found"))?;
-        if query.offset_bytes > expected.size_bytes {
+        if query.offset_bytes >= expected.size_bytes {
             return Err(RpcError::new(
                 RpcErrorCode::Validation,
-                "artifact offset exceeds authoritative size",
+                "artifact offset does not permit non-empty progress",
             ));
         }
         let stored = self
@@ -1942,12 +2096,111 @@ impl RpcService {
                 "event limit is outside the allowed range",
             ));
         }
-        self.require_task(&query.agent_id)?;
+        let (_, task) = self.require_task(&query.agent_id)?;
         let stored = self
             .store
-            .task_events_after(&query.agent_id, query.after, query.limit + 1)
+            .task_events_after(
+                &query.agent_id,
+                0,
+                MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION + 1,
+            )
             .map_err(map_store)?;
-        task_page_from_events(query.after, query.limit, stored)
+        if stored.len() > MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION {
+            return Err(RpcError::new(
+                RpcErrorCode::Oversized,
+                "private task event history exceeds the bounded public projection",
+            ));
+        }
+        let events = self.task_high_level_events(&task, stored)?;
+        task_page_from_events(query.after, query.limit, events)
+    }
+
+    fn task_high_level_events(
+        &self,
+        task: &TaskRecord,
+        stored: Vec<StoredEvent>,
+    ) -> Result<Vec<TaskEventView>, RpcError> {
+        let mut events = Vec::new();
+        if task.phase != TaskPhase::Queued {
+            events.push(TaskEventView {
+                sequence: 0,
+                source_sequence: 0,
+                attempt_sequence: task.attempt_sequence,
+                event_type: "attempt_started".into(),
+                payload_json: "{}".into(),
+                redaction_level: "allowlisted".into(),
+            });
+        }
+        for event in stored
+            .into_iter()
+            .filter(|event| event.attempt_sequence == task.attempt_sequence)
+        {
+            let projected = if event.event_type == "review.progress"
+                && matches!(
+                    task.task_kind,
+                    TaskKind::Review | TaskKind::ReviewContinuation
+                ) {
+                Some(("review_progress", "{}".to_owned(), "allowlisted"))
+            } else {
+                public_pending_request_id(&event).map(|request_id| {
+                    (
+                        "pending_request",
+                        serde_json::json!({"request_id": request_id}).to_string(),
+                        "bounded",
+                    )
+                })
+            };
+            if let Some((event_type, payload_json, redaction_level)) = projected {
+                events.push(TaskEventView {
+                    sequence: 0,
+                    source_sequence: event.source_sequence,
+                    attempt_sequence: task.attempt_sequence,
+                    event_type: event_type.into(),
+                    payload_json,
+                    redaction_level: redaction_level.into(),
+                });
+            }
+        }
+        if matches!(
+            task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        ) {
+            let snapshot = self
+                .store
+                .review_snapshot(&task.execution_agent_id)
+                .map_err(map_store)?;
+            if let Some(snapshot) = snapshot
+                .filter(|snapshot| snapshot.report.finalized && snapshot.finalization.is_some())
+            {
+                events.push(TaskEventView {
+                    sequence: 0,
+                    source_sequence: 0,
+                    attempt_sequence: task.attempt_sequence,
+                    event_type: "review_finalized".into(),
+                    payload_json: serde_json::json!({
+                        "revision": snapshot.report.current_revision,
+                    })
+                    .to_string(),
+                    redaction_level: "allowlisted".into(),
+                });
+            }
+        }
+        if task.phase == TaskPhase::Terminal {
+            events.push(TaskEventView {
+                sequence: 0,
+                source_sequence: 0,
+                attempt_sequence: task.attempt_sequence,
+                event_type: "terminal".into(),
+                payload_json: "{}".into(),
+                redaction_level: "allowlisted".into(),
+            });
+        }
+        for (index, event) in events.iter_mut().enumerate() {
+            event.sequence = u64::try_from(index + 1).map_err(|_| {
+                RpcError::new(RpcErrorCode::Oversized, "public event sequence overflowed")
+            })?;
+        }
+        Ok(events)
     }
 
     fn task_wait(&self, query: TaskWaitQuery) -> Result<RpcSuccess, RpcError> {
@@ -2386,19 +2639,45 @@ impl From<StoredTaskResult> for TaskResultView {
             residual_gaps: stored.result.residual_gaps,
             artifacts: stored.result.artifacts,
             result_sha256: stored.result_sha256,
+            review_evidence: None,
         }
     }
+}
+
+fn public_pending_request_id(event: &StoredEvent) -> Option<String> {
+    if event.event_type != "driver.message" {
+        return None;
+    }
+    serde_json::from_str::<Value>(&event.payload_json)
+        .ok()?
+        .get("request_id")?
+        .as_str()
+        .filter(|request_id| !request_id.is_empty() && request_id.len() <= 256)
+        .map(str::to_owned)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn task_page_from_events(
     after: u64,
     limit: usize,
-    stored: Vec<StoredEvent>,
+    projected: Vec<TaskEventView>,
 ) -> Result<TaskEventPage, RpcError> {
+    let start = usize::try_from(after).unwrap_or(usize::MAX);
+    if start >= projected.len() {
+        return Ok(TaskEventPage {
+            events: Vec::new(),
+            next_sequence: after,
+            has_more: false,
+        });
+    }
     let mut events = Vec::new();
     let mut payload_bytes = 0usize;
-    let mut has_more = stored.len() > limit;
-    for event in stored.into_iter().take(limit) {
+    let remaining = projected.len() - start;
+    let mut has_more = remaining > limit;
+    for event in projected.into_iter().skip(start).take(limit) {
         if event.payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
             return Err(RpcError::new(
                 RpcErrorCode::Oversized,
@@ -2411,14 +2690,7 @@ fn task_page_from_events(
             break;
         }
         payload_bytes = next_bytes;
-        events.push(TaskEventView {
-            sequence: event.sequence,
-            source_sequence: event.source_sequence,
-            attempt_sequence: event.attempt_sequence,
-            event_type: event.event_type,
-            payload_json: event.payload_json,
-            redaction_level: event.redaction_level,
-        });
+        events.push(event);
     }
     Ok(TaskEventPage {
         next_sequence: events.last().map(|event| event.sequence).unwrap_or(after),

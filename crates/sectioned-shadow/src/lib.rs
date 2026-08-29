@@ -380,6 +380,7 @@ pub struct ShadowRun {
 }
 
 const SHADOW_REPORT_CAP_BYTES: u64 = 16 * 1024 * 1024;
+const SHADOW_ARTIFACT_CHUNK_BYTES: u64 = 8 * 1024;
 
 pub async fn run_shadow_v2<C: PublicMcpClient>(
     client: &C,
@@ -531,7 +532,50 @@ pub async fn run_shadow_v2<C: PublicMcpClient>(
     let checkpoint_count = report
         .as_ref()
         .and_then(|(_, _, bytes)| finalized_checkpoint_count(bytes));
-    let report_valid = checkpoint_count.is_some();
+    let review_evidence_valid = result
+        .get("result")
+        .and_then(|value| value.get("review_evidence"))
+        .zip(report.as_ref())
+        .zip(checkpoint_count)
+        .is_some_and(|((evidence, (sha256, size_bytes, _)), checkpoint_count)| {
+            let counts = &evidence["counts"];
+            let validation_count = counts["validations"].as_u64();
+            let daemon = &evidence["validation_provenance"]["daemon_verification"];
+            let model = &evidence["validation_provenance"]["model_attestation"];
+            evidence["finalized"] == true
+                && matches!(
+                    evidence["final_signal"].as_str(),
+                    Some(
+                        "findings_present"
+                            | "no_findings_observed"
+                            | "incomplete_evidence"
+                            | "unable_to_review"
+                    )
+                )
+                && evidence["report_revision"]
+                    .as_u64()
+                    .is_some_and(|revision| {
+                        revision > 0
+                            && evidence["finalization_revision"].as_u64().is_some_and(
+                                |finalization| finalization > 0 && finalization <= revision,
+                            )
+                    })
+                && evidence["artifact"]["sha256"].as_str() == Some(sha256.as_str())
+                && evidence["artifact"]["size_bytes"].as_u64() == Some(*size_bytes)
+                && counts["checkpoints"].as_u64() == Some(checkpoint_count)
+                && validation_count.is_some_and(|count| count > 0)
+                && evidence["independence"]["fresh_session_observed"].as_bool()
+                    == Some(fresh_session)
+                && evidence["independence"]["counts_as_independent"].as_bool()
+                    == Some(counts_as_independent)
+                && daemon["source_integrity_verified"] == true
+                && daemon["finalized_report_verified"] == true
+                && daemon["artifact_digest_verified"] == true
+                && daemon["validation_records_structurally_verified"] == true
+                && model["present"] == true
+                && model["validation_record_count"].as_u64() == validation_count
+        });
+    let report_valid = checkpoint_count.is_some() && review_evidence_valid;
     let close_reaped = client
         .call("zcode_agent_close", json!({"agent_id": agent_id}))
         .await
@@ -671,8 +715,6 @@ async fn read_v2_verified_report<C: PublicMcpClient>(
     agent_id: &str,
     result: &Value,
 ) -> Result<(String, u64, Vec<u8>), ShadowError> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
     let artifact = result
         .get("artifacts")
         .and_then(Value::as_array)
@@ -688,9 +730,14 @@ async fn read_v2_verified_report<C: PublicMcpClient>(
         .get("size_bytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| ShadowError::Protocol("report artifact omitted size".into()))?;
-    if size_bytes > SHADOW_REPORT_CAP_BYTES {
+    if size_bytes == 0 || size_bytes > SHADOW_REPORT_CAP_BYTES {
         return Err(ShadowError::Protocol(
-            "report artifact exceeds the shadow cap".into(),
+            "report artifact size is outside the shadow bounds".into(),
+        ));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ShadowError::Protocol(
+            "report artifact digest is invalid".into(),
         ));
     }
     let attempt_sequence = result
@@ -699,7 +746,13 @@ async fn read_v2_verified_report<C: PublicMcpClient>(
         .and_then(Value::as_u64)
         .ok_or_else(|| ShadowError::Protocol("result omitted attempt sequence".into()))?;
     let mut bytes = Vec::with_capacity(size_bytes as usize);
-    while (bytes.len() as u64) < size_bytes {
+    let max_chunks = size_bytes.div_ceil(SHADOW_ARTIFACT_CHUNK_BYTES);
+    for _ in 0..max_chunks {
+        if bytes.len() as u64 == size_bytes {
+            break;
+        }
+        let offset = bytes.len() as u64;
+        let requested = (size_bytes - offset).min(SHADOW_ARTIFACT_CHUNK_BYTES);
         let response = client
             .call(
                 "zcode_agent_result",
@@ -707,31 +760,22 @@ async fn read_v2_verified_report<C: PublicMcpClient>(
                     "agent_id": agent_id,
                     "attempt_sequence": attempt_sequence,
                     "artifact_id": artifact_id,
-                    "offset_bytes": bytes.len() as u64,
-                    "limit_bytes": 8192
+                    "offset_bytes": offset,
+                    "limit_bytes": requested
                 }),
             )
             .await?;
         let chunk = response
             .get("artifact_chunk")
             .ok_or_else(|| ShadowError::Protocol("artifact response omitted chunk".into()))?;
-        if string_field(chunk, "artifact_id")? != artifact_id
-            || string_field(chunk, "sha256")? != sha256
-            || chunk.get("size_bytes").and_then(Value::as_u64) != Some(size_bytes)
-            || chunk.get("offset_bytes").and_then(Value::as_u64) != Some(bytes.len() as u64)
-        {
-            return Err(ShadowError::Protocol(
-                "artifact chunk metadata changed during retrieval".into(),
-            ));
-        }
-        let decoded = BASE64
-            .decode(string_field(chunk, "bytes_base64")?)
-            .map_err(|_| ShadowError::Protocol("artifact chunk base64 is invalid".into()))?;
-        if decoded.is_empty() || bytes.len().saturating_add(decoded.len()) > size_bytes as usize {
-            return Err(ShadowError::Protocol(
-                "artifact chunk length is invalid".into(),
-            ));
-        }
+        let decoded = validate_v2_artifact_chunk(
+            chunk,
+            &artifact_id,
+            &sha256,
+            size_bytes,
+            offset,
+            requested,
+        )?;
         bytes.extend_from_slice(&decoded);
     }
     if bytes.len() as u64 != size_bytes || format!("{:x}", Sha256::digest(&bytes)) != sha256 {
@@ -740,6 +784,51 @@ async fn read_v2_verified_report<C: PublicMcpClient>(
         ));
     }
     Ok((sha256, size_bytes, bytes))
+}
+
+fn validate_v2_artifact_chunk(
+    chunk: &Value,
+    artifact_id: &str,
+    sha256: &str,
+    size_bytes: u64,
+    offset: u64,
+    requested: u64,
+) -> Result<Vec<u8>, ShadowError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    if string_field(chunk, "artifact_id")? != artifact_id
+        || string_field(chunk, "sha256")? != sha256
+        || chunk.get("size_bytes").and_then(Value::as_u64) != Some(size_bytes)
+        || chunk.get("offset_bytes").and_then(Value::as_u64) != Some(offset)
+    {
+        return Err(ShadowError::Protocol(
+            "artifact chunk metadata changed during retrieval".into(),
+        ));
+    }
+    let decoded = BASE64
+        .decode(string_field(chunk, "bytes_base64")?)
+        .map_err(|_| ShadowError::Protocol("artifact chunk base64 is invalid".into()))?;
+    let returned = chunk
+        .get("returned_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ShadowError::Protocol("artifact chunk omitted returned size".into()))?;
+    let next_offset = offset
+        .checked_add(
+            u64::try_from(decoded.len())
+                .map_err(|_| ShadowError::Protocol("artifact chunk length overflowed".into()))?,
+        )
+        .ok_or_else(|| ShadowError::Protocol("artifact chunk offset overflowed".into()))?;
+    if decoded.is_empty()
+        || returned != decoded.len() as u64
+        || decoded.len() as u64 != requested
+        || next_offset > size_bytes
+        || chunk.get("eof").and_then(Value::as_bool) != Some(next_offset == size_bytes)
+    {
+        return Err(ShadowError::Protocol(
+            "artifact chunk progress is invalid".into(),
+        ));
+    }
+    Ok(decoded)
 }
 
 pub async fn run_shadow<C: PublicMcpClient>(
@@ -1097,4 +1186,43 @@ pub fn object(value: Value) -> Result<Map<String, Value>, ShadowError> {
 
 pub fn bounded_pause(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(1, 5000))
+}
+
+#[cfg(test)]
+mod artifact_chunk_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    fn chunk(bytes: &[u8], offset: u64, size: u64, eof: bool) -> Value {
+        serde_json::json!({
+            "artifact_id":"report",
+            "sha256":"a".repeat(64),
+            "size_bytes":size,
+            "offset_bytes":offset,
+            "returned_bytes":bytes.len(),
+            "eof":eof,
+            "bytes_base64":BASE64.encode(bytes),
+        })
+    }
+
+    #[test]
+    fn collector_rejects_zero_nonmonotonic_oversized_and_incorrect_eof_chunks() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            validate_v2_artifact_chunk(&chunk(b"data", 0, 4, true), "report", &digest, 4, 0, 4)
+                .unwrap(),
+            b"data"
+        );
+        for invalid in [
+            chunk(b"", 0, 4, false),
+            chunk(b"data", 1, 4, true),
+            chunk(b"extra", 0, 4, true),
+            chunk(b"data", 0, 4, false),
+        ] {
+            assert!(
+                validate_v2_artifact_chunk(&invalid, "report", &digest, 4, 0, 4).is_err(),
+                "collector accepted invalid chunk {invalid}"
+            );
+        }
+    }
 }

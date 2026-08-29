@@ -888,6 +888,21 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
         other => panic!("unexpected artifact: {other:?}"),
     }
 
+    assert_eq!(
+        fixture
+            .service
+            .dispatch(RpcMethod::TaskArtifact(TaskArtifactQuery {
+                agent_id: agent_id.clone(),
+                attempt_sequence: None,
+                artifact_id: "s05-artifact".into(),
+                offset_bytes: bytes.len() as u64,
+                limit_bytes: 1,
+            }))
+            .unwrap_err()
+            .code,
+        RpcErrorCode::Validation
+    );
+
     std::fs::write(&path, b"tampered").unwrap();
     assert_eq!(
         fixture
@@ -903,6 +918,151 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
             .code,
         RpcErrorCode::ResultInvalid
     );
+}
+
+#[test]
+fn v2_events_use_a_bounded_high_level_cursor_and_wait_ignores_raw_churn() {
+    let fixture = fixture();
+    let (_repository, agent_id) = submit_general_fixture(
+        &fixture,
+        "high-level-events",
+        "feature-events",
+        "owner-events",
+    );
+    let execution_id = fixture
+        .store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert!(fixture
+        .scheduler
+        .start_ready()
+        .unwrap()
+        .contains(&execution_id));
+    fixture.factory.runtime(&execution_id);
+    let job = fixture.store.get_job(&execution_id).unwrap().unwrap();
+    let runtime_agent_id = job.runtime_agent_id.clone().unwrap();
+    fixture
+        .store
+        .append_lifecycle(&LifecycleWrite {
+            agent_id: execution_id.clone(),
+            runtime_agent_id,
+            owner_epoch: job.owner_epoch,
+            source_sequence: 10_000,
+            event_type: "driver.message".into(),
+            turn_id: None,
+            payload_json: serde_json::json!({
+                "kind":"request",
+                "method":"interaction/requestPermission",
+                "request_id":"public-request"
+            })
+            .to_string(),
+            redaction_level: "redacted".into(),
+            terminal: None,
+            turn_state: None,
+        })
+        .unwrap();
+
+    let first = match fixture
+        .service
+        .dispatch(RpcMethod::TaskEvents(TaskEventQuery {
+            agent_id: agent_id.clone(),
+            after: 0,
+            limit: 1,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskEvents { page } => page,
+        other => panic!("unexpected first event page: {other:?}"),
+    };
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].sequence, 1);
+    assert_eq!(first.events[0].event_type, "attempt_started");
+    assert!(first.has_more);
+
+    let second = match fixture
+        .service
+        .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: agent_id.clone(),
+            after: first.next_sequence,
+            timeout_ms: 50,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskWait {
+            page, timed_out, ..
+        } => {
+            assert!(!timed_out);
+            page
+        }
+        other => panic!("unexpected wait page: {other:?}"),
+    };
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].sequence, 2);
+    assert_eq!(second.events[0].event_type, "pending_request");
+    assert_eq!(second.next_sequence, 2);
+    assert!(!second.has_more);
+
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: agent_id.clone(),
+            after: second.next_sequence,
+            timeout_ms: 10,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskWait {
+            page, timed_out, ..
+        } => {
+            assert!(timed_out);
+            assert!(page.events.is_empty());
+            assert_eq!(page.next_sequence, 2);
+        }
+        other => panic!("unexpected quiet wait: {other:?}"),
+    }
+
+    fixture
+        .store
+        .store_task_result(
+            &execution_id,
+            &TaskResult {
+                outcome: TaskOutcome::Succeeded,
+                summary: "complete".into(),
+                partial: false,
+                base_commit: None,
+                head_commit: None,
+                changed_files: Vec::new(),
+                diff_stat: None,
+                checks: Vec::new(),
+                residual_gaps: Vec::new(),
+                artifacts: Vec::new(),
+            },
+        )
+        .unwrap();
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id,
+            after: second.next_sequence,
+            timeout_ms: 10,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskWait {
+            task,
+            page,
+            timed_out,
+        } => {
+            assert!(!timed_out);
+            assert_eq!(task.phase, "TERMINAL");
+            assert_eq!(page.events.len(), 1);
+            assert_eq!(page.events[0].sequence, 3);
+            assert_eq!(page.events[0].event_type, "terminal");
+        }
+        other => panic!("unexpected terminal wait: {other:?}"),
+    }
 }
 
 #[derive(Clone, Copy)]

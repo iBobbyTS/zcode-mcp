@@ -187,7 +187,7 @@ impl FixtureMcp {
         let terminal = calls > 0;
         Ok(Json(json!({
             "task":task(&state, if terminal { "TERMINAL" } else { "ACTIVE" }, false),
-            "result":if terminal { result() } else { Value::Null },
+            "result":if terminal { result(&state) } else { Value::Null },
             "artifacts":if terminal { artifacts(&state) } else { Vec::<Value>::new() },
             "pending_requests":[]
         })))
@@ -204,7 +204,7 @@ impl FixtureMcp {
         }
         Ok(Json(json!({
             "task":task(&state,"ACTIVE",false),
-            "events":[{"sequence":input.after_sequence + 1,"attempt_sequence":1,"event_type":"lifecycle","redaction_level":"allowlisted","pending_request_id":Value::Null}],
+            "events":[{"sequence":input.after_sequence + 1,"attempt_sequence":1,"event_type":"attempt_started","redaction_level":"allowlisted","pending_request_id":Value::Null}],
             "next_sequence":input.after_sequence + 1,
             "has_more":false,
             "timed_out":false
@@ -243,7 +243,7 @@ impl FixtureMcp {
         };
         Ok(Json(json!({
             "task":task(&state,"TERMINAL",false),
-            "result":result(),
+            "result":result(&state),
             "artifacts":artifacts(&state),
             "artifact_chunk":chunk
         })))
@@ -280,7 +280,13 @@ fn task(state: &FixtureState, phase: &str, reaped: bool) -> Value {
     })
 }
 
-fn result() -> Value {
+fn result(state: &FixtureState) -> Value {
+    let artifact = json!({
+        "artifact_id":"fixture-report",
+        "kind":"report_markdown",
+        "sha256":format!("{:x}",Sha256::digest(state.report.as_slice())),
+        "size_bytes":state.report.len()
+    });
     json!({
         "outcome":"SUCCEEDED",
         "summary":"fixture completed",
@@ -292,7 +298,25 @@ fn result() -> Value {
         "diff_stat":Value::Null,
         "checks":[],
         "residual_gaps":[],
-        "result_sha256":"fixture-result"
+        "result_sha256":"fixture-result",
+        "review_evidence":{
+            "final_signal":"no_findings_observed",
+            "finalized":true,
+            "report_revision":3,
+            "finalization_revision":3,
+            "artifact":artifact,
+            "counts":{"checkpoints":1,"findings":0,"open_findings":0,"validations":1},
+            "independence":{"independent_evidence":true,"fresh_session_observed":true,"counts_as_independent":true},
+            "validation_provenance":{
+                "daemon_verification":{
+                    "source_integrity_verified":true,
+                    "finalized_report_verified":true,
+                    "artifact_digest_verified":true,
+                    "validation_records_structurally_verified":true
+                },
+                "model_attestation":{"present":true,"validation_record_count":1}
+            }
+        }
     })
 }
 

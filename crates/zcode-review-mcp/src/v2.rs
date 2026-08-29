@@ -30,8 +30,8 @@ use zcode_reviewd::{
         MessageDispositionView, MessageInput, ReadinessResultView, RespondInput, ResponseDecision,
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
         SubmissionDispositionView, SystemStatusView, TaskArtifactMetadataView, TaskArtifactQuery,
-        TaskEventPage, TaskEventQuery, TaskListQuery, TaskPhaseFilter, TaskResultView, TaskView,
-        TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+        TaskEventPage, TaskEventQuery, TaskListQuery, TaskPhaseFilter, TaskResultView,
+        TaskReviewEvidenceView, TaskView, TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
     },
 };
 
@@ -532,11 +532,119 @@ pub struct PublicResult {
     pub checks: Vec<String>,
     pub residual_gaps: Vec<String>,
     pub result_sha256: String,
+    pub review_evidence: Option<PublicReviewEvidence>,
 }
 
-impl From<TaskResultView> for PublicResult {
-    fn from(value: TaskResultView) -> Self {
-        Self {
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicReviewEvidence {
+    pub final_signal: String,
+    pub finalized: bool,
+    pub report_revision: u64,
+    pub finalization_revision: u64,
+    pub artifact: PublicArtifact,
+    pub counts: PublicReviewEvidenceCounts,
+    pub independence: PublicReviewIndependence,
+    pub validation_provenance: PublicValidationProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicReviewEvidenceCounts {
+    pub checkpoints: u64,
+    pub findings: u64,
+    pub open_findings: u64,
+    pub validations: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicReviewIndependence {
+    pub independent_evidence: bool,
+    pub fresh_session_observed: bool,
+    pub counts_as_independent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicValidationProvenance {
+    pub daemon_verification: PublicDaemonVerification,
+    pub model_attestation: PublicModelAttestation,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicDaemonVerification {
+    pub source_integrity_verified: bool,
+    pub finalized_report_verified: bool,
+    pub artifact_digest_verified: bool,
+    pub validation_records_structurally_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicModelAttestation {
+    pub present: bool,
+    pub validation_record_count: u64,
+}
+
+impl TryFrom<TaskReviewEvidenceView> for PublicReviewEvidence {
+    type Error = String;
+
+    fn try_from(value: TaskReviewEvidenceView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            final_signal: value.final_signal,
+            finalized: value.finalized,
+            report_revision: value.report_revision,
+            finalization_revision: value.finalization_revision,
+            artifact: value.artifact.try_into()?,
+            counts: PublicReviewEvidenceCounts {
+                checkpoints: value.counts.checkpoints,
+                findings: value.counts.findings,
+                open_findings: value.counts.open_findings,
+                validations: value.counts.validations,
+            },
+            independence: PublicReviewIndependence {
+                independent_evidence: value.independence.independent_evidence,
+                fresh_session_observed: value.independence.fresh_session_observed,
+                counts_as_independent: value.independence.counts_as_independent,
+            },
+            validation_provenance: PublicValidationProvenance {
+                daemon_verification: PublicDaemonVerification {
+                    source_integrity_verified: value
+                        .validation_provenance
+                        .daemon_verification
+                        .source_integrity_verified,
+                    finalized_report_verified: value
+                        .validation_provenance
+                        .daemon_verification
+                        .finalized_report_verified,
+                    artifact_digest_verified: value
+                        .validation_provenance
+                        .daemon_verification
+                        .artifact_digest_verified,
+                    validation_records_structurally_verified: value
+                        .validation_provenance
+                        .daemon_verification
+                        .validation_records_structurally_verified,
+                },
+                model_attestation: PublicModelAttestation {
+                    present: value.validation_provenance.model_attestation.present,
+                    validation_record_count: value
+                        .validation_provenance
+                        .model_attestation
+                        .validation_record_count,
+                },
+            },
+        })
+    }
+}
+
+impl TryFrom<TaskResultView> for PublicResult {
+    type Error = String;
+
+    fn try_from(value: TaskResultView) -> Result<Self, Self::Error> {
+        Ok(Self {
             outcome: value.outcome.into(),
             summary: value.summary,
             partial: value.partial,
@@ -548,7 +656,8 @@ impl From<TaskResultView> for PublicResult {
             checks: value.checks,
             residual_gaps: value.residual_gaps,
             result_sha256: value.result_sha256,
-        }
+            review_evidence: value.review_evidence.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
@@ -655,9 +764,19 @@ pub struct AgentEventsInput {
 pub struct PublicTaskEvent {
     pub sequence: u64,
     pub attempt_sequence: u64,
-    pub event_type: String,
+    pub event_type: PublicTaskEventType,
     pub redaction_level: String,
     pub pending_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTaskEventType {
+    AttemptStarted,
+    ReviewProgress,
+    PendingRequest,
+    ReviewFinalized,
+    Terminal,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1029,7 +1148,7 @@ impl SubagentMcp {
                 artifacts,
             } => Ok((
                 task.into(),
-                result.map(Into::into),
+                result.map(TryInto::try_into).transpose()?,
                 artifacts
                     .into_iter()
                     .map(TryInto::try_into)
@@ -1204,8 +1323,8 @@ fn review_manifest(input: &ReviewSpawnInput) -> Result<ReviewManifest, String> {
     })
 }
 
-fn project_event_page(page: TaskEventPage) -> AgentEventsOutput {
-    AgentEventsOutput {
+fn project_event_page(page: TaskEventPage) -> Result<AgentEventsOutput, String> {
+    Ok(AgentEventsOutput {
         events: page
             .events
             .into_iter()
@@ -1219,27 +1338,26 @@ fn project_event_page(page: TaskEventPage) -> AgentEventsOutput {
                                 .and_then(|id| id.as_str())
                                 .map(str::to_owned)
                         });
-                let event_type = if pending_request_id.is_some() {
-                    "pending_request"
-                } else if event.event_type.contains("result") {
-                    "result"
-                } else if event.event_type.contains("attempt") {
-                    "attempt"
-                } else {
-                    "lifecycle"
+                let event_type = match event.event_type.as_str() {
+                    "attempt_started" => PublicTaskEventType::AttemptStarted,
+                    "review_progress" => PublicTaskEventType::ReviewProgress,
+                    "pending_request" => PublicTaskEventType::PendingRequest,
+                    "review_finalized" => PublicTaskEventType::ReviewFinalized,
+                    "terminal" => PublicTaskEventType::Terminal,
+                    _ => return Err(protocol_error()),
                 };
-                PublicTaskEvent {
+                Ok(PublicTaskEvent {
                     sequence: event.sequence,
                     attempt_sequence: event.attempt_sequence,
-                    event_type: event_type.into(),
+                    event_type,
                     redaction_level: event.redaction_level,
                     pending_request_id,
-                }
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, String>>()?,
         next_sequence: page.next_sequence,
         has_more: page.has_more,
-    }
+    })
 }
 
 fn project_response(value: ResponseOutcomeView, attempt_sequence: u64) -> AgentRespondOutput {
@@ -1477,7 +1595,7 @@ impl SubagentMcp {
             after: input.after_sequence,
             limit: input.limit,
         }))? {
-            RpcSuccess::TaskEvents { page } => Ok(Json(project_event_page(page))),
+            RpcSuccess::TaskEvents { page } => Ok(Json(project_event_page(page)?)),
             _ => Err(protocol_error()),
         }
     }
@@ -1509,7 +1627,7 @@ impl SubagentMcp {
                 page,
                 timed_out,
             } => {
-                let projected = project_event_page(page);
+                let projected = project_event_page(page)?;
                 Ok(Json(AgentWaitOutput {
                     task: task.into(),
                     events: projected.events,
@@ -1652,22 +1770,50 @@ impl SubagentMcp {
             if limit_bytes == 0 || limit_bytes > MAX_ARTIFACT_CHUNK_BYTES {
                 return Err("validation: limit_bytes is outside the allowed range".into());
             }
+            let expected = artifacts
+                .iter()
+                .find(|artifact| artifact.artifact_id == artifact_id)
+                .ok_or_else(|| {
+                    "validation: artifact_id is not in the authoritative result".to_owned()
+                })?;
+            if offset_bytes >= expected.size_bytes {
+                return Err("validation: offset_bytes does not permit non-empty progress".into());
+            }
             match self.rpc(RpcMethod::TaskArtifact(TaskArtifactQuery {
                 agent_id: input.agent_id,
                 attempt_sequence: input.attempt_sequence,
-                artifact_id,
+                artifact_id: artifact_id.clone(),
                 offset_bytes,
                 limit_bytes,
             }))? {
-                RpcSuccess::TaskArtifact { chunk } => Some(PublicArtifactChunk {
-                    artifact_id: chunk.artifact_id,
-                    offset_bytes: chunk.offset_bytes,
-                    returned_bytes: chunk.bytes.len(),
-                    eof: chunk.eof,
-                    sha256: chunk.sha256,
-                    size_bytes: chunk.size_bytes,
-                    bytes_base64: BASE64.encode(chunk.bytes),
-                }),
+                RpcSuccess::TaskArtifact { chunk } => {
+                    let returned_bytes = chunk.bytes.len();
+                    let next_offset = offset_bytes
+                        .checked_add(u64::try_from(returned_bytes).map_err(|_| protocol_error())?)
+                        .ok_or_else(protocol_error)?;
+                    if chunk.artifact_id != artifact_id
+                        || chunk.sha256 != expected.sha256
+                        || chunk.size_bytes != expected.size_bytes
+                        || chunk.offset_bytes != offset_bytes
+                        || returned_bytes == 0
+                        || returned_bytes > limit_bytes
+                        || next_offset > expected.size_bytes
+                        || chunk.eof != (next_offset == expected.size_bytes)
+                    {
+                        return Err(
+                            "protocol_error: artifact chunk violated authoritative metadata".into(),
+                        );
+                    }
+                    Some(PublicArtifactChunk {
+                        artifact_id: chunk.artifact_id,
+                        offset_bytes: chunk.offset_bytes,
+                        returned_bytes,
+                        eof: chunk.eof,
+                        sha256: chunk.sha256,
+                        size_bytes: chunk.size_bytes,
+                        bytes_base64: BASE64.encode(chunk.bytes),
+                    })
+                }
                 _ => return Err(protocol_error()),
             }
         } else {
@@ -1970,7 +2116,7 @@ mod tests {
                 sequence: 3,
                 source_sequence: 99,
                 attempt_sequence: 2,
-                event_type: "runtime_request".into(),
+                event_type: "pending_request".into(),
                 payload_json: serde_json::json!({
                     "request_id": "request-public",
                     "runtime_agent_id": "private-runtime",
@@ -1982,8 +2128,12 @@ mod tests {
             }],
             next_sequence: 3,
             has_more: false,
-        });
-        assert_eq!(output.events[0].event_type, "pending_request");
+        })
+        .unwrap();
+        assert_eq!(
+            output.events[0].event_type,
+            PublicTaskEventType::PendingRequest
+        );
         assert_eq!(
             output.events[0].pending_request_id.as_deref(),
             Some("request-public")

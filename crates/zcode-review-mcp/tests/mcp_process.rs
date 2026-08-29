@@ -37,6 +37,56 @@ use zcode_reviewd::{
 const OFFICIAL_RUNTIME_SHA256: &str =
     "9318f60fb8c2c3bc83ce62da10220ebcdc9a99786df0a9abb1a4435ba66e4274";
 
+static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct PolicyEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl Drop for PolicyEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.as_ref() {
+            Some(value) => std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", value),
+            None => std::env::remove_var("ZCODE_REVIEW_HOOK_PROVENANCE"),
+        }
+    }
+}
+
+fn install_verified_policy(root: &Path) -> PolicyEnvGuard {
+    let lock = POLICY_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os("ZCODE_REVIEW_HOOK_PROVENANCE");
+    let config = root.join("policy-config.json");
+    let provenance = root.join("policy-provenance.json");
+    std::fs::write(&config, "{}\n").unwrap();
+    let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/zcode-subagent-mcp-v2")
+        .canonicalize()
+        .unwrap();
+    for script in ["install-review-hook.mjs", "preflight-review-hook.mjs"] {
+        let output = Command::new("node")
+            .arg(plugin_root.join("scripts").join(script))
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--provenance",
+                provenance.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{script} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", provenance);
+    PolicyEnvGuard {
+        _lock: lock,
+        previous,
+    }
+}
+
 fn discover(protocol_version: &str) -> Vec<Value> {
     discover_mode(protocol_version, None)
 }
@@ -931,6 +981,7 @@ fn v2_general_lifecycle_is_scoped_redacted_and_restart_stable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restart() {
     let directory = tempfile::tempdir().unwrap();
+    let _policy_env = install_verified_policy(directory.path());
     let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
     let factory = Arc::new(PublicFakeFactory {
         bootstrap_entered: Arc::new(Barrier::new(1)),
@@ -1121,11 +1172,22 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
         json!({"agent_id":public_agent_id,"after_sequence":0,"limit":100}),
     );
     let first_cursor = first_events["next_sequence"].as_u64().unwrap();
-    assert!(first_events["events"]
-        .as_array()
-        .unwrap()
+    let first_event_rows = first_events["events"].as_array().unwrap();
+    assert!(!first_event_rows.is_empty());
+    assert!(first_event_rows
         .iter()
         .all(|event| event["attempt_sequence"] == 1));
+    assert_eq!(first_event_rows[0]["sequence"], 1);
+    assert!(first_event_rows.iter().all(|event| matches!(
+        event["event_type"].as_str(),
+        Some(
+            "attempt_started"
+                | "review_progress"
+                | "pending_request"
+                | "review_finalized"
+                | "terminal"
+        )
+    )));
 
     let continuation = v2.tool(
         "zcode_review_continue",
@@ -1175,13 +1237,16 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
     assert!(!second_prepared.worktree.path.exists());
     let continuation_events = v2.tool(
         "zcode_agent_events",
-        json!({"agent_id":public_agent_id,"after_sequence":first_cursor,"limit":100}),
+        json!({"agent_id":public_agent_id,"after_sequence":0,"limit":100}),
     );
     let continuation_rows = continuation_events["events"].as_array().unwrap();
     assert!(!continuation_rows.is_empty());
-    assert!(continuation_rows
-        .iter()
-        .all(|event| event["sequence"].as_u64().unwrap() > first_cursor));
+    assert_eq!(continuation_rows[0]["sequence"], 1);
+    assert_eq!(
+        continuation_events["next_sequence"],
+        continuation_rows.last().unwrap()["sequence"]
+    );
+    assert!(continuation_events["next_sequence"].as_u64().unwrap() <= first_cursor);
     assert!(continuation_rows
         .iter()
         .all(|event| event["attempt_sequence"] == 2));
@@ -1192,6 +1257,21 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
     );
     assert_eq!(selected_first["task"]["attempt_sequence"], 1);
     assert_eq!(selected_first["result"]["outcome"], "SUCCEEDED");
+    let evidence = &selected_first["result"]["review_evidence"];
+    assert_eq!(evidence["final_signal"], "no_findings_observed");
+    assert_eq!(evidence["finalized"], true);
+    assert_eq!(evidence["counts"]["checkpoints"], 1);
+    assert_eq!(evidence["counts"]["validations"], 1);
+    assert_eq!(evidence["counts"]["findings"], 0);
+    assert_eq!(evidence["independence"]["counts_as_independent"], true);
+    assert_eq!(
+        evidence["validation_provenance"]["daemon_verification"]["artifact_digest_verified"],
+        true
+    );
+    assert_eq!(
+        evidence["validation_provenance"]["model_attestation"]["present"],
+        true
+    );
     let first_artifact = selected_first["artifacts"]
         .as_array()
         .unwrap()
