@@ -127,6 +127,11 @@ pub struct StructuredReviewProvenance {
     pub policy_version: String,
     pub policy_sha256: String,
     pub hook_provenance: review_preparation::ReviewHookProvenance,
+    /// Daemon-process identity captured with the in-process review snapshot.
+    /// This is intentionally omitted from serialized/public projections; the
+    /// RPC system status is the sole public service-generation surface.
+    #[serde(skip)]
+    pub service_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,10 +200,18 @@ pub struct ReviewJobOrchestrator {
     scheduler: Scheduler,
     spawn_lock: Arc<Mutex<()>>,
     hook_provenance: review_preparation::ReviewHookProvenance,
+    service_generation: String,
 }
 
 impl ReviewJobOrchestrator {
     pub fn new(scheduler: Scheduler) -> Result<Self, OrchestrationError> {
+        Self::new_with_service_generation(scheduler, String::new())
+    }
+
+    pub fn new_with_service_generation(
+        scheduler: Scheduler,
+        service_generation: String,
+    ) -> Result<Self, OrchestrationError> {
         if scheduler.ledger().is_none() || !scheduler.review_completion_enabled() {
             return Err(OrchestrationError::Unavailable(
                 "scheduler has no job-scoped ledger completion gate",
@@ -208,6 +221,7 @@ impl ReviewJobOrchestrator {
             scheduler,
             spawn_lock: Arc::new(Mutex::new(())),
             hook_provenance: review_preparation::review_bash_hook_provenance(),
+            service_generation,
         })
     }
 
@@ -658,6 +672,7 @@ impl ReviewJobOrchestrator {
             review_kind,
             ReviewSubmissionDisposition::Existing,
             &self.hook_provenance,
+            &self.service_generation,
         )))
     }
 
@@ -938,6 +953,7 @@ impl ReviewJobOrchestrator {
             attempt.review_kind,
             ReviewSubmissionDisposition::Created,
             &self.hook_provenance,
+            &self.service_generation,
         ))
     }
 
@@ -1414,6 +1430,7 @@ fn cleanup_prepared_job_root(prepared: &PreparedLaunchSpec) -> Result<(), Orches
         .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn structured_projection(
     job: Job,
     task: TaskRecord,
@@ -1422,6 +1439,7 @@ fn structured_projection(
     review_kind: StructuredReviewKind,
     disposition: ReviewSubmissionDisposition,
     hook_provenance: &review_preparation::ReviewHookProvenance,
+    service_generation: &str,
 ) -> StructuredReviewProjection {
     let fresh_session_observed = job
         .zcode_session_id
@@ -1460,6 +1478,7 @@ fn structured_projection(
                 .clone()
                 .unwrap_or_default(),
             hook_provenance: hook_provenance.clone(),
+            service_generation: service_generation.to_owned(),
         },
     }
 }

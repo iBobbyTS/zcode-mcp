@@ -93,11 +93,13 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
     let Ok(record) = serde_json::from_slice::<ReviewHookProvenance>(&bytes) else {
         return unverified();
     };
-    let service_generation = std::env::var("ZCODE_REVIEW_SERVICE_GENERATION").ok();
     let artifact_matches = file_hash_matches(
         record.effective_hook_path.as_deref(),
         record.effective_hook_sha256.as_deref(),
     );
+    // `activation_generation` identifies the installed/preflighted hook
+    // artifact. The daemon's restart-scoped service generation is a separate
+    // process identity and is intentionally not coupled to this record.
     let verified = record.hook_activation_verified
         && record.daemon_policy_version == daemon_policy_version
         && record.daemon_policy_sha256 == daemon_policy_sha256
@@ -114,8 +116,7 @@ pub fn review_bash_hook_provenance() -> ReviewHookProvenance {
         && record
             .activation_generation
             .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        && record.activation_generation.as_deref() == service_generation.as_deref();
+            .is_some_and(|value| !value.is_empty());
     if verified {
         record
     } else {

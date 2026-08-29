@@ -59,12 +59,14 @@ current service process:
 
 ```bash
 export ZCODE_REVIEW_HOOK_PROVENANCE=/absolute/review-bash-hook-provenance.json
-export ZCODE_REVIEW_SERVICE_GENERATION="$(node -p "require(process.env.ZCODE_REVIEW_HOOK_PROVENANCE).activation_generation")"
 ```
 
-Missing or mismatched generation, a disabled config entry, an older/tampered
-artifact, or a config that no longer references the hook remains unverified and
-structured review startup fails closed with `REVIEW_BASH_POLICY_UNVERIFIED`.
+The daemon creates a fresh opaque `service_generation` for every process
+lifetime. Do not derive it from `activation_generation`: the latter identifies
+the installed/preflighted hook artifact and remains independent of daemon
+restart identity. A disabled config entry, an older/tampered artifact, or a
+config that no longer references the hook remains unverified and structured
+review startup fails closed with `REVIEW_BASH_POLICY_UNVERIFIED`.
 
 When installing through the plugin UI:
 

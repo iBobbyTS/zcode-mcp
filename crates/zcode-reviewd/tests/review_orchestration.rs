@@ -47,12 +47,11 @@ struct Fixture {
 }
 
 static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static VERIFIED_POLICY_ENV: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
+static VERIFIED_POLICY_ENV: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 struct PolicyEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     previous_provenance: Option<std::ffi::OsString>,
-    previous_generation: Option<std::ffi::OsString>,
 }
 
 impl Drop for PolicyEnvGuard {
@@ -61,14 +60,10 @@ impl Drop for PolicyEnvGuard {
             Some(value) => std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", value),
             None => std::env::remove_var("ZCODE_REVIEW_HOOK_PROVENANCE"),
         }
-        match &self.previous_generation {
-            Some(value) => std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", value),
-            None => std::env::remove_var("ZCODE_REVIEW_SERVICE_GENERATION"),
-        }
     }
 }
 
-fn verified_policy_paths() -> (PathBuf, String) {
+fn verified_policy_path() -> PathBuf {
     VERIFIED_POLICY_ENV
         .get_or_init(|| {
             let root =
@@ -113,8 +108,8 @@ fn verified_policy_paths() -> (PathBuf, String) {
             );
             let record: serde_json::Value =
                 serde_json::from_slice(&fs::read(&provenance).unwrap()).unwrap();
-            let generation = record["activation_generation"].as_str().unwrap().to_owned();
-            (provenance, generation)
+            assert!(record["activation_generation"].as_str().is_some());
+            provenance
         })
         .clone()
 }
@@ -122,19 +117,15 @@ fn verified_policy_paths() -> (PathBuf, String) {
 fn policy_env(verified: bool) -> PolicyEnvGuard {
     let lock = POLICY_ENV_LOCK.lock().unwrap();
     let previous_provenance = std::env::var_os("ZCODE_REVIEW_HOOK_PROVENANCE");
-    let previous_generation = std::env::var_os("ZCODE_REVIEW_SERVICE_GENERATION");
     if verified {
-        let (provenance, generation) = verified_policy_paths();
+        let provenance = verified_policy_path();
         std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", provenance);
-        std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", generation);
     } else {
         std::env::remove_var("ZCODE_REVIEW_HOOK_PROVENANCE");
-        std::env::remove_var("ZCODE_REVIEW_SERVICE_GENERATION");
     }
     PolicyEnvGuard {
         _lock: lock,
         previous_provenance,
-        previous_generation,
     }
 }
 
@@ -701,6 +692,44 @@ fn unverified_structured_submission_fails_closed_before_enqueue() {
     assert_eq!(error.code, RpcErrorCode::Validation);
     assert_eq!(error.message, "REVIEW_BASH_POLICY_UNVERIFIED");
     assert!(fixture.store.list_jobs(10).unwrap().is_empty());
+}
+
+#[test]
+fn verified_hook_admission_uses_restart_scoped_service_generation() {
+    let fixture = Fixture::new();
+    let first_generation = match fixture.service.dispatch(RpcMethod::SystemStatus).unwrap() {
+        RpcSuccess::SystemStatus { status } => status.service_generation,
+        other => panic!("unexpected status response: {other:?}"),
+    };
+    let replacement =
+        RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
+    let replacement_generation = match replacement.dispatch(RpcMethod::SystemStatus).unwrap() {
+        RpcSuccess::SystemStatus { status } => status.service_generation,
+        other => panic!("unexpected replacement status response: {other:?}"),
+    };
+    assert_ne!(first_generation, replacement_generation);
+
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission("generation-admission"),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    assert_eq!(review.provenance.service_generation, first_generation);
+    assert!(review.provenance.hook_provenance.hook_activation_verified);
+    assert_ne!(
+        review.provenance.service_generation,
+        review
+            .provenance
+            .hook_provenance
+            .activation_generation
+            .clone()
+            .unwrap()
+    );
 }
 
 #[test]

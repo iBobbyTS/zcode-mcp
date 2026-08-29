@@ -1153,11 +1153,15 @@ impl RpcService {
         if !Arc::ptr_eq(&scheduler.store(), &store) {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
-        let orchestrator = ReviewJobOrchestrator::new(scheduler.clone()).ok();
-        let service_generation = std::env::var("ZCODE_REVIEW_SERVICE_GENERATION")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(opaque_generation()?);
+        // This identity is scoped to the daemon process lifetime.  Hook
+        // installation/preflight has its own activation_generation and must
+        // never control the public restart-scoped service generation.
+        let service_generation = opaque_generation()?;
+        let orchestrator = ReviewJobOrchestrator::new_with_service_generation(
+            scheduler.clone(),
+            service_generation.clone(),
+        )
+        .ok();
         Ok(Self {
             scheduler,
             store,

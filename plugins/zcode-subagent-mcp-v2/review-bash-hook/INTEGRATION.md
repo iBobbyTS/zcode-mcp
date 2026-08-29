@@ -5,10 +5,11 @@ surface. Its `hooks/hooks.json` explicitly registers the nested guard and audit
 scripts; nested-directory presence or `reviewPolicy.resource` alone is not
 activation evidence.
 
-The daemon must receive `ZCODE_REVIEW_HOOK_PROVENANCE` and
-`ZCODE_REVIEW_SERVICE_GENERATION`; the latter must equal the verified record's
-`activation_generation`. This binds activation evidence to the current service
-generation rather than accepting a stale preflight from an older process.
+The daemon receives `ZCODE_REVIEW_HOOK_PROVENANCE` for the installed/preflighted
+hook identity. The daemon itself creates a fresh opaque restart-scoped
+`service_generation` for each process lifetime. Do not set
+`ZCODE_REVIEW_SERVICE_GENERATION` from the provenance record: hook
+`activation_generation` and daemon service identity are intentionally separate.
 
 ## Option A — Install as a local ZCode plugin
 

@@ -1,5 +1,10 @@
 # Integration Guide
 
+The hook's `activation_generation` identifies its installed/preflighted artifact;
+the daemon independently creates a fresh opaque `service_generation` on every
+restart. Do not export `ZCODE_REVIEW_SERVICE_GENERATION` from the hook
+provenance record.
+
 ## Option A — Install as a local ZCode plugin
 
 The repository root is already a valid plugin:

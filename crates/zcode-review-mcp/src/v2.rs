@@ -1820,6 +1820,7 @@ mod tests {
                 policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
                 policy_sha256: String::new(),
                 hook_provenance: review_preparation::ReviewHookProvenance::default(),
+                service_generation: "test-generation".into(),
             },
         });
         assert!(output.provenance.policy_sha256.is_empty());
