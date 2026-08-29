@@ -7,7 +7,7 @@ use review_preparation::{
     NetworkPolicy, PreparedGeneralTask, PreparedLaunchSpec, ReviewKind, ReviewManifest, RoundKind,
     ScratchPolicy,
 };
-use review_store::Store;
+use review_store::{LifecycleWrite, Store};
 use sectioned_shadow::{
     run_shadow_v2, EvidenceClassification, RmcpFacadeClient, ShadowConfig, ShadowMode,
     SHADOW_SCHEMA,
@@ -545,6 +545,7 @@ fn complete_next_review_attempt(
     factory: &PublicFakeFactory,
     ledger: &LedgerManager,
     checkpoint_id: &str,
+    inject_redacted_progress: bool,
 ) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let execution_id = loop {
@@ -572,6 +573,36 @@ fn complete_next_review_attempt(
             }),
         )
         .unwrap();
+    if inject_redacted_progress {
+        let job = store.get_job(&execution_id).unwrap().unwrap();
+        let runtime_agent_id = job.runtime_agent_id.unwrap();
+        for (source_sequence, redaction_level) in [
+            ((1u64 << 62) + 1, "redacted"),
+            ((1u64 << 62) + 2, "bounded"),
+        ] {
+            store
+                .append_lifecycle(&LifecycleWrite {
+                    agent_id: execution_id.clone(),
+                    runtime_agent_id: runtime_agent_id.clone(),
+                    owner_epoch: job.owner_epoch,
+                    source_sequence,
+                    event_type: "review.progress".into(),
+                    turn_id: None,
+                    payload_json: json!({
+                        "stage":"inspection",
+                        "summary":format!("{redaction_level} MCP progress secret"),
+                        "counters":{"private":1},
+                        "attempt_sequence":1,
+                        "updated_at":1
+                    })
+                    .to_string(),
+                    redaction_level: redaction_level.into(),
+                    terminal: None,
+                    turn_state: None,
+                })
+                .unwrap();
+        }
+    }
     ledger
         .call_tool(
             &execution_id,
@@ -1051,6 +1082,7 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
             &shadow_factory,
             &shadow_ledger,
             "fresh-public-checkpoint",
+            true,
         )
     });
     let facade =
@@ -1108,8 +1140,32 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
     assert!(progress["last_progress_at"].as_u64().is_some());
     assert!(progress["semantic_idle_ms"].as_u64().is_some());
     assert_eq!(progress["nudge_sent"], false);
+    let fail_closed = shadow_rows
+        .iter()
+        .filter(|event| event["event_type"] == "review_progress" && event.get("stage").is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(fail_closed.len(), 2);
+    for event in fail_closed {
+        let event = event.as_object().unwrap();
+        for field in [
+            "stage",
+            "summary",
+            "counters",
+            "last_progress_at",
+            "semantic_idle_ms",
+            "nudge_sent",
+        ] {
+            assert!(!event.contains_key(field), "MCP event leaked {field}");
+        }
+    }
     let public = shadow_events.to_string();
-    for forbidden in ["run_idempotency_key", "runtime_agent_id", "payload_json"] {
+    for forbidden in [
+        "run_idempotency_key",
+        "runtime_agent_id",
+        "payload_json",
+        "MCP progress secret",
+        "private",
+    ] {
         assert!(
             !public.contains(forbidden),
             "public event leaked {forbidden}"
@@ -1182,6 +1238,7 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
         &factory,
         &ledger,
         "continuation-parent-checkpoint",
+        false,
     );
     let first_status = wait_public_terminal(&mut v2, &public_agent_id, 1);
     assert_eq!(first_status["task"]["counts_as_independent"], true);
@@ -1252,6 +1309,7 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
         &factory,
         &ledger,
         "continuation-public-checkpoint",
+        false,
     );
     let second_status = wait_public_terminal(&mut v2, &public_agent_id, 2);
     assert_eq!(second_status["task"]["counts_as_independent"], false);

@@ -1201,6 +1201,126 @@ fn v2_review_progress_exposes_the_existing_bounded_store_projection() {
 }
 
 #[test]
+fn v2_review_progress_transport_paginates_projected_maximum_unicode_fields() {
+    let fixture = fixture();
+    let (agent_id, runtime_id, owner_epoch) =
+        running_review_progress_fixture(&fixture, "frame-budget");
+    let execution_id = fixture
+        .store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    let summary = "🧪".repeat(MAX_TOOL_TEXT_CHARS);
+    let counters = (0..16)
+        .map(|index| {
+            let prefix = format!("counter-{index:02}-");
+            (
+                format!("{prefix}{}", "k".repeat(MAX_TOOL_ID_BYTES - prefix.len())),
+                1_000_000_000u64,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let counters_json = serde_json::to_string(&counters).unwrap();
+    for (index, stage) in ["inspection", "validation", "synthesis"]
+        .into_iter()
+        .enumerate()
+    {
+        let mutation = fixture
+            .store
+            .record_review_progress_event(
+                &review_store::ReviewProgressWrite {
+                    agent_id: execution_id.clone(),
+                    attempt_sequence: 1,
+                    run_idempotency_key: runtime_id.clone(),
+                    stage: stage.into(),
+                    summary: summary.clone(),
+                    counters_json: Some(counters_json.clone()),
+                },
+                &runtime_id,
+                owner_epoch,
+                10_000 + index as u64,
+            )
+            .unwrap();
+        assert_eq!(
+            mutation.disposition,
+            review_store::ReviewProgressDisposition::Applied
+        );
+    }
+
+    let rpc = client(&fixture.socket);
+    let mut after = 0;
+    let mut observed_progress = Vec::new();
+    for (page_index, expected_next) in [2, 3, 4].into_iter().enumerate() {
+        let response = rpc
+            .call(&request(
+                &format!("progress-frame-page-{page_index}"),
+                RpcMethod::TaskEvents(TaskEventQuery {
+                    agent_id: agent_id.clone(),
+                    after,
+                    limit: 100,
+                }),
+            ))
+            .unwrap();
+        let frame = serde_json::to_vec(&response).unwrap();
+        assert!(frame.len() <= MAX_FRAME_BYTES);
+        assert!(frame.len() > MAX_PAGE_PAYLOAD_BYTES);
+        let page = match success(response) {
+            RpcSuccess::TaskEvents { page } => page,
+            other => panic!("unexpected transport progress page: {other:?}"),
+        };
+        assert_eq!(page.next_sequence, expected_next);
+        assert_eq!(page.has_more, expected_next < 4);
+        observed_progress.extend(
+            page.events
+                .iter()
+                .filter(|event| event.event_type == "review_progress")
+                .cloned(),
+        );
+        after = page.next_sequence;
+    }
+    assert_eq!(observed_progress.len(), 3);
+    assert_eq!(
+        observed_progress
+            .iter()
+            .map(|event| event.stage.unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            TaskReviewProgressStage::Inspection,
+            TaskReviewProgressStage::Validation,
+            TaskReviewProgressStage::Synthesis,
+        ]
+    );
+    assert!(observed_progress.iter().all(|event| {
+        event.summary.as_deref() == Some(summary.as_str())
+            && event.counters.as_ref() == Some(&counters)
+    }));
+
+    let response = rpc
+        .call(&request(
+            "progress-frame-wait",
+            RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id,
+                after,
+                timeout_ms: 10,
+            }),
+        ))
+        .unwrap();
+    assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_FRAME_BYTES);
+    match success(response) {
+        RpcSuccess::TaskWait {
+            page, timed_out, ..
+        } => {
+            assert!(timed_out);
+            assert!(page.events.is_empty());
+            assert_eq!(page.next_sequence, 4);
+            assert!(!page.has_more);
+        }
+        other => panic!("unexpected transport progress wait: {other:?}"),
+    }
+}
+
+#[test]
 fn v2_review_progress_fail_closes_the_whole_group_without_losing_event_identity() {
     let fixture = fixture();
     let (agent_id, runtime_id, owner_epoch) =
@@ -1256,8 +1376,8 @@ fn v2_review_progress_fail_closes_the_whole_group_without_losing_event_identity(
     fixture
         .store
         .append_lifecycle(&LifecycleWrite {
-            agent_id: execution_id,
-            runtime_agent_id: runtime_id,
+            agent_id: execution_id.clone(),
+            runtime_agent_id: runtime_id.clone(),
             owner_epoch,
             source_sequence: 200,
             event_type: "review.progress".into(),
@@ -1272,6 +1392,30 @@ fn v2_review_progress_fail_closes_the_whole_group_without_losing_event_identity(
             turn_state: None,
         })
         .unwrap();
+    for (source_sequence, redaction_level) in [(300, "redacted"), (301, "bounded")] {
+        fixture
+            .store
+            .append_lifecycle(&LifecycleWrite {
+                agent_id: execution_id.clone(),
+                runtime_agent_id: runtime_id.clone(),
+                owner_epoch,
+                source_sequence,
+                event_type: "review.progress".into(),
+                turn_id: None,
+                payload_json: serde_json::json!({
+                    "stage":"inspection",
+                    "summary":format!("{redaction_level} progress must stay private"),
+                    "counters":{"private":1},
+                    "attempt_sequence":1,
+                    "updated_at":1
+                })
+                .to_string(),
+                redaction_level: redaction_level.into(),
+                terminal: None,
+                turn_state: None,
+            })
+            .unwrap();
+    }
 
     let page = match fixture
         .service
@@ -1322,6 +1466,25 @@ fn v2_review_progress_fail_closes_the_whole_group_without_losing_event_identity(
     assert_eq!(future.last_progress_at, Some(future_timestamp));
     assert_eq!(future.semantic_idle_ms, Some(0));
     assert_eq!(future.nudge_sent, Some(false));
+    for source_sequence in [300, 301] {
+        let event = page
+            .events
+            .iter()
+            .find(|event| event.source_sequence == source_sequence)
+            .unwrap();
+        assert_eq!(event.event_type, "review_progress");
+        assert_eq!(event.payload_json, "{}");
+        assert!(event.stage.is_none());
+        assert!(event.summary.is_none());
+        assert!(event.counters.is_none());
+        assert!(event.last_progress_at.is_none());
+        assert!(event.semantic_idle_ms.is_none());
+        assert!(event.nudge_sent.is_none());
+    }
+    assert_eq!(page.next_sequence, 10);
+    assert!(!serde_json::to_string(&page)
+        .unwrap()
+        .contains("must stay private"));
     assert!(!serde_json::to_string(&page)
         .unwrap()
         .contains("/secret/path"));

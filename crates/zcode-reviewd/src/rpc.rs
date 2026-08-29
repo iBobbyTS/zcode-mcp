@@ -35,6 +35,7 @@ use std::{
 
 pub const RPC_VERSION: u16 = 10;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
+const MAX_REQUEST_ID_BYTES: usize = 128;
 pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -2119,7 +2120,7 @@ impl RpcService {
                 "event limit is outside the allowed range",
             ));
         }
-        let (_, task) = self.require_task(&query.agent_id)?;
+        let (job, task) = self.require_task(&query.agent_id)?;
         let stored = self
             .store
             .task_events_after(
@@ -2135,7 +2136,8 @@ impl RpcService {
             ));
         }
         let events = self.task_high_level_events(&task, stored)?;
-        task_page_from_events(query.after, query.limit, events)
+        let frame_budget_task = task_frame_budget_view(job, task);
+        task_page_from_events(query.after, query.limit, events, &frame_budget_task)
     }
 
     fn task_high_level_events(
@@ -2690,6 +2692,23 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
     }
 }
 
+fn task_frame_budget_view(job: Job, task: TaskRecord) -> TaskView {
+    let mut view = task_view(job, task);
+    // Budget against the longest variants and JSON booleans that can be
+    // observed if task state changes between page construction and the wait
+    // response. Stable identifiers and effective budgets retain their exact
+    // serialized representation.
+    view.task_kind = "review_continuation".into();
+    view.phase = "WAITING_INPUT".into();
+    view.independent_evidence = false;
+    view.fresh_session_observed = false;
+    view.stop_requested = false;
+    view.close_requested = false;
+    view.closed = false;
+    view.reaped = false;
+    view
+}
+
 impl From<StoredTaskResult> for TaskResultView {
     fn from(stored: StoredTaskResult) -> Self {
         Self {
@@ -2801,6 +2820,7 @@ fn task_page_from_events(
     after: u64,
     limit: usize,
     projected: Vec<TaskEventView>,
+    frame_budget_task: &TaskView,
 ) -> Result<TaskEventPage, RpcError> {
     let start = usize::try_from(after).unwrap_or(usize::MAX);
     if start >= projected.len() {
@@ -2826,6 +2846,25 @@ fn task_page_from_events(
             has_more = true;
             break;
         }
+        let mut candidate_events = events.clone();
+        candidate_events.push(event.clone());
+        let candidate = TaskEventPage {
+            next_sequence: event.sequence,
+            events: candidate_events,
+            // `false` is one byte longer than `true`, so it is the
+            // conservative value for the transport-frame calculation.
+            has_more: false,
+        };
+        if !task_page_fits_frame(frame_budget_task, &candidate)? {
+            if events.is_empty() {
+                return Err(RpcError::new(
+                    RpcErrorCode::Oversized,
+                    "projected public event exceeds the RPC frame cap",
+                ));
+            }
+            has_more = true;
+            break;
+        }
         payload_bytes = next_bytes;
         events.push(event);
     }
@@ -2834,6 +2873,31 @@ fn task_page_from_events(
         events,
         has_more,
     })
+}
+
+fn task_page_fits_frame(
+    frame_budget_task: &TaskView,
+    page: &TaskEventPage,
+) -> Result<bool, RpcError> {
+    let request_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
+    let response = RpcResponse::success(
+        request_id,
+        RpcSuccess::TaskWait {
+            task: frame_budget_task.clone(),
+            page: page.clone(),
+            // `false` is the longer JSON boolean and therefore the
+            // conservative representation.
+            timed_out: false,
+        },
+    );
+    serde_json::to_vec(&response)
+        .map(|frame| frame.len() <= MAX_FRAME_BYTES)
+        .map_err(|_| {
+            RpcError::new(
+                RpcErrorCode::Internal,
+                "public event page could not be serialized",
+            )
+        })
 }
 
 fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
@@ -2992,7 +3056,7 @@ fn validate_id(value: &str, field: &str) -> Result<(), RpcError> {
 }
 
 fn valid_request_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128 && !value.contains('\0')
+    !value.is_empty() && value.len() <= MAX_REQUEST_ID_BYTES && !value.contains('\0')
 }
 
 fn wait_timeout() -> RpcError {
