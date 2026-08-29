@@ -3,15 +3,31 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from conformance import (FakeRuntime, LaunchBudgetExceeded, LaunchLedger,
-                         PublicV2Client, REQUIRED_TOOLS, collect_artifact,
+from conformance import (FakeRuntime, FatalConformanceError,
+                         InfrastructureConformanceError, LaunchBudgetExceeded, LaunchLedger,
+                         PACK_DIRECTORIES, PACK_FILES, PublicV2Client, REQUIRED_TOOLS, collect_artifact,
                          finalize_pack, normalize, redact, validate_artifact_chunk,
                          StdioMCPTransport)
-from run_matrix import CASE_C_BUDGET, _call_case, _poll_terminal
+from run_matrix import CASE_C_BUDGET, _call_case, _poll_terminal, _public_events, main
 
 
 class S02Tests(unittest.TestCase):
+    def _valid_pack_source(self, root: Path) -> Path:
+        source = root / "pack"
+        source.mkdir()
+        for name in PACK_FILES:
+            (source / name).write_text(f"# {name}\n\nRendered evidence.\n")
+        for directory in PACK_DIRECTORIES:
+            (source / directory).mkdir()
+        (source / "fixtures/case-a-manifest.json").write_text("{}\n")
+        (source / "normalized/identity.json").write_text("{}\n")
+        (source / "raw-transcripts/mcp.jsonl").write_text('{"direction":"test"}\n')
+        (source / "redacted-logs/case-a.json").write_text("{}\n")
+        return source
+
     def test_atomic_ledger_budget_and_retry_slots(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = LaunchLedger(Path(d) / "launch-ledger.json")
@@ -84,12 +100,7 @@ class S02Tests(unittest.TestCase):
 
     def test_pack_finalizer_is_atomic_and_excludes_junk(self):
         with tempfile.TemporaryDirectory() as d:
-            source, destination = Path(d) / "pack", Path(d) / "pack.zip"
-            source.mkdir()
-            for name in ("SUMMARY.md", "SYSTEM-IDENTITY.md", "SCENARIO-MATRIX.md", "PERMISSION-MATRIX.md",
-                         "PROGRESS-TIMELINE.md", "EVENT-METRICS.md", "RESULT-ARTIFACT-MATRIX.md",
-                         "RESTART-CLEANUP.md", "KNOWN-GAPS.md"):
-                (source / name).write_text("redacted\n")
+            source, destination = self._valid_pack_source(Path(d)), Path(d) / "pack.zip"
             (source / ".DS_Store").write_bytes(b"junk")
             _, digest = finalize_pack(source, destination)
             self.assertEqual(len(digest), 64)
@@ -99,13 +110,9 @@ class S02Tests(unittest.TestCase):
 
     def test_pack_rejects_empty_rendered_report(self):
         with tempfile.TemporaryDirectory() as d:
-            source = Path(d) / "pack"
-            source.mkdir()
-            for name in ("SUMMARY.md", "SYSTEM-IDENTITY.md", "SCENARIO-MATRIX.md", "PERMISSION-MATRIX.md",
-                         "PROGRESS-TIMELINE.md", "EVENT-METRICS.md", "RESULT-ARTIFACT-MATRIX.md",
-                         "RESTART-CLEANUP.md", "KNOWN-GAPS.md"):
-                (source / name).write_text("\n" if name == "SUMMARY.md" else "redacted\n")
-            with self.assertRaisesRegex(ValueError, "empty rendered pack report"):
+            source = self._valid_pack_source(Path(d))
+            (source / "SUMMARY.md").write_text("\n")
+            with self.assertRaisesRegex(ValueError, "empty pack evidence"):
                 finalize_pack(source, Path(d) / "pack.zip")
 
     def test_artifact_chunk_rejects_bad_ranges(self):
@@ -128,7 +135,9 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(evidence["continuation"]["agent_id"], evidence["spawn"]["agent_id"])
         self.assertEqual(evidence["continuation"]["review_id"], evidence["spawn"]["review_id"])
         self.assertFalse(evidence["continuation"]["counts_as_independent"])
-        self.assertNotEqual(evidence["continuation"]["provenance"]["zcode_session_id"], evidence["spawn"]["provenance"]["zcode_session_id"])
+        self.assertNotEqual(evidence["continuation"]["provenance"]["prompt_sha256"], evidence["spawn"]["provenance"]["prompt_sha256"])
+        self.assertNotIn("zcode_session_id", json.dumps(evidence))
+        self.assertEqual(evidence["continuation_replay"]["submission_disposition"], "existing")
         self.assertTrue(all(item["reconstructed"] for item in evidence["artifact_chunks"]))
         self.assertTrue(evidence["permissions"])
         self.assertEqual(evidence["permissions"][0]["response"]["effective_decision"], "deny")
@@ -137,28 +146,42 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(evidence["restart_reads"]["agent_get_after_close"]["task"]["resources_reaped"], True)
         self.assertEqual(evidence["message"]["disposition"], "queued")
         self.assertEqual(evidence["message_replay"]["disposition"], "already_delivered")
-        progress = [event for page in evidence["event_pages"] for event in page["events"] if event["event_type"] == "review_progress"]
+        progress = [event for event in _public_events(evidence) if event["event_type"] == "review_progress"]
         self.assertGreaterEqual(len({event["stage"] for event in progress}), 3)
-        self.assertTrue(all(all(field in event for field in ("stage", "summary", "counters", "last_progress_at", "semantic_idle_ms", "nudge_sent")) for event in progress))
-        self.assertTrue(all(field in event for event in ("stage", "summary", "counters", "last_progress_at", "semantic_idle_ms", "nudge_sent")) for event in progress)
+        self.assertTrue(all(all(field in event for field in ("stage", "summary", "last_progress_at", "semantic_idle_ms", "nudge_sent")) for event in progress))
+        self.assertTrue(all(field in event for event in ("stage", "summary", "last_progress_at", "semantic_idle_ms", "nudge_sent")) for event in progress)
+        self.assertTrue(evidence["progress_metrics"]["soft_threshold_crossings"])
+        self.assertTrue(evidence["progress_metrics"]["non_refresh_sequences"])
 
     def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
         with tempfile.TemporaryDirectory() as d:
-            source = Path(d) / "pack"
-            source.mkdir()
-            for name in ("SUMMARY.md", "SYSTEM-IDENTITY.md", "SCENARIO-MATRIX.md", "PERMISSION-MATRIX.md",
-                         "PROGRESS-TIMELINE.md", "EVENT-METRICS.md", "RESULT-ARTIFACT-MATRIX.md",
-                         "RESTART-CLEANUP.md", "KNOWN-GAPS.md"):
-                (source / name).write_text("redacted\n")
+            source = self._valid_pack_source(Path(d))
             normalized = source / "normalized"
-            normalized.mkdir()
             (normalized / "arbitrary.txt").write_text("safe\n")
             with self.assertRaisesRegex(ValueError, "unexpected pack filename"):
                 finalize_pack(source, Path(d) / "pack.zip")
             (normalized / "arbitrary.txt").unlink()
-            (normalized / "case-a.json").write_text("token leaked-value\n")
+            (normalized / "case-a.json").write_text('{"note":"token leaked-value"}\n')
             with self.assertRaisesRegex(ValueError, "unredacted secret"):
                 finalize_pack(source, Path(d) / "pack.zip")
+
+    def test_pack_rejects_empty_roots_placeholders_binary_and_invalid_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = self._valid_pack_source(Path(d))
+            (source / "raw-transcripts/mcp.jsonl").unlink()
+            with self.assertRaisesRegex(ValueError, "empty pack evidence roots"):
+                finalize_pack(source, Path(d) / "empty.zip")
+            (source / "raw-transcripts/mcp.jsonl").write_text('{"direction":"test"}\n')
+            (source / "SUMMARY.md").write_text("# Summary\n\nTODO\n")
+            with self.assertRaisesRegex(ValueError, "template or placeholder"):
+                finalize_pack(source, Path(d) / "placeholder.zip")
+            (source / "SUMMARY.md").write_text("# Summary\n\nRendered.\n")
+            (source / "normalized/identity.json").write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ValueError, "binary or invalid UTF-8"):
+                finalize_pack(source, Path(d) / "binary.zip")
+            (source / "normalized/identity.json").write_text("not json\n")
+            with self.assertRaisesRegex(ValueError, "invalid JSON evidence"):
+                finalize_pack(source, Path(d) / "json.zip")
 
     def test_fatal_case_error_propagates_and_freezes_matrix(self):
         class FailingRuntime(FakeRuntime):
@@ -174,22 +197,148 @@ class S02Tests(unittest.TestCase):
                 _call_case(client, Path(__file__).parents[1] / "case-01-user-fuzzy-search", manifest, Path(d))
             self.assertTrue((Path(d) / "case-01-user-fuzzy-search.json").is_file())
 
-    def test_transport_failure_rolls_back_unobservable_launch(self):
+    def test_ambiguous_transport_keeps_one_reservation_and_retries_same_call(self):
         class BrokenTransport:
+            def __init__(self):
+                self.calls = 0
             def call(self, tool, args):
-                raise RuntimeError("broken pipe")
+                self.calls += 1
+                raise InfrastructureConformanceError("broken pipe")
         with tempfile.TemporaryDirectory() as d:
             ledger = LaunchLedger(Path(d) / "ledger.json")
-            client = PublicV2Client(BrokenTransport(), ledger)
-            with self.assertRaises(RuntimeError):
-                client.call("zcode_review_spawn", {}, launches=True)
+            transport = BrokenTransport()
+            client = PublicV2Client(transport, ledger)
+            with self.assertRaises(InfrastructureConformanceError):
+                client.call("zcode_review_spawn", {}, launches=True, retry_infrastructure=True)
+            self.assertEqual(transport.calls, 2)
+            self.assertEqual(ledger.count, 1)
+            self.assertEqual(ledger.retries, 1)
+            self.assertTrue(json.loads(ledger.path.read_text())["reservations"])
+
+    def test_existing_submission_does_not_reserve_a_new_launch(self):
+        class ExistingTransport:
+            def call(self, tool, args):
+                return {"submission_disposition": "existing", "agent_id": "a"}
+        with tempfile.TemporaryDirectory() as d:
+            ledger = LaunchLedger(Path(d) / "ledger.json")
+            result = PublicV2Client(ExistingTransport(), ledger).call("zcode_review_spawn", {}, launches=True)
+            self.assertEqual(result["submission_disposition"], "existing")
             self.assertEqual(ledger.count, 0)
+
+    def test_rmcp_iserror_preserves_public_text_and_stable_class_without_retry(self):
+        class ErrorTransport:
+            def __init__(self):
+                self.calls = 0
+            def call(self, tool, args):
+                self.calls += 1
+                return {"isError": True, "content": [{"type": "text", "text": "validation: exact public detail"}]}
+        transport = ErrorTransport()
+        with self.assertRaises(FatalConformanceError) as caught:
+            PublicV2Client(transport).call("zcode_agent_result", {}, retry_infrastructure=True)
+        self.assertEqual(transport.calls, 1)
+        self.assertEqual(caught.exception.error_class, "VALIDATION")
+        self.assertEqual(caught.exception.public_text, "validation: exact public detail")
 
     def test_fake_no_progress_hits_injected_hard_timeout_without_sleeping_30s(self):
         runtime = FakeRuntime("no-progress")
         client = PublicV2Client(runtime)
         with self.assertRaisesRegex(Exception, "SEMANTIC_HARD_TIMEOUT"):
-            _poll_terminal(client, "missing-agent", {}, timeout_s=0.001)
+            _poll_terminal(client, "missing-agent", {}, expected_attempt=1, timeout_s=0.001)
+
+    def test_main_runner_uses_real_facade_restart_path_and_renders_pack(self):
+        class FakeFacadeTransport:
+            instances = []
+            runtime = FakeRuntime("case-c")
+
+            def __init__(self, command, env=None, **kwargs):
+                self.command = command
+                self.env = env or {}
+                self.proc = SimpleNamespace(pid=5000 + len(self.instances))
+                self.transcript = []
+                self.closed = False
+                self.instances.append(self)
+
+            def list_tools(self):
+                value = {"tools": [{"name": name} for name in sorted(REQUIRED_TOOLS)]}
+                self.transcript.append({"direction": "response", "payload": value})
+                return value
+
+            def call(self, tool, args):
+                self.transcript.append({"direction": "request", "payload": redact({"tool": tool, "arguments": args})})
+                value = self.runtime.call(tool, args)
+                self.transcript.append({"direction": "response", "payload": redact(value)})
+                return value
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as d:
+            temp = Path(d)
+            binary, runtime = temp / "zcode-review-mcp", temp / "zcode.cjs"
+            binary.write_text("facade")
+            runtime.write_text("runtime")
+            output, pack_path = temp / "output", temp / "pack.zip"
+            with patch("run_matrix.StdioMCPTransport", FakeFacadeTransport), patch(
+                "run_matrix._runtime_version", return_value="3.10.1"
+            ):
+                exit_code = main([
+                    "--official",
+                    "--mcp-binary", str(binary),
+                    "--runtime", str(runtime),
+                    "--output", str(output),
+                    "--ledger", str(temp / "ledger.json"),
+                    "--pack", str(pack_path),
+                    "--timeout", "0.1",
+                ])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(FakeFacadeTransport.instances), 2)
+            self.assertTrue(FakeFacadeTransport.instances[0].closed)
+            self.assertTrue(pack_path.is_file())
+            case_c = json.loads((output / "normalized/case-03-agent-control-lifecycle.json").read_text())
+            self.assertEqual(case_c["facade_restart"]["kind"], "actual_facade_process_restart")
+            self.assertTrue(case_c["facade_restart"]["process"]["process_changed"])
+            import zipfile
+            with zipfile.ZipFile(pack_path) as archive:
+                summary = archive.read("SUMMARY.md").decode()
+                self.assertIn("OFFICIAL_RUNTIME_READY_WITH_GAPS", summary)
+
+    def test_main_runner_freezes_after_typed_fatal_without_next_case(self):
+        class StatusFacade:
+            runtime = FakeRuntime("ready")
+
+            def __init__(self, command, env=None, **kwargs):
+                self.proc = SimpleNamespace(pid=7001)
+                self.transcript = [{"direction": "harness", "payload": {"status": "started"}}]
+
+            def list_tools(self):
+                return {"tools": [{"name": name} for name in sorted(REQUIRED_TOOLS)]}
+
+            def call(self, tool, args):
+                return self.runtime.call(tool, args)
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as d:
+            temp = Path(d)
+            binary, runtime = temp / "mcp", temp / "zcode.cjs"
+            binary.write_text("facade")
+            runtime.write_text("runtime")
+            with patch("run_matrix.StdioMCPTransport", StatusFacade), patch(
+                "run_matrix._runtime_version", return_value="3.10.1"
+            ), patch(
+                "run_matrix._call_case",
+                side_effect=FatalConformanceError("fatal public contract", error_class="PROTOCOL_ERROR"),
+            ) as call_case:
+                exit_code = main([
+                    "--official", "--mcp-binary", str(binary), "--runtime", str(runtime),
+                    "--output", str(temp / "output"), "--ledger", str(temp / "ledger.json"),
+                    "--pack", str(temp / "pack.zip"), "--timeout", "0.1",
+                ])
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(call_case.call_count, 1)
+            fatal = json.loads((temp / "output/redacted-logs/fatal.json").read_text())
+            self.assertEqual(fatal["error_class"], "PROTOCOL_ERROR")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import tempfile
 import time
 import zipfile
 import uuid
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +52,22 @@ class LaunchBudgetExceeded(RuntimeError):
 
 
 class FatalConformanceError(RuntimeError):
-    pass
+    """A typed public-contract failure that always freezes the matrix."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_class: str = "CONFORMANCE",
+        public_text: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_class = error_class
+        self.public_text = public_text
+
+
+class InfrastructureConformanceError(RuntimeError):
+    """A classified transport/observation failure eligible for one call retry."""
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -184,15 +200,37 @@ class LaunchLedger:
             self._persist(count, retries, reservations)
             self._reservations = reservations
 
-    def rollback(self, *, retry: bool = False, token: str | None = None) -> None:
-        """Release a reservation when no child launch was observable.
+    def mark_retry(self, token: str) -> None:
+        """Consume one retry allowance without reserving a second launch.
 
-        The public MCP transport can fail before returning a response (for
-        example, a broken pipe or bounded read timeout).  In that situation
-        the harness must not claim that an official child launch happened.
-        Rollback addresses an explicit reservation token, so one failed
-        process cannot consume another worker's successful launch. The lock
-        and on-disk reread keep concurrent ledgers consistent.
+        An ambiguous transport failure may already have launched the child.  A
+        retry of the same idempotent public submission therefore reuses the
+        original conservative reservation instead of claiming a second launch.
+        """
+        with self._locked():
+            state = _read_json(self.path)
+            count, retries = int(state.get("count", 0)), int(state.get("retries", 0))
+            raw = state.get("reservations", {})
+            reservations = {str(key): bool(value) for key, value in raw.items()} if isinstance(raw, Mapping) else {}
+            if token not in reservations:
+                raise ValueError("launch reservation is no longer active")
+            if reservations[token]:
+                return
+            retry_limit = min(MAX_RETRY_LAUNCHES, max(0, self.limit - NOMINAL_OFFICIAL_LAUNCHES))
+            if retries >= retry_limit:
+                raise LaunchBudgetExceeded(f"retry slots exhausted ({retry_limit})")
+            reservations[token] = True
+            retries += 1
+            self._persist(count, retries, reservations)
+            self.count, self.retries = count, retries
+            self._reservations = reservations
+
+    def rollback(self, *, retry: bool = False, token: str | None = None) -> None:
+        """Release a reservation only after public evidence proves no launch.
+
+        Transport failures are ambiguous and must never call this method.  The
+        current legitimate use is an immediate ``submission_disposition`` of
+        ``existing`` before any ambiguous retry occurred.
         """
         token = token or self._last_reservation
         with self._locked():
@@ -223,6 +261,39 @@ def _tool_payload(value: Any) -> Any:
     return value
 
 
+def _rmcp_error(value: Any) -> tuple[str, str] | None:
+    """Return stable public error class and complete rmcp text fallback."""
+    if not isinstance(value, Mapping) or value.get("isError") is not True:
+        return None
+    texts: list[str] = []
+    content = value.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, Mapping) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+    error = value.get("error")
+    if isinstance(error, Mapping):
+        code = str(error.get("code", "")).strip()
+        message = str(error.get("message", "")).strip()
+        if message:
+            texts.append(message)
+    public_text = "\n".join(text for text in texts if text).strip() or "MCP tool returned isError"
+    prefix = public_text.split(":", 1)[0].strip().lower().replace("-", "_").replace(" ", "_")
+    stable = {
+        "validation": "VALIDATION",
+        "not_found": "NOT_FOUND",
+        "conflict": "CONFLICT",
+        "daemon_unavailable": "DAEMON_UNAVAILABLE",
+        "runtime_failure": "RUNTIME_FAILURE",
+        "protocol_error": "PROTOCOL_ERROR",
+        "persistence": "PERSISTENCE",
+        "unavailable": "UNAVAILABLE",
+    }.get(prefix)
+    if stable is None and isinstance(error, Mapping) and error.get("code") is not None:
+        stable = re.sub(r"[^A-Z0-9]+", "_", str(error["code"]).upper()).strip("_") or "MCP_ERROR"
+    return stable or "MCP_ERROR", public_text
+
+
 class PublicV2Client:
     """Public V2 adapter; no private daemon RPCs are exposed."""
 
@@ -235,39 +306,56 @@ class PublicV2Client:
         args: Mapping[str, Any] | None = None,
         *,
         launches: bool = False,
-        retry: bool = False,
+        retry_infrastructure: bool = False,
     ) -> Any:
         reservation_token: str | None = None
         if launches:
             if self.ledger is None:
                 raise RuntimeError("LaunchLedger is mandatory for official launch paths")
-            reservation_token, _ = self.ledger.reserve_with_token(retry=retry)
-        try:
-            result = self.transport.call(tool, dict(args or {}))
-        except (TimeoutError, OSError, RuntimeError):
-            # No response means no observable child launch.  Release the
-            # reservation so an identical infrastructure failure may consume
-            # the one permitted retry slot truthfully.
-            if reservation_token is not None and self.ledger is not None:
-                self.ledger.rollback(token=reservation_token)
-            raise
-        if isinstance(result, Mapping) and result.get("isError") is True:
-            if reservation_token is not None and self.ledger is not None:
-                self.ledger.rollback(token=reservation_token)
-            error = result.get("error")
-            if isinstance(error, Mapping):
-                raise FatalConformanceError(f"MCP error from {tool}: {error.get('code', 'UNKNOWN')}: {error.get('message', '')}")
-            raise FatalConformanceError(f"MCP error from {tool}")
+            reservation_token, _ = self.ledger.reserve_with_token()
+        ambiguous_retry = False
+        while True:
+            try:
+                result = self.transport.call(tool, dict(args or {}))
+                break
+            except FatalConformanceError:
+                raise
+            except InfrastructureConformanceError as exc:
+                error = exc
+            except (TimeoutError, OSError) as exc:
+                error = exc
+            except RuntimeError:
+                # Generic RuntimeError is a harness/protocol defect, never an
+                # infrastructure retry classification.
+                raise
+            if retry_infrastructure and not ambiguous_retry and reservation_token is not None and self.ledger is not None:
+                self.ledger.mark_retry(reservation_token)
+                ambiguous_retry = True
+                continue
+            raise InfrastructureConformanceError(str(error)) from error
+        public_error = _rmcp_error(result)
+        if public_error is not None:
+            error_class, public_text = public_error
+            raise FatalConformanceError(
+                f"MCP error from {tool}: {error_class}: {public_text}",
+                error_class=error_class,
+                public_text=public_text,
+            )
         result = _tool_payload(result)
-        if isinstance(result, Mapping) and result.get("isError") is True:
-            if reservation_token is not None and self.ledger is not None:
-                self.ledger.rollback(token=reservation_token)
-            error = result.get("error")
-            if isinstance(error, Mapping):
-                raise FatalConformanceError(f"MCP error from {tool}: {error.get('code', 'UNKNOWN')}: {error.get('message', '')}")
-            raise FatalConformanceError(f"MCP error from {tool}")
+        public_error = _rmcp_error(result)
+        if public_error is not None:
+            error_class, public_text = public_error
+            raise FatalConformanceError(
+                f"MCP error from {tool}: {error_class}: {public_text}",
+                error_class=error_class,
+                public_text=public_text,
+            )
         if reservation_token is not None and self.ledger is not None:
-            self.ledger.commit(reservation_token)
+            disposition = result.get("submission_disposition") if isinstance(result, Mapping) else None
+            if disposition == "existing" and not ambiguous_retry:
+                self.ledger.rollback(token=reservation_token)
+            else:
+                self.ledger.commit(reservation_token)
         return result
 
     def catalog(self) -> dict[str, Any]:
@@ -282,10 +370,24 @@ class PublicV2Client:
         if isinstance(raw, Mapping) and raw.get("isError") is True:
             error = raw.get("error")
             detail = f": {error.get('code', 'UNKNOWN')}: {error.get('message', '')}" if isinstance(error, Mapping) else ""
+            public_error = _rmcp_error(raw)
+            if public_error is not None:
+                error_class, public_text = public_error
+                raise FatalConformanceError(
+                    f"MCP error from tools/list: {error_class}: {public_text}",
+                    error_class=error_class,
+                    public_text=public_text,
+                )
             raise FatalConformanceError(f"MCP error from tools/list{detail}")
         raw = _tool_payload(raw)
-        if isinstance(raw, Mapping) and raw.get("isError") is True:
-            raise FatalConformanceError("MCP error from tools/list")
+        public_error = _rmcp_error(raw)
+        if public_error is not None:
+            error_class, public_text = public_error
+            raise FatalConformanceError(
+                f"MCP error from tools/list: {error_class}: {public_text}",
+                error_class=error_class,
+                public_text=public_text,
+            )
         tools_value = raw.get("tools", []) if isinstance(raw, Mapping) else []
         names: list[str] = []
         if isinstance(tools_value, list):
@@ -360,7 +462,7 @@ class StdioMCPTransport:
 
     def _write(self, payload: Mapping[str, Any]) -> None:
         if self.proc.stdin is None:
-            raise RuntimeError("MCP stdin unavailable")
+            raise FatalConformanceError("MCP stdin unavailable", error_class="HARNESS_STATE")
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
         if len(encoded) > self.max_frame_bytes:
             raise RuntimeError("MCP request frame exceeds limit")
@@ -371,44 +473,44 @@ class StdioMCPTransport:
         while view:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("MCP stdin write timed out")
+                raise InfrastructureConformanceError("MCP stdin write timed out")
             _, writable, _ = select.select([], [fd], [], remaining)
             if not writable:
                 continue
             try:
                 written = os.write(fd, view)
             except BrokenPipeError as exc:
-                raise RuntimeError("MCP process closed stdin") from exc
+                raise InfrastructureConformanceError("MCP process closed stdin") from exc
             view = view[written:]
 
     def _read_line(self) -> Mapping[str, Any]:
         if self.proc.stdout is None:
-            raise RuntimeError("MCP stdout unavailable")
+            raise FatalConformanceError("MCP stdout unavailable", error_class="HARNESS_STATE")
         fd = self.proc.stdout.fileno()
         deadline = time.monotonic() + self.timeout
         while b"\n" not in self._read_buffer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("MCP response timed out")
+                raise InfrastructureConformanceError("MCP response timed out")
             readable, _, _ = select.select([fd], [], [], remaining)
             if not readable:
                 continue
             chunk = os.read(fd, 65536)
             if not chunk:
-                raise RuntimeError("MCP process exited before response")
+                raise InfrastructureConformanceError("MCP process exited before response")
             self._read_buffer.extend(chunk)
             if len(self._read_buffer) > self.max_frame_bytes:
-                raise RuntimeError("MCP response frame exceeds limit")
+                raise FatalConformanceError("MCP response frame exceeds limit", error_class="PROTOCOL_ERROR")
         line, _, remainder = self._read_buffer.partition(b"\n")
         self._read_buffer = bytearray(remainder)
         try:
             message = json.loads(line.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
-            raise RuntimeError("MCP emitted invalid JSON") from exc
+            raise FatalConformanceError("MCP emitted invalid JSON", error_class="PROTOCOL_ERROR") from exc
         if not isinstance(message, Mapping):
-            raise RuntimeError("MCP emitted a non-object response")
+            raise FatalConformanceError("MCP emitted a non-object response", error_class="PROTOCOL_ERROR")
         if message.get("jsonrpc") != "2.0":
-            raise RuntimeError("MCP emitted an incompatible JSON-RPC version")
+            raise FatalConformanceError("MCP emitted an incompatible JSON-RPC version", error_class="PROTOCOL_ERROR")
         self._record("response", message)
         return message
 
@@ -426,7 +528,7 @@ class StdioMCPTransport:
             if "error" in message:
                 return {"isError": True, "error": message["error"]}
             if "result" not in message:
-                raise RuntimeError("MCP response omitted result/error")
+                raise FatalConformanceError("MCP response omitted result/error", error_class="PROTOCOL_ERROR")
             return message["result"]
 
     def list_tools(self) -> Any:
@@ -481,7 +583,7 @@ _ABS = re.compile(
     r"(?<![A-Za-z0-9])(?:/(?:Users|private|var|tmp|home|Volumes|opt|etc|srv|workspace|absolute)/[^\s\"'`<>;,}]*)"
     r"|(?:[A-Za-z]:\\(?:Users|private|Temp|tmp)\\[^\s\"'`<>;,}]*)"
 )
-_ANY_ABS = re.compile(r"(?<![A-Za-z0-9])/(?:[^/\s\"'`<>]+/)+[^\s\"'`<>;,}]*")
+_ANY_ABS = re.compile(r"(?<![A-Za-z0-9\]])/(?:[^/\s\"'`<>]+/)+[^\s\"'`<>;,}]*")
 
 
 def _redact_text(value: str) -> str:
@@ -535,8 +637,11 @@ def normalize(case: str, observations: Mapping[str, Any]) -> dict[str, Any]:
                 normalized_event = {key: value for key, value in event.items() if key in public_fields}
                 normalized_event["event_type"] = event_type
                 if event_type == "review_progress":
-                    required = ("stage", "summary", "counters", "last_progress_at", "semantic_idle_ms", "nudge_sent")
+                    required = ("stage", "summary", "last_progress_at", "semantic_idle_ms", "nudge_sent")
                     projection_valid = projection_valid and all(key in event for key in required)
+                    projection_valid = projection_valid and (
+                        "counters" not in event or isinstance(event.get("counters"), Mapping)
+                    )
                 retained.append(normalized_event)
         out["events"] = retained
         sequences = [event.get("sequence") for event in retained]
@@ -558,6 +663,7 @@ class FakeRuntime:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     agents: dict[str, dict[str, Any]] = field(default_factory=dict)
     idempotencies: dict[str, str] = field(default_factory=dict)
+    continuations: dict[str, tuple[str, int]] = field(default_factory=dict)
     service_generation: str = "fake-generation-1"
     _sequence: int = 0
     _pending: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -565,20 +671,45 @@ class FakeRuntime:
     _terminal: set[str] = field(default_factory=set)
     _results: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
 
-    def _events(self, attempt_sequence: int = 1) -> list[dict[str, Any]]:
+    def _review_provenance(self, attempt_sequence: int) -> dict[str, Any]:
+        digest = lambda label: hashlib.sha256(f"{label}-{attempt_sequence}".encode()).hexdigest()
+        return {
+            "review_kind": "initial_bounded",
+            "manifest_sha256": digest("manifest"),
+            "prepared_sha256": digest("prepared"),
+            "prompt_sha256": digest("prompt"),
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "requested_model": "sol",
+            "fresh_session_observed": True,
+            "policy_version": "review-bash-policy-v1",
+            "policy_sha256": digest("policy"),
+            "daemon_policy_version": "review-bash-policy-v1",
+            "daemon_policy_sha256": digest("policy"),
+            "expected_hook_version": "1",
+            "expected_hook_sha256": digest("hook"),
+            "effective_hook_version": "1",
+            "effective_hook_sha256": digest("hook"),
+            "hook_activation_verified": True,
+            "activation_method": "fake",
+            "activation_generation": "fake-hook-generation",
+        }
+
+    def _events(self, agent_id: str, attempt_sequence: int = 1) -> list[dict[str, Any]]:
         if self.mode == "no-progress":
             return []
-        sequence = 1
-        events = [{"sequence": sequence, "attempt_sequence": attempt_sequence, "event_type": "attempt_started"}]
+        self._sequence += 1
+        events = [{"sequence": self._sequence, "attempt_sequence": attempt_sequence, "event_type": "attempt_started", "redaction_level": "allowlisted"}]
         if self.mode in {"progress", "case-c"}:
-            sequence += 1
+            self._sequence += 1
+            request_id = f"fake-request-{agent_id}-{attempt_sequence}"
             events.append({
-                "sequence": sequence,
+                "sequence": self._sequence,
                 "attempt_sequence": attempt_sequence,
                 "event_type": "pending_request",
-                "pending_request_id": f"fake-request-{attempt_sequence}",
+                "pending_request_id": request_id,
+                "redaction_level": "allowlisted",
             })
-            request_id = f"fake-request-{attempt_sequence}"
             self._pending[request_id] = {
                 "request_id": request_id,
                 "kind": "permission",
@@ -591,19 +722,22 @@ class FakeRuntime:
                 "responded": False,
             }
         if self.mode in {"progress", "case-c"}:
-            for stage in ("inspection", "validation", "synthesis"):
-                sequence += 1
-                events.append({
-                    "sequence": sequence,
+            for index, stage in enumerate(("inspection", "validation", "synthesis")):
+                self._sequence += 1
+                event = {
+                    "sequence": self._sequence,
                     "attempt_sequence": attempt_sequence,
-                "event_type": "review_progress",
-                "stage": stage,
+                    "event_type": "review_progress",
+                    "redaction_level": "allowlisted",
+                    "stage": stage,
                     "summary": f"fake {stage} progress",
-                    "counters": {"checkpoints": 1},
                     "last_progress_at": int(time.time() * 1000),
                     "semantic_idle_ms": 0,
                     "nudge_sent": False,
-                })
+                }
+                if index != 1:  # counters are optional on the public schema
+                    event["counters"] = {"checkpoints": 1}
+                events.append(event)
         return events
 
     def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -613,18 +747,28 @@ class FakeRuntime:
         if tool == "zcode_system_status":
             return {
                 "api_surface": "subagent_v2",
-                "protocol_version": 2,
+                "protocol_version": 10,
                 "service_generation": self.service_generation,
-                "components": {"daemon": "ready" if self.mode != "readiness-failure" else "unavailable"},
+                "components": {
+                    "daemon": "READY" if self.mode != "readiness-failure" else "UNAVAILABLE",
+                    "runtime": "READY" if self.mode != "readiness-failure" else "UNAVAILABLE",
+                    "store": "READY",
+                    "scheduler": "READY",
+                    "driver": "READY",
+                    "facade": "UNKNOWN",
+                    "model_auth": "READY",
+                },
                 "capabilities": {},
                 "tools": sorted(REQUIRED_TOOLS),
             }
         if tool == "zcode_system_ensure_ready":
             if self.mode in {"no-progress", "readiness-timeout"}:
-                return {"ready": False, "probe_result": "NOT_OBSERVED_WITHIN_TIMEOUT", "reason_code": "NOT_OBSERVED_WITHIN_TIMEOUT"}
+                status = self.call("zcode_system_status", {})
+                return {"ready": False, "status": status, "probe_result": "NOT_OBSERVED_WITHIN_TIMEOUT", "reason_code": "NOT_OBSERVED_WITHIN_TIMEOUT"}
             if self.mode == "readiness-failure":
-                return {"ready": False, "probe_result": "RUNTIME_FAILED", "reason_code": "RUNTIME_FAILED"}
-            return {"ready": True, "probe_result": "READY", "reason_code": None}
+                status = self.call("zcode_system_status", {})
+                return {"ready": False, "status": status, "probe_result": "RUNTIME_FAILED", "reason_code": "RUNTIME_FAILED"}
+            return {"ready": True, "status": self.call("zcode_system_status", {}), "probe_result": "READY", "reason_code": None}
         if tool in {"zcode_review_spawn", "zcode_agent_spawn"}:
             key = str(args.get("idempotency_key", ""))
             if key in self.idempotencies:
@@ -637,8 +781,8 @@ class FakeRuntime:
                     "phase": task.get("phase", "RUNNING"),
                     "attempt_sequence": task.get("attempt_sequence", 1),
                     "effective_budget": task.get("effective_budget", {}),
-                    "provenance": {"fresh_session_observed": True, "zcode_session_id": task.get("session_id")},
-                    "counts_as_independent": True,
+                    "provenance": self._review_provenance(task.get("attempt_sequence", 1)),
+                    "counts_as_independent": False,
                 }
             agent_id = f"fake-agent-{len(self.agents) + 1}"
             self.idempotencies[key] = agent_id
@@ -647,10 +791,10 @@ class FakeRuntime:
                 "closed": False,
                 "phase": "RUNNING",
                 "review_id": f"review-{agent_id}",
-                "session_id": f"fake-session-{agent_id}-1",
-                "events": self._events(),
+                "events": self._events(agent_id),
                 "responded_requests": set(),
                 "nudge_count": 0,
+                "wait_calls": 0,
             }
             budget = args.get("budget") or {
                 "wall_time_ms": 300000,
@@ -670,54 +814,94 @@ class FakeRuntime:
                 "phase": "RUNNING",
                 "attempt_sequence": 1,
                 "effective_budget": budget,
-                "provenance": {
-                    "fresh_session_observed": True,
-                    "zcode_session_id": f"fake-session-{agent_id}-1",
-                },
+                "provenance": self._review_provenance(1),
                 "counts_as_independent": True,
             }
         if tool == "zcode_review_continue":
             agent_id = str(args.get("agent_id"))
             task = self.agents.setdefault(agent_id, {"attempt_sequence": 1, "closed": False, "events": []})
             if task.get("closed"):
-                return {"isError": True, "error": {"code": "CONFLICT", "message": "agent is closed"}}
+                return {"isError": True, "content": [{"type": "text", "text": "conflict: agent is closed"}]}
+            key = str(args.get("idempotency_key", ""))
+            if key in self.continuations:
+                _, attempt = self.continuations[key]
+                return {
+                    "agent_id": agent_id,
+                    "review_id": str(args.get("review_id")),
+                    "submission_disposition": "existing",
+                    "phase": task.get("phase", "RUNNING"),
+                    "attempt_sequence": attempt,
+                    "effective_budget": task.get("effective_budget", {}),
+                    "counts_as_independent": False,
+                    "provenance": self._review_provenance(attempt),
+                }
             task["attempt_sequence"] += 1
             task["phase"] = "RUNNING"
-            task["session_id"] = f"fake-session-{agent_id}-{task['attempt_sequence']}"
-            task["events"] = self._events(task["attempt_sequence"])
+            task["wait_calls"] = 0
+            self.continuations[key] = (agent_id, task["attempt_sequence"])
+            task["events"].extend(self._events(agent_id, task["attempt_sequence"]))
             return {
                 "agent_id": agent_id,
                 "review_id": str(args.get("review_id")),
                 "submission_disposition": "created",
                 "phase": "RUNNING",
                 "attempt_sequence": task["attempt_sequence"],
+                "effective_budget": task.get("effective_budget", {}),
                 "counts_as_independent": False,
-                "fresh_session_observed": True,
-                "provenance": {"fresh_session_observed": True, "zcode_session_id": task["session_id"]},
+                "provenance": self._review_provenance(task["attempt_sequence"]),
             }
         if tool == "zcode_agent_events":
             task = self.agents.setdefault(str(args.get("agent_id")), {"attempt_sequence": 1, "closed": False, "events": []})
             after = int(args.get("after_sequence", 0))
-            events = [event for event in task.get("events", []) if event["sequence"] > after]
-            return {"events": events[: int(args.get("limit", 100))], "next_sequence": events[-1]["sequence"] if events else after, "has_more": False}
+            events = [deepcopy(event) for event in task.get("events", []) if event["sequence"] > after]
+            limit = int(args.get("limit", 100))
+            page = events[:limit]
+            return {"events": page, "next_sequence": page[-1]["sequence"] if page else after, "has_more": len(events) > len(page)}
         if tool == "zcode_agent_wait":
             after = int(args.get("after_sequence", 0))
             if self.mode == "no-progress":
                 return {"task": {"phase": "RUNNING"}, "events": [], "next_sequence": after, "has_more": False, "timed_out": True, "status": "timeout", "progress": []}
             agent_id = str(args.get("agent_id"))
             task = self.agents.get(agent_id, {})
+            if task.get("phase") == "TERMINAL":
+                return {"task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)}, "events": [], "next_sequence": after, "has_more": False, "timed_out": False}
             current_events = task.get("events", [])
-            terminal_sequence = (current_events[-1]["sequence"] if current_events else after) + 1
+            if task.get("wait_calls", 0) == 0:
+                task["wait_calls"] = 1
+                visible = [deepcopy(event) for event in current_events if event["sequence"] > after]
+                page = visible[:100]
+                return {
+                    "task": {"phase": "RUNNING", "attempt_sequence": task.get("attempt_sequence", 1)},
+                    "events": page,
+                    "next_sequence": page[-1]["sequence"] if page else after,
+                    "has_more": len(visible) > len(page),
+                    "timed_out": False,
+                }
+            progress = [event for event in current_events if event.get("event_type") == "review_progress" and event.get("attempt_sequence") == task.get("attempt_sequence", 1)]
+            for event in progress:
+                event["semantic_idle_ms"] = 120001
+            if progress:
+                progress[-1]["nudge_sent"] = True
+            self._sequence += 1
+            terminal_sequence = self._sequence
             task["phase"] = "TERMINAL"
             self._terminal.add(agent_id)
-            terminal = {"sequence": terminal_sequence, "attempt_sequence": task.get("attempt_sequence", 1), "event_type": "terminal"}
+            terminal = {"sequence": terminal_sequence, "attempt_sequence": task.get("attempt_sequence", 1), "event_type": "terminal", "redaction_level": "allowlisted"}
             task["events"] = [*current_events, terminal]
-            return {"task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)}, "events": [terminal] if terminal_sequence > after else [], "next_sequence": terminal_sequence, "has_more": False, "timed_out": False}
+            visible = [deepcopy(event) for event in task["events"] if event["sequence"] > after]
+            page = visible[:100]
+            return {
+                "task": {"phase": "TERMINAL", "attempt_sequence": task.get("attempt_sequence", 1)},
+                "events": page,
+                "next_sequence": page[-1]["sequence"] if page else after,
+                "has_more": len(visible) > len(page),
+                "timed_out": False,
+            }
         if tool == "zcode_agent_respond":
             request_id = str(args.get("request_id"))
             request = self._pending.get(request_id)
             if request is None:
-                return {"isError": True, "error": {"code": "NOT_FOUND", "message": "request not found"}}
+                return {"isError": True, "content": [{"type": "text", "text": "not_found: request not found"}]}
             if request.get("responded"):
                 disposition = "already_responded"
             else:
@@ -751,9 +935,9 @@ class FakeRuntime:
             if args.get("offset_bytes") is not None and args.get("limit_bytes") is not None:
                 offset, limit = int(args["offset_bytes"]), int(args["limit_bytes"])
                 if limit <= 0 or limit > MAX_ARTIFACT_CHUNK_BYTES:
-                    return {"isError": True, "error": {"code": "VALIDATION", "message": "artifact chunk size is outside the allowed range"}}
+                    return {"isError": True, "content": [{"type": "text", "text": "validation: artifact chunk size is outside the allowed range"}]}
                 if offset < 0 or offset >= len(artifact):
-                    return {"isError": True, "error": {"code": "VALIDATION", "message": "artifact offset does not permit non-empty progress"}}
+                    return {"isError": True, "content": [{"type": "text", "text": "validation: artifact offset does not permit non-empty progress"}]}
                 data = artifact[offset : offset + limit]
                 chunk = {"artifact_id": artifact_id, "offset_bytes": offset, "returned_bytes": len(data), "eof": offset + len(data) == len(artifact), "sha256": digest, "size_bytes": len(artifact), "bytes_base64": base64.b64encode(data).decode()}
             return {
@@ -763,6 +947,15 @@ class FakeRuntime:
                     "finalization_revision": attempt, "artifact": {"artifact_id": artifact_id, "sha256": digest, "size_bytes": len(artifact)},
                     "counts": {"checkpoints": 1, "findings": 0, "open_findings": 0, "validations": 1},
                     "independence": {"independent_evidence": attempt == 1, "fresh_session_observed": True, "counts_as_independent": attempt == 1},
+                    "validation_provenance": {
+                        "daemon_verification": {
+                            "source_integrity_verified": True,
+                            "finalized_report_verified": True,
+                            "artifact_digest_verified": True,
+                            "validation_records_structurally_verified": True,
+                        },
+                        "model_attestation": {"present": True, "validation_record_count": 1},
+                    },
                 }},
                 "artifacts": [{"artifact_id": artifact_id, "kind": "report_markdown", "sha256": digest, "size_bytes": len(artifact)}],
                 "artifact_chunk": chunk,
@@ -877,6 +1070,10 @@ _FORBIDDEN_CONTENT = re.compile(
     r"|\b(?:token|password|secret|api[_-]?key|authorization)\s+[A-Za-z0-9._~+/=-]{8,}\b"
     r"|-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----"
 )
+_PLACEHOLDER_CONTENT = re.compile(
+    r"(?im)(?:\{\{[^\n}]+\}\}|<placeholder>|\bTODO\b|\bTBD\b|"
+    r"until a bounded official matrix is run|^Record (?:requested|continuation|artifact))"
+)
 
 # Pack roots are intentionally narrow.  This prevents a collector from
 # silently smuggling arbitrary files into an otherwise valid evidence pack.
@@ -888,13 +1085,39 @@ _PACK_ROOT_FILES: dict[str, tuple[re.Pattern[str], ...]] = {
 }
 
 
-def _check_pack_content(path: Path, data: bytes) -> None:
+def _check_pack_content(path: Path, data: bytes, *, relative: Path | None = None) -> None:
     try:
         text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return
-    if _FORBIDDEN_CONTENT.search(text) or _ABS.search(text) or _ANY_ABS.search(text):
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"binary or invalid UTF-8 pack content: {path}") from exc
+    if not text.strip():
+        raise ValueError(f"empty pack evidence: {path}")
+    if _FORBIDDEN_CONTENT.search(text) or _ABS.search(text):
         raise ValueError(f"unredacted secret or path in pack content: {path}")
+    relative = relative or path
+    if len(relative.parts) == 1:
+        if _PLACEHOLDER_CONTENT.search(text):
+            raise ValueError(f"template or placeholder content in rendered report: {relative}")
+        return
+    root = relative.parts[0]
+    if root in {"fixtures", "normalized", "redacted-logs"}:
+        try:
+            value = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"invalid JSON evidence: {relative}") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError(f"JSON evidence root must be an object: {relative}")
+    elif root == "raw-transcripts":
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"empty JSONL evidence: {relative}")
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except ValueError as exc:
+                raise ValueError(f"invalid JSONL evidence: {relative}") from exc
+            if not isinstance(value, Mapping):
+                raise ValueError(f"JSONL evidence entry must be an object: {relative}")
 
 
 def _check_pack_filename(relative: Path) -> None:
@@ -916,7 +1139,11 @@ def _pack_members(source: Path) -> list[Path]:
     missing = [name for name in PACK_FILES if not (source / name).is_file() or (source / name).is_symlink()]
     if missing:
         raise ValueError("missing pack reports: " + ", ".join(missing))
+    missing_directories = [name for name in PACK_DIRECTORIES if not (source / name).is_dir() or (source / name).is_symlink()]
+    if missing_directories:
+        raise ValueError("missing pack evidence roots: " + ", ".join(missing_directories))
     members: list[Path] = []
+    root_counts = {name: 0 for name in PACK_DIRECTORIES}
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
         if path.is_symlink():
@@ -941,10 +1168,13 @@ def _pack_members(source: Path) -> list[Path]:
         else:
             _check_pack_filename(relative)
         data = path.read_bytes()
-        if len(relative.parts) == 1 and not data.strip():
-            raise ValueError(f"empty rendered pack report: {relative}")
-        _check_pack_content(path, data)
+        _check_pack_content(path, data, relative=relative)
+        if len(relative.parts) > 1:
+            root_counts[relative.parts[0]] += 1
         members.append(path)
+    empty_roots = [name for name, count in root_counts.items() if count == 0]
+    if empty_roots:
+        raise ValueError("empty pack evidence roots: " + ", ".join(empty_roots))
     return members
 
 
@@ -958,6 +1188,7 @@ def verify_pack(destination: Path, expected_digest: str | None = None) -> str:
         required_dirs = {f"{directory}/" for directory in PACK_DIRECTORIES}
         if not required_roots.issubset(names) or not required_dirs.issubset(names):
             raise ValueError("pack is missing required report or directory")
+        root_counts = {directory: 0 for directory in PACK_DIRECTORIES}
         for name in names:
             pure = Path(name)
             if pure.is_absolute() or ".." in pure.parts:
@@ -976,7 +1207,12 @@ def verify_pack(destination: Path, expected_digest: str | None = None) -> str:
             if len(pure.parts) > 1:
                 _check_pack_filename(pure)
             if not name.endswith("/"):
-                _check_pack_content(Path(name), archive.read(name))
+                _check_pack_content(Path(name), archive.read(name), relative=pure)
+                if len(pure.parts) > 1:
+                    root_counts[pure.parts[0]] += 1
+        empty_roots = [name for name, count in root_counts.items() if count == 0]
+        if empty_roots:
+            raise ValueError("pack contains empty evidence roots: " + ", ".join(empty_roots))
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     if expected_digest is not None and digest != expected_digest:
         raise ValueError("pack digest mismatch")

@@ -14,9 +14,20 @@
 - redaction 覆盖自由文本 secret/bearer/token（含空格、冒号、等号和引号形式）与完整绝对路径；pack finalizer/verify 执行根文件、目录、内容、symlink、cache/secret/path 与原子发布检查。
 - FakeRuntime 增加 readiness/no-progress/restart-loss/progress、continuation、artifact 与 close/idempotency 负路径。
 
+## Repair wave 4 closure
+
+- Scope remained S02-only: `live-tests/**` plus this handoff; product crates and S01 fixtures/reset were not edited, and no official endpoint was called.
+- R1/R7: fatal public-contract errors freeze immediately. Only classified infrastructure transport failures retry the same individual launch call once; ambiguous reservations stay consumed, immediate `existing` submissions release the unused reservation, and lifecycle errors never rerun a whole case.
+- R2/R3: Case C uses only public provenance fields, optional counters, deduplicated dynamic event snapshots, attempt-2 validation, public-field threshold/non-refresh evidence, preserved rmcp error text/stable classes, and an actual MCP facade process restart with stable daemon `service_generation`. Active daemon restart remains deterministic fake-only.
+- R5: all nine reports render from normalized evidence with computed case/overall enums. Pack finalize/verify reject placeholders, empty evidence roots/files, invalid UTF-8, malformed JSON/JSONL, unsafe names, symlinks, secrets, paths, and caches.
+- R6: MCP identity binds to the launched command/hash; service/daemon state binds to public status; Hook identity binds to public spawn provenance. Active daemon binary, active runtime digest, and effective config digest are not publicly bindable and are recorded as explicit gaps rather than guessed.
+- Direct main-runner tests cover successful actual-facade restart/rendering and fatal freeze before the next case.
+
 ## 验证
 
 - `python3 -m py_compile live-tests/*.py`
 - `python3 -m unittest discover -s live-tests -v`（6/6）
 - `git diff --check`
 - 仅对本地 facade 做了 `tools/list` 协议冒烟；本轮未调用 official runtime。
+
+Wave 4 final validation: 20/20 stdlib tests passed; py_compile, diff-check, and CodeGraph sync passed; official calls remained 0.
