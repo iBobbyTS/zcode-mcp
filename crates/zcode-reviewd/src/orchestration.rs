@@ -194,6 +194,7 @@ impl std::error::Error for OrchestrationError {}
 pub struct ReviewJobOrchestrator {
     scheduler: Scheduler,
     spawn_lock: Arc<Mutex<()>>,
+    hook_provenance: review_preparation::ReviewHookProvenance,
 }
 
 impl ReviewJobOrchestrator {
@@ -206,6 +207,7 @@ impl ReviewJobOrchestrator {
         Ok(Self {
             scheduler,
             spawn_lock: Arc::new(Mutex::new(())),
+            hook_provenance: review_preparation::review_bash_hook_provenance(),
         })
     }
 
@@ -452,7 +454,7 @@ impl ReviewJobOrchestrator {
         }
         self.ensure_structured_idempotency_unclaimed(&input.manifest.idempotency_key)?;
         let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
-        if let Err(error) = require_verified_hook_policy() {
+        if let Err(error) = require_verified_hook_policy(&self.hook_provenance) {
             self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
         }
@@ -544,7 +546,7 @@ impl ReviewJobOrchestrator {
             return Ok(existing);
         }
         let (prepared, prepared_created) = prepare_with_ownership(&input.manifest)?;
-        if let Err(error) = require_verified_hook_policy() {
+        if let Err(error) = require_verified_hook_policy(&self.hook_provenance) {
             self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
         }
@@ -606,7 +608,7 @@ impl ReviewJobOrchestrator {
                 "idempotency identity is not a structured review attempt",
             ))?;
         let prepared = prepared_from_job(&job)?;
-        require_verified_hook_policy()?;
+        require_verified_hook_policy(&self.hook_provenance)?;
         let expected_manifest_sha = manifest_sha256(manifest)?;
         let expected_budget =
             resolve_effective_budget(budget).map_err(OrchestrationError::Store)?;
@@ -655,6 +657,7 @@ impl ReviewJobOrchestrator {
             &prompt,
             review_kind,
             ReviewSubmissionDisposition::Existing,
+            &self.hook_provenance,
         )))
     }
 
@@ -934,6 +937,7 @@ impl ReviewJobOrchestrator {
             &prompt,
             attempt.review_kind,
             ReviewSubmissionDisposition::Created,
+            &self.hook_provenance,
         ))
     }
 
@@ -1347,15 +1351,11 @@ fn cleanup_prepared(prepared: &PreparedLaunchSpec) -> Result<(), OrchestrationEr
         .map_err(|_| OrchestrationError::Unavailable("prepared review cleanup failed"))
 }
 
-fn require_verified_hook_policy() -> Result<(), OrchestrationError> {
-    let current = review_preparation::review_bash_hook_provenance();
-    require_verified_hook_policy_record(&current)
-}
-
-fn require_verified_hook_policy_record(
+fn require_verified_hook_policy(
     current: &review_preparation::ReviewHookProvenance,
 ) -> Result<(), OrchestrationError> {
-    if !current.hook_activation_verified {
+    let observed = review_preparation::review_bash_hook_provenance();
+    if !current.hook_activation_verified || observed != *current {
         return Err(OrchestrationError::Contract(
             "REVIEW_BASH_POLICY_UNVERIFIED",
         ));
@@ -1388,7 +1388,7 @@ mod hook_policy_tests {
             activation_generation: None,
         };
         assert!(matches!(
-            require_verified_hook_policy_record(&current),
+            require_verified_hook_policy(&current),
             Err(OrchestrationError::Contract(
                 "REVIEW_BASH_POLICY_UNVERIFIED"
             ))
@@ -1421,8 +1421,8 @@ fn structured_projection(
     prompt: &ReviewPrompt,
     review_kind: StructuredReviewKind,
     disposition: ReviewSubmissionDisposition,
+    hook_provenance: &review_preparation::ReviewHookProvenance,
 ) -> StructuredReviewProjection {
-    let hook_provenance = review_preparation::review_bash_hook_provenance();
     let fresh_session_observed = job
         .zcode_session_id
         .as_deref()
@@ -1459,7 +1459,7 @@ fn structured_projection(
                 .effective_hook_sha256
                 .clone()
                 .unwrap_or_default(),
-            hook_provenance,
+            hook_provenance: hook_provenance.clone(),
         },
     }
 }

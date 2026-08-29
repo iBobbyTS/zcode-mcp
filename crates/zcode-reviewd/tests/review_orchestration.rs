@@ -43,10 +43,114 @@ struct Fixture {
     scheduler: Scheduler,
     service: RpcService,
     _server: RpcServer,
+    _policy_env: Option<PolicyEnvGuard>,
+}
+
+static POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static VERIFIED_POLICY_ENV: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
+
+struct PolicyEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous_provenance: Option<std::ffi::OsString>,
+    previous_generation: Option<std::ffi::OsString>,
+}
+
+impl Drop for PolicyEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous_provenance {
+            Some(value) => std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", value),
+            None => std::env::remove_var("ZCODE_REVIEW_HOOK_PROVENANCE"),
+        }
+        match &self.previous_generation {
+            Some(value) => std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", value),
+            None => std::env::remove_var("ZCODE_REVIEW_SERVICE_GENERATION"),
+        }
+    }
+}
+
+fn verified_policy_paths() -> (PathBuf, String) {
+    VERIFIED_POLICY_ENV
+        .get_or_init(|| {
+            let root =
+                std::env::temp_dir().join(format!("zcode-reviewd-policy-{}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let config = root.join("config.json");
+            let provenance = root.join("provenance.json");
+            fs::write(&config, "{}\n").unwrap();
+            let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/zcode-subagent-mcp-v2")
+                .canonicalize()
+                .unwrap();
+            let install = Command::new("node")
+                .arg(plugin_root.join("scripts/install-review-hook.mjs"))
+                .args([
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--provenance",
+                    provenance.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                install.status.success(),
+                "install stderr: {}",
+                String::from_utf8_lossy(&install.stderr)
+            );
+            let preflight = Command::new("node")
+                .arg(plugin_root.join("scripts/preflight-review-hook.mjs"))
+                .args([
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--provenance",
+                    provenance.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                preflight.status.success(),
+                "preflight stderr: {}",
+                String::from_utf8_lossy(&preflight.stderr)
+            );
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&provenance).unwrap()).unwrap();
+            let generation = record["activation_generation"].as_str().unwrap().to_owned();
+            (provenance, generation)
+        })
+        .clone()
+}
+
+fn policy_env(verified: bool) -> PolicyEnvGuard {
+    let lock = POLICY_ENV_LOCK.lock().unwrap();
+    let previous_provenance = std::env::var_os("ZCODE_REVIEW_HOOK_PROVENANCE");
+    let previous_generation = std::env::var_os("ZCODE_REVIEW_SERVICE_GENERATION");
+    if verified {
+        let (provenance, generation) = verified_policy_paths();
+        std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", provenance);
+        std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", generation);
+    } else {
+        std::env::remove_var("ZCODE_REVIEW_HOOK_PROVENANCE");
+        std::env::remove_var("ZCODE_REVIEW_SERVICE_GENERATION");
+    }
+    PolicyEnvGuard {
+        _lock: lock,
+        previous_provenance,
+        previous_generation,
+    }
 }
 
 impl Fixture {
     fn new() -> Self {
+        let (provenance, generation) = verified_policy_paths();
+        std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", provenance);
+        std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", generation);
+        Self::new_with_policy(None)
+    }
+
+    fn new_unverified() -> Self {
+        Self::new_with_policy(Some(policy_env(false)))
+    }
+
+    fn new_with_policy(_policy_env: Option<PolicyEnvGuard>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("repository");
         fs::create_dir_all(repository.join("src")).unwrap();
@@ -162,6 +266,7 @@ impl Fixture {
             scheduler,
             service,
             _server: server,
+            _policy_env,
         }
     }
 
@@ -590,7 +695,7 @@ fn submit_only_returns_stable_job_before_runtime_bootstrap() {
 
 #[test]
 fn unverified_structured_submission_fails_closed_before_enqueue() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new_unverified();
     let input = fixture.structured_submission("unverified-policy");
     let error = fixture
         .service
@@ -602,9 +707,41 @@ fn unverified_structured_submission_fails_closed_before_enqueue() {
 }
 
 #[test]
+fn verified_policy_snapshot_rejects_runtime_config_wrapper_and_artifact_drift() {
+    let fixture = Fixture::new();
+    let _policy_env = policy_env(true);
+    let provenance_path = PathBuf::from(std::env::var("ZCODE_REVIEW_HOOK_PROVENANCE").unwrap());
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
+    let config_path = PathBuf::from(provenance["effective_config_path"].as_str().unwrap());
+    let guard_path = PathBuf::from(provenance["effective_guard_wrapper_path"].as_str().unwrap());
+    let artifact_path = PathBuf::from(provenance["effective_hook_path"].as_str().unwrap());
+
+    for (index, path) in [config_path, guard_path, artifact_path]
+        .into_iter()
+        .enumerate()
+    {
+        let original = fs::read(&path).unwrap();
+        let mut drifted = original.clone();
+        drifted.push(b'\n');
+        fs::write(&path, drifted).unwrap();
+        let input = fixture.structured_submission(&format!("runtime-drift-{index}"));
+        let error = fixture
+            .service
+            .dispatch(RpcMethod::SubmitStructuredReview { input })
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert_eq!(error.message, "REVIEW_BASH_POLICY_UNVERIFIED");
+        assert!(fixture.store.list_jobs(10).unwrap().is_empty());
+        fs::write(&path, original).unwrap();
+    }
+}
+
+#[test]
 fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
     let fixture = Fixture::new();
     let expected_runtime = "f".repeat(64);
+    let expected_hook = review_preparation::review_bash_hook_sha256();
     let first_input = fixture.structured_submission("structured-first");
     let first_report = fixture.repository.join(&first_input.manifest.report_target);
     let first = match fixture
@@ -635,11 +772,19 @@ fn structured_fresh_then_same_review_continuation_preserves_attempt_evidence() {
         first.provenance.policy_version,
         review_preparation::REVIEW_BASH_POLICY_VERSION
     );
-    assert_eq!(first.provenance.policy_sha256, "");
-    assert!(!first.provenance.hook_provenance.hook_activation_verified);
+    assert_eq!(first.provenance.policy_sha256, expected_hook);
+    assert!(first.provenance.hook_provenance.hook_activation_verified);
+    assert_eq!(
+        first
+            .provenance
+            .hook_provenance
+            .effective_hook_sha256
+            .as_deref(),
+        Some(expected_hook.as_str())
+    );
     assert_eq!(
         first.provenance.hook_provenance.expected_hook_sha256,
-        review_preparation::review_bash_hook_sha256()
+        expected_hook
     );
     assert_eq!(first.effective_budget.wall_time_ms, 5_000);
     let replayed_first = match fixture
