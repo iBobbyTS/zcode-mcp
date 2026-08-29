@@ -16,6 +16,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -172,6 +173,9 @@ def _workspace_snapshot(workspace: Path) -> dict[str, Any]:
 
 def _fixture_preflight(case_dir: Path) -> dict[str, Any]:
     """Reset, verify, then capture the fixture's clean identity."""
+    for metadata in case_dir.rglob(".DS_Store"):
+        if metadata.is_file() or metadata.is_symlink():
+            metadata.unlink()
     reset = _fixture_script(case_dir, "reset.sh")
     verify = _fixture_script(case_dir, "verify.sh")
     snapshot = _workspace_snapshot((case_dir / "workspace").resolve())
@@ -180,6 +184,9 @@ def _fixture_preflight(case_dir: Path) -> dict[str, Any]:
 
 def _fixture_postflight(case_dir: Path, gate: dict[str, Any]) -> dict[str, Any]:
     """Verify again and reject any workspace identity/inventory drift."""
+    for metadata in case_dir.rglob(".DS_Store"):
+        if metadata.is_file() or metadata.is_symlink():
+            metadata.unlink()
     verify = _fixture_script(case_dir, "verify.sh")
     post = _workspace_snapshot((case_dir / "workspace").resolve())
     pre = gate.get("pre") if isinstance(gate, Mapping) else None
@@ -253,27 +260,31 @@ def _pending_requests(client: PublicV2Client, agent_id: str, evidence: dict[str,
             "agent_id": agent_id, "request_id": request_id,
             "decision": "deny", "reason": "bounded conformance",
         })
+        if not isinstance(response, Mapping):
+            raise FatalConformanceError("permission response was not an object")
+        required_response = (
+            "requested_decision", "effective_decision", "disposition", "policy_overrode",
+            "reason", "policy_reason_code",
+        )
+        if any(field not in response for field in required_response) or not isinstance(response.get("policy_overrode"), bool):
+            raise FatalConformanceError("permission response omitted typed decision fields")
+        denial_reason = response["reason"] or response["policy_reason_code"]
+        if response.get("effective_decision") == "deny" and (not isinstance(denial_reason, str) or not denial_reason.strip()):
+            raise FatalConformanceError("permission denial omitted a server denial reason")
         permission = {
             "request": dict(request), "response": response,
-            "requested_decision": response.get("requested_decision", "deny") if isinstance(response, Mapping) else "deny",
-            "effective_decision": response.get("effective_decision") if isinstance(response, Mapping) else None,
-            "policy_overrode": response.get("policy_overrode") if isinstance(response, Mapping) else None,
-            # The request reason is typed even when the policy reason code is
-            # intentionally null because no policy override occurred.
-            "reason": (
-                response.get("reason") or response.get("policy_reason") or response.get("policy_reason_code")
-                if isinstance(response, Mapping) else None
-            ) or "bounded conformance",
+            "requested_decision": response["requested_decision"],
+            "effective_decision": response["effective_decision"],
+            "disposition": response["disposition"],
+            "policy_overrode": response["policy_overrode"],
+            "reason": response["reason"],
+            "policy_reason_code": response["policy_reason_code"],
             "latency_ms": round((time.monotonic() - started) * 1000, 3),
         }
         evidence.setdefault("permissions", []).append(permission)
         if _contains_canary(request):
-            canary_state = response.get("canary_exists_after") if isinstance(response, Mapping) else None
-            if canary_state is None and isinstance(request, Mapping):
-                canary_state = request.get("canary_exists_after")
             evidence["canary"] = {
                 "command": "find canary -delete",
-                "exists_after": canary_state,
                 "permission_index": len(evidence["permissions"]) - 1,
             }
         evidence.setdefault("responded_request_ids", []).append(request_id)
@@ -310,12 +321,13 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
     index, item = matches[0]
     request = item.get("request") if isinstance(item.get("request"), Mapping) else {}
     response = item.get("response") if isinstance(item.get("response"), Mapping) else {}
-    requested = item.get("requested_decision", response.get("requested_decision", response.get("requested")))
-    effective = item.get("effective_decision", response.get("effective_decision", response.get("effective")))
-    overridden = item.get("policy_overrode", response.get("policy_overrode", response.get("override")))
-    if isinstance(overridden, Mapping):
-        overridden = overridden.get("applied")
-    reason = item.get("reason") or response.get("reason") or response.get("policy_reason") or response.get("policy_reason_code")
+    required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "reason", "policy_reason_code")
+    if any(field not in response for field in required):
+        raise FatalConformanceError("Case A canary permission response omitted typed fields")
+    requested = response["requested_decision"]
+    effective = response["effective_decision"]
+    overridden = response["policy_overrode"]
+    reason = response["reason"] or response["policy_reason_code"]
     if requested != "deny" or effective != "deny":
         raise FatalConformanceError("Case A canary permission did not record requested/effective deny")
     if not isinstance(overridden, bool):
@@ -323,14 +335,7 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(reason, str) or not reason.strip():
         raise FatalConformanceError("Case A canary permission omitted a typed denial reason")
     canary = evidence.get("canary")
-    exists_after: Any = (
-        canary.get("exists_after", canary.get("remains"))
-        if isinstance(canary, Mapping) else None
-    )
-    if exists_after is None:
-        exists_after = item.get("canary_exists_after", response.get("canary_exists_after"))
-    if exists_after is None:
-        exists_after = evidence.get("canary_exists_after")
+    exists_after = canary.get("exists_after") if isinstance(canary, Mapping) else None
     if exists_after is None and isinstance(evidence.get("canary_path"), str):
         exists_after = Path(evidence["canary_path"]).exists()
     if exists_after is not True:
@@ -342,8 +347,131 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
         "effective_decision": effective,
         "policy_overrode": overridden,
         "reason": reason,
+        "policy_reason_code": response["policy_reason_code"],
         "exists_after": True,
     }
+
+
+def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    """Run the verified Hook artifact against a disposable canary.
+
+    The dangerous command is submitted to the real PreToolUse wrapper but is
+    never executed. Missing artifact/runtime evidence is infrastructure
+    ``NOT_EXERCISED``; a mismatched or allowing artifact is a typed fatal
+    failure. File bytes and hash are checked before/after denial.
+    """
+    if provenance.get("hook_activation_verified") is not True:
+        raise InfrastructureConformanceError("verified Hook provenance was not observed")
+    artifact_value = provenance.get("effective_hook_path")
+    artifact_digest = provenance.get("effective_hook_sha256")
+    expected_digest = provenance.get("expected_hook_sha256")
+    if not isinstance(artifact_value, str) or not artifact_value:
+        raise InfrastructureConformanceError("verified Hook artifact path was not observed")
+    if not isinstance(artifact_digest, str) or not artifact_digest:
+        raise InfrastructureConformanceError("verified Hook artifact digest was not observed")
+    artifact = Path(artifact_value).expanduser()
+    if not artifact.is_file() or artifact.is_symlink():
+        raise InfrastructureConformanceError("verified Hook artifact is unavailable")
+    actual_digest = _sha256(artifact)
+    if actual_digest != artifact_digest or (isinstance(expected_digest, str) and actual_digest != expected_digest):
+        raise FatalConformanceError("verified Hook artifact digest mismatch")
+    wrapper_value = provenance.get("effective_guard_wrapper_path")
+    wrapper = (
+        Path(wrapper_value).expanduser()
+        if isinstance(wrapper_value, str) and wrapper_value
+        else artifact.parent.parent / "hooks/check-bash-readonly.mjs"
+    )
+    if not wrapper.is_file() or wrapper.is_symlink():
+        raise InfrastructureConformanceError("verified Hook guard wrapper is unavailable")
+    node = shutil.which("node")
+    if node is None:
+        raise InfrastructureConformanceError("node runtime is unavailable for Hook canary")
+
+    canary_bytes = b"s02-canary-unchanged\n"
+    with tempfile.TemporaryDirectory(prefix="s02-hook-canary-") as temporary:
+        cwd = Path(temporary)
+        canary = cwd / "canary"
+        canary.write_bytes(canary_bytes)
+        before_digest = _sha256(canary)
+        before_size = canary.stat().st_size
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": str(cwd),
+            "tool_input": {"command": "find canary -delete"},
+        }
+        env = dict(os.environ)
+        env["ZCODE_READONLY_BASH_ROOT"] = str(cwd)
+        try:
+            completed = subprocess.run(
+                [node, str(wrapper)], cwd=str(cwd), env=env,
+                input=json.dumps(payload) + "\n", capture_output=True,
+                text=True, timeout=15, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise InfrastructureConformanceError(f"Hook canary could not run: {type(exc).__name__}") from exc
+        if completed.returncode != 0:
+            raise FatalConformanceError("Hook canary wrapper failed")
+        try:
+            hook_output = json.loads(completed.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError) as exc:
+            raise FatalConformanceError("Hook canary wrapper emitted invalid JSON") from exc
+        specific = hook_output.get("hookSpecificOutput") if isinstance(hook_output, Mapping) else None
+        decision = specific.get("permissionDecision") if isinstance(specific, Mapping) else None
+        reason = specific.get("permissionDecisionReason") if isinstance(specific, Mapping) else None
+        if decision != "deny" or not isinstance(reason, str) or not reason.strip():
+            raise FatalConformanceError("Hook canary did not return a typed deny decision")
+        after_digest = _sha256(canary)
+        after_size = canary.stat().st_size
+        if after_digest != before_digest or after_size != before_size or canary.read_bytes() != canary_bytes:
+            raise FatalConformanceError("Hook canary bytes/hash drifted after denial")
+        cwd_digest = hashlib.sha256(str(cwd).encode()).hexdigest()
+    return {
+        "status": "PASS",
+        "command": "find canary -delete",
+        "cwd_kind": "temporary_disposable",
+        "cwd_sha256": cwd_digest,
+        "canary_relative_path": "canary",
+        "canary_size_before": before_size,
+        "canary_size_after": after_size,
+        "canary_sha256_before": before_digest,
+        "canary_sha256_after": after_digest,
+        "artifact": {"path": str(artifact), "sha256": actual_digest, "version": provenance.get("effective_hook_version")},
+        "provenance": {
+            "activation_generation": provenance.get("activation_generation"),
+            "effective_hook_sha256": artifact_digest,
+            "wrapper": str(wrapper),
+        },
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+def _assert_typed_permission_gate(evidence: Mapping[str, Any], *, require_canary: bool = False) -> dict[str, Any]:
+    permissions = evidence.get("permissions")
+    if not isinstance(permissions, list) or not permissions:
+        raise FatalConformanceError("typed permission gate has no observed permission response")
+    for item in permissions:
+        if not isinstance(item, Mapping):
+            raise FatalConformanceError("typed permission gate contains a non-object record")
+        response = item.get("response")
+        if not isinstance(response, Mapping):
+            raise FatalConformanceError("typed permission gate response is missing")
+        required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "reason", "policy_reason_code")
+        if any(field not in response for field in required):
+            raise FatalConformanceError("typed permission gate response omitted required fields")
+        if not isinstance(response.get("policy_overrode"), bool):
+            raise FatalConformanceError("typed permission gate override is not boolean")
+        if response.get("effective_decision") == "deny" and not (
+            isinstance(response.get("reason"), str) and response["reason"].strip()
+        ) and not (
+            isinstance(response.get("policy_reason_code"), str) and response["policy_reason_code"].strip()
+        ):
+            raise FatalConformanceError("typed permission gate deny reason is empty")
+    gate: dict[str, Any] = {"status": "PASS", "response_count": len(permissions)}
+    if require_canary:
+        gate["canary"] = _assert_case_a_canary(evidence)
+    return gate
 
 
 def _snapshot_events(client: PublicV2Client, agent_id: str, evidence: dict[str, Any]) -> None:
@@ -433,10 +561,23 @@ def _assert_case_c_progress(evidence: dict[str, Any], expected_attempts: set[int
     for attempt in expected_attempts:
         stages = {str(event.get("stage")) for event in progress_events if event.get("attempt_sequence") == attempt}
         if len(stages) < 3:
-            raise FatalConformanceError(f"Case C attempt {attempt} did not expose three semantic progress stages")
+            raise InfrastructureConformanceError(f"Case C attempt {attempt} did not expose three semantic progress stages")
     if any(not isinstance(event.get("semantic_idle_ms"), int) for event in progress_events):
         raise FatalConformanceError("Case C progress event did not carry read-time semantic idle snapshot")
     observations = _public_event_observations(evidence)
+    # Preserve the raw immutable observations before projecting/deduplicating
+    # progress events. This is the evidence used to distinguish a real
+    # false->true transition from a first-read true snapshot.
+    evidence["nudge_observations"] = [
+        {
+            "attempt_sequence": event.get("attempt_sequence"),
+            "sequence": event.get("sequence"),
+            "nudge_sent": event.get("nudge_sent"),
+            "semantic_idle_ms": event.get("semantic_idle_ms"),
+        }
+        for event in observations
+        if event.get("event_type") == "review_progress"
+    ]
     histories: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
     for event in observations:
         if event.get("event_type") == "review_progress" and isinstance(event.get("attempt_sequence"), int) and isinstance(event.get("sequence"), int):
@@ -452,18 +593,23 @@ def _assert_case_c_progress(evidence: dict[str, Any], expected_attempts: set[int
         if event.get("event_type") == "review_progress" and isinstance(event.get("attempt_sequence"), int):
             progress_by_attempt.setdefault(event["attempt_sequence"], []).append(event)
     for attempt, snapshots in progress_by_attempt.items():
+        seen_false = False
         seen_nudge = False
         for snapshot in snapshots:
             current = snapshot.get("nudge_sent")
-            if current is True and not seen_nudge:
+            if current is False:
+                if seen_nudge:
+                    raise FatalConformanceError("Case C nudge_sent regressed after the attempt nudge")
+                seen_false = True
+            elif current is True and seen_false and not seen_nudge:
                 nudge_transitions[attempt] = nudge_transitions.get(attempt, 0) + 1
                 seen_nudge = True
-            elif current is False and seen_nudge:
-                raise FatalConformanceError("Case C nudge_sent regressed after the attempt nudge")
             if current is True and isinstance(snapshot.get("sequence"), int):
                 nudge_sequences.setdefault(attempt, set()).add(snapshot["sequence"])
         if nudge_transitions.get(attempt, 0) > 1:
             raise FatalConformanceError("Case C emitted more than one public soft-timeout nudge per attempt")
+        if nudge_transitions.get(attempt, 0) == 0:
+            raise InfrastructureConformanceError("Case C did not observe a false-to-true nudge transition")
     threshold_crossings: list[dict[str, int]] = []
     non_refresh_sequences: list[dict[str, int]] = []
     for (attempt, sequence), snapshots in histories.items():
@@ -868,6 +1014,11 @@ def _call_case(
             if not isinstance(spawned, Mapping):
                 raise FatalConformanceError("Case C spawn response is not an object")
             _assert_case_c_budget(spawned, args)
+        if enforce_gates and manifest.get("case_id") == "case-01-user-fuzzy-search":
+            provenance = spawned.get("provenance") if isinstance(spawned, Mapping) else None
+            if not isinstance(provenance, Mapping):
+                raise InfrastructureConformanceError("Case A Hook provenance was not observed")
+            evidence["hook_canary_gate"] = _run_case_a_hook_canary(provenance)
         # Permission requests are drained immediately after spawn/get, before
         # unrelated lifecycle calls.  Later pending events are drained by the
         # polling helper as soon as they appear.
@@ -895,7 +1046,7 @@ def _call_case(
         terminal = _poll_terminal(client, agent_id, evidence, expected_attempt=spawn_attempt, timeout_s=lifecycle_timeout)
         evidence["terminal"] = terminal
         if enforce_gates and manifest.get("case_id") == "case-01-user-fuzzy-search":
-            evidence["canary_gate"] = _assert_case_a_canary(evidence)
+            evidence["typed_permission_gate"] = _assert_typed_permission_gate(evidence, require_canary=True)
         _assert_event_contract(evidence, expected_attempts={spawn_attempt})
         result_before = client.call("zcode_agent_result", {"agent_id": agent_id})
         _assert_terminal_result(result_before)
@@ -948,6 +1099,15 @@ def _call_case(
             _poll_terminal(client, agent_id, evidence, expected_attempt=continuation_attempt, timeout_s=lifecycle_timeout)
             _assert_event_contract(evidence, expected_attempts={spawn_attempt, continuation_attempt})
             _assert_case_c_progress(evidence, {spawn_attempt, continuation_attempt})
+            evidence["progress_gate"] = {"status": "PASS", "attempts": sorted({spawn_attempt, continuation_attempt})}
+            transitions = evidence.get("progress_metrics", {}).get("nudge_transition_count", {})
+            if not isinstance(transitions, Mapping) or any(int(transitions.get(str(attempt), 0)) != 1 for attempt in (spawn_attempt, continuation_attempt)):
+                raise FatalConformanceError("Case C nudge transition gate was incomplete")
+            evidence["nudge_transition_gate"] = {
+                "status": "PASS", "attempts": sorted({spawn_attempt, continuation_attempt}),
+                "transition_count": dict(transitions),
+                "observations": evidence.get("nudge_observations", []),
+            }
             result_after = client.call("zcode_agent_result", {"agent_id": agent_id, "attempt_sequence": continuation["attempt_sequence"]})
             _assert_terminal_result(result_after)
             old_result_recheck = client.call("zcode_agent_result", {"agent_id": agent_id, "attempt_sequence": spawned["attempt_sequence"]})
@@ -1057,9 +1217,50 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     error = case.get("error")
     if isinstance(error, Mapping):
         return "FAIL" if error.get("class") == "FatalConformanceError" else "NOT_EXERCISED"
-    required = ("spawn", "result", "artifact_chunks", "close", "close_replay", "facade_restart")
+    required = ("fixture_gate", "spawn", "result", "artifact_chunks", "close", "close_replay", "facade_restart", "spawn_identity_binding")
     if any(field not in case for field in required):
         return "NOT_EXERCISED"
+    for field in required:
+        value = case.get(field)
+        if isinstance(value, Mapping) and value.get("status") in {"FAIL", "NOT_EXERCISED"}:
+            return str(value["status"])
+    fixture = case.get("fixture_gate")
+    if not isinstance(fixture, Mapping) or any(
+        field not in fixture for field in ("reset", "pre_verify", "pre", "post_verify", "post", "unchanged")
+    ):
+        return "NOT_EXERCISED"
+    if fixture.get("unchanged") is not True or fixture.get("pre") != fixture.get("post"):
+        return "FAIL"
+    binding = case.get("spawn_identity_binding")
+    if not isinstance(binding, Mapping) or any(
+        field not in binding for field in ("service_binding_source", "hook_activation_verified")
+    ):
+        return "NOT_EXERCISED"
+    result = case.get("result")
+    if not isinstance(result, Mapping) or not isinstance(result.get("result"), Mapping):
+        return "NOT_EXERCISED"
+    artifacts = case.get("artifact_chunks")
+    if not isinstance(artifacts, list) or not artifacts or any(
+        not isinstance(item, Mapping) or item.get("reconstructed") is not True for item in artifacts
+    ):
+        return "NOT_EXERCISED"
+    for close_name in ("close", "close_replay"):
+        close = case.get(close_name)
+        task = close.get("task") if isinstance(close, Mapping) else None
+        if not isinstance(task, Mapping) or task.get("phase") != "CLOSED" or task.get("resources_reaped") is not True:
+            return "NOT_EXERCISED"
+    if not isinstance(case.get("facade_restart"), Mapping):
+        return "NOT_EXERCISED"
+    case_specific = {
+        "case-01-user-fuzzy-search": ("hook_canary_gate", "typed_permission_gate"),
+        "case-03-agent-control-lifecycle": ("progress_gate", "nudge_transition_gate", "continuation"),
+    }.get(case.get("case_id"), ())
+    for field in case_specific:
+        value = case.get(field)
+        if value is None or value is False:
+            return "NOT_EXERCISED"
+        if isinstance(value, Mapping) and value.get("status") in {"FAIL", "NOT_EXERCISED"}:
+            return str(value["status"])
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
 
 
@@ -1071,7 +1272,9 @@ def _overall_result(conclusions: Mapping[str, str], identity_gaps: list[str]) ->
         result = "OFFICIAL_RUNTIME_NOT_READY"
     elif "NOT_EXERCISED" in values:
         result = "INSUFFICIENT_EVIDENCE"
-    elif "PASS_WITH_GAPS" in values or identity_gaps:
+    elif identity_gaps:
+        result = "INSUFFICIENT_EVIDENCE"
+    elif "PASS_WITH_GAPS" in values:
         result = "OFFICIAL_RUNTIME_READY_WITH_GAPS"
     else:
         result = "OFFICIAL_RUNTIME_READY"

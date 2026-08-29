@@ -223,7 +223,8 @@ class S02Tests(unittest.TestCase):
             "request": {"tool_name": "bash", "operation": "find canary -delete", "summary": "find canary -delete"},
             "response": {
                 "requested_decision": "deny", "effective_decision": "deny",
-                "policy_overrode": False, "policy_reason_code": None,
+                "disposition": "responded",
+                "policy_overrode": False, "reason": "policy", "policy_reason_code": None,
             },
             "requested_decision": "deny", "effective_decision": "deny",
             "policy_overrode": False, "reason": "bounded conformance",
@@ -283,6 +284,36 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(evidence["conclusion"], "PASS_WITH_GAPS")
         self.assertIn("Hook activation was not publicly verified", evidence["gaps"])
         self.assertIn("Hook activation was not publicly verified", evidence["spawn_identity_binding"]["gaps"])
+
+    def test_missing_mandatory_gate_cannot_pass(self):
+        from run_matrix import _computed_case_conclusion
+        case = {"case_id": "case-01-user-fuzzy-search", "fixture_gate": {"status": "PASS"},
+                "spawn": {}, "result": {}, "artifact_chunks": [], "close": {},
+                "close_replay": {}, "facade_restart": {}, "spawn_identity_binding": {}}
+        self.assertEqual(_computed_case_conclusion(case), "NOT_EXERCISED")
+
+    def test_first_true_nudge_is_not_a_transition(self):
+        from run_matrix import _assert_case_c_progress
+        events = [{"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"}]
+        for sequence, stage in enumerate(("inspection", "validation", "synthesis"), start=2):
+            events.append({"sequence": sequence, "attempt_sequence": 1, "event_type": "review_progress",
+                           "stage": stage, "summary": stage, "last_progress_at": 1,
+                           "semantic_idle_ms": 120001, "nudge_sent": True})
+        with self.assertRaises(InfrastructureConformanceError):
+            _assert_case_c_progress({"event_snapshots": [{"events": events}]}, {1})
+
+    def test_permission_missing_disposition_is_fatal(self):
+        from run_matrix import _pending_requests
+        class Client:
+            def __init__(self): self.calls = 0
+            def call(self, tool, args):
+                if tool == "zcode_agent_get":
+                    return {"pending_requests": [{"request_id": "r", "kind": "permission", "state": "PENDING", "respondable": True,
+                                                     "tool_name": "bash", "operation": "cat file", "summary": "cat file", "policy_preview": {}}]}
+                self.calls += 1
+                return {"requested_decision": "deny", "effective_decision": "deny", "policy_overrode": False, "reason": "policy"}
+        with self.assertRaises(FatalConformanceError):
+            _pending_requests(Client(), "agent", {})
 
     def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
         with tempfile.TemporaryDirectory() as d:
@@ -452,17 +483,14 @@ class S02Tests(unittest.TestCase):
                     "--pack", str(pack_path),
                     "--timeout", "0.1",
                 ])
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(FakeFacadeTransport.instances), 2)
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(len(FakeFacadeTransport.instances), 1)
             self.assertTrue(FakeFacadeTransport.instances[0].closed)
             self.assertTrue(pack_path.is_file())
-            case_c = json.loads((output / "normalized/case-03-agent-control-lifecycle.json").read_text())
-            self.assertEqual(case_c["facade_restart"]["kind"], "actual_facade_process_restart")
-            self.assertTrue(case_c["facade_restart"]["process"]["process_changed"])
             import zipfile
             with zipfile.ZipFile(pack_path) as archive:
                 summary = archive.read("SUMMARY.md").decode()
-                self.assertIn("OFFICIAL_RUNTIME_READY_WITH_GAPS", summary)
+                self.assertIn("OFFICIAL_RUNTIME_NOT_READY", summary)
 
     def test_main_runner_freezes_after_typed_fatal_without_next_case(self):
         class StatusFacade:

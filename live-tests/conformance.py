@@ -702,6 +702,9 @@ class FakeRuntime:
 
     def _review_provenance(self, attempt_sequence: int) -> dict[str, Any]:
         digest = lambda label: hashlib.sha256(f"{label}-{attempt_sequence}".encode()).hexdigest()
+        hook_artifact = Path(__file__).resolve().parents[1] / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+        hook_wrapper = hook_artifact.parent.parent / "hooks/check-bash-readonly.mjs"
+        hook_digest = hashlib.sha256(hook_artifact.read_bytes()).hexdigest() if hook_artifact.is_file() else digest("hook")
         return {
             "review_kind": "initial_bounded",
             "manifest_sha256": digest("manifest"),
@@ -716,9 +719,11 @@ class FakeRuntime:
             "daemon_policy_version": "review-bash-policy-v1",
             "daemon_policy_sha256": digest("policy"),
             "expected_hook_version": "1",
-            "expected_hook_sha256": digest("hook"),
+            "expected_hook_sha256": hook_digest,
             "effective_hook_version": "1",
-            "effective_hook_sha256": digest("hook"),
+            "effective_hook_sha256": hook_digest,
+            "effective_hook_path": str(hook_artifact),
+            "effective_guard_wrapper_path": str(hook_wrapper),
             "hook_activation_verified": True,
             "activation_method": "fake",
             "activation_generation": "fake-hook-generation",
@@ -971,7 +976,7 @@ class FakeRuntime:
                 "requested_decision": args.get("decision", "deny"),
                 "effective_decision": "deny",
                 "policy_overrode": False,
-                "policy_reason_code": None,
+                "policy_reason_code": "bounded_conformance",
                 "reason": args.get("reason", "bounded conformance"),
                 "attempt_sequence": attempt,
             }
