@@ -1285,7 +1285,9 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
         return "FAIL"
     case_specific = {
         "case-01-user-fuzzy-search": ("hook_canary_gate", "typed_permission_gate"),
-        "case-03-agent-control-lifecycle": ("progress_gate", "nudge_transition_gate", "continuation"),
+        "case-03-agent-control-lifecycle": (
+            "progress_gate", "nudge_transition_gate", "continuation", "continuation_identity_binding",
+        ),
     }.get(case.get("case_id"), ())
     for field in case_specific:
         value = case.get(field)
@@ -1322,15 +1324,23 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
                     return "NOT_EXERCISED"
                 if field == "progress_gate" and not isinstance(value.get("attempts"), list):
                     return "NOT_EXERCISED"
+                if field == "progress_gate" and not value.get("attempts"):
+                    return "NOT_EXERCISED"
                 if field == "nudge_transition_gate":
                     transitions = value.get("transition_count")
-                    if not isinstance(transitions, Mapping) or any(
+                    if not isinstance(transitions, Mapping) or not transitions or any(
                         not isinstance(v, int) or v != 1 for v in transitions.values()
                     ):
                         return "FAIL" if isinstance(transitions, Mapping) else "NOT_EXERCISED"
+                if field == "nudge_transition_gate" and not value.get("attempts"):
+                    return "NOT_EXERCISED"
                 if field == "continuation" and (
                     any(key not in value for key in ("agent_id", "review_id", "attempt_sequence", "counts_as_independent"))
                     or value.get("counts_as_independent") is not False
+                ):
+                    return "NOT_EXERCISED"
+                if field == "continuation_identity_binding" and any(
+                    key not in value for key in ("service_binding_source", "hook_activation_verified")
                 ):
                     return "NOT_EXERCISED"
             elif not value:
