@@ -1,5 +1,8 @@
 use crate::{
-    prompts::{build_review_continuation_prompt, build_review_prompt, ReviewPrompt},
+    prompts::{
+        build_review_prompt, build_task_review_continuation_prompt, build_task_review_prompt,
+        ReviewPrompt,
+    },
     ReviewFailure, Scheduler, SchedulerError,
 };
 use review_ledger::{ArtifactIntegrity, LedgerManager};
@@ -472,7 +475,7 @@ impl ReviewJobOrchestrator {
             self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
         }
-        let prompt = match build_review_prompt(&prepared) {
+        let prompt = match build_task_review_prompt(&prepared) {
             Ok(prompt) => prompt,
             Err(error) => {
                 self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
@@ -568,13 +571,14 @@ impl ReviewJobOrchestrator {
             self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
             return Err(error);
         }
-        let prompt = match build_review_continuation_prompt(&prepared, &input.frozen_finding_ids) {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
-                return Err(OrchestrationError::Prompt(error.to_string()));
-            }
-        };
+        let prompt =
+            match build_task_review_continuation_prompt(&prepared, &input.frozen_finding_ids) {
+                Ok(prompt) => prompt,
+                Err(error) => {
+                    self.cleanup_new_unclaimed_prepared(&prepared, prepared_created)?;
+                    return Err(OrchestrationError::Prompt(error.to_string()));
+                }
+            };
         self.enqueue_structured_attempt(
             StructuredAttempt {
                 execution_agent_id,
@@ -627,9 +631,9 @@ impl ReviewJobOrchestrator {
         let expected_budget =
             resolve_effective_budget(budget).map_err(OrchestrationError::Store)?;
         let prompt = if task_kind == TaskKind::ReviewContinuation {
-            build_review_continuation_prompt(&prepared, frozen_finding_ids)
+            build_task_review_continuation_prompt(&prepared, frozen_finding_ids)
         } else {
-            build_review_prompt(&prepared)
+            build_task_review_prompt(&prepared)
         }
         .map_err(|error| OrchestrationError::Prompt(error.to_string()))?;
         let valid = job.idempotency_key.as_deref() == Some(manifest.idempotency_key.as_str())

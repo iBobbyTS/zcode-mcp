@@ -36,6 +36,8 @@ pub struct ReviewPrompt {
     pub sha256: String,
 }
 
+const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptError {
     InvalidContract(&'static str),
@@ -138,6 +140,31 @@ LIVE_STEER: false"
         text,
         sha256,
     })
+}
+
+pub fn build_task_review_prompt(
+    prepared: &PreparedLaunchSpec,
+) -> Result<ReviewPrompt, PromptError> {
+    add_task_progress_instruction(build_review_prompt(prepared)?)
+}
+
+pub fn build_task_review_continuation_prompt(
+    prepared: &PreparedLaunchSpec,
+    frozen_finding_ids: &[String],
+) -> Result<ReviewPrompt, PromptError> {
+    add_task_progress_instruction(build_review_continuation_prompt(
+        prepared,
+        frozen_finding_ids,
+    )?)
+}
+
+fn add_task_progress_instruction(mut prompt: ReviewPrompt) -> Result<ReviewPrompt, PromptError> {
+    prompt.text.push_str("\n\n");
+    prompt.text.push_str(TASK_PROGRESS_INSTRUCTION);
+    validate_review_prompt(prompt.kind, prompt.round_kind, &prompt.text)?;
+    let sha256 = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
+    prompt.sha256 = sha256;
+    Ok(prompt)
 }
 
 pub fn validate_review_continuation_prompt(
@@ -337,5 +364,24 @@ uncertainty one legal final signal"
             &legal_metadata
         )
         .is_ok());
+    }
+
+    #[test]
+    fn task_prompt_adds_daemon_bound_progress_without_changing_legacy_prompt() {
+        let legacy = format!(
+            "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nROUND_KIND: INITIAL_BOUNDED\nFRESH_SESSION_REQUIRED: true\n\
+PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_checkpoint review_finding_upsert review_validation_record review_finalize exactly once observable repository covered scope, gaps, uncertainty one legal final signal"
+        );
+        let prompt = ReviewPrompt {
+            kind: ReviewPromptKind::Code,
+            round_kind: RoundKind::InitialBounded,
+            text: legacy.clone(),
+            sha256: String::new(),
+        };
+        let task = add_task_progress_instruction(prompt).unwrap();
+        assert!(task.text.contains("TASK_SCOPED_SEMANTIC_PROGRESS"));
+        assert!(task.text.contains("mcp__review-ledger__review_progress"));
+        assert_ne!(task.text, legacy);
+        assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
     }
 }

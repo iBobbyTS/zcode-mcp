@@ -546,6 +546,16 @@ fn main() {
                 );
             }
             "session/send" => {
+                let content = params
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if mode == "review-flow-nudge-send-failure"
+                    && content.contains("Provide one bounded semantic progress update")
+                {
+                    let _ = write_value(&mut out, error(id, -32012, "SCRIPTED_NUDGE_FAILURE"));
+                    continue;
+                }
                 if mode == "review-flow-send-failure" && next_turn > 1 {
                     let _ = write_value(&mut out, error(id, -32011, "SCRIPTED_SEND_FAILURE"));
                     continue;
@@ -570,10 +580,6 @@ fn main() {
                         json!({"turnId": turn_id, "turnNumber": next_turn - 1}),
                     ),
                 );
-                let content = params
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
                 let review_flow_initial = is_review_flow(&mode) && next_turn == 2;
                 if content.contains("permission") || review_flow_initial {
                     let request_id = Value::String("server-1".into());

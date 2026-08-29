@@ -222,6 +222,7 @@ impl Fixture {
             ) {
                 ("CRASH", _) => "crash",
                 ("SEND-FAIL", _) => "review-flow-send-failure",
+                (_, key) if key.ends_with("nudge-send-failure") => "review-flow-nudge-send-failure",
                 (_, key) if key.ends_with("semantic-timeout") => "review-flow-no-progress",
                 (_, key) if key.ends_with("missing-final") => "review-flow-no-finalize",
                 (_, key)
@@ -737,12 +738,36 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
             .unwrap()
             .filter(|progress| progress.nudge_sent)
     });
+    wait_until(|| {
+        let events = fixture
+            .store
+            .task_events_after(&review.agent_id, 0, 100)
+            .unwrap();
+        (events
+            .iter()
+            .filter(|event| {
+                event.event_type == "driver.lifecycle"
+                    && event.payload_json.contains("turn.started")
+            })
+            .count()
+            >= 2)
+            .then_some(())
+    });
     // A much larger than 900s logical duration is represented with the
     // injected monotonic clock; no wall-clock sleep is involved.
     clock.advance(Duration::from_secs(901));
     let terminal = fixture.wait_terminal(&execution);
     assert_eq!(terminal.state, JobState::Failed);
-    assert_eq!(terminal.failure_code.as_deref(), Some("TIMEOUT"));
+    assert_eq!(
+        terminal.failure_code.as_deref(),
+        Some("TIMEOUT"),
+        "terminal={terminal:?} error={:?} events={:?}",
+        fixture.scheduler.last_error(&execution),
+        fixture
+            .store
+            .task_events_after(&review.agent_id, 0, 100)
+            .unwrap()
+    );
     let result = fixture.store.task_result(&execution).unwrap().unwrap();
     assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
     assert!(result
@@ -754,6 +779,58 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
         .unwrap()
         .is_empty());
     assert!(!worktree.exists());
+}
+
+#[test]
+fn semantic_nudge_send_failure_is_explicit_and_hard_timeout_still_cleans_up() {
+    let fixture =
+        Fixture::new_with_semantic_timeouts(Duration::from_millis(30), Duration::from_millis(100));
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission("nudge-send-failure"),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let execution = fixture
+        .store
+        .get_task(&review.agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    fixture.scheduler.start_ready().unwrap();
+    let running = fixture.store.get_job(&execution).unwrap().unwrap();
+    let identity = running.process_identity.unwrap();
+    let clock = fixture.monotonic_clock.as_ref().unwrap();
+    clock.advance(Duration::from_millis(31));
+    wait_until(|| {
+        fixture
+            .scheduler
+            .last_error(&execution)
+            .filter(|message| message.contains("semantic progress nudge failed"))
+    });
+    let starts = fixture
+        .store
+        .task_events_after(&review.agent_id, 0, 100)
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event.event_type == "driver.lifecycle" && event.payload_json.contains("turn.started")
+        })
+        .count();
+    assert_eq!(starts, 1, "failed nudge must not look like a started turn");
+    clock.advance(Duration::from_millis(100));
+    let terminal = fixture.wait_terminal(&execution);
+    assert!(matches!(
+        terminal.failure_code.as_deref(),
+        Some("TIMEOUT") | Some("FAILED")
+    ));
+    assert!(observe_process_group(identity.process_group_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

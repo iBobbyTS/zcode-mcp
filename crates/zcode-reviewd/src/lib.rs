@@ -4062,7 +4062,11 @@ impl Scheduler {
                         match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
                             Ok(true) => {
                                 let nudge_timeout = scheduler.inner.config.control_timeout / 2;
-                                let stopped = runtime.stop_turn(&session_id, nudge_timeout);
+                                let stopped = if runtime.turn_snapshot().active {
+                                    runtime.stop_turn(&session_id, nudge_timeout)
+                                } else {
+                                    Ok(runtime.turn_snapshot())
+                                };
                                 if let Err(error) = stopped.and_then(|_| runtime.send_turn(
                                     &session_id,
                                     "Provide one bounded semantic progress update via review_progress.",
