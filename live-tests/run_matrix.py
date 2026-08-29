@@ -1328,6 +1328,11 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
                         not isinstance(v, int) or v != 1 for v in transitions.values()
                     ):
                         return "FAIL" if isinstance(transitions, Mapping) else "NOT_EXERCISED"
+                if field == "continuation" and (
+                    any(key not in value for key in ("agent_id", "review_id", "attempt_sequence", "counts_as_independent"))
+                    or value.get("counts_as_independent") is not False
+                ):
+                    return "NOT_EXERCISED"
             elif not value:
                 return "NOT_EXERCISED"
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
