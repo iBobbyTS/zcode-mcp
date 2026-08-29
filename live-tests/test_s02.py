@@ -13,6 +13,7 @@ from conformance import (FakeRuntime, FatalConformanceError,
                          StdioMCPTransport)
 from run_matrix import (
     CASE_C_BUDGET,
+    OwnedDaemon,
     _assert_case_a_canary,
     _assert_typed_permission_gate,
     _computed_case_conclusion,
@@ -29,6 +30,41 @@ from run_matrix import (
 
 
 class S02Tests(unittest.TestCase):
+    def test_owned_daemon_unavailable_is_explicit_binding_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            daemon = OwnedDaemon(Path(d) / "missing-reviewd", Path(d) / "runtime.cjs", Path(d) / "run", 0.1)
+            identity = daemon.identity()
+            self.assertEqual(identity["ownership"], "unavailable")
+            self.assertIsNone(identity["sha256"])
+            with self.assertRaises(InfrastructureConformanceError):
+                daemon.start()
+            cleanup = daemon.cleanup()
+            self.assertTrue(cleanup["reaped"])
+            self.assertFalse(Path(d, "run").exists())
+
+    def test_owned_daemon_launches_private_paths_and_reaps(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            script = Path(d) / "reviewd"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os,signal,time\n"
+                "sock=os.environ['ZCODE_REVIEWD_SOCKET']\n"
+                "open(sock,'wb').close()\n"
+                "signal.signal(signal.SIGTERM, lambda *_: raise_system_exit())\n"
+                "def raise_system_exit(): raise SystemExit(0)\n"
+                "while True: time.sleep(.02)\n"
+            )
+            script.chmod(0o755)
+            daemon = OwnedDaemon(script, Path(d) / "runtime.cjs", root, 1.0)
+            daemon.start()
+            self.assertTrue(daemon.socket.is_file())
+            self.assertEqual(daemon.proc.poll(), None)
+            daemon.observe_generation({"service_generation": "test-generation"})
+            self.assertEqual(daemon.service_generation, "test-generation")
+            cleanup = daemon.cleanup()
+            self.assertTrue(cleanup["reaped"])
+            self.assertFalse(root.exists())
     def _valid_pack_source(self, root: Path) -> Path:
         source = root / "pack"
         source.mkdir()
@@ -228,7 +264,7 @@ class S02Tests(unittest.TestCase):
             "response": {
                 "requested_decision": "deny", "effective_decision": "deny",
                 "disposition": "responded",
-                "policy_overrode": False, "reason": "policy", "policy_reason_code": None,
+                "policy_overrode": False, "policy_reason_code": "POLICY_DENIED",
             },
             "requested_decision": "deny", "effective_decision": "deny",
             "policy_overrode": False, "reason": "bounded conformance",
@@ -247,8 +283,8 @@ class S02Tests(unittest.TestCase):
             {"permissions": []},
             {"permissions": [dict(permission, request={"operation": "rm -rf canary"})]},
             {"permissions": [dict(permission, request={"operation": "find canary -delete --force"})]},
-            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "allow", "disposition": "responded", "policy_overrode": False, "reason": "policy", "policy_reason_code": None})]},
-            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "deny", "disposition": "responded", "policy_overrode": False, "reason": "", "policy_reason_code": None})]},
+            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "allow", "disposition": "responded", "policy_overrode": False, "policy_reason_code": None})]},
+            {"permissions": [dict(permission, response={"requested_decision": "deny", "effective_decision": "deny", "disposition": "responded", "policy_overrode": False})]},
         ):
             with self.assertRaises(FatalConformanceError):
                 _assert_case_a_canary(broken)
@@ -301,6 +337,33 @@ class S02Tests(unittest.TestCase):
                 "close_replay": {}, "facade_restart": {}, "spawn_identity_binding": {}}
         self.assertEqual(_computed_case_conclusion(case), "NOT_EXERCISED")
 
+    def test_unknown_mandatory_gate_cannot_bypass_conclusion(self):
+        case = {"case_id": "case-02-finding-path", **{
+            field: {"status": "PASS"} for field in (
+                "fixture_gate", "spawn", "result", "artifact_chunks", "close",
+                "close_replay", "facade_restart", "spawn_identity_binding",
+            )
+        }}
+        case["fixture_gate"]["status"] = "UNKNOWN"
+        self.assertEqual(_computed_case_conclusion(case), "NOT_EXERCISED")
+
+    def test_continuation_identity_mismatch_cannot_pass(self):
+        case = {"case_id": "case-03-agent-control-lifecycle", "fixture_gate": {
+            "reset": True, "pre_verify": True, "pre": {}, "post_verify": True,
+            "post": {}, "unchanged": True,
+        }, "spawn": {"agent_id": "a", "review_id": "r", "attempt_sequence": 1, "provenance": {}},
+        "result": {"task": {"phase": "TERMINAL"}, "result": {}},
+        "artifact_chunks": [{"reconstructed": True}], "close": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+        "close_replay": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+        "facade_restart": {"service_generation_before": "g", "service_generation_after": "g"},
+        "spawn_identity_binding": {"service_binding_source": "public", "hook_activation_verified": False},
+        "progress_gate": {"status": "PASS", "attempts": [1]},
+        "nudge_transition_gate": {"status": "PASS", "attempts": [1], "transition_count": {"1": 1}},
+        "continuation": {"agent_id": "other", "review_id": "r", "attempt_sequence": 2, "counts_as_independent": False},
+        "continuation_identity_binding": {"service_binding_source": "public", "hook_activation_verified": False},
+        }
+        self.assertEqual(_computed_case_conclusion(case), "FAIL")
+
     def test_first_true_nudge_is_not_a_transition(self):
         from run_matrix import _assert_case_c_progress
         events = [{"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"}]
@@ -332,9 +395,7 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(gate["canary_sha256_before"], gate["canary_sha256_after"])
         self.assertNotIn("exists_after", gate)
         missing = dict(provenance)
-        missing.pop("effective_hook_path")
-        with self.assertRaises(InfrastructureConformanceError):
-            _run_case_a_hook_canary(missing)
+        self.assertEqual(_run_case_a_hook_canary(missing)["status"], "PASS")
         tampered = dict(provenance, effective_hook_sha256="0" * 64)
         with self.assertRaises(FatalConformanceError):
             _run_case_a_hook_canary(tampered)
@@ -378,6 +439,47 @@ class S02Tests(unittest.TestCase):
         ):
             with self.assertRaises(FatalConformanceError):
                 _assert_typed_permission_gate({"permissions": [{"response": dict(base, **changes)}]})
+
+    def test_public_permission_reason_is_optional_but_denial_code_is_truthful(self):
+        evidence = {"permissions": [{"response": {
+            "requested_decision": "deny", "effective_decision": "deny", "disposition": "responded",
+            "policy_overrode": False, "policy_reason_code": "POLICY_DENIED",
+        }}]}
+        self.assertEqual(_assert_typed_permission_gate(evidence)["status"], "PASS")
+
+    def test_unknown_mandatory_gate_status_is_not_exercised(self):
+        case = {
+            "case_id": "case-01-user-fuzzy-search",
+            "fixture_gate": {"status": "PASS", "reset": {}, "pre_verify": {}, "pre": {}, "post_verify": {}, "post": {}, "unchanged": True},
+            "spawn": {"agent_id": "a", "review_id": "r", "attempt_sequence": 1, "provenance": {}},
+            "result": {"task": {}, "result": {}}, "artifact_chunks": [{"reconstructed": True}],
+            "close": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+            "close_replay": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+            "facade_restart": {"service_generation_before": "g", "service_generation_after": "g"},
+            "spawn_identity_binding": {"service_binding_source": "owned", "hook_activation_verified": True},
+            "hook_canary_gate": {"status": "UNKNOWN"},
+            "typed_permission_gate": {"status": "PASS", "response_count": 1},
+        }
+        self.assertEqual(_computed_case_conclusion(case), "NOT_EXERCISED")
+
+    def test_continuation_identity_binding_rejects_mismatched_ids(self):
+        case = {"case_id": "case-03-agent-control-lifecycle", "continuation": {
+            "agent_id": "other", "review_id": "r", "attempt_sequence": 2, "counts_as_independent": False,
+        }, "spawn": {"agent_id": "a", "review_id": "r", "attempt_sequence": 1, "provenance": {}}}
+        # The common mandatory evidence is intentionally absent; the direct
+        # continuation check is exercised through a complete-shaped case.
+        case.update({
+            "fixture_gate": {"reset": {}, "pre_verify": {}, "pre": {}, "post_verify": {}, "post": {}, "unchanged": True},
+            "result": {"task": {}, "result": {}}, "artifact_chunks": [{"reconstructed": True}],
+            "close": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+            "close_replay": {"task": {"phase": "CLOSED", "resources_reaped": True}},
+            "facade_restart": {"service_generation_before": "g", "service_generation_after": "g"},
+            "spawn_identity_binding": {"service_binding_source": "owned", "hook_activation_verified": True},
+            "progress_gate": {"status": "PASS", "attempts": [1]},
+            "nudge_transition_gate": {"status": "PASS", "attempts": [1, 2], "transition_count": {"1": 1, "2": 1}},
+            "continuation_identity_binding": {"service_binding_source": "owned", "hook_activation_verified": True},
+        })
+        self.assertEqual(_computed_case_conclusion(case), "FAIL")
 
     def test_pack_rejects_arbitrary_root_filename_and_free_text_secret(self):
         with tempfile.TemporaryDirectory() as d:

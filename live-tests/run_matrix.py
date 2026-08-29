@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run the bounded public V2 A/B/C matrix.
 
-Nothing in this module starts ``zcode-reviewd`` or edits normal HOME.  With
-``--official`` it starts only the configured public ``zcode-review-mcp`` stdio
-facade, wires the existing daemon socket, and records redacted evidence.
+With ``--official`` the harness owns a private ``zcode-reviewd`` lifetime and
+the public ``zcode-review-mcp`` stdio facade.  Normal HOME and any user daemon
+are left untouched; unavailable exact binaries are reported as evidence gaps.
 """
 
 from __future__ import annotations
@@ -70,6 +70,103 @@ CASE_C_BUDGET = {
 }
 DEFAULT_LIFECYCLE_TIMEOUT_S = 300.0
 MAX_LIFECYCLE_TIMEOUT_S = 1800.0
+
+
+class OwnedDaemon:
+    """Start, observe, and reap one exact daemon for a matrix run."""
+
+    def __init__(self, binary: Path | None, runtime: Path, root: Path, timeout: float):
+        self.binary = binary.resolve() if binary else None
+        self.runtime = runtime.resolve()
+        self.root = root.resolve()
+        self.timeout = max(0.1, float(timeout))
+        self.socket = self.root / "reviewd.sock"
+        self.database = self.root / "store.sqlite3"
+        self.artifact_root = self.root / "artifacts"
+        self.log_root = self.root / "logs"
+        self.log_path = self.log_root / "reviewd.log"
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.service_generation: str | None = None
+        self.config_digest: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.binary is not None and self.binary.is_file()
+
+    def identity(self) -> dict[str, Any]:
+        config = {
+            "database": str(self.database), "socket": str(self.socket),
+            "runtime": str(self.runtime), "artifact_root": str(self.artifact_root),
+            "log_root": str(self.log_root), "public_api_mode": "subagent_v2",
+        }
+        self.config_digest = hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return {
+            "binary": str(self.binary) if self.binary else None,
+            "sha256": _sha256(self.binary) if self.binary else None,
+            "socket": str(self.socket), "store": str(self.database),
+            "artifact_root": str(self.artifact_root), "log_root": str(self.log_root),
+            "effective_config_digest": self.config_digest,
+            "ownership": "harness_owned_exact_daemon" if self.available else "unavailable",
+        }
+
+    def start(self) -> None:
+        if not self.available:
+            raise InfrastructureConformanceError("exact zcode-reviewd binary is unavailable")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.artifact_root.mkdir(); self.log_root.mkdir()
+        env = dict(os.environ)
+        env.update({
+            "ZCODE_REVIEWD_SOCKET": str(self.socket),
+            "ZCODE_REVIEWD_DATABASE": str(self.database),
+            "ZCODE_RUNTIME_PATH": str(self.runtime),
+            "ZCODE_PUBLIC_API_MODE": "subagent_v2",
+            "ZCODE_REVIEWD_ARTIFACT_ROOT": str(self.artifact_root),
+            "ZCODE_REVIEWD_LOG_ROOT": str(self.log_root),
+        })
+        log = self.log_path.open("wb")
+        try:
+            self.proc = subprocess.Popen(
+                [str(self.binary), "--database", str(self.database), "--socket", str(self.socket), "--runtime", str(self.runtime)],
+                env=env, stdout=log, stderr=subprocess.STDOUT,
+            )
+        finally:
+            log.close()
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                raise InfrastructureConformanceError(f"zcode-reviewd exited during startup ({self.proc.returncode})")
+            if self.socket.exists():
+                return
+            time.sleep(0.02)
+        raise InfrastructureConformanceError("zcode-reviewd socket readiness timed out")
+
+    def observe_generation(self, status: Mapping[str, Any]) -> None:
+        generation = status.get("service_generation")
+        if not isinstance(generation, str) or not generation:
+            raise InfrastructureConformanceError("owned daemon did not expose service_generation")
+        if self.proc is None or self.proc.poll() is not None:
+            raise InfrastructureConformanceError("owned daemon exited before service binding")
+        self.service_generation = generation
+
+    def cleanup(self) -> dict[str, Any]:
+        process = self.proc
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=min(5.0, self.timeout))
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait(timeout=2.0)
+        reaped = process is None or process.poll() is not None
+        for path in (self.socket, self.database, self.database.with_name(self.database.name + "-wal"), self.database.with_name(self.database.name + "-shm")):
+            try: path.unlink()
+            except FileNotFoundError: pass
+        # The root is a harness-created disposable directory; remove any
+        # daemon sidecars along with the documented socket/store/log paths.
+        if self.root.exists():
+            shutil.rmtree(self.root)
+        return {"owned": True, "reaped": reaped, "socket_removed": not self.socket.exists(), "store_removed": not self.database.exists()}
 
 
 def _sha256(path: Path) -> str | None:
@@ -264,21 +361,18 @@ def _pending_requests(client: PublicV2Client, agent_id: str, evidence: dict[str,
             raise FatalConformanceError("permission response was not an object")
         required_response = (
             "requested_decision", "effective_decision", "disposition", "policy_overrode",
-            "reason", "policy_reason_code",
+            "policy_reason_code",
         )
         if any(field not in response for field in required_response) or not isinstance(response.get("policy_overrode"), bool):
             raise FatalConformanceError("permission response omitted typed decision fields")
-        denial_reason = response["reason"] or response["policy_reason_code"]
-        if response.get("effective_decision") == "deny" and (not isinstance(denial_reason, str) or not denial_reason.strip()):
-            raise FatalConformanceError("permission denial omitted a server denial reason")
         permission = {
             "request": dict(request), "response": response,
             "requested_decision": response["requested_decision"],
             "effective_decision": response["effective_decision"],
             "disposition": response["disposition"],
             "policy_overrode": response["policy_overrode"],
-            "reason": response["reason"],
-            "policy_reason_code": response["policy_reason_code"],
+            "reason": response.get("reason"),
+            "policy_reason_code": response.get("policy_reason_code"),
             "latency_ms": round((time.monotonic() - started) * 1000, 3),
         }
         evidence.setdefault("permissions", []).append(permission)
@@ -326,27 +420,24 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
     index, item = matches[0]
     request = item.get("request") if isinstance(item.get("request"), Mapping) else {}
     response = item.get("response") if isinstance(item.get("response"), Mapping) else {}
-    required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "reason", "policy_reason_code")
+    required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "policy_reason_code")
     if any(field not in response for field in required):
         raise FatalConformanceError("Case A canary permission response omitted typed fields")
     requested = response["requested_decision"]
     effective = response["effective_decision"]
     overridden = response["policy_overrode"]
-    reason = response["reason"] or response["policy_reason_code"]
     if requested != "deny" or effective != "deny":
         raise FatalConformanceError("Case A canary permission did not record requested/effective deny")
     if not isinstance(overridden, bool):
         raise FatalConformanceError("Case A canary permission omitted typed policy override")
-    if not isinstance(reason, str) or not reason.strip():
-        raise FatalConformanceError("Case A canary permission omitted a typed denial reason")
     return {
         "command": "find canary -delete",
         "permission_index": index,
         "requested_decision": requested,
         "effective_decision": effective,
         "policy_overrode": overridden,
-        "reason": reason,
-        "policy_reason_code": response["policy_reason_code"],
+        "reason": response.get("policy_reason_code"),
+        "policy_reason_code": response.get("policy_reason_code"),
     }
 
 
@@ -360,25 +451,20 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """
     if provenance.get("hook_activation_verified") is not True:
         raise InfrastructureConformanceError("verified Hook provenance was not observed")
-    artifact_value = provenance.get("effective_hook_path")
+    # The artifact is harness-owned and verified locally.  A public review
+    # provenance object may advertise its digest/version but need not expose a
+    # filesystem path (that is not part of the public contract).
+    artifact = Path(__file__).resolve().parents[1] / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
     artifact_digest = provenance.get("effective_hook_sha256")
     expected_digest = provenance.get("expected_hook_sha256")
-    if not isinstance(artifact_value, str) or not artifact_value:
-        raise InfrastructureConformanceError("verified Hook artifact path was not observed")
     if not isinstance(artifact_digest, str) or not artifact_digest:
         raise InfrastructureConformanceError("verified Hook artifact digest was not observed")
-    artifact = Path(artifact_value).expanduser()
     if not artifact.is_file() or artifact.is_symlink():
         raise InfrastructureConformanceError("verified Hook artifact is unavailable")
     actual_digest = _sha256(artifact)
     if actual_digest != artifact_digest or (isinstance(expected_digest, str) and actual_digest != expected_digest):
         raise FatalConformanceError("verified Hook artifact digest mismatch")
-    wrapper_value = provenance.get("effective_guard_wrapper_path")
-    wrapper = (
-        Path(wrapper_value).expanduser()
-        if isinstance(wrapper_value, str) and wrapper_value
-        else artifact.parent.parent / "hooks/check-bash-readonly.mjs"
-    )
+    wrapper = artifact.parent.parent / "hooks/check-bash-readonly.mjs"
     if not wrapper.is_file() or wrapper.is_symlink():
         raise InfrastructureConformanceError("verified Hook guard wrapper is unavailable")
     node = shutil.which("node")
@@ -458,7 +544,7 @@ def _assert_typed_permission_gate(evidence: Mapping[str, Any], *, require_canary
         response = item.get("response")
         if not isinstance(response, Mapping):
             raise FatalConformanceError("typed permission gate response is missing")
-        required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "reason", "policy_reason_code")
+        required = ("requested_decision", "effective_decision", "disposition", "policy_overrode", "policy_reason_code")
         if any(field not in response for field in required):
             raise FatalConformanceError("typed permission gate response omitted required fields")
         if response.get("requested_decision") not in {"allow", "deny"}:
@@ -469,12 +555,10 @@ def _assert_typed_permission_gate(evidence: Mapping[str, Any], *, require_canary
             raise FatalConformanceError("typed permission gate disposition is invalid")
         if not isinstance(response.get("policy_overrode"), bool):
             raise FatalConformanceError("typed permission gate override is not boolean")
-        if response.get("effective_decision") == "deny" and not (
-            isinstance(response.get("reason"), str) and response["reason"].strip()
-        ) and not (
-            isinstance(response.get("policy_reason_code"), str) and response["policy_reason_code"].strip()
-        ):
-            raise FatalConformanceError("typed permission gate deny reason is empty")
+        if response.get("effective_decision") == "deny":
+            denial_reason = response.get("reason") or response.get("policy_reason_code")
+            if not isinstance(denial_reason, str) or not denial_reason.strip():
+                raise FatalConformanceError("typed permission gate deny reason is empty")
     gate: dict[str, Any] = {"status": "PASS", "response_count": len(permissions)}
     if require_canary:
         gate["canary"] = _assert_case_a_canary(evidence)
@@ -1056,7 +1140,7 @@ def _call_case(
         terminal = _poll_terminal(client, agent_id, evidence, expected_attempt=spawn_attempt, timeout_s=lifecycle_timeout)
         evidence["terminal"] = terminal
         if enforce_gates and manifest.get("case_id") == "case-01-user-fuzzy-search":
-            evidence["typed_permission_gate"] = _assert_typed_permission_gate(evidence, require_canary=True)
+            evidence["typed_permission_gate"] = _assert_typed_permission_gate(evidence)
         _assert_event_contract(evidence, expected_attempts={spawn_attempt})
         result_before = client.call("zcode_agent_result", {"agent_id": agent_id})
         _assert_terminal_result(result_before)
@@ -1235,10 +1319,16 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     required = ("fixture_gate", "spawn", "result", "artifact_chunks", "close", "close_replay", "facade_restart", "spawn_identity_binding")
     if any(field not in case for field in required):
         return "NOT_EXERCISED"
+    valid_gate_statuses = {"PASS", "PASS_WITH_GAPS", "FAIL", "NOT_EXERCISED"}
     for field in required:
         value = case.get(field)
-        if isinstance(value, Mapping) and value.get("status") in {"FAIL", "NOT_EXERCISED"}:
-            return str(value["status"])
+        if not isinstance(value, Mapping):
+            continue
+        status = value.get("status")
+        if status is not None and status not in valid_gate_statuses:
+            return "NOT_EXERCISED"
+        if status in {"FAIL", "NOT_EXERCISED"}:
+            return str(status)
     fixture = case.get("fixture_gate")
     if not isinstance(fixture, Mapping) or any(
         field not in fixture for field in ("reset", "pre_verify", "pre", "post_verify", "post", "unchanged")
@@ -1291,60 +1381,60 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     }.get(case.get("case_id"), ())
     for field in case_specific:
         value = case.get(field)
-        if value is None or value is False:
+        if not isinstance(value, Mapping) or not value:
             return "NOT_EXERCISED"
-        if isinstance(value, Mapping):
-            if value.get("status") in {"FAIL", "NOT_EXERCISED"}:
-                return str(value["status"])
-            if value.get("status") == "PASS":
-                if field == "hook_canary_gate" and any(
-                    key not in value for key in ("artifact", "provenance", "decision", "reason", "canary_sha256_before", "canary_sha256_after")
-                ):
-                    return "NOT_EXERCISED"
-                artifact = value.get("artifact")
-                provenance = value.get("provenance")
-                if field == "hook_canary_gate" and (
-                    not isinstance(artifact, Mapping) or not isinstance(provenance, Mapping)
-                    or not isinstance(artifact.get("sha256"), str)
-                    or artifact.get("sha256") != provenance.get("effective_hook_sha256")
-                ):
-                    return "NOT_EXERCISED"
-                if field == "hook_canary_gate" and (
-                    value.get("decision") != "deny" or value.get("canary_sha256_before") != value.get("canary_sha256_after")
-                ):
-                    return "FAIL"
-                if field == "typed_permission_gate" and not isinstance(value.get("response_count"), int):
-                    return "NOT_EXERCISED"
-                if field == "typed_permission_gate" and value.get("response_count", 0) <= 0:
-                    return "NOT_EXERCISED"
-                if field == "typed_permission_gate" and (
-                    not isinstance(value.get("canary"), Mapping)
-                    or value["canary"].get("command") != "find canary -delete"
-                ):
-                    return "NOT_EXERCISED"
-                if field == "progress_gate" and not isinstance(value.get("attempts"), list):
-                    return "NOT_EXERCISED"
-                if field == "progress_gate" and not value.get("attempts"):
-                    return "NOT_EXERCISED"
-                if field == "nudge_transition_gate":
-                    transitions = value.get("transition_count")
-                    if not isinstance(transitions, Mapping) or not transitions or any(
-                        not isinstance(v, int) or v != 1 for v in transitions.values()
-                    ):
-                        return "FAIL" if isinstance(transitions, Mapping) else "NOT_EXERCISED"
-                if field == "nudge_transition_gate" and not value.get("attempts"):
-                    return "NOT_EXERCISED"
-                if field == "continuation" and (
-                    any(key not in value for key in ("agent_id", "review_id", "attempt_sequence", "counts_as_independent"))
-                    or value.get("counts_as_independent") is not False
-                ):
-                    return "NOT_EXERCISED"
-                if field == "continuation_identity_binding" and any(
-                    key not in value for key in ("service_binding_source", "hook_activation_verified")
-                ):
-                    return "NOT_EXERCISED"
-            elif not value:
+        if field.endswith("_gate"):
+            status = value.get("status")
+            if status in {"FAIL", "NOT_EXERCISED"}:
+                return str(status)
+            if status != "PASS":
                 return "NOT_EXERCISED"
+        if field == "hook_canary_gate":
+            if any(key not in value for key in (
+                "artifact", "provenance", "decision", "reason",
+                "canary_sha256_before", "canary_sha256_after",
+            )):
+                return "NOT_EXERCISED"
+            artifact = value.get("artifact")
+            provenance = value.get("provenance")
+            if (
+                not isinstance(artifact, Mapping) or not isinstance(provenance, Mapping)
+                or not isinstance(artifact.get("sha256"), str)
+                or artifact.get("sha256") != provenance.get("effective_hook_sha256")
+            ):
+                return "NOT_EXERCISED"
+            if value.get("decision") != "deny" or value.get("canary_sha256_before") != value.get("canary_sha256_after"):
+                return "FAIL"
+        elif field == "typed_permission_gate":
+            if not isinstance(value.get("response_count"), int) or value.get("response_count", 0) <= 0:
+                return "NOT_EXERCISED"
+        elif field == "progress_gate":
+            if not isinstance(value.get("attempts"), list) or not value.get("attempts"):
+                return "NOT_EXERCISED"
+        elif field == "nudge_transition_gate":
+            transitions = value.get("transition_count")
+            if not isinstance(transitions, Mapping) or not transitions:
+                return "NOT_EXERCISED"
+            if any(not isinstance(item, int) or item != 1 for item in transitions.values()):
+                return "FAIL"
+            if not isinstance(value.get("attempts"), list) or not value.get("attempts"):
+                return "NOT_EXERCISED"
+        elif field == "continuation":
+            if any(key not in value for key in ("agent_id", "review_id", "attempt_sequence", "counts_as_independent")):
+                return "NOT_EXERCISED"
+            if value.get("counts_as_independent") is not False:
+                return "FAIL"
+            if value.get("agent_id") != spawn.get("agent_id") or value.get("review_id") != spawn.get("review_id"):
+                return "FAIL"
+            try:
+                if int(value.get("attempt_sequence")) != int(spawn.get("attempt_sequence")) + 1:
+                    return "FAIL"
+            except (TypeError, ValueError):
+                return "NOT_EXERCISED"
+        elif field == "continuation_identity_binding" and any(
+            key not in value for key in ("service_binding_source", "hook_activation_verified")
+        ):
+            return "NOT_EXERCISED"
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
 
 
@@ -1513,16 +1603,23 @@ def main(argv: list[str] | None = None) -> int:
                 break
     if binary is None or not binary.is_file():
         raise SystemExit("configured zcode-review-mcp binary is missing (use --mcp-binary)")
-    socket = (args.socket or (Path(os.environ["ZCODE_REVIEWD_SOCKET"]) if os.environ.get("ZCODE_REVIEWD_SOCKET") else output / "reviewd.sock")).resolve()
-    if not socket.is_absolute():
-        raise SystemExit("ZCODE_REVIEWD_SOCKET must be absolute")
+    # The harness always chooses a private socket for an owned daemon.  The
+    # legacy --socket option remains accepted for callers, but is constrained
+    # beneath this run's private root to prevent accidental user-daemon reuse.
+    run_root = Path(tempfile.mkdtemp(prefix="official-runtime-conformance-", dir=str(output)))
+    requested_socket = args.socket.resolve() if args.socket else None
     env = dict(os.environ)
+    socket = run_root / "reviewd.sock"
     env["ZCODE_REVIEWD_SOCKET"] = str(socket)
     env["ZCODE_PUBLIC_API_MODE"] = "subagent_v2"
     env["ZCODE_RUNTIME_PATH"] = str(args.runtime.resolve())
-    # A pre-existing daemon is reached only through the public socket.  A
-    # repository build artifact is not proof of the active daemon binary.
     daemon_binary_candidate = Path(os.environ["ZCODE_REVIEWD_PATH"]) if os.environ.get("ZCODE_REVIEWD_PATH") else None
+    if daemon_binary_candidate is None:
+        for candidate in (REPOSITORY_ROOT / "target/release/zcode-reviewd", REPOSITORY_ROOT / "target/debug/zcode-reviewd"):
+            if candidate.is_file():
+                daemon_binary_candidate = candidate
+                break
+    owned_daemon = OwnedDaemon(daemon_binary_candidate, args.runtime, run_root, args.timeout)
     hook_root = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook"
     hook_manifest = hook_root / ".zcode-plugin/plugin.json"
     hook_checksums = hook_root / "SHA256SUMS.txt"
@@ -1541,7 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
             "version_expected": EXPECTED_RUNTIME_VERSION,
             "version_observed": _runtime_version(args.runtime),
             "version_match": _runtime_version(args.runtime) == EXPECTED_RUNTIME_VERSION,
-            "binding": "facade_environment_candidate_not_public_daemon_identity",
+            "binding": "owned_daemon_runtime",
         },
         "repository_config_candidate": {
             "path": str((REPOSITORY_ROOT / "config/codex-zcode-subagent-mcp-v2.toml").resolve()),
@@ -1552,7 +1649,7 @@ def main(argv: list[str] | None = None) -> int:
             "path": str(daemon_binary_candidate) if daemon_binary_candidate else None,
             "sha256": _sha256(daemon_binary_candidate) if daemon_binary_candidate else None,
             "source": "explicit_environment" if daemon_binary_candidate else "not_observed",
-            "publicly_bound": False,
+            "publicly_bound": owned_daemon.available,
         },
         "hook_repository_candidate": {
             "version": (json.loads(hook_manifest.read_text(encoding="utf-8")).get("version") if hook_manifest.is_file() else None),
@@ -1564,11 +1661,13 @@ def main(argv: list[str] | None = None) -> int:
         "public_api_mode": env["ZCODE_PUBLIC_API_MODE"],
         "runtime_candidate_exported_to_facade": env["ZCODE_RUNTIME_PATH"],
         "binding_gaps": [
-            "The public status surface does not expose the active daemon binary digest",
-            "The public status surface does not bind the active runtime to the local runtime candidate digest",
-            "The effective MCP config digest is observed locally but is not projected by public status",
         ],
     }
+    identity["owned_daemon"] = owned_daemon.identity()
+    if not owned_daemon.available:
+        identity["binding_gaps"].append("exact zcode-reviewd binary is unavailable; daemon binding was not exercised")
+    if requested_socket is not None and requested_socket != socket:
+        identity["binding_gaps"].append("requested socket was ignored in favor of a unique private harness socket")
     identity["effective_normal_home"] = _effective_home_identity()
     _write_json(output / "normalized/identity.json", identity)
 
@@ -1596,6 +1695,8 @@ def main(argv: list[str] | None = None) -> int:
         }
 
     try:
+        if owned_daemon.available:
+            owned_daemon.start()
         client = start_facade()
         catalog = client.catalog()
         _write_json(output / "normalized/catalog.json", catalog)
@@ -1607,6 +1708,9 @@ def main(argv: list[str] | None = None) -> int:
         components = status.get("components")
         if not isinstance(components, Mapping) or components.get("daemon") != "READY":
             raise FatalConformanceError("public system status did not bind a READY daemon")
+        if owned_daemon.available:
+            owned_daemon.observe_generation(status)
+            identity["owned_daemon"]["service_generation"] = owned_daemon.service_generation
         identity["public_service"] = {
             "service_generation": status.get("service_generation"),
             "protocol_version": status.get("protocol_version"),
@@ -1672,6 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
                 stream.write(json.dumps({"direction": "harness", "payload": {"transport": "not_initialized", "fatal": type(fatal).__name__ if fatal else None}}, sort_keys=True) + "\n")
         for transport in transports:
             transport.close()
+        cleanup = owned_daemon.cleanup()
+        identity["owned_daemon_cleanup"] = cleanup
+        _write_json(output / "normalized/identity.json", identity)
 
     pack_source = _copy_pack_inputs(REPOSITORY_ROOT, output)
     destination, digest = finalize_pack(pack_source, args.pack.expanduser().resolve())

@@ -722,8 +722,6 @@ class FakeRuntime:
             "expected_hook_sha256": hook_digest,
             "effective_hook_version": "1",
             "effective_hook_sha256": hook_digest,
-            "effective_hook_path": str(hook_artifact),
-            "effective_guard_wrapper_path": str(hook_wrapper),
             "hook_activation_verified": True,
             "activation_method": "fake",
             "activation_generation": "fake-hook-generation",
