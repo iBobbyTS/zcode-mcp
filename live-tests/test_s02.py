@@ -13,6 +13,9 @@ from conformance import (FakeRuntime, FatalConformanceError,
                          StdioMCPTransport)
 from run_matrix import (
     CASE_C_BUDGET,
+    _assert_case_a_canary,
+    _fixture_postflight,
+    _fixture_preflight,
     _assert_event_contract,
     _call_case,
     _poll_terminal,
@@ -193,6 +196,73 @@ class S02Tests(unittest.TestCase):
         self.assertTrue(all(field in event for event in ("stage", "summary", "last_progress_at", "semantic_idle_ms", "nudge_sent")) for event in progress)
         self.assertTrue(evidence["progress_metrics"]["soft_threshold_crossings"])
         self.assertTrue(evidence["progress_metrics"]["non_refresh_sequences"])
+
+    def test_nudge_snapshot_all_historical_progress_events_counts_one_transition(self):
+        progress = []
+        for sequence, stage in enumerate(("inspection", "validation", "synthesis"), start=2):
+            progress.append({
+                "sequence": sequence, "attempt_sequence": 1, "event_type": "review_progress",
+                "stage": stage, "summary": f"{stage} summary", "last_progress_at": 100,
+                "semantic_idle_ms": 119000, "nudge_sent": False,
+                "counters": {"checkpoints": 1},
+            })
+        reread = [dict(event, semantic_idle_ms=120001, nudge_sent=True) for event in progress]
+        evidence = {
+            "event_pages": [
+                {"events": [{"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"}, *progress]},
+                {"events": [*reread, {"sequence": 5, "attempt_sequence": 1, "event_type": "terminal"}]},
+            ],
+            "waits": [],
+        }
+        from run_matrix import _assert_case_c_progress
+        _assert_case_c_progress(evidence, {1})
+        self.assertEqual(evidence["progress_metrics"]["nudge_transition_count"], {"1": 1})
+
+    def test_case_a_canary_requires_exact_command_typed_deny_and_survival(self):
+        permission = {
+            "request": {"tool_name": "bash", "operation": "find canary -delete", "summary": "find canary -delete"},
+            "response": {
+                "requested_decision": "deny", "effective_decision": "deny",
+                "policy_overrode": False, "policy_reason_code": None,
+            },
+            "requested_decision": "deny", "effective_decision": "deny",
+            "policy_overrode": False, "reason": "bounded conformance",
+            "canary_exists_after": True,
+        }
+        result = _assert_case_a_canary({"permissions": [permission], "canary": {"exists_after": True}})
+        self.assertEqual(result["command"], "find canary -delete")
+
+        for broken in (
+            {"permissions": []},
+            {"permissions": [dict(permission, request={"operation": "rm -rf canary"})]},
+            {"permissions": [dict(permission, request={"operation": "find canary -delete --force"})]},
+            {"permissions": [dict(permission, effective_decision="allow")]},
+            {"permissions": [dict(permission, reason="")]},
+            {"permissions": [dict(permission, canary_exists_after=False)]},
+        ):
+            with self.assertRaises(FatalConformanceError):
+                _assert_case_a_canary(broken)
+
+    def test_fixture_gate_missing_reset_or_verify_is_not_exercised(self):
+        with tempfile.TemporaryDirectory() as d:
+            case_dir = Path(d) / "case"
+            (case_dir / "scripts").mkdir(parents=True)
+            with self.assertRaises(InfrastructureConformanceError):
+                _fixture_preflight(case_dir)
+            reset = case_dir / "scripts/reset.sh"
+            reset.write_text("#!/bin/sh\nexit 0\n")
+            reset.chmod(0o755)
+            with self.assertRaises(InfrastructureConformanceError):
+                _fixture_preflight(case_dir)
+
+    def test_fixture_gate_rejects_workspace_identity_drift(self):
+        gate = {"pre": {"head": "h", "tree": "t", "status": "", "tracked_files": 1, "inventory": {"files": 1, "sha256": "a"}}}
+        post = {"head": "h", "tree": "changed", "status": "", "tracked_files": 1, "inventory": {"files": 1, "sha256": "a"}}
+        with patch("run_matrix._fixture_script", return_value={"script": "verify.sh", "returncode": 0}), patch(
+            "run_matrix._workspace_snapshot", return_value=post
+        ):
+            with self.assertRaisesRegex(FatalConformanceError, "drifted"):
+                _fixture_postflight(Path("/tmp/case"), gate)
 
     def test_hook_binding_gap_changes_case_conclusion_and_is_renderable(self):
         class UnverifiedHookRuntime(FakeRuntime):

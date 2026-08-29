@@ -724,7 +724,7 @@ class FakeRuntime:
             "activation_generation": "fake-hook-generation",
         }
 
-    def _events(self, agent_id: str, attempt_sequence: int = 1) -> list[dict[str, Any]]:
+    def _events(self, agent_id: str, attempt_sequence: int = 1, *, include_canary: bool = False) -> list[dict[str, Any]]:
         if self.mode == "no-progress":
             return []
         self._sequence += 1
@@ -767,6 +767,28 @@ class FakeRuntime:
                 if index != 1:  # counters are optional on the public schema
                     event["counters"] = {"checkpoints": 1}
                 events.append(event)
+        if include_canary:
+            self._sequence += 1
+            request_id = f"fake-canary-{agent_id}-{attempt_sequence}"
+            events.append({
+                "sequence": self._sequence,
+                "attempt_sequence": attempt_sequence,
+                "event_type": "pending_request",
+                "pending_request_id": request_id,
+                "redaction_level": "allowlisted",
+            })
+            self._pending[request_id] = {
+                "request_id": request_id,
+                "kind": "permission",
+                "state": "pending",
+                "respondable": True,
+                "tool_name": "bash",
+                "operation": "find canary -delete",
+                "summary": "find canary -delete",
+                "policy_preview": "externally_decidable",
+                "canary_exists_after": True,
+                "responded": False,
+            }
         return events
 
     def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -815,12 +837,15 @@ class FakeRuntime:
                 }
             agent_id = f"fake-agent-{len(self.agents) + 1}"
             self.idempotencies[key] = agent_id
+            repository = str(args.get("repository", ""))
+            case_id = Path(repository).parent.name if repository else None
             self.agents[agent_id] = {
                 "attempt_sequence": 1,
                 "closed": False,
                 "phase": "RUNNING",
                 "review_id": f"review-{agent_id}",
-                "events": self._events(agent_id),
+                "events": self._events(agent_id, include_canary=case_id == "case-01-user-fuzzy-search"),
+                "case_id": case_id,
                 "responded_requests": set(),
                 "nudge_count": 0,
                 "wait_calls": 0,
@@ -909,8 +934,11 @@ class FakeRuntime:
             progress = [event for event in current_events if event.get("event_type") == "review_progress" and event.get("attempt_sequence") == task.get("attempt_sequence", 1)]
             for event in progress:
                 event["semantic_idle_ms"] = 120001
-            if progress:
-                progress[-1]["nudge_sent"] = True
+            # Public ``nudge_sent`` is an attempt-level read-time snapshot.
+            # Once the nudge is emitted, rereading the stream projects the
+            # updated value onto every historical progress event.
+            for event in progress:
+                event["nudge_sent"] = True
             self._sequence += 1
             terminal_sequence = self._sequence
             task["phase"] = "TERMINAL"
@@ -938,7 +966,18 @@ class FakeRuntime:
                 disposition = "responded"
             agent_id = str(args.get("agent_id"))
             attempt = self.agents.get(agent_id, {}).get("attempt_sequence", 1)
-            return {"disposition": disposition, "requested_decision": args.get("decision", "deny"), "effective_decision": "deny", "policy_overrode": False, "policy_reason_code": None, "attempt_sequence": attempt}
+            result = {
+                "disposition": disposition,
+                "requested_decision": args.get("decision", "deny"),
+                "effective_decision": "deny",
+                "policy_overrode": False,
+                "policy_reason_code": None,
+                "reason": args.get("reason", "bounded conformance"),
+                "attempt_sequence": attempt,
+            }
+            if request.get("operation") == "find canary -delete":
+                result["canary_exists_after"] = True
+            return result
         if tool == "zcode_agent_message":
             agent_id = str(args.get("agent_id"))
             message_id = str(args.get("message_id"))
