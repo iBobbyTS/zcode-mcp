@@ -145,23 +145,35 @@ LIVE_STEER: false"
 pub fn build_task_review_prompt(
     prepared: &PreparedLaunchSpec,
 ) -> Result<ReviewPrompt, PromptError> {
-    add_task_progress_instruction(build_review_prompt(prepared)?)
+    add_task_progress_instruction(build_review_prompt(prepared)?, None)
 }
 
 pub fn build_task_review_continuation_prompt(
     prepared: &PreparedLaunchSpec,
     frozen_finding_ids: &[String],
 ) -> Result<ReviewPrompt, PromptError> {
-    add_task_progress_instruction(build_review_continuation_prompt(
-        prepared,
-        frozen_finding_ids,
-    )?)
+    add_task_progress_instruction(
+        build_review_continuation_prompt(prepared, frozen_finding_ids)?,
+        Some(frozen_finding_ids),
+    )
 }
 
-fn add_task_progress_instruction(mut prompt: ReviewPrompt) -> Result<ReviewPrompt, PromptError> {
+fn add_task_progress_instruction(
+    mut prompt: ReviewPrompt,
+    frozen_finding_ids: Option<&[String]>,
+) -> Result<ReviewPrompt, PromptError> {
     prompt.text.push_str("\n\n");
     prompt.text.push_str(TASK_PROGRESS_INSTRUCTION);
-    validate_review_prompt(prompt.kind, prompt.round_kind, &prompt.text)?;
+    if let Some(frozen_finding_ids) = frozen_finding_ids {
+        validate_review_continuation_prompt(
+            prompt.kind,
+            prompt.round_kind,
+            &prompt.text,
+            frozen_finding_ids,
+        )?;
+    } else {
+        validate_review_prompt(prompt.kind, prompt.round_kind, &prompt.text)?;
+    }
     let sha256 = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
     prompt.sha256 = sha256;
     Ok(prompt)
@@ -378,10 +390,34 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
             text: legacy.clone(),
             sha256: String::new(),
         };
-        let task = add_task_progress_instruction(prompt).unwrap();
+        let task = add_task_progress_instruction(prompt, None).unwrap();
         assert!(task.text.contains("TASK_SCOPED_SEMANTIC_PROGRESS"));
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
         assert_ne!(task.text, legacy);
         assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
+    }
+
+    #[test]
+    fn task_continuation_prompt_uses_the_continuation_validator() {
+        let frozen = vec!["S02-F6".to_owned()];
+        let text = format!(
+            "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nROUND_KIND: REPAIR_DELTA\nFRESH_SESSION_REQUIRED: true\n\
+PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\nCOUNTS_AS_INDEPENDENT: false\nFROZEN_FINDING_IDS: [\"S02-F6\"]\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: findings_present,no_findings_observed,incomplete_evidence,unable_to_review\nBASE_SHA: a\nHEAD_SHA: b\nPLAN_INPUT: p\nCONTEXT_INPUTS: []\nSCOPE_PATHS: []\n\nreview_checkpoint review_finding_upsert review_validation_record review_finalize exactly once observable repository covered scope, gaps, uncertainty one legal final signal"
+        );
+        let prompt = ReviewPrompt {
+            kind: ReviewPromptKind::Code,
+            round_kind: RoundKind::RepairDelta,
+            text,
+            sha256: String::new(),
+        };
+        let task = add_task_progress_instruction(prompt, Some(&frozen)).unwrap();
+        assert!(task.text.contains("mcp__review-ledger__review_progress"));
+        assert!(validate_review_continuation_prompt(
+            task.kind,
+            task.round_kind,
+            &task.text,
+            &frozen
+        )
+        .is_ok());
     }
 }
