@@ -54,6 +54,18 @@ read, denies a destructive canary, and verifies the canary file is unchanged.
 The resulting provenance file is the only source accepted as an effective hook
 identity by the daemon.
 
+Start the daemon with both the verified file and its generation bound to the
+current service process:
+
+```bash
+export ZCODE_REVIEW_HOOK_PROVENANCE=/absolute/review-bash-hook-provenance.json
+export ZCODE_REVIEW_SERVICE_GENERATION="$(node -p "require(process.env.ZCODE_REVIEW_HOOK_PROVENANCE).activation_generation")"
+```
+
+Missing or mismatched generation, a disabled config entry, an older/tampered
+artifact, or a config that no longer references the hook remains unverified and
+structured review startup fails closed with `REVIEW_BASH_POLICY_UNVERIFIED`.
+
 When installing through the plugin UI:
 
 1. Add the parent directory as a local plugin source and enable it.
