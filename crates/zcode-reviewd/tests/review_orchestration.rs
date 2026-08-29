@@ -140,10 +140,7 @@ fn policy_env(verified: bool) -> PolicyEnvGuard {
 
 impl Fixture {
     fn new() -> Self {
-        let (provenance, generation) = verified_policy_paths();
-        std::env::set_var("ZCODE_REVIEW_HOOK_PROVENANCE", provenance);
-        std::env::set_var("ZCODE_REVIEW_SERVICE_GENERATION", generation);
-        Self::new_with_policy(None)
+        Self::new_with_policy(Some(policy_env(true)))
     }
 
     fn new_unverified() -> Self {
@@ -709,7 +706,6 @@ fn unverified_structured_submission_fails_closed_before_enqueue() {
 #[test]
 fn verified_policy_snapshot_rejects_runtime_config_wrapper_and_artifact_drift() {
     let fixture = Fixture::new();
-    let _policy_env = policy_env(true);
     let provenance_path = PathBuf::from(std::env::var("ZCODE_REVIEW_HOOK_PROVENANCE").unwrap());
     let provenance: serde_json::Value =
         serde_json::from_slice(&fs::read(&provenance_path).unwrap()).unwrap();
@@ -2118,18 +2114,20 @@ fn concurrent_first_spawn_is_one_independent_job_and_conflicts_stay_rejected() {
 
 #[test]
 fn terminal_event_write_faults_classify_nonclean_before_releasing_slots() {
-    let fixture = Fixture::new();
-    let (natural, _, _) = fixture.spawn(fixture.manifest("terminal-fault", "S06"));
-    fixture.wait_pending(&natural);
-    fixture.fail_terminal_event_writes();
-    fixture.respond_permission(&natural);
-    let natural_terminal = fixture.wait_terminal(&natural);
-    assert_eq!(natural_terminal.state, JobState::FailedRuntimeLost);
-    assert_eq!(
-        natural_terminal.failure_code.as_deref(),
-        Some("LIFECYCLE_SINK_FAILED")
-    );
-    wait_until(|| (fixture.scheduler.active_count() == 0).then_some(()));
+    {
+        let fixture = Fixture::new();
+        let (natural, _, _) = fixture.spawn(fixture.manifest("terminal-fault", "S06"));
+        fixture.wait_pending(&natural);
+        fixture.fail_terminal_event_writes();
+        fixture.respond_permission(&natural);
+        let natural_terminal = fixture.wait_terminal(&natural);
+        assert_eq!(natural_terminal.state, JobState::FailedRuntimeLost);
+        assert_eq!(
+            natural_terminal.failure_code.as_deref(),
+            Some("LIFECYCLE_SINK_FAILED")
+        );
+        wait_until(|| (fixture.scheduler.active_count() == 0).then_some(()));
+    }
 
     let fixture = Fixture::new();
     let (delivery, _, _) = fixture.spawn(fixture.manifest("delivery-fault", "SEND-FAIL"));
