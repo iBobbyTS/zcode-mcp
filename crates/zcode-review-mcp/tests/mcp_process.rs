@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use review_ledger::{LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_VALIDATION_RECORD};
+use review_ledger::{
+    LedgerManager, REVIEW_CHECKPOINT, REVIEW_FINALIZE, REVIEW_PROGRESS, REVIEW_VALIDATION_RECORD,
+};
 use review_preparation::{
     CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletionSubmission,
     NetworkPolicy, PreparedGeneralTask, PreparedLaunchSpec, ReviewKind, ReviewManifest, RoundKind,
@@ -556,6 +558,20 @@ fn complete_next_review_attempt(
         );
         thread::sleep(Duration::from_millis(5));
     };
+    let progress_identity = store.review_progress(&execution_id).unwrap().unwrap();
+    scheduler
+        .call_task_review_tool(
+            &execution_id,
+            REVIEW_PROGRESS,
+            json!({
+                "attempt_sequence":progress_identity.attempt_sequence,
+                "run_idempotency_key":progress_identity.run_idempotency_key,
+                "stage":"inspection",
+                "summary":"public composition progress",
+                "counters":{"files":1,"findings":0}
+            }),
+        )
+        .unwrap();
     ledger
         .call_tool(
             &execution_id,
@@ -1078,11 +1094,27 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
         "zcode_agent_events",
         json!({"agent_id":shadow_agent_id,"after_sequence":0,"limit":100}),
     );
-    assert!(shadow_events["events"]
-        .as_array()
-        .unwrap()
+    let shadow_rows = shadow_events["events"].as_array().unwrap();
+    assert!(shadow_rows
         .iter()
         .all(|event| event["attempt_sequence"] == 1));
+    let progress = shadow_rows
+        .iter()
+        .find(|event| event["event_type"] == "review_progress")
+        .unwrap();
+    assert_eq!(progress["stage"], "inspection");
+    assert_eq!(progress["summary"], "public composition progress");
+    assert_eq!(progress["counters"], json!({"files":1,"findings":0}));
+    assert!(progress["last_progress_at"].as_u64().is_some());
+    assert!(progress["semantic_idle_ms"].as_u64().is_some());
+    assert_eq!(progress["nudge_sent"], false);
+    let public = shadow_events.to_string();
+    for forbidden in ["run_idempotency_key", "runtime_agent_id", "payload_json"] {
+        assert!(
+            !public.contains(forbidden),
+            "public event leaked {forbidden}"
+        );
+    }
     drop(before_restart);
     server.shutdown();
     drop(service);

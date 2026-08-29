@@ -31,7 +31,8 @@ use zcode_reviewd::{
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
         SubmissionDispositionView, SystemStatusView, TaskArtifactMetadataView, TaskArtifactQuery,
         TaskEventPage, TaskEventQuery, TaskListQuery, TaskPhaseFilter, TaskResultView,
-        TaskReviewEvidenceView, TaskView, TaskWaitQuery, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+        TaskReviewEvidenceView, TaskReviewProgressStage, TaskView, TaskWaitQuery,
+        MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
     },
 };
 
@@ -767,6 +768,18 @@ pub struct PublicTaskEvent {
     pub event_type: PublicTaskEventType,
     pub redaction_level: String,
     pub pending_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<PublicReviewProgressStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counters: Option<BTreeMap<String, u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_idle_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nudge_sent: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -777,6 +790,15 @@ pub enum PublicTaskEventType {
     PendingRequest,
     ReviewFinalized,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicReviewProgressStage {
+    Scope,
+    Inspection,
+    Validation,
+    Synthesis,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1346,12 +1368,56 @@ fn project_event_page(page: TaskEventPage) -> Result<AgentEventsOutput, String> 
                     "terminal" => PublicTaskEventType::Terminal,
                     _ => return Err(protocol_error()),
                 };
+                let progress = if event_type == PublicTaskEventType::ReviewProgress {
+                    match (
+                        event.stage,
+                        event.summary,
+                        event.last_progress_at,
+                        event.semantic_idle_ms,
+                        event.nudge_sent,
+                    ) {
+                        (
+                            Some(stage),
+                            Some(summary),
+                            Some(last_progress_at),
+                            Some(semantic_idle_ms),
+                            Some(nudge_sent),
+                        ) => Some((
+                            match stage {
+                                TaskReviewProgressStage::Scope => PublicReviewProgressStage::Scope,
+                                TaskReviewProgressStage::Inspection => {
+                                    PublicReviewProgressStage::Inspection
+                                }
+                                TaskReviewProgressStage::Validation => {
+                                    PublicReviewProgressStage::Validation
+                                }
+                                TaskReviewProgressStage::Synthesis => {
+                                    PublicReviewProgressStage::Synthesis
+                                }
+                            },
+                            summary,
+                            event.counters,
+                            last_progress_at,
+                            semantic_idle_ms,
+                            nudge_sent,
+                        )),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 Ok(PublicTaskEvent {
                     sequence: event.sequence,
                     attempt_sequence: event.attempt_sequence,
                     event_type,
                     redaction_level: event.redaction_level,
                     pending_request_id,
+                    stage: progress.as_ref().map(|progress| progress.0),
+                    summary: progress.as_ref().map(|progress| progress.1.clone()),
+                    counters: progress.as_ref().and_then(|progress| progress.2.clone()),
+                    last_progress_at: progress.as_ref().map(|progress| progress.3),
+                    semantic_idle_ms: progress.as_ref().map(|progress| progress.4),
+                    nudge_sent: progress.as_ref().map(|progress| progress.5),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -2074,6 +2140,19 @@ mod tests {
         }
         let schemas = serde_json::to_string(&tools).unwrap();
         assert!(schemas.contains("command_ids"));
+        for progress_field in [
+            "stage",
+            "summary",
+            "counters",
+            "last_progress_at",
+            "semantic_idle_ms",
+            "nudge_sent",
+        ] {
+            assert!(
+                schemas.contains(progress_field),
+                "public schema omitted {progress_field}"
+            );
+        }
         for forbidden in [
             "workspace_path",
             "runtime_agent_id",
@@ -2125,6 +2204,12 @@ mod tests {
                 })
                 .to_string(),
                 redaction_level: "bounded".into(),
+                stage: None,
+                summary: None,
+                counters: None,
+                last_progress_at: None,
+                semantic_idle_ms: None,
+                nudge_sent: None,
             }],
             next_sequence: 3,
             has_more: false,
@@ -2142,6 +2227,85 @@ mod tests {
         assert!(!public.contains("private-runtime"));
         assert!(!public.contains("/secret/path"));
         assert!(!public.contains("secret"));
+    }
+
+    #[test]
+    fn event_projection_emits_atomic_typed_progress_and_omits_it_elsewhere() {
+        let output = project_event_page(TaskEventPage {
+            events: vec![
+                zcode_reviewd::rpc::TaskEventView {
+                    sequence: 1,
+                    source_sequence: 7,
+                    attempt_sequence: 2,
+                    event_type: "review_progress".into(),
+                    payload_json: "{}".into(),
+                    redaction_level: "allowlisted".into(),
+                    stage: Some(TaskReviewProgressStage::Validation),
+                    summary: Some("validated bounded projection".into()),
+                    counters: Some(BTreeMap::from([("checks".into(), 3)])),
+                    last_progress_at: Some(1234),
+                    semantic_idle_ms: Some(56),
+                    nudge_sent: Some(false),
+                },
+                zcode_reviewd::rpc::TaskEventView {
+                    sequence: 2,
+                    source_sequence: 8,
+                    attempt_sequence: 2,
+                    event_type: "review_progress".into(),
+                    payload_json: "{}".into(),
+                    redaction_level: "allowlisted".into(),
+                    stage: Some(TaskReviewProgressStage::Synthesis),
+                    summary: None,
+                    counters: Some(BTreeMap::from([("private".into(), 1)])),
+                    last_progress_at: Some(1235),
+                    semantic_idle_ms: Some(0),
+                    nudge_sent: Some(true),
+                },
+                zcode_reviewd::rpc::TaskEventView {
+                    sequence: 3,
+                    source_sequence: 0,
+                    attempt_sequence: 2,
+                    event_type: "terminal".into(),
+                    payload_json: "{}".into(),
+                    redaction_level: "allowlisted".into(),
+                    stage: Some(TaskReviewProgressStage::Synthesis),
+                    summary: Some("must not escape on terminal".into()),
+                    counters: None,
+                    last_progress_at: Some(1236),
+                    semantic_idle_ms: Some(0),
+                    nudge_sent: Some(true),
+                },
+            ],
+            next_sequence: 3,
+            has_more: false,
+        })
+        .unwrap();
+        let public = serde_json::to_value(output).unwrap();
+        assert_eq!(public["events"][0]["stage"], "validation");
+        assert_eq!(
+            public["events"][0]["summary"],
+            "validated bounded projection"
+        );
+        assert_eq!(
+            public["events"][0]["counters"],
+            serde_json::json!({"checks":3})
+        );
+        assert_eq!(public["events"][0]["last_progress_at"], 1234);
+        assert_eq!(public["events"][0]["semantic_idle_ms"], 56);
+        assert_eq!(public["events"][0]["nudge_sent"], false);
+        for index in [1, 2] {
+            let event = public["events"][index].as_object().unwrap();
+            for field in [
+                "stage",
+                "summary",
+                "counters",
+                "last_progress_at",
+                "semantic_idle_ms",
+                "nudge_sent",
+            ] {
+                assert!(!event.contains_key(field), "event {index} leaked {field}");
+            }
+        }
     }
 
     #[test]

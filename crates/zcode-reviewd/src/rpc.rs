@@ -6,17 +6,19 @@ use crate::{
     GeneralCheckResult, MessageDisposition, ResponseDisposition, RuntimePreflightResult, Scheduler,
     SchedulerError,
 };
-use review_ledger::{ArtifactIntegrity, ToolResult, VerifiedArtifact};
+use review_ledger::{
+    ArtifactIntegrity, ToolResult, VerifiedArtifact, MAX_TOOL_ID_BYTES, MAX_TOOL_TEXT_CHARS,
+};
 use review_preparation::{canonical_general_repository, ReviewManifest};
 use review_preparation::{
     BudgetLimits, GeneralCompletionSubmission, GeneralProfile, GeneralTaskManifest,
     PreparedGeneralTask, PreparedLaunchSpec,
 };
 use review_store::{
-    DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
-    StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
-    TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
-    TurnState, WaitSnapshot,
+    DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState,
+    ReviewProgressState, Store, StoreError, StoredArtifact, StoredEvent, StoredPendingRequest,
+    StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
+    TaskSubmissionDisposition, TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,7 +30,7 @@ use std::{
     path::Path,
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const RPC_VERSION: u16 = 10;
@@ -808,6 +810,27 @@ pub struct TaskEventView {
     pub event_type: String,
     pub payload_json: String,
     pub redaction_level: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<TaskReviewProgressStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counters: Option<BTreeMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_idle_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudge_sent: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskReviewProgressStage {
+    Scope,
+    Inspection,
+    Validation,
+    Synthesis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2129,8 +2152,25 @@ impl RpcService {
                 event_type: "attempt_started".into(),
                 payload_json: "{}".into(),
                 redaction_level: "allowlisted".into(),
+                stage: None,
+                summary: None,
+                counters: None,
+                last_progress_at: None,
+                semantic_idle_ms: None,
+                nudge_sent: None,
             });
         }
+        let progress_state = if matches!(
+            task.task_kind,
+            TaskKind::Review | TaskKind::ReviewContinuation
+        ) {
+            self.store
+                .review_progress(&task.execution_agent_id)
+                .map_err(map_store)?
+        } else {
+            None
+        };
+        let wall_now_ms = wall_now_millis();
         for event in stored
             .into_iter()
             .filter(|event| event.attempt_sequence == task.attempt_sequence)
@@ -2140,17 +2180,23 @@ impl RpcService {
                     task.task_kind,
                     TaskKind::Review | TaskKind::ReviewContinuation
                 ) {
-                Some(("review_progress", "{}".to_owned(), "allowlisted"))
+                Some((
+                    "review_progress",
+                    "{}".to_owned(),
+                    "allowlisted",
+                    project_review_progress(task, &event, progress_state.as_ref(), wall_now_ms),
+                ))
             } else {
                 public_pending_request_id(&event).map(|request_id| {
                     (
                         "pending_request",
                         serde_json::json!({"request_id": request_id}).to_string(),
                         "bounded",
+                        None,
                     )
                 })
             };
-            if let Some((event_type, payload_json, redaction_level)) = projected {
+            if let Some((event_type, payload_json, redaction_level, progress)) = projected {
                 events.push(TaskEventView {
                     sequence: 0,
                     source_sequence: event.source_sequence,
@@ -2158,6 +2204,14 @@ impl RpcService {
                     event_type: event_type.into(),
                     payload_json,
                     redaction_level: redaction_level.into(),
+                    stage: progress.as_ref().map(|progress| progress.stage),
+                    summary: progress.as_ref().map(|progress| progress.summary.clone()),
+                    counters: progress
+                        .as_ref()
+                        .and_then(|progress| progress.counters.clone()),
+                    last_progress_at: progress.as_ref().map(|progress| progress.last_progress_at),
+                    semantic_idle_ms: progress.as_ref().map(|progress| progress.semantic_idle_ms),
+                    nudge_sent: progress.as_ref().map(|progress| progress.nudge_sent),
                 });
             }
         }
@@ -2182,6 +2236,12 @@ impl RpcService {
                     })
                     .to_string(),
                     redaction_level: "allowlisted".into(),
+                    stage: None,
+                    summary: None,
+                    counters: None,
+                    last_progress_at: None,
+                    semantic_idle_ms: None,
+                    nudge_sent: None,
                 });
             }
         }
@@ -2193,6 +2253,12 @@ impl RpcService {
                 event_type: "terminal".into(),
                 payload_json: "{}".into(),
                 redaction_level: "allowlisted".into(),
+                stage: None,
+                summary: None,
+                counters: None,
+                last_progress_at: None,
+                semantic_idle_ms: None,
+                nudge_sent: None,
             });
         }
         for (index, event) in events.iter_mut().enumerate() {
@@ -2642,6 +2708,77 @@ impl From<StoredTaskResult> for TaskResultView {
             review_evidence: None,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredReviewProgressPayload {
+    stage: TaskReviewProgressStage,
+    summary: String,
+    #[serde(default)]
+    counters: Option<BTreeMap<String, u64>>,
+    attempt_sequence: u64,
+    updated_at: i64,
+}
+
+struct ProjectedReviewProgress {
+    stage: TaskReviewProgressStage,
+    summary: String,
+    counters: Option<BTreeMap<String, u64>>,
+    last_progress_at: u64,
+    semantic_idle_ms: u64,
+    nudge_sent: bool,
+}
+
+fn project_review_progress(
+    task: &TaskRecord,
+    event: &StoredEvent,
+    state: Option<&ReviewProgressState>,
+    wall_now_ms: u64,
+) -> Option<ProjectedReviewProgress> {
+    if event.redaction_level != "allowlisted" {
+        return None;
+    }
+    let state = state.filter(|state| {
+        state.agent_id == task.execution_agent_id && state.attempt_sequence == task.attempt_sequence
+    })?;
+    let payload = serde_json::from_str::<StoredReviewProgressPayload>(&event.payload_json).ok()?;
+    if payload.attempt_sequence != task.attempt_sequence
+        || payload.summary.is_empty()
+        || payload.summary.chars().count() > MAX_TOOL_TEXT_CHARS
+        || payload.summary.contains('\0')
+        || payload.counters.as_ref().is_some_and(|counters| {
+            counters.len() > 16
+                || counters.iter().any(|(key, value)| {
+                    key.is_empty()
+                        || key.len() > MAX_TOOL_ID_BYTES
+                        || !key
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+                        || *value > 1_000_000_000
+                })
+        })
+    {
+        return None;
+    }
+    let last_progress_at = u64::try_from(payload.updated_at).ok()?;
+    Some(ProjectedReviewProgress {
+        stage: payload.stage,
+        summary: payload.summary,
+        counters: payload.counters,
+        last_progress_at,
+        semantic_idle_ms: wall_now_ms.saturating_sub(last_progress_at),
+        nudge_sent: state.nudge_sent,
+    })
+}
+
+fn wall_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn public_pending_request_id(event: &StoredEvent) -> Option<String> {

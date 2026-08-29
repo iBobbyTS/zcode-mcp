@@ -363,6 +363,70 @@ fn submit_general_fixture(
     (repository, agent_id)
 }
 
+fn running_review_progress_fixture(fixture: &Fixture, name: &str) -> (String, String, u64) {
+    let (repository, prepared_owner) = submit_general_fixture(
+        fixture,
+        &format!("progress-prepared-{name}"),
+        "feature-progress-prepared",
+        "owner-progress-prepared",
+    );
+    let prepared_owner_task = fixture.store.get_task(&prepared_owner).unwrap().unwrap();
+    let prepared_owner_job = fixture
+        .store
+        .get_job(&prepared_owner_task.execution_agent_id)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .request_stop(&prepared_owner_task.execution_agent_id)
+        .unwrap();
+    let execution_id = format!("progress-execution-{name}");
+    let public_id = format!("progress-public-{name}");
+    let runtime_id = format!("progress-runtime-{name}");
+    let mut job = NewJob::new(&execution_id, prepared_owner_job.workspace_path);
+    job.idempotency_key = Some(format!("progress-key-{name}"));
+    job.review_kind = Some("code".into());
+    job.prepared_launch_json = prepared_owner_job.prepared_launch_json;
+    job.prepared_launch_sha256 = prepared_owner_job.prepared_launch_sha256;
+    fixture
+        .store
+        .enqueue_task(&NewTask {
+            job,
+            public_agent_id: public_id.clone(),
+            task_kind: TaskKind::Review,
+            review_id: Some(format!("progress-review-{name}")),
+            continuation_of: None,
+            repository: repository.to_string_lossy().into_owned(),
+            feature_id: "feature-progress".into(),
+            ownership_token: "owner-progress".into(),
+            budget: BudgetRequest::Omitted,
+            retain_partial: false,
+        })
+        .unwrap();
+    let claim = fixture
+        .store
+        .claim_next("progress-daemon", 4, 4)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.job.agent_id, execution_id);
+    fixture
+        .store
+        .mark_session_running(
+            &execution_id,
+            claim.owner_epoch,
+            &runtime_id,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    fixture
+        .store
+        .initialize_review_progress(&execution_id, 1, &runtime_id)
+        .unwrap();
+    (public_id, runtime_id, claim.owner_epoch)
+}
+
 fn request(request_id: &str, method: RpcMethod) -> RpcRequest {
     RpcRequest {
         version: RPC_VERSION,
@@ -918,6 +982,349 @@ fn s05_readiness_is_bounded_and_artifact_chunks_are_verified() {
             .code,
         RpcErrorCode::ResultInvalid
     );
+}
+
+#[test]
+fn v2_review_progress_exposes_the_existing_bounded_store_projection() {
+    let fixture = fixture();
+    let (agent_id, runtime_id, owner_epoch) = running_review_progress_fixture(&fixture, "base-gap");
+    let execution_id = fixture
+        .store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    let mut source_sequence = 1u64 << 62;
+    for (stage, summary, counters) in [
+        (
+            "inspection",
+            "inspected the bounded RPC owner",
+            r#"{"files":2,"findings":0}"#,
+        ),
+        (
+            "validation",
+            "validated the bounded RPC owner",
+            r#"{"checks":3}"#,
+        ),
+        (
+            "synthesis",
+            "synthesized the bounded RPC result",
+            r#"{"findings":0}"#,
+        ),
+    ] {
+        let mutation = fixture
+            .store
+            .record_review_progress_event(
+                &review_store::ReviewProgressWrite {
+                    agent_id: execution_id.clone(),
+                    attempt_sequence: 1,
+                    run_idempotency_key: runtime_id.clone(),
+                    stage: stage.into(),
+                    summary: summary.into(),
+                    counters_json: Some(counters.into()),
+                },
+                &runtime_id,
+                owner_epoch,
+                source_sequence,
+            )
+            .unwrap();
+        assert_eq!(
+            mutation.disposition,
+            review_store::ReviewProgressDisposition::Applied
+        );
+        source_sequence += 1;
+    }
+    let before_duplicate = fixture
+        .store
+        .review_progress(&execution_id)
+        .unwrap()
+        .unwrap();
+    let duplicate = fixture
+        .store
+        .record_review_progress_event(
+            &review_store::ReviewProgressWrite {
+                agent_id: execution_id.clone(),
+                attempt_sequence: 1,
+                run_idempotency_key: runtime_id.clone(),
+                stage: "synthesis".into(),
+                summary: "same-stage cosmetic change must be ignored".into(),
+                counters_json: Some(r#"{"findings":999}"#.into()),
+            },
+            &runtime_id,
+            owner_epoch,
+            source_sequence,
+        )
+        .unwrap();
+    assert_eq!(
+        duplicate.disposition,
+        review_store::ReviewProgressDisposition::Duplicate
+    );
+    assert_eq!(duplicate.state.updated_at, before_duplicate.updated_at);
+
+    let page = match fixture
+        .service
+        .dispatch(RpcMethod::TaskEvents(TaskEventQuery {
+            agent_id: agent_id.clone(),
+            after: 0,
+            limit: 100,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskEvents { page } => page,
+        other => panic!("unexpected progress event page: {other:?}"),
+    };
+    assert_eq!(page.next_sequence, 4);
+    assert_eq!(
+        page.events
+            .iter()
+            .filter_map(|event| event.stage)
+            .collect::<Vec<_>>(),
+        vec![
+            TaskReviewProgressStage::Inspection,
+            TaskReviewProgressStage::Validation,
+            TaskReviewProgressStage::Synthesis,
+        ]
+    );
+    let event = page
+        .events
+        .iter()
+        .find(|event| event.stage == Some(TaskReviewProgressStage::Inspection))
+        .unwrap();
+    let public = serde_json::to_value(event).unwrap();
+    assert_eq!(public["stage"], "inspection");
+    assert_eq!(public["summary"], "inspected the bounded RPC owner");
+    assert_eq!(
+        public["counters"],
+        serde_json::json!({"files":2,"findings":0})
+    );
+    assert!(public["last_progress_at"].as_u64().is_some());
+    assert!(public["semantic_idle_ms"].as_u64().is_some());
+    assert_eq!(public["nudge_sent"], false);
+    let wait_page = match fixture
+        .service
+        .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: agent_id.clone(),
+            after: 1,
+            timeout_ms: 10,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskWait {
+            page, timed_out, ..
+        } => {
+            assert!(!timed_out);
+            page
+        }
+        other => panic!("unexpected progress event wait: {other:?}"),
+    };
+    assert_eq!(
+        wait_page.events[0].stage,
+        Some(TaskReviewProgressStage::Inspection)
+    );
+    assert_eq!(
+        wait_page.events[0].summary.as_deref(),
+        Some("inspected the bounded RPC owner")
+    );
+    let attempt_started = serde_json::to_value(&page.events[0]).unwrap();
+    for field in [
+        "stage",
+        "summary",
+        "counters",
+        "last_progress_at",
+        "semantic_idle_ms",
+        "nudge_sent",
+    ] {
+        assert!(
+            attempt_started.get(field).is_none(),
+            "attempt leaked {field}"
+        );
+    }
+
+    let synthesis = page
+        .events
+        .iter()
+        .find(|event| event.stage == Some(TaskReviewProgressStage::Synthesis))
+        .unwrap()
+        .clone();
+    thread::sleep(Duration::from_millis(5));
+    assert!(fixture
+        .store
+        .claim_review_progress_nudge(&execution_id)
+        .unwrap());
+    let reread = match fixture
+        .service
+        .dispatch(RpcMethod::TaskEvents(TaskEventQuery {
+            agent_id: agent_id.clone(),
+            after: 0,
+            limit: 100,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskEvents { page } => page,
+        other => panic!("unexpected reread progress page: {other:?}"),
+    };
+    assert_eq!(reread.next_sequence, page.next_sequence);
+    let synthesis_reread = reread
+        .events
+        .iter()
+        .find(|event| event.sequence == synthesis.sequence)
+        .unwrap();
+    assert_eq!(synthesis_reread.stage, synthesis.stage);
+    assert_eq!(synthesis_reread.summary, synthesis.summary);
+    assert_eq!(synthesis_reread.counters, synthesis.counters);
+    assert_eq!(
+        synthesis_reread.last_progress_at,
+        synthesis.last_progress_at
+    );
+    assert!(synthesis_reread.semantic_idle_ms >= synthesis.semantic_idle_ms);
+    assert_eq!(synthesis.nudge_sent, Some(false));
+    assert_eq!(synthesis_reread.nudge_sent, Some(true));
+
+    match fixture
+        .service
+        .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id,
+            after: reread.next_sequence,
+            timeout_ms: 10,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskWait {
+            page, timed_out, ..
+        } => {
+            assert!(timed_out);
+            assert!(page.events.is_empty());
+            assert_eq!(page.next_sequence, 4);
+        }
+        other => panic!("unexpected progress snapshot wait: {other:?}"),
+    }
+}
+
+#[test]
+fn v2_review_progress_fail_closes_the_whole_group_without_losing_event_identity() {
+    let fixture = fixture();
+    let (agent_id, runtime_id, owner_epoch) =
+        running_review_progress_fixture(&fixture, "invalid-payloads");
+    let execution_id = fixture
+        .store
+        .get_task(&agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    let future_timestamp = wall_now_millis().saturating_add(60_000);
+    let payloads = [
+        "{".to_owned(),
+        serde_json::json!({
+            "stage":"inspection","summary":"negative counter","counters":{"files":-1},
+            "attempt_sequence":1,"updated_at":1
+        })
+        .to_string(),
+        r#"{"stage":"inspection","summary":"overflow counter","counters":{"files":18446744073709551616},"attempt_sequence":1,"updated_at":1}"#.into(),
+        serde_json::json!({
+            "stage":"inspection","summary":"wrong attempt","counters":{"files":1},
+            "attempt_sequence":2,"updated_at":1
+        })
+        .to_string(),
+        serde_json::json!({
+            "stage":"inspection","summary":"contains private data","counters":{"files":1},
+            "attempt_sequence":1,"updated_at":1,"private_path":"/secret/path"
+        })
+        .to_string(),
+        serde_json::json!({
+            "stage":"inspection","summary":"negative timestamp","counters":{"files":1},
+            "attempt_sequence":1,"updated_at":-1
+        })
+        .to_string(),
+    ];
+    for (index, payload_json) in payloads.into_iter().enumerate() {
+        fixture
+            .store
+            .append_lifecycle(&LifecycleWrite {
+                agent_id: execution_id.clone(),
+                runtime_agent_id: runtime_id.clone(),
+                owner_epoch,
+                source_sequence: 100 + index as u64,
+                event_type: "review.progress".into(),
+                turn_id: None,
+                payload_json,
+                redaction_level: "allowlisted".into(),
+                terminal: None,
+                turn_state: None,
+            })
+            .unwrap();
+    }
+    fixture
+        .store
+        .append_lifecycle(&LifecycleWrite {
+            agent_id: execution_id,
+            runtime_agent_id: runtime_id,
+            owner_epoch,
+            source_sequence: 200,
+            event_type: "review.progress".into(),
+            turn_id: None,
+            payload_json: serde_json::json!({
+                "stage":"inspection","summary":"future clock skew","counters":{"files":1},
+                "attempt_sequence":1,"updated_at":future_timestamp
+            })
+            .to_string(),
+            redaction_level: "allowlisted".into(),
+            terminal: None,
+            turn_state: None,
+        })
+        .unwrap();
+
+    let page = match fixture
+        .service
+        .dispatch(RpcMethod::TaskEvents(TaskEventQuery {
+            agent_id,
+            after: 0,
+            limit: 100,
+        }))
+        .unwrap()
+    {
+        RpcSuccess::TaskEvents { page } => page,
+        other => panic!("unexpected malformed progress page: {other:?}"),
+    };
+    for source_sequence in 100..106 {
+        let event = page
+            .events
+            .iter()
+            .find(|event| event.source_sequence == source_sequence)
+            .unwrap();
+        assert_eq!(event.event_type, "review_progress");
+        assert!(event.stage.is_none());
+        assert!(event.summary.is_none());
+        assert!(event.counters.is_none());
+        assert!(event.last_progress_at.is_none());
+        assert!(event.semantic_idle_ms.is_none());
+        assert!(event.nudge_sent.is_none());
+        let serialized = serde_json::to_value(event).unwrap();
+        for field in [
+            "stage",
+            "summary",
+            "counters",
+            "last_progress_at",
+            "semantic_idle_ms",
+            "nudge_sent",
+        ] {
+            assert!(
+                serialized.get(field).is_none(),
+                "malformed event exposed {field}"
+            );
+        }
+        assert_eq!(serialized["payload_json"], "{}");
+    }
+    let future = page
+        .events
+        .iter()
+        .find(|event| event.source_sequence == 200)
+        .unwrap();
+    assert_eq!(future.last_progress_at, Some(future_timestamp));
+    assert_eq!(future.semantic_idle_ms, Some(0));
+    assert_eq!(future.nudge_sent, Some(false));
+    assert!(!serde_json::to_string(&page)
+        .unwrap()
+        .contains("/secret/path"));
 }
 
 #[test]
