@@ -14,20 +14,29 @@ if (!configPath || configPath.startsWith('--')) process.exit(2);
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const events = config?.hooks?.events ?? {};
 assert.equal(config?.hooks?.enabled, true, 'hooks are disabled');
+const expectedScripts = {
+  PreToolUse: path.join(pluginRoot, 'review-bash-hook', 'hooks', 'check-bash-readonly.mjs'),
+  PostToolUse: path.join(pluginRoot, 'review-bash-hook', 'hooks', 'audit-bash-result.mjs'),
+  PostToolUseFailure: path.join(pluginRoot, 'review-bash-hook', 'hooks', 'audit-bash-result.mjs'),
+};
 const entries = {};
 for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
-  entries[event] = events[event]?.find((entry) => entry.matcher === 'Bash' && entry.description === `review-bash-hook:${event}`);
-  assert.ok(entries[event], `missing ${event} hook`);
+  const bashEntries = Array.isArray(events[event])
+    ? events[event].filter((entry) => entry?.matcher === 'Bash')
+    : [];
+  assert.equal(bashEntries.length, 1, `${event} must contain one Bash hook`);
+  entries[event] = bashEntries[0];
+  assert.equal(Object.hasOwn(entries[event], 'description'), false, `${event} description is not supported by ZCode 0.16.5`);
   assert.equal(entries[event].hooks?.length, 1, `${event} hook shape changed`);
   assert.equal(entries[event].hooks[0].command, process.execPath, `${event} command changed`);
   assert.equal(entries[event].hooks[0].args?.length, 1, `${event} args changed`);
+  assert.equal(entries[event].hooks[0].args[0], expectedScripts[event], `${event} wrapper changed`);
 }
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-preflight-'));
 fs.writeFileSync(path.join(root, 'README.md'), 'safe\n');
 const canary = path.join(root, 'canary');
 fs.writeFileSync(canary, 'unchanged\n');
 const guardWrapper = entries.PreToolUse.hooks[0].args[0];
-assert.equal(guardWrapper, path.join(pluginRoot, 'review-bash-hook', 'hooks', 'check-bash-readonly.mjs'));
 const run = (command) => spawnSync(entries.PreToolUse.hooks[0].command, [guardWrapper], {
   input: `${JSON.stringify({ tool_name: 'Bash', cwd: root, tool_input: { command } })}\n`, encoding: 'utf8',
 });

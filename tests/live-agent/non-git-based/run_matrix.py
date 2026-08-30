@@ -64,6 +64,16 @@ from fixture_workspace import (
 DEFAULT_RUNTIME = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
 DEFAULT_PACK = Path.home() / "Desktop/audit-pack/zcode-mcp-official-runtime-conformance.zip"
 EXPECTED_RUNTIME_VERSION = "3.10.1"
+# Observed on the local ZCode 0.16.5 client: descriptions and duplicate Bash
+# matchers are rejected during session bootstrap.  Keep this operational fact
+# in the evidence pack rather than treating the old marker-based shape as a
+# product contract.
+OBSERVED_ZCODE_HOOK_COMPATIBILITY = {
+    "client_version": "0.16.5",
+    "required_shape": "one Bash matcher per supported event; no description field",
+    "correction": "replace legacy Bash entries with the current wrapper and preserve unrelated non-Bash hooks",
+    "evidence_source": "local app-server session/create probe",
+}
 CASE_C_BUDGET = {
     "wall_time_ms": 1_800_000,
     "semantic_soft_timeout_ms": 120_000,
@@ -1008,6 +1018,47 @@ def _runtime_version(path: Path) -> str | None:
     return str(value) if value is not None else None
 
 
+def _assert_zcode_016_hook_config(config: Path, provenance: Path) -> None:
+    """Read-only assertion for the ZCode 0.16.5 Hook configuration shape."""
+    try:
+        config_value = json.loads(config.read_text(encoding="utf-8"))
+        provenance_value = json.loads(provenance.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise InfrastructureConformanceError("installed Hook config/provenance is unreadable") from error
+    events = config_value.get("hooks", {}).get("events")
+    if not isinstance(events, dict):
+        raise InfrastructureConformanceError("installed Hook config omitted events")
+    expected_scripts = {
+        "PreToolUse": provenance_value.get("effective_guard_wrapper_path"),
+        "PostToolUse": provenance_value.get("effective_audit_wrapper_path"),
+        "PostToolUseFailure": provenance_value.get("effective_audit_wrapper_path"),
+    }
+    for event, expected_script in expected_scripts.items():
+        entries = events.get(event)
+        if not isinstance(entries, list) or not isinstance(expected_script, str):
+            raise InfrastructureConformanceError(f"installed Hook config omitted {event}")
+        bash_entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("matcher") == "Bash"]
+        if len(bash_entries) != 1:
+            raise InfrastructureConformanceError(f"ZCode 0.16.5 requires one Bash matcher for {event}")
+        entry = bash_entries[0]
+        if "description" in entry:
+            raise InfrastructureConformanceError(f"ZCode 0.16.5 does not accept Hook descriptions for {event}")
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
+            raise InfrastructureConformanceError(f"installed Hook shape changed for {event}")
+        hook = hooks[0]
+        if (
+            hook.get("type") != "process"
+            or Path(str(hook.get("command", ""))).name != "node"
+            or hook.get("timeoutMs") != 5000
+            or hook.get("args") != [expected_script]
+            or Path(expected_script).name == "check-bash-status.mjs"
+        ):
+            raise InfrastructureConformanceError(f"installed Hook wrapper changed for {event}")
+    if provenance_value.get("effective_config_sha256") != _sha256(config):
+        raise InfrastructureConformanceError("Hook config digest disagrees with provenance")
+
+
 def _prepare_verified_hook(run_root: Path) -> tuple[Path, Callable[[], dict[str, Any]], dict[str, Any]]:
     """Install the repository Hook into HOME for one run, then restore bytes."""
     home = Path.home()
@@ -1052,6 +1103,7 @@ def _prepare_verified_hook(run_root: Path) -> tuple[Path, Callable[[], dict[str,
         value = json.loads(provenance.read_text(encoding="utf-8"))
         if value.get("hook_activation_verified") is not True:
             raise InfrastructureConformanceError("Hook preflight did not produce verified provenance")
+        _assert_zcode_016_hook_config(config, provenance)
         return provenance, restore, {"sha256": _sha256(provenance), "backup": {"cli_config": hashlib.sha256(backups[config][1]).hexdigest() if backups[config][0] else None, "legacy_hook": hashlib.sha256(backups[old_hook][1]).hexdigest() if backups[old_hook][0] else None}}
     except Exception:
         restore()
@@ -1625,6 +1677,7 @@ def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, An
         "case_conclusions": conclusions,
         "public_catalog_exact": catalog.get("exact"),
         "readiness": (readiness.get("readiness") or {}).get("probe_result") if isinstance(readiness.get("readiness"), Mapping) else None,
+        "observed_hook_compatibility": OBSERVED_ZCODE_HOOK_COMPATIBILITY,
     }
     reports: dict[str, str] = {
         "SUMMARY.md": f"{titles['SUMMARY.md']}\n\nOverall: `{overall}`\n\n{_json_block(summary)}\n",
@@ -1822,6 +1875,7 @@ def main(argv: list[str] | None = None) -> int:
             "checksums_sha256": _sha256(hook_checksums),
             "binding": "repository_candidate_only_until_public_review_provenance",
         },
+        "observed_hook_compatibility": OBSERVED_ZCODE_HOOK_COMPATIBILITY,
         "service_socket": str(socket),
         "public_api_mode": env["ZCODE_PUBLIC_API_MODE"],
         "runtime_candidate_exported_to_facade": env["ZCODE_RUNTIME_PATH"],

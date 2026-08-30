@@ -22,6 +22,7 @@ from run_matrix import (
     _fixture_postflight,
     _fixture_preflight,
     _overall_result,
+    _assert_zcode_016_hook_config,
     _classify_readiness,
     _run_case_a_hook_canary,
     _assert_event_contract,
@@ -73,6 +74,33 @@ class S02Tests(unittest.TestCase):
             cleanup = daemon.cleanup()
             self.assertTrue(cleanup["reaped"])
             self.assertFalse(Path(d, "run").exists())
+
+    def test_zcode_016_hook_config_assertion_is_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            provenance = root / "provenance.json"
+            guard = root / "check-bash-readonly.mjs"
+            audit = root / "audit-bash-result.mjs"
+            config.write_text(json.dumps({
+                "unrelated": {"keep": True},
+                "hooks": {"enabled": True, "events": {
+                    "PreToolUse": [
+                        {"matcher": "Other", "hooks": [{"type": "process", "command": "other"}]},
+                        {"matcher": "Bash", "hooks": [{"type": "process", "command": "node", "args": [str(guard)], "timeoutMs": 5000}]},
+                    ],
+                    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "process", "command": "node", "args": [str(audit)], "timeoutMs": 5000}]}],
+                    "PostToolUseFailure": [{"matcher": "Bash", "hooks": [{"type": "process", "command": "node", "args": [str(audit)], "timeoutMs": 5000}]}],
+                }},
+            }), encoding="utf-8")
+            provenance.write_text(json.dumps({
+                "effective_guard_wrapper_path": str(guard),
+                "effective_audit_wrapper_path": str(audit),
+                "effective_config_sha256": _sha256(config),
+            }), encoding="utf-8")
+            before = config.read_bytes()
+            _assert_zcode_016_hook_config(config, provenance)
+            self.assertEqual(config.read_bytes(), before)
 
     def test_owned_daemon_launches_private_paths_and_reaps(self):
         with tempfile.TemporaryDirectory() as d:

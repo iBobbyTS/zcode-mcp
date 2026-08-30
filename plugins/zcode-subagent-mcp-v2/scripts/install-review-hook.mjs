@@ -42,14 +42,15 @@ const events = {
 };
 for (const [event, { script }] of Object.entries(events)) {
   const existing = Array.isArray(next.hooks.events[event]) ? next.hooks.events[event] : [];
-  const marker = `review-bash-hook:${event}`;
   const entry = {
     matcher: 'Bash',
     hooks: [{ type: 'process', command: process.execPath, args: [path.join(hookRoot, 'hooks', script)], timeoutMs: 5000 }],
-    description: marker,
   };
-  const withoutMarker = existing.filter((candidate) => candidate?.description !== marker);
-  next.hooks.events[event] = [...withoutMarker, entry];
+  // ZCode 0.16.5 accepts one Bash matcher per event and rejects the
+  // description field.  Replace all existing Bash entries (including the
+  // legacy check-bash-status wrapper) while preserving unrelated matchers.
+  const unrelated = existing.filter((candidate) => candidate?.matcher !== 'Bash');
+  next.hooks.events[event] = [...unrelated, entry];
 }
 atomicWrite(configPath, next);
 

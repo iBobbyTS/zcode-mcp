@@ -18,7 +18,18 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-install-'));
   const config = path.join(directory, 'config.json');
   const provenance = path.join(directory, 'provenance.json');
-  fs.writeFileSync(config, JSON.stringify({ unrelated: { keep: true }, hooks: { events: { Other: [{ matcher: 'Other' }] } } }));
+  fs.writeFileSync(config, JSON.stringify({
+    unrelated: { keep: true },
+    hooks: {
+      events: {
+        Other: [{ matcher: 'Other' }],
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: ['/old/check-bash-status.mjs'], timeoutMs: 5000 }] },
+          { matcher: 'Bash', description: 'legacy marker', hooks: [{ type: 'process', command: 'node', args: ['/old/other.mjs'], timeoutMs: 5000 }] },
+        ],
+      },
+    },
+  }));
 
   const install = run(installScript, ['--config', config, '--provenance', provenance]);
   assert.equal(install.status, 0, install.stderr);
@@ -26,6 +37,16 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   assert.deepEqual(installed.unrelated, { keep: true });
   assert.deepEqual(installed.hooks.events.Other, [{ matcher: 'Other' }]);
   assert.equal(installed.hooks.enabled, true);
+  for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
+    const bashEntries = installed.hooks.events[event].filter((entry) => entry.matcher === 'Bash');
+    assert.equal(bashEntries.length, 1);
+    assert.equal(Object.hasOwn(bashEntries[0], 'description'), false);
+    assert.equal(bashEntries[0].hooks.length, 1);
+    assert.equal(bashEntries[0].hooks[0].args[0].endsWith(event === 'PreToolUse' ? 'check-bash-readonly.mjs' : 'audit-bash-result.mjs'), true);
+  }
+  const installedBytes = fs.readFileSync(config);
+  assert.equal(run(installScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.deepEqual(fs.readFileSync(config), installedBytes);
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 1);
 
   const preflight = run(preflightScript, ['--config', config, '--provenance', provenance]);
@@ -34,7 +55,7 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
 
   const driftedConfig = JSON.parse(fs.readFileSync(config, 'utf8'));
   for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
-    const entry = driftedConfig.hooks.events[event].find((candidate) => candidate.description === `review-bash-hook:${event}`);
+    const entry = driftedConfig.hooks.events[event].find((candidate) => candidate.matcher === 'Bash');
     entry.hooks[0].args = ['/usr/bin/true'];
   }
   fs.writeFileSync(config, JSON.stringify(driftedConfig));

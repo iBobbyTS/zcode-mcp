@@ -24,12 +24,16 @@ const expectedScripts = {
   PostToolUseFailure: path.join(hookRoot, 'hooks', 'audit-bash-result.mjs'),
 };
 const events = config?.hooks?.events ?? {};
-const active = config?.hooks?.enabled === true && Object.entries(expectedScripts).every(([event, expectedScript]) =>
-  Array.isArray(events[event]) && events[event].some((entry) =>
-    entry.matcher === 'Bash' && entry.description === `review-bash-hook:${event}` &&
+const active = config?.hooks?.enabled === true && Object.entries(expectedScripts).every(([event, expectedScript]) => {
+  if (!Array.isArray(events[event])) return false;
+  const bashEntries = events[event].filter((entry) => entry?.matcher === 'Bash');
+  if (bashEntries.length !== 1) return false;
+  const [entry] = bashEntries;
+  return !Object.hasOwn(entry, 'description') &&
     entry.hooks?.length === 1 && entry.hooks[0].type === 'process' &&
     entry.hooks[0].command === process.execPath && entry.hooks[0].timeoutMs === 5000 &&
-    entry.hooks[0].args?.length === 1 && entry.hooks[0].args[0] === expectedScript));
+    entry.hooks[0].args?.length === 1 && entry.hooks[0].args[0] === expectedScript;
+});
 const hashFile = (file) => {
   try { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); } catch { return null; }
 };

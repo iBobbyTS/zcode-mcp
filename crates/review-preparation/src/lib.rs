@@ -199,40 +199,45 @@ fn config_event_references(config: &serde_json::Value, event: &str, expected_pat
         .pointer(&format!("/hooks/events/{event}"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                let hook = entry
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_array)
-                    .filter(|hooks| hooks.len() == 1)
-                    .and_then(|hooks| hooks.first());
-                let command = hook
-                    .and_then(|hook| hook.get("command"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|command| {
-                        PathBuf::from(command)
-                            .file_name()
-                            .map(|name| name.to_owned())
-                    });
-                entry.get("matcher").and_then(serde_json::Value::as_str) == Some("Bash")
-                    && entry.get("description").and_then(serde_json::Value::as_str)
-                        == Some(&format!("review-bash-hook:{event}"))
-                    && hook
-                        .and_then(|hook| hook.get("type"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("process")
-                    && hook
-                        .and_then(|hook| hook.get("timeoutMs"))
-                        .and_then(serde_json::Value::as_u64)
-                        == Some(5_000)
-                    && command.as_deref().is_some_and(|name| name == "node")
-                    && hook
-                        .and_then(|hook| hook.get("args"))
+            let bash_entries = entries
+                .iter()
+                .filter(|entry| {
+                    entry.get("matcher").and_then(serde_json::Value::as_str) == Some("Bash")
+                })
+                .collect::<Vec<_>>();
+            bash_entries.len() == 1
+                && bash_entries.into_iter().all(|entry| {
+                    let hook = entry
+                        .get("hooks")
                         .and_then(serde_json::Value::as_array)
-                        .filter(|args| args.len() == 1)
-                        .and_then(|args| args.first())
+                        .filter(|hooks| hooks.len() == 1)
+                        .and_then(|hooks| hooks.first());
+                    let command = hook
+                        .and_then(|hook| hook.get("command"))
                         .and_then(serde_json::Value::as_str)
-                        == Some(expected_path)
-            })
+                        .and_then(|command| {
+                            PathBuf::from(command)
+                                .file_name()
+                                .map(|name| name.to_owned())
+                        });
+                    entry.get("description").is_none()
+                        && hook
+                            .and_then(|hook| hook.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("process")
+                        && hook
+                            .and_then(|hook| hook.get("timeoutMs"))
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(5_000)
+                        && command.as_deref().is_some_and(|name| name == "node")
+                        && hook
+                            .and_then(|hook| hook.get("args"))
+                            .and_then(serde_json::Value::as_array)
+                            .filter(|args| args.len() == 1)
+                            .and_then(|args| args.first())
+                            .and_then(serde_json::Value::as_str)
+                            == Some(expected_path)
+                })
         })
 }
 
@@ -386,3 +391,60 @@ impl From<serde_json::Error> for PreparationError {
 }
 
 pub type PreparationResult<T> = Result<T, PreparationError>;
+
+#[cfg(test)]
+mod hook_config_tests {
+    use super::config_event_references;
+    use serde_json::json;
+
+    fn event_entry(path: &str) -> serde_json::Value {
+        json!({
+            "matcher": "Bash",
+            "hooks": [{
+                "type": "process",
+                "command": "node",
+                "args": [path],
+                "timeoutMs": 5000
+            }]
+        })
+    }
+
+    #[test]
+    fn accepts_zcode_016_description_free_single_bash_entry() {
+        let config = json!({
+            "hooks": {"events": {
+                "PreToolUse": [
+                    {"matcher": "Other", "hooks": []},
+                    event_entry("/hooks/check-bash-readonly.mjs")
+                ]
+            }}
+        });
+        assert!(config_event_references(
+            &config,
+            "PreToolUse",
+            "/hooks/check-bash-readonly.mjs"
+        ));
+    }
+
+    #[test]
+    fn rejects_description_or_duplicate_bash_entries() {
+        let mut described = event_entry("/hooks/check-bash-readonly.mjs");
+        described["description"] = json!("review-bash-hook:PreToolUse");
+        let config = json!({"hooks": {"events": {"PreToolUse": [described]}}});
+        assert!(!config_event_references(
+            &config,
+            "PreToolUse",
+            "/hooks/check-bash-readonly.mjs"
+        ));
+
+        let config = json!({"hooks": {"events": {"PreToolUse": [
+            event_entry("/hooks/check-bash-readonly.mjs"),
+            event_entry("/hooks/check-bash-readonly.mjs")
+        ]}}});
+        assert!(!config_event_references(
+            &config,
+            "PreToolUse",
+            "/hooks/check-bash-readonly.mjs"
+        ));
+    }
+}
