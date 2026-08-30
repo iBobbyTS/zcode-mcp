@@ -1149,7 +1149,7 @@ _PACK_ROOT_FILES: dict[str, tuple[re.Pattern[str], ...]] = {
     "fixtures": (re.compile(r"case-[0-9a-z-]+(?:-manifest)?\.json$"),),
     "normalized": (re.compile(r"(?:identity|catalog|readiness|case-[0-9a-z-]+)\.json$"),),
     "raw-transcripts": (re.compile(r"mcp\.jsonl$"),),
-    "redacted-logs": (re.compile(r"(?:fatal|case-[0-9a-z-]+)\.json$"),),
+    "redacted-logs": (re.compile(r"(?:fatal|owned-daemon|case-[0-9a-z-]+)\.json$"),),
 }
 
 

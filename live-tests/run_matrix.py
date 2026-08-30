@@ -168,6 +168,27 @@ class OwnedDaemon:
             shutil.rmtree(self.root)
         return {"owned": True, "reaped": reaped, "socket_removed": not self.socket.exists(), "store_removed": not self.database.exists()}
 
+    def copy_log(self, destination: Path) -> dict[str, Any]:
+        """Copy a redacted daemon log before deleting the private run root."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not self.log_path.is_file():
+            destination.write_text(
+                json.dumps({"present": False, "log": "daemon log was not created"}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return {"present": False, "sha256": _sha256(destination)}
+        try:
+            raw = self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise InfrastructureConformanceError(
+                f"owned daemon log could not be read: {type(exc).__name__}"
+            ) from exc
+        destination.write_text(
+            json.dumps({"present": True, "log": redact(raw)}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return {"present": True, "sha256": _sha256(destination)}
+
 
 def _sha256(path: Path) -> str | None:
     try:
@@ -1606,7 +1627,9 @@ def main(argv: list[str] | None = None) -> int:
     # The harness always chooses a private socket for an owned daemon.  The
     # legacy --socket option remains accepted for callers, but is constrained
     # beneath this run's private root to prevent accidental user-daemon reuse.
-    run_root = Path(tempfile.mkdtemp(prefix="official-runtime-conformance-", dir=str(output)))
+    # Keep the private socket well below macOS' Unix-domain SUN_LEN limit.
+    # mkdtemp creates this harness-owned directory with mode 0700.
+    run_root = Path(tempfile.mkdtemp(prefix="zcode-rt-"))
     requested_socket = args.socket.resolve() if args.socket else None
     env = dict(os.environ)
     socket = run_root / "reviewd.sock"
@@ -1776,6 +1799,9 @@ def main(argv: list[str] | None = None) -> int:
                 stream.write(json.dumps({"direction": "harness", "payload": {"transport": "not_initialized", "fatal": type(fatal).__name__ if fatal else None}}, sort_keys=True) + "\n")
         for transport in transports:
             transport.close()
+        identity["owned_daemon_log"] = owned_daemon.copy_log(
+            output / "redacted-logs/owned-daemon.json"
+        )
         cleanup = owned_daemon.cleanup()
         identity["owned_daemon_cleanup"] = cleanup
         _write_json(output / "normalized/identity.json", identity)

@@ -65,6 +65,19 @@ class S02Tests(unittest.TestCase):
             cleanup = daemon.cleanup()
             self.assertTrue(cleanup["reaped"])
             self.assertFalse(root.exists())
+
+    def test_owned_daemon_copies_log_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(tempfile.mkdtemp(prefix="zcode-rt-"))
+            daemon = OwnedDaemon(None, Path(d) / "runtime.cjs", root, 0.1)
+            daemon.log_root.mkdir()
+            daemon.log_path.write_text("socket=/Users/alice/private/reviewd.sock\n")
+            destination = Path(d) / "redacted-logs/owned-daemon.json"
+            evidence = daemon.copy_log(destination)
+            self.assertTrue(evidence["present"])
+            self.assertNotIn("/Users/alice", destination.read_text())
+            daemon.cleanup()
+            self.assertTrue(destination.is_file())
     def _valid_pack_source(self, root: Path) -> Path:
         source = root / "pack"
         source.mkdir()
@@ -637,7 +650,9 @@ class S02Tests(unittest.TestCase):
             binary.write_text("facade")
             runtime.write_text("runtime")
             output, pack_path = temp / "output", temp / "pack.zip"
-            with patch("run_matrix.StdioMCPTransport", FakeFacadeTransport), patch(
+            with patch.dict("os.environ", {"ZCODE_REVIEWD_PATH": str(temp / "missing-reviewd")}, clear=False), patch(
+                "run_matrix.StdioMCPTransport", FakeFacadeTransport
+            ), patch(
                 "run_matrix._runtime_version", return_value="3.10.1"
             ):
                 exit_code = main([
