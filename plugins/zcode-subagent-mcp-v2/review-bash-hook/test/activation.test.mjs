@@ -25,7 +25,7 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
         Other: [{ matcher: 'Other' }],
         PreToolUse: [
           { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: ['/old/check-bash-status.mjs'], timeoutMs: 5000 }] },
-          { matcher: 'Bash', description: 'legacy marker', hooks: [{ type: 'process', command: 'node', args: ['/old/other.mjs'], timeoutMs: 5000 }] },
+          { matcher: 'Bash', description: 'review-bash-hook:PreToolUse', hooks: [{ type: 'process', command: 'node', args: ['/old/other.mjs'], timeoutMs: 5000 }] },
         ],
       },
     },
@@ -62,7 +62,8 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 1);
   assert.notEqual(run(preflightScript, ['--config', config, '--provenance', provenance]).status, 0);
 
-  assert.equal(run(installScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.notEqual(run(installScript, ['--config', config, '--provenance', provenance]).status, 0);
+  fs.writeFileSync(config, installedBytes);
   assert.equal(run(preflightScript, ['--config', config, '--provenance', provenance]).status, 0);
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 0);
 
@@ -92,4 +93,29 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   tampered.effective_hook_path = path.join(directory, 'missing-hook.mjs');
   fs.writeFileSync(provenance, JSON.stringify(tampered));
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 1);
+});
+
+test('fails closed without changing config when an unknown Bash hook is present', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-unknown-'));
+  const config = path.join(directory, 'config.json');
+  const provenance = path.join(directory, 'provenance.json');
+  const original = {
+    hooks: {
+      enabled: true,
+      events: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: ['/user/custom-bash-hook.mjs'], timeoutMs: 5000 }] },
+          { matcher: 'Other', hooks: [] },
+        ],
+      },
+    },
+  };
+  fs.writeFileSync(config, JSON.stringify(original, null, 2));
+  const before = fs.readFileSync(config);
+  const result = run(installScript, ['--config', config, '--provenance', provenance]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unknown Bash hook/);
+  assert.deepEqual(fs.readFileSync(config), before);
+  assert.deepEqual(JSON.parse(fs.readFileSync(config, 'utf8')), original);
+  assert.equal(fs.existsSync(provenance), false);
 });

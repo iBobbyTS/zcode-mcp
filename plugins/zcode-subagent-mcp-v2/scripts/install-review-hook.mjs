@@ -40,14 +40,36 @@ const events = {
   PostToolUse: { script: 'audit-bash-result.mjs' },
   PostToolUseFailure: { script: 'audit-bash-result.mjs' },
 };
+
+function processHookArgs(candidate) {
+  if (!candidate || candidate.matcher !== 'Bash' || !Array.isArray(candidate.hooks)) return [];
+  return candidate.hooks
+    .filter((hook) => hook?.type === 'process' && Array.isArray(hook.args))
+    .flatMap((hook) => hook.args)
+    .filter((arg) => typeof arg === 'string');
+}
+
+function isRecognizedReviewHook(candidate, event, expectedScript) {
+  if (candidate?.matcher !== 'Bash') return false;
+  if (candidate.description === `review-bash-hook:${event}`) return true;
+  const args = processHookArgs(candidate);
+  return args.some((arg) => path.resolve(arg) === expectedScript || path.basename(arg) === 'check-bash-status.mjs');
+}
+
 for (const [event, { script }] of Object.entries(events)) {
   const existing = Array.isArray(next.hooks.events[event]) ? next.hooks.events[event] : [];
+  const expectedScript = path.join(hookRoot, 'hooks', script);
+  const bashEntries = existing.filter((candidate) => candidate?.matcher === 'Bash');
+  const unknownBashEntries = bashEntries.filter((candidate) => !isRecognizedReviewHook(candidate, event, expectedScript));
+  if (unknownBashEntries.length > 0) {
+    throw new Error(`${event} contains an unknown Bash hook; refusing to modify configuration`);
+  }
   const entry = {
     matcher: 'Bash',
-    hooks: [{ type: 'process', command: process.execPath, args: [path.join(hookRoot, 'hooks', script)], timeoutMs: 5000 }],
+    hooks: [{ type: 'process', command: process.execPath, args: [expectedScript], timeoutMs: 5000 }],
   };
   // ZCode 0.16.5 accepts one Bash matcher per event and rejects the
-  // description field.  Replace all existing Bash entries (including the
+  // description field. Replace only recognized review hooks (including the
   // legacy check-bash-status wrapper) while preserving unrelated matchers.
   const unrelated = existing.filter((candidate) => candidate?.matcher !== 'Bash');
   next.hooks.events[event] = [...unrelated, entry];
