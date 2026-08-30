@@ -1202,6 +1202,7 @@ def _call_case(
     *,
     facade_restart: Callable[[], tuple[PublicV2Client, Mapping[str, Any]]] | None = None,
     enforce_gates: bool = False,
+    provenance_path: Path | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {"case_id": manifest.get("case_id", case_dir.name), "calls": []}
     agent_id: str | None = None
@@ -1256,8 +1257,10 @@ def _call_case(
             provenance = spawned.get("provenance") if isinstance(spawned, Mapping) else None
             if not isinstance(provenance, Mapping):
                 raise InfrastructureConformanceError("Case A Hook provenance was not observed")
+            if provenance_path is None:
+                raise InfrastructureConformanceError("Case A Hook provenance path was not provided")
             evidence["hook_canary_gate"] = _run_case_a_hook_canary(
-                provenance, provenance_path=hook_provenance
+                provenance, provenance_path=provenance_path
             )
         # Permission requests are drained immediately after spawn/get, before
         # unrelated lifecycle calls.  Later pending events are drained by the
@@ -1991,6 +1994,7 @@ def main(argv: list[str] | None = None) -> int:
                 output / "normalized",
                 facade_restart=restart_facade if manifest.get("case_id") == "case-03-agent-control-lifecycle" else None,
                 enforce_gates=True,
+                provenance_path=hook_provenance,
             )
             _write_json(output / "normalized" / f"{manifest['case_id']}.json", evidence)
             for binding_name in ("spawn_identity_binding", "continuation_identity_binding"):
