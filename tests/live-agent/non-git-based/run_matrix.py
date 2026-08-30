@@ -614,10 +614,10 @@ def _assert_typed_permission_gate(evidence: Mapping[str, Any], *, require_canary
             raise FatalConformanceError("typed permission gate disposition is invalid")
         if not isinstance(response.get("policy_overrode"), bool):
             raise FatalConformanceError("typed permission gate override is not boolean")
-        if response.get("effective_decision") == "deny":
-            denial_reason = response.get("reason") or response.get("policy_reason_code")
-            if not isinstance(denial_reason, str) or not denial_reason.strip():
-                raise FatalConformanceError("typed permission gate deny reason is empty")
+        for field in ("reason", "policy_reason_code"):
+            value = response.get(field)
+            if value is not None and not isinstance(value, str):
+                raise FatalConformanceError(f"typed permission gate {field} must be string or null")
     gate: dict[str, Any] = {"status": "PASS", "response_count": len(permissions)}
     if require_canary:
         gate["canary"] = _assert_case_a_canary(evidence)

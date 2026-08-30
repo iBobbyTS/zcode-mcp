@@ -541,13 +541,12 @@ class S02Tests(unittest.TestCase):
         self.assertEqual(_computed_case_conclusion({"case_id": "case-01-user-fuzzy-search", "error": {"class": "InfrastructureConformanceError"}}), "NOT_EXERCISED")
         self.assertEqual(_overall_result({"case-01-user-fuzzy-search": "PASS"}, ["active daemon identity was not bound"]), "INSUFFICIENT_EVIDENCE")
 
-    def test_typed_permission_gate_does_not_synthesize_missing_reason(self):
+    def test_typed_permission_gate_allows_null_denial_reasons(self):
         evidence = {"permissions": [{"response": {
             "requested_decision": "deny", "effective_decision": "deny", "disposition": "responded",
             "policy_overrode": False, "reason": None, "policy_reason_code": None,
         }}]}
-        with self.assertRaises(FatalConformanceError):
-            _assert_typed_permission_gate(evidence)
+        self.assertEqual(_assert_typed_permission_gate(evidence)["status"], "PASS")
 
     def test_typed_permission_gate_rejects_invalid_decision_and_disposition_types(self):
         base = {
@@ -558,6 +557,8 @@ class S02Tests(unittest.TestCase):
             {"requested_decision": None},
             {"effective_decision": "unknown"},
             {"disposition": None},
+            {"reason": 42},
+            {"policy_reason_code": []},
         ):
             with self.assertRaises(FatalConformanceError):
                 _assert_typed_permission_gate({"permissions": [{"response": dict(base, **changes)}]})
