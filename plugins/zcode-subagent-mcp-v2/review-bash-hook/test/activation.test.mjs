@@ -18,13 +18,16 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-install-'));
   const config = path.join(directory, 'config.json');
   const provenance = path.join(directory, 'provenance.json');
+  const legacy = path.join(directory, 'legacy', 'check-bash-status.mjs');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.copyFileSync(path.join(pluginRoot, 'review-bash-hook', 'single-file', 'check-bash-status.mjs'), legacy);
   fs.writeFileSync(config, JSON.stringify({
     unrelated: { keep: true },
     hooks: {
       events: {
         Other: [{ matcher: 'Other' }],
         PreToolUse: [
-          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: ['/old/check-bash-status.mjs'], timeoutMs: 5000 }] },
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: [legacy], timeoutMs: 5000 }] },
           { matcher: 'Bash', description: 'review-bash-hook:PreToolUse', hooks: [{ type: 'process', command: 'node', args: ['/old/other.mjs'], timeoutMs: 5000 }] },
         ],
       },
@@ -117,5 +120,54 @@ test('fails closed without changing config when an unknown Bash hook is present'
   assert.match(result.stderr, /unknown Bash hook/);
   assert.deepEqual(fs.readFileSync(config), before);
   assert.deepEqual(JSON.parse(fs.readFileSync(config, 'utf8')), original);
+  assert.equal(fs.existsSync(provenance), false);
+});
+
+test('does not replace an unknown same-name Bash hook', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-same-name-'));
+  const config = path.join(directory, 'config.json');
+  const provenance = path.join(directory, 'provenance.json');
+  const customHook = path.join('/user/custom', 'check-bash-status.mjs');
+  const original = {
+    hooks: {
+      enabled: true,
+      events: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: [customHook], timeoutMs: 5000 }] },
+        ],
+      },
+    },
+  };
+  fs.writeFileSync(config, JSON.stringify(original, null, 2));
+  const before = fs.readFileSync(config);
+  const result = run(installScript, ['--config', config, '--provenance', provenance]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unknown Bash hook/);
+  assert.deepEqual(fs.readFileSync(config), before);
+  assert.equal(fs.existsSync(provenance), false);
+});
+
+test('does not treat the guard single-file as an audit hook', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-event-'));
+  const config = path.join(directory, 'config.json');
+  const provenance = path.join(directory, 'provenance.json');
+  const legacyHook = path.join(directory, 'check-bash-status.mjs');
+  fs.copyFileSync(path.join(pluginRoot, 'review-bash-hook', 'single-file', 'check-bash-status.mjs'), legacyHook);
+  const original = {
+    hooks: {
+      enabled: true,
+      events: {
+        PostToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: [legacyHook], timeoutMs: 5000 }] },
+        ],
+      },
+    },
+  };
+  fs.writeFileSync(config, JSON.stringify(original, null, 2));
+  const before = fs.readFileSync(config);
+  const result = run(installScript, ['--config', config, '--provenance', provenance]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /unknown Bash hook/);
+  assert.deepEqual(fs.readFileSync(config), before);
   assert.equal(fs.existsSync(provenance), false);
 });

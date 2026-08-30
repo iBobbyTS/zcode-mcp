@@ -35,6 +35,10 @@ const next = structuredClone(config);
 next.hooks ??= {};
 next.hooks.enabled = true;
 next.hooks.events ??= {};
+const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const canonicalSingleFile = path.join(hookRoot, 'single-file', 'check-bash-status.mjs');
+const canonicalSingleFileSize = fs.statSync(canonicalSingleFile).size;
+const canonicalSingleFileSha256 = hashFile(canonicalSingleFile);
 const events = {
   PreToolUse: { script: 'check-bash-readonly.mjs' },
   PostToolUse: { script: 'audit-bash-result.mjs' },
@@ -49,11 +53,27 @@ function processHookArgs(candidate) {
     .filter((arg) => typeof arg === 'string');
 }
 
+function hasCanonicalSingleFileContent(file) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() && stat.size === canonicalSingleFileSize && hashFile(file) === canonicalSingleFileSha256;
+  } catch {
+    return false;
+  }
+}
+
 function isRecognizedReviewHook(candidate, event, expectedScript) {
   if (candidate?.matcher !== 'Bash') return false;
   if (candidate.description === `review-bash-hook:${event}`) return true;
   const args = processHookArgs(candidate);
-  return args.some((arg) => path.resolve(arg) === expectedScript || path.basename(arg) === 'check-bash-status.mjs');
+  if (args.some((arg) => path.resolve(arg) === expectedScript)) return true;
+  // The generated single-file hook is a guard-only legacy form. Match it by
+  // canonical path or exact bytes; a user-owned file with the same basename
+  // must remain unknown and fail closed.
+  return event === 'PreToolUse' && args.some((arg) => {
+    const resolved = path.resolve(arg);
+    return resolved === canonicalSingleFile || hasCanonicalSingleFileContent(resolved);
+  });
 }
 
 for (const [event, { script }] of Object.entries(events)) {
@@ -69,8 +89,8 @@ for (const [event, { script }] of Object.entries(events)) {
     hooks: [{ type: 'process', command: process.execPath, args: [expectedScript], timeoutMs: 5000 }],
   };
   // ZCode 0.16.5 accepts one Bash matcher per event and rejects the
-  // description field. Replace only recognized review hooks (including the
-  // legacy check-bash-status wrapper) while preserving unrelated matchers.
+  // description field. Replace only recognized review hooks while preserving
+  // unrelated matchers.
   const unrelated = existing.filter((candidate) => candidate?.matcher !== 'Bash');
   next.hooks.events[event] = [...unrelated, entry];
 }
@@ -80,7 +100,6 @@ const effectiveConfigPath = path.resolve(configPath);
 const effectiveHookPath = path.join(hookRoot, 'lib', 'readonly-bash-policy.mjs');
 const guardWrapperPath = path.join(hookRoot, 'hooks', 'check-bash-readonly.mjs');
 const auditWrapperPath = path.join(hookRoot, 'hooks', 'audit-bash-result.mjs');
-const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const hookSource = fs.readFileSync(effectiveHookPath);
 const hookSha256 = crypto.createHash('sha256').update(hookSource).digest('hex');
 const daemonSource = fs.readFileSync(path.join(pluginRoot, '..', '..', 'crates', 'review-preparation', 'src', 'policy.rs'));

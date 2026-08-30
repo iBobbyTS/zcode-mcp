@@ -49,12 +49,14 @@ node ../scripts/check-review-hook.mjs --config /absolute/config.json \
 
 Installation and checking are separate and idempotent. The installer replaces
 only a recognized review hook (the historical `review-bash-hook:<event>` marker,
-the legacy `check-bash-status.mjs` wrapper, or this package's current wrapper)
-and preserves unrelated matchers. If an event contains an unknown `Bash`
-matcher, installation fails closed without writing the configuration; merge that
-hook explicitly before retrying. The installed entry is deliberately
-description-free because ZCode 0.16.5 accepts only one `Bash` matcher per event
-and rejects the `description` field.
+the exact bytes of this package's generated single-file guard in `PreToolUse`,
+or the event's current wrapper) and preserves unrelated matchers. A
+`check-bash-status.mjs` basename alone is never trusted: an unknown same-name
+user hook causes installation to fail closed without writing the configuration.
+If an event contains an unknown `Bash` matcher, merge that hook explicitly
+before retrying. The installed entry is deliberately description-free because
+ZCode 0.16.5 accepts only one `Bash` matcher per event and rejects the
+`description` field.
 Preflight starts a fresh isolated session-shaped hook invocation, allows a safe
 read, denies a destructive canary, and verifies the canary file is unchanged.
 The resulting provenance file is the only source accepted as an effective hook
