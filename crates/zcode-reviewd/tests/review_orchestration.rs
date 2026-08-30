@@ -224,6 +224,8 @@ impl Fixture {
                 ("SEND-FAIL", _) => "review-flow-send-failure",
                 (_, key) if key.ends_with("nudge-send-failure") => "review-flow-nudge-send-failure",
                 (_, key) if key.ends_with("semantic-timeout") => "review-flow-no-progress",
+                (_, key) if key.ends_with("progress-only") => "review-flow-progress-only",
+                (_, key) if key.ends_with("ledger-without-progress") => "review-flow-ledger-without-progress",
                 (_, key) if key.ends_with("missing-final") => "review-flow-no-finalize",
                 (_, key)
                     if [
@@ -243,6 +245,7 @@ impl Fixture {
             let mut command = Command::new(&runtime);
             command
                 .arg(mode)
+                .env("ZCODE_FAKE_MODE", mode)
                 .env(
                     "ZCODE_FAKE_SESSION_ID",
                     format!("fake-session-{}", job.agent_id),
@@ -674,7 +677,25 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
     ));
 
     let terminal = fixture.wait_terminal(execution_id);
-    assert_eq!(terminal.state, JobState::Completed);
+    let snapshot = fixture.store.review_snapshot(execution_id).unwrap();
+    let events = fixture
+        .store
+        .task_events_after(public_id, 0, 100)
+        .unwrap();
+    assert_eq!(
+        terminal.state,
+        JobState::Completed,
+        "job={:?} last_error={:?} snapshot={:?} events={:?}",
+        fixture.store.get_job(execution_id).unwrap(),
+        fixture.scheduler.last_error(execution_id),
+        snapshot.as_ref().map(|snapshot| (
+            snapshot.checkpoints.len(),
+            snapshot.findings.len(),
+            snapshot.validations.len(),
+            snapshot.report.finalized,
+        )),
+        events.iter().rev().take(12).collect::<Vec<_>>(),
+    );
     let task = fixture
         .store
         .task_by_execution_agent_id(execution_id)
@@ -683,11 +704,7 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
     assert_eq!(task.phase, TaskPhase::Terminal);
     let result = fixture.store.task_result(execution_id).unwrap().unwrap();
     assert_eq!(result.result.outcome, TaskOutcome::Succeeded);
-    let snapshot = fixture
-        .store
-        .review_snapshot(execution_id)
-        .unwrap()
-        .unwrap();
+    let snapshot = snapshot.unwrap();
     assert!(snapshot.report.finalized);
     assert_eq!(snapshot.checkpoints.len(), 1);
     assert_eq!(snapshot.validations.len(), 1);

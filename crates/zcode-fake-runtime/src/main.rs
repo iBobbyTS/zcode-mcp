@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
 };
 
@@ -202,6 +202,7 @@ fn ledger_tool_call(
 }
 
 fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
+    let mode = std::env::var("ZCODE_FAKE_MODE").unwrap_or_default();
     let server = server
         .as_object()
         .ok_or_else(|| io::Error::other("ledger MCP descriptor is not an object"))?;
@@ -248,7 +249,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     let mut child = process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let mut input = child
         .stdin
@@ -260,14 +261,17 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             .take()
             .ok_or_else(|| io::Error::other("ledger MCP stdout is missing"))?,
     );
+    let mut stderr = child.stderr.take().unwrap();
 
-    let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))?;
+    let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
+        .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
     if initialized["result"]["serverInfo"]["name"] != "zcode-review-ledger" {
         return Err(io::Error::other(
             "ledger MCP initialize response is invalid",
         ));
     }
-    let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))?;
+    let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))
+        .map_err(|error| io::Error::other(format!("stage=tools-list: {error}")))?;
     let names = listed["result"]["tools"]
         .as_array()
         .ok_or_else(|| io::Error::other("ledger MCP tool list is missing"))?
@@ -284,7 +288,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     }
 
     let mut next_id = 3;
-    if task_scoped {
+    if task_scoped && mode != "review-flow-ledger-without-progress" {
         ledger_tool_call(
             &mut input,
             &mut output,
@@ -297,6 +301,14 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             }),
         )?;
         next_id += 1;
+    }
+    if mode == "review-flow-progress-only" {
+        drop(input);
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(io::Error::other(format!("stage=child-wait: ledger MCP process exited with {status}")));
+        }
+        return Ok(());
     }
     ledger_tool_call(
         &mut input,
@@ -359,9 +371,12 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     }
     drop(input);
     let status = child.wait()?;
+    let mut stderr_bytes = Vec::new();
+    let _ = stderr.take(8192).read_to_end(&mut stderr_bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
     if !status.success() {
         return Err(io::Error::other(
-            "ledger MCP process did not exit successfully",
+            format!("stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}"),
         ));
     }
     Ok(())
@@ -453,7 +468,8 @@ fn main() {
                     let Some(server) = ledger_server.as_ref() else {
                         std::process::exit(23);
                     };
-                    if run_ledger_flow(server, mode != "review-flow-no-finalize").is_err() {
+                    if let Err(error) = run_ledger_flow(server, mode != "review-flow-no-finalize") {
+                        eprintln!("fake-runtime ledger failure: {error}");
                         std::process::exit(23);
                     }
                     ledger_completed = true;
@@ -634,7 +650,10 @@ fn main() {
                         let Some(server) = ledger_server.as_ref() else {
                             std::process::exit(23);
                         };
-                        if run_ledger_flow(server, mode != "review-flow-no-finalize").is_err() {
+                        if let Err(error) =
+                            run_ledger_flow(server, mode != "review-flow-no-finalize")
+                        {
+                            eprintln!("fake-runtime ledger failure: {error}");
                             std::process::exit(23);
                         }
                         ledger_completed = true;
