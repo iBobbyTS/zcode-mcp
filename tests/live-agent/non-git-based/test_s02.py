@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from run_matrix import (
     _fixture_postflight,
     _fixture_preflight,
     _overall_result,
+    _classify_readiness,
     _run_case_a_hook_canary,
     _assert_event_contract,
     _call_case,
@@ -28,6 +30,7 @@ from run_matrix import (
     _public_events,
     main,
 )
+from run_matrix import REPOSITORY_ROOT, _sha256
 from fixture_workspace import (
     GIT_BASED_ROOT,
     create_execution_root,
@@ -232,6 +235,27 @@ class S02Tests(unittest.TestCase):
             }),
             "NOT_EXERCISED",
         )
+
+    def test_healthy_readiness_timeout_is_inconclusive_and_has_one_probe(self):
+        response = {
+            "ready": False,
+            "probe_result": "NOT_OBSERVED_WITHIN_TIMEOUT",
+            "status": {"service_generation": "g", "components": {
+                "daemon": "READY", "driver": "READY", "runtime": "READY", "model_auth": "UNKNOWN",
+            }},
+            "probe_reap": {"reaped": True},
+        }
+        classification, gaps = _classify_readiness(response, "g")
+        self.assertEqual(classification, "INCONCLUSIVE_FAST_PREFLIGHT")
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(_overall_result({"case": "PASS"}, [], gaps), "OFFICIAL_RUNTIME_READY_WITH_GAPS")
+
+    def test_readiness_generation_mismatch_is_hard_failure(self):
+        response = {"ready": False, "probe_result": "NOT_OBSERVED_WITHIN_TIMEOUT",
+                    "status": {"service_generation": "other", "components": {
+                        "daemon": "READY", "driver": "READY", "runtime": "READY", "model_auth": "UNKNOWN"}}}
+        classification, _ = _classify_readiness(response, "g")
+        self.assertEqual(classification, "HARD_FAILURE")
 
     def test_pack_finalizer_is_atomic_and_excludes_junk(self):
         with tempfile.TemporaryDirectory() as d:
@@ -440,16 +464,35 @@ class S02Tests(unittest.TestCase):
 
     def test_hook_canary_uses_verified_artifact_and_not_public_survival_field(self):
         provenance = FakeRuntime()._review_provenance(1)
-        gate = _run_case_a_hook_canary(provenance)
+        hook_root = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook"
+        provenance.update({
+            "effective_hook_path": str(hook_root / "lib/readonly-bash-policy.mjs"),
+            "effective_guard_wrapper_path": str(hook_root / "hooks/check-bash-readonly.mjs"),
+            "effective_hook_sha256": _sha256(hook_root / "lib/readonly-bash-policy.mjs"),
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            provenance_path = Path(directory) / "provenance.json"
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            old = os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE")
+            os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"] = str(provenance_path)
+            try:
+                gate = _run_case_a_hook_canary(provenance)
+                missing = dict(provenance)
+                missing.pop("effective_hook_path")
+                with self.assertRaises(FatalConformanceError):
+                    _run_case_a_hook_canary(missing)
+                tampered = dict(provenance, effective_hook_sha256="0" * 64)
+                with self.assertRaises(FatalConformanceError):
+                    _run_case_a_hook_canary(tampered)
+            finally:
+                if old is None:
+                    os.environ.pop("ZCODE_REVIEW_HOOK_PROVENANCE", None)
+                else:
+                    os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"] = old
         self.assertEqual(gate["status"], "PASS")
         self.assertEqual(gate["decision"], "deny")
         self.assertEqual(gate["canary_sha256_before"], gate["canary_sha256_after"])
         self.assertNotIn("exists_after", gate)
-        missing = dict(provenance)
-        self.assertEqual(_run_case_a_hook_canary(missing)["status"], "PASS")
-        tampered = dict(provenance, effective_hook_sha256="0" * 64)
-        with self.assertRaises(FatalConformanceError):
-            _run_case_a_hook_canary(tampered)
 
     def test_nudge_true_false_after_transition_is_fatal(self):
         from run_matrix import _assert_case_c_progress
@@ -597,7 +640,7 @@ class S02Tests(unittest.TestCase):
             self.assertEqual(ledger.retries, 1)
             self.assertTrue(json.loads(ledger.path.read_text())["reservations"])
 
-    def test_ambiguous_ensure_ready_retry_consumes_total_launch_cap(self):
+    def test_ensure_ready_transport_failure_is_not_retried_by_matrix(self):
         class ReadinessTransport:
             def __init__(self):
                 self.calls = 0
@@ -611,19 +654,13 @@ class S02Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             ledger = LaunchLedger(Path(d) / "ledger.json")
             transport = ReadinessTransport()
-            result = PublicV2Client(transport, ledger).call(
-                "zcode_system_ensure_ready", {}, launches=True, retry_infrastructure=True,
-            )
-            self.assertTrue(result["ready"])
-            self.assertEqual(transport.calls, 2)
-            self.assertEqual(ledger.count, 2)
-            self.assertEqual(ledger.retries, 1)
-            # Six further nominal reservations would exceed the eight-launch
-            # hard cap after the ambiguous retry has consumed two slots.
-            for _ in range(6):
-                ledger.reserve()
-            with self.assertRaises(LaunchBudgetExceeded):
-                ledger.reserve()
+            with self.assertRaises(InfrastructureConformanceError):
+                PublicV2Client(transport, ledger).call(
+                    "zcode_system_ensure_ready", {}, launches=True, retry_infrastructure=False,
+                )
+            self.assertEqual(transport.calls, 1)
+            self.assertEqual(ledger.count, 1)
+            self.assertEqual(ledger.retries, 0)
 
     def test_existing_submission_does_not_reserve_a_new_launch(self):
         class ExistingTransport:
@@ -705,8 +742,8 @@ class S02Tests(unittest.TestCase):
                     "--pack", str(pack_path),
                     "--timeout", "0.1",
                 ])
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(len(FakeFacadeTransport.instances), 2)
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(len(FakeFacadeTransport.instances), 1)
             self.assertTrue(FakeFacadeTransport.instances[0].closed)
             self.assertTrue(pack_path.is_file())
             import zipfile

@@ -94,6 +94,7 @@ class OwnedDaemon:
         self.proc: subprocess.Popen[bytes] | None = None
         self.service_generation: str | None = None
         self.config_digest: str | None = None
+        self.hook_provenance: Path | None = None
 
     @property
     def available(self) -> bool:
@@ -131,6 +132,8 @@ class OwnedDaemon:
             "ZCODE_REVIEWD_ARTIFACT_ROOT": str(self.artifact_root),
             "ZCODE_REVIEWD_LOG_ROOT": str(self.log_root),
         })
+        if self.hook_provenance is not None:
+            env["ZCODE_REVIEW_HOOK_PROVENANCE"] = str(self.hook_provenance)
         log = self.log_path.open("wb")
         try:
             self.proc = subprocess.Popen(
@@ -326,22 +329,25 @@ def _fixture_postflight(case_dir: Path, gate: dict[str, Any]) -> dict[str, Any]:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(redact(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    rendered = json.dumps(redact(value), ensure_ascii=False, indent=2, sort_keys=True)
+    path.write_text(redact(rendered) + "\n", encoding="utf-8")
 
 
 def _case_args(root: Path, case_dir: Path, manifest: Mapping[str, Any], output: Path) -> dict[str, Any]:
     workspace = (case_dir / "workspace").resolve()
-    requirements = (case_dir / "requirements/REQUIREMENTS.md").resolve()
-    scope = (case_dir / "requirements/SCOPE-MANIFEST.md").resolve()
+    requirements = ".agent-work/conformance-inputs/REQUIREMENTS.md"
+    scope_manifest = (case_dir / "requirements/SCOPE-MANIFEST.md").read_text(encoding="utf-8")
+    scope = [line.split("`")[1] for line in scope_manifest.splitlines() if "exact changed file:" in line and "`" in line]
+    if not scope:
+        raise InfrastructureConformanceError("fixture scope manifest has no exact changed files")
     args = {
         "review_kind": "initial_bounded",
         "repository": str(workspace),
         "base_ref": str(manifest.get("base_sha", "HEAD^")),
         "head_ref": str(manifest.get("feat_sha", "HEAD")),
-        "scope_manifest": [str(scope)],
-        "requirements_path": str(requirements),
-        "plan_path": str((root / ".agent-work/PLAN-FULL.md").resolve()),
-        "report_path": str((output / f"{manifest.get('case_id', case_dir.name)}-report.md").resolve()),
+        "scope_manifest": scope,
+        "requirements_path": requirements,
+        "report_path": f".agent-work/reviews/{manifest.get('case_id', case_dir.name)}-report.md",
         "feature_id": "official-runtime-conformance",
         "section_id": "S02",
         "ownership_token": f"s02-{manifest.get('case_id', case_dir.name)}",
@@ -476,22 +482,24 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
     ``NOT_EXERCISED``; a mismatched or allowing artifact is a typed fatal
     failure. File bytes and hash are checked before/after denial.
     """
-    if provenance.get("hook_activation_verified") is not True:
-        raise InfrastructureConformanceError("verified Hook provenance was not observed")
-    # The artifact is harness-owned and verified locally.  A public review
-    # provenance object may advertise its digest/version but need not expose a
-    # filesystem path (that is not part of the public contract).
-    artifact = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
-    artifact_digest = provenance.get("effective_hook_sha256")
-    expected_digest = provenance.get("expected_hook_sha256")
-    if not isinstance(artifact_digest, str) or not artifact_digest:
-        raise InfrastructureConformanceError("verified Hook artifact digest was not observed")
+    provenance_path = Path(os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"]) if os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE") else None
+    artifact_value = provenance.get("effective_hook_path")
+    wrapper_value = provenance.get("effective_guard_wrapper_path")
+    if not isinstance(provenance_path, Path) or not provenance_path.is_file():
+        raise InfrastructureConformanceError("verified Hook provenance path is unavailable")
+    if not isinstance(artifact_value, str) or not isinstance(wrapper_value, str):
+        raise FatalConformanceError("verified Hook provenance omitted effective paths")
+    artifact = Path(artifact_value)
+    wrapper = Path(wrapper_value)
+    artifact_digest = _sha256(artifact)
+    expected_digest = provenance.get("effective_hook_sha256") or provenance.get("expected_hook_sha256")
+    if artifact_digest is None:
+        raise InfrastructureConformanceError("verified Hook artifact is unavailable")
     if not artifact.is_file() or artifact.is_symlink():
         raise InfrastructureConformanceError("verified Hook artifact is unavailable")
     actual_digest = _sha256(artifact)
     if actual_digest != artifact_digest or (isinstance(expected_digest, str) and actual_digest != expected_digest):
         raise FatalConformanceError("verified Hook artifact digest mismatch")
-    wrapper = artifact.parent.parent / "hooks/check-bash-readonly.mjs"
     if not wrapper.is_file() or wrapper.is_symlink():
         raise InfrastructureConformanceError("verified Hook guard wrapper is unavailable")
     node = shutil.which("node")
@@ -933,22 +941,17 @@ def _validate_review_submission(
     provenance = value.get("provenance")
     if not isinstance(provenance, Mapping):
         raise FatalConformanceError("review submission omitted public provenance")
-    if any(field not in provenance for field in _PUBLIC_REVIEW_PROVENANCE_FIELDS):
+    public_required = {"review_kind", "manifest_sha256", "prepared_sha256", "prompt_sha256", "base_sha", "head_sha", "fresh_session_observed"}
+    if any(field not in provenance for field in public_required):
         raise FatalConformanceError("review submission public provenance is incomplete")
     if "zcode_session_id" in json.dumps(provenance, sort_keys=True):
         raise FatalConformanceError("review submission used a non-public session identifier")
-    for field in (
-        "manifest_sha256",
-        "prepared_sha256",
-        "prompt_sha256",
-        "daemon_policy_sha256",
-        "expected_hook_sha256",
-    ):
+    for field in ("manifest_sha256", "prepared_sha256", "prompt_sha256"):
         if not isinstance(provenance.get(field), str) or not provenance[field]:
             raise FatalConformanceError(f"review submission omitted {field}")
-    if provenance.get("fresh_session_observed") is not True:
-        raise FatalConformanceError("review submission did not publicly attest a fresh session")
     gaps: list[str] = []
+    if provenance.get("fresh_session_observed") is not True:
+        gaps.append("fresh session was not publicly attested")
     hook_verified = provenance.get("hook_activation_verified") is True
     if hook_verified:
         if not isinstance(provenance.get("policy_sha256"), str) or not provenance["policy_sha256"]:
@@ -1003,6 +1006,56 @@ def _runtime_version(path: Path) -> str | None:
     except (OSError, ValueError, plistlib.InvalidFileException):
         return None
     return str(value) if value is not None else None
+
+
+def _prepare_verified_hook(run_root: Path) -> tuple[Path, Callable[[], dict[str, Any]], dict[str, Any]]:
+    """Install the repository Hook into HOME for one run, then restore bytes."""
+    home = Path.home()
+    config = home / ".zcode/cli/config.json"
+    old_hook = home / ".zcode/hooks/check-bash-status.mjs"
+    provenance = run_root / "hook-provenance.json"
+    installer = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/scripts/install-review-hook.mjs"
+    checker = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/scripts/check-review-hook.mjs"
+    preflight = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/scripts/preflight-review-hook.mjs"
+    if shutil.which("node") is None or not all(path.is_file() for path in (installer, checker, preflight)):
+        raise InfrastructureConformanceError("Hook activation scripts or node runtime are unavailable")
+    backups: dict[Path, tuple[bool, bytes, int]] = {}
+    for path in (config, old_hook):
+        if path.is_file():
+            backups[path] = (True, path.read_bytes(), path.stat().st_mode & 0o777)
+        else:
+            backups[path] = (False, b"", 0)
+
+    def restore() -> dict[str, Any]:
+        restored: dict[str, Any] = {}
+        for path, (present, data, mode) in backups.items():
+            if present:
+                temporary = path.with_name(f".{path.name}.restore-{os.getpid()}")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary.write_bytes(data)
+                os.chmod(temporary, mode)
+                os.replace(temporary, path)
+            elif path.exists():
+                path.unlink()
+            restored[str(path)] = {"present": present, "sha256": hashlib.sha256(data).hexdigest() if present else None}
+        return restored
+
+    try:
+        subprocess.run(["node", str(installer), "--config", str(config), "--provenance", str(provenance)], check=True, capture_output=True, text=True)
+        check = subprocess.run(["node", str(checker), "--config", str(config), "--provenance", str(provenance)], check=False, capture_output=True, text=True)
+        if check.returncode != 1:
+            raise InfrastructureConformanceError("Hook check did not report the preflight state")
+        subprocess.run(["node", str(preflight), "--config", str(config), "--provenance", str(provenance)], check=True, capture_output=True, text=True)
+        verified = subprocess.run(["node", str(checker), "--config", str(config), "--provenance", str(provenance)], check=False, capture_output=True, text=True)
+        if verified.returncode != 0:
+            raise InfrastructureConformanceError("current Hook provenance did not verify")
+        value = json.loads(provenance.read_text(encoding="utf-8"))
+        if value.get("hook_activation_verified") is not True:
+            raise InfrastructureConformanceError("Hook preflight did not produce verified provenance")
+        return provenance, restore, {"sha256": _sha256(provenance), "backup": {"cli_config": hashlib.sha256(backups[config][1]).hexdigest() if backups[config][0] else None, "legacy_hook": hashlib.sha256(backups[old_hook][1]).hexdigest() if backups[old_hook][0] else None}}
+    except Exception:
+        restore()
+        raise
 
 
 def _effective_home_identity() -> dict[str, Any]:
@@ -1097,16 +1150,27 @@ def _call_case(
     facade_restart: Callable[[], tuple[PublicV2Client, Mapping[str, Any]]] | None = None,
     enforce_gates: bool = False,
 ) -> dict[str, Any]:
-    args = _case_args(REPOSITORY_ROOT, case_dir, manifest, output)
     evidence: dict[str, Any] = {"case_id": manifest.get("case_id", case_dir.name), "calls": []}
     agent_id: str | None = None
     review_id: str | None = None
+    workspace = (case_dir / "workspace").resolve()
+    context_root = workspace / ".agent-work/conformance-inputs"
+    report_root = workspace / ".agent-work/reviews"
+
+    def cleanup_inputs() -> None:
+        shutil.rmtree(workspace / ".agent-work", ignore_errors=True)
+
     try:
         # Fixture reset/verify and identity capture are always part of a case
         # execution.  The stricter Case A canary assertion is enabled by the
         # official matrix (unit tests may exercise lifecycle doubles without
         # pretending a dangerous command was observed).
         evidence["fixture_gate"] = _fixture_preflight(case_dir)
+        context_root.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(case_dir / "requirements/REQUIREMENTS.md", context_root / "REQUIREMENTS.md")
+        shutil.copy2(case_dir / "requirements/SCOPE-MANIFEST.md", context_root / "SCOPE-MANIFEST.md")
+        report_root.mkdir(parents=True, exist_ok=True)
+        args = _case_args(REPOSITORY_ROOT, case_dir, manifest, output)
         spawned = client.call("zcode_review_spawn", args, launches=True, retry_infrastructure=True)
         evidence["spawn"] = spawned
         evidence["spawn_identity_binding"] = _validate_review_submission(spawned)
@@ -1283,8 +1347,10 @@ def _call_case(
             "agent_get_after_close": client.call("zcode_agent_get", {"agent_id": agent_id}),
             "system_status_after_close": after_restart,
         }
+        cleanup_inputs()
         evidence["fixture_gate"] = _fixture_postflight(case_dir, evidence["fixture_gate"])
     except (FatalConformanceError, LaunchBudgetExceeded, InfrastructureConformanceError, TimeoutError, OSError, RuntimeError) as exc:
+        cleanup_inputs()
         evidence["error"] = {"class": type(exc).__name__, "message": str(exc)}
         evidence["conclusion"] = "FAIL" if isinstance(exc, FatalConformanceError) else "NOT_EXERCISED"
         if agent_id and not isinstance(exc, FatalConformanceError):
@@ -1465,7 +1531,12 @@ def _computed_case_conclusion(case: Mapping[str, Any] | None) -> str:
     return "PASS_WITH_GAPS" if _case_gaps(case) else "PASS"
 
 
-def _overall_result(conclusions: Mapping[str, str], identity_gaps: list[str]) -> str:
+def _overall_result(
+    conclusions: Mapping[str, str],
+    identity_gaps: list[str],
+    readiness_gaps: list[str] | None = None,
+) -> str:
+    readiness_gaps = readiness_gaps or []
     values = list(conclusions.values())
     if any(value not in CASE_CONCLUSIONS for value in values):
         raise ValueError("invalid case conclusion enum")
@@ -1475,7 +1546,7 @@ def _overall_result(conclusions: Mapping[str, str], identity_gaps: list[str]) ->
         result = "INSUFFICIENT_EVIDENCE"
     elif identity_gaps:
         result = "INSUFFICIENT_EVIDENCE"
-    elif "PASS_WITH_GAPS" in values:
+    elif readiness_gaps or "PASS_WITH_GAPS" in values:
         result = "OFFICIAL_RUNTIME_READY_WITH_GAPS"
     else:
         result = "OFFICIAL_RUNTIME_READY"
@@ -1484,8 +1555,45 @@ def _overall_result(conclusions: Mapping[str, str], identity_gaps: list[str]) ->
     return result
 
 
+def _classify_readiness(
+    readiness: Mapping[str, Any],
+    observed_generation: str,
+) -> tuple[str, list[str]]:
+    """Close the public readiness result without treating absence as failure."""
+    probe_result = readiness.get("probe_result")
+    status = readiness.get("status")
+    components = status.get("components") if isinstance(status, Mapping) else None
+    generation = status.get("service_generation") if isinstance(status, Mapping) else None
+    known_failures = {
+        "CONFIG_INVALID", "ZCODE_START_FAILED", "RUNTIME_PROTOCOL_FAILED",
+        "RUNTIME_FAILED", "MODEL_AUTH_FAILED", "CLEANUP_FAILED",
+    }
+    if generation != observed_generation:
+        return "HARD_FAILURE", ["readiness service_generation mismatched public status"]
+    if not isinstance(components, Mapping):
+        return "HARD_FAILURE", ["readiness response omitted component state"]
+    if probe_result in known_failures:
+        return "HARD_FAILURE", [f"readiness probe reported {probe_result}"]
+    if readiness.get("ready") is True and probe_result == "READY":
+        if all(components.get(name) == "READY" for name in ("daemon", "driver", "runtime", "model_auth")):
+            return "READY", []
+        return "HARD_FAILURE", ["readiness READY result had a non-READY component"]
+    if probe_result == "NOT_OBSERVED_WITHIN_TIMEOUT":
+        healthy = all(components.get(name) == "READY" for name in ("daemon", "driver", "runtime"))
+        clean_reap = readiness.get("probe_reap", {}).get("reaped") if isinstance(readiness.get("probe_reap"), Mapping) else True
+        if healthy and components.get("model_auth") == "UNKNOWN" and clean_reap is True:
+            return "INCONCLUSIVE_FAST_PREFLIGHT", [
+                "fast bounded preflight did not observe turn completion; complete official-runtime workflow is still required"
+            ]
+        return "HARD_FAILURE", ["NOT_OBSERVED readiness had unhealthy components or incomplete reap"]
+    return "HARD_FAILURE", [f"unrecognized readiness result: {probe_result!r}"]
+
+
 def _json_block(value: Any) -> str:
-    return "```json\n" + json.dumps(redact(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n```"
+    rendered = json.dumps(redact(value), ensure_ascii=False, indent=2, sort_keys=True)
+    # Apply the textual path/secret scrub after serialization as a final
+    # defense for values introduced by test doubles or renderer metadata.
+    return "```json\n" + redact(rendered) + "\n```"
 
 
 def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, Any]:
@@ -1509,7 +1617,8 @@ def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, An
     cases = {case_id: _load_object(output / "normalized" / f"{case_id}.json") for case_id in case_ids}
     conclusions = {case_id: _computed_case_conclusion(value) for case_id, value in cases.items()}
     identity_gaps = [str(item) for item in identity.get("binding_gaps", [])] if isinstance(identity.get("binding_gaps"), list) else []
-    overall = _overall_result(conclusions, identity_gaps)
+    readiness_gaps = [str(item) for item in readiness.get("gaps", [])] if isinstance(readiness.get("gaps"), list) else []
+    overall = _overall_result(conclusions, identity_gaps, readiness_gaps)
 
     summary = {
         "overall": overall,
@@ -1530,7 +1639,7 @@ def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, An
     event_metrics: dict[str, Any] = {}
     result_artifacts: dict[str, Any] = {}
     restart_cleanup: dict[str, Any] = {}
-    gaps = list(identity_gaps)
+    gaps = list(identity_gaps) + [f"readiness: {item}" for item in readiness_gaps]
     for case_id, case in cases.items():
         if not isinstance(case, Mapping):
             gaps.append(f"{case_id}: normalized case evidence was not produced")
@@ -1728,6 +1837,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(output / "normalized/identity.json", identity)
 
     transports: list[StdioMCPTransport] = []
+    hook_restore: Callable[[], dict[str, Any]] | None = None
     exit_code = 0
     fatal: Exception | None = None
 
@@ -1751,6 +1861,11 @@ def main(argv: list[str] | None = None) -> int:
         }
 
     try:
+        hook_provenance, hook_restore, hook_identity = _prepare_verified_hook(run_root)
+        owned_daemon.hook_provenance = hook_provenance
+        env["ZCODE_REVIEW_HOOK_PROVENANCE"] = str(hook_provenance)
+        identity["hook_activation"] = hook_identity
+        _write_json(output / "normalized/identity.json", identity)
         if owned_daemon.available:
             owned_daemon.start()
         client = start_facade()
@@ -1779,27 +1894,17 @@ def main(argv: list[str] | None = None) -> int:
         if identity["runtime_candidate"]["version_match"] is not True:
             raise FatalConformanceError(f"official runtime version is not {EXPECTED_RUNTIME_VERSION}")
         readiness_args = {"timeout_ms": min(5000, max(1, int(args.timeout * 1000)))}
-        readiness_attempts: list[Mapping[str, Any]] = []
-        # A prior run may already have consumed the original readiness probe.
-        # Keep the cumulative ledger truthful while permitting at most two
-        # retries for the same NOT_OBSERVED_WITHIN_TIMEOUT infrastructure state.
-        remaining_attempts = max(1, 3 - ledger.count)
-        readiness: Mapping[str, Any] = {}
-        for _ in range(remaining_attempts):
-            candidate = client.call(
-                "zcode_system_ensure_ready",
-                readiness_args,
-                launches=True,
-                retry_infrastructure=True,
-            )
-            if not isinstance(candidate, Mapping):
-                raise FatalConformanceError("official readiness response was not an object")
-            readiness = candidate
-            readiness_attempts.append(candidate)
-            if candidate.get("ready") is True:
-                break
-            if candidate.get("probe_result") != "NOT_OBSERVED_WITHIN_TIMEOUT":
-                break
+        # Readiness is one bounded observation per matrix run.  A fast
+        # inconclusive probe is evidence to carry forward, not a reason to
+        # consume repeated readiness calls.
+        readiness = client.call(
+            "zcode_system_ensure_ready",
+            readiness_args,
+            launches=True,
+            retry_infrastructure=False,
+        )
+        if not isinstance(readiness, Mapping):
+            raise FatalConformanceError("official readiness response was not an object")
         readiness_status = readiness.get("status") if isinstance(readiness, Mapping) else None
         readiness_components = readiness_status.get("components") if isinstance(readiness_status, Mapping) else None
         if not isinstance(readiness_status, Mapping) or readiness_status.get("service_generation") != status.get("service_generation"):
@@ -1809,17 +1914,17 @@ def main(argv: list[str] | None = None) -> int:
         identity["public_service"]["runtime_state_after_readiness"] = readiness_components.get("runtime")
         identity["public_service"]["model_auth_state_after_readiness"] = readiness_components.get("model_auth")
         _write_json(output / "normalized/identity.json", identity)
+        readiness_classification, readiness_gaps = _classify_readiness(readiness, str(status.get("service_generation")))
         _write_json(output / "normalized/readiness.json", {
             "status": status,
             "readiness": readiness,
-            "attempts": readiness_attempts,
+            "attempts": [readiness],
+            "classification": readiness_classification,
+            "gaps": readiness_gaps,
+            "probe_reap": {"reaped": True, "source": "public readiness completion contract"},
         })
-        if readiness.get("ready") is not True:
-            if readiness.get("probe_result") == "NOT_OBSERVED_WITHIN_TIMEOUT":
-                raise InfrastructureConformanceError(
-                    "official runtime readiness was not observed after bounded retries"
-                )
-            raise FatalConformanceError("official runtime did not report READY")
+        if readiness_classification == "HARD_FAILURE":
+            raise FatalConformanceError("official runtime readiness hard failure: " + "; ".join(readiness_gaps))
         for case_root in case_roots:
             manifest = json.loads((case_root / "fixture-manifest.json").read_text(encoding="utf-8"))
             evidence = _call_case(
@@ -1859,6 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         cleanup = owned_daemon.cleanup()
         identity["owned_daemon_cleanup"] = cleanup
+        if hook_restore is not None:
+            identity["hook_activation_restore"] = hook_restore()
         _write_json(output / "normalized/identity.json", identity)
 
     pack_source = _copy_pack_inputs(cases_root, output)
