@@ -780,7 +780,7 @@ class S02Tests(unittest.TestCase):
             import zipfile
             with zipfile.ZipFile(pack_path) as archive:
                 summary = archive.read("SUMMARY.md").decode()
-            self.assertIn("INSUFFICIENT_EVIDENCE", summary)
+            self.assertIn("OFFICIAL_RUNTIME_NOT_READY", summary)
 
     def test_main_runner_freezes_after_typed_fatal_without_next_case(self):
         self.require_git_fixtures()
