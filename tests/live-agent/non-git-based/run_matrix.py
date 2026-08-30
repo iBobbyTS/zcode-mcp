@@ -494,16 +494,25 @@ def _run_case_a_hook_canary(
     ``NOT_EXERCISED``; a mismatched or allowing artifact is a typed fatal
     failure. File bytes and hash are checked before/after denial.
     """
-    artifact_value = provenance.get("effective_hook_path")
-    wrapper_value = provenance.get("effective_guard_wrapper_path")
     if not isinstance(provenance_path, Path) or not provenance_path.is_file():
         raise InfrastructureConformanceError("verified Hook provenance path is unavailable")
+    try:
+        local_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InfrastructureConformanceError("verified Hook provenance is unreadable") from exc
+    if not isinstance(local_provenance, Mapping):
+        raise InfrastructureConformanceError("verified Hook provenance is not an object")
+    artifact_value = local_provenance.get("effective_hook_path")
+    wrapper_value = local_provenance.get("effective_guard_wrapper_path")
     if not isinstance(artifact_value, str) or not isinstance(wrapper_value, str):
-        raise FatalConformanceError("verified Hook provenance omitted effective paths")
+        raise FatalConformanceError("local Hook provenance omitted effective paths")
     artifact = Path(artifact_value)
     wrapper = Path(wrapper_value)
     artifact_digest = _sha256(artifact)
     expected_digest = provenance.get("effective_hook_sha256") or provenance.get("expected_hook_sha256")
+    local_digest = local_provenance.get("effective_hook_sha256")
+    if isinstance(local_digest, str) and isinstance(expected_digest, str) and local_digest != expected_digest:
+        raise FatalConformanceError("public and local Hook provenance digests disagree")
     if artifact_digest is None:
         raise InfrastructureConformanceError("verified Hook artifact is unavailable")
     if not artifact.is_file() or artifact.is_symlink():
@@ -511,8 +520,12 @@ def _run_case_a_hook_canary(
     actual_digest = _sha256(artifact)
     if actual_digest != artifact_digest or (isinstance(expected_digest, str) and actual_digest != expected_digest):
         raise FatalConformanceError("verified Hook artifact digest mismatch")
+    wrapper_digest = _sha256(wrapper)
+    expected_wrapper_digest = local_provenance.get("effective_guard_wrapper_sha256")
     if not wrapper.is_file() or wrapper.is_symlink():
         raise InfrastructureConformanceError("verified Hook guard wrapper is unavailable")
+    if isinstance(expected_wrapper_digest, str) and wrapper_digest != expected_wrapper_digest:
+        raise FatalConformanceError("verified Hook guard wrapper digest mismatch")
     node = shutil.which("node")
     if node is None:
         raise InfrastructureConformanceError("node runtime is unavailable for Hook canary")
@@ -573,7 +586,7 @@ def _run_case_a_hook_canary(
         "provenance": {
             "activation_generation": provenance.get("activation_generation"),
             "effective_hook_sha256": artifact_digest,
-            "wrapper": str(wrapper),
+            "wrapper_sha256": wrapper_digest,
         },
         "decision": decision,
         "reason": reason,
