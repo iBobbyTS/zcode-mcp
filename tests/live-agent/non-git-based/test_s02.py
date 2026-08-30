@@ -501,13 +501,19 @@ class S02Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             provenance_path = Path(directory) / "provenance.json"
             provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
-            gate = _run_case_a_hook_canary(provenance, provenance_path=provenance_path)
+            public_provenance = {
+                key: value for key, value in provenance.items()
+                if key not in {"effective_hook_path", "effective_guard_wrapper_path"}
+            }
+            gate = _run_case_a_hook_canary(public_provenance, provenance_path=provenance_path)
             with self.assertRaises(InfrastructureConformanceError):
                 _run_case_a_hook_canary(provenance)
             missing = dict(provenance)
             missing.pop("effective_hook_path")
             with self.assertRaises(FatalConformanceError):
-                _run_case_a_hook_canary(missing, provenance_path=provenance_path)
+                missing_path = Path(directory) / "missing-path.json"
+                missing_path.write_text(json.dumps(missing), encoding="utf-8")
+                _run_case_a_hook_canary(public_provenance, provenance_path=missing_path)
             tampered = dict(provenance, effective_hook_sha256="0" * 64)
             with self.assertRaises(FatalConformanceError):
                 _run_case_a_hook_canary(tampered, provenance_path=provenance_path)
