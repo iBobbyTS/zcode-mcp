@@ -1730,6 +1730,22 @@ struct TerminalDecision {
     forced_outcome: Option<(CompletionOutcome, String)>,
 }
 
+struct ReviewTerminalResolution {
+    terminal: RuntimeTerminal,
+    lifecycle_terminal: RuntimeTerminal,
+    review_committed: bool,
+}
+
+impl ReviewTerminalResolution {
+    fn unchanged(terminal: RuntimeTerminal) -> Self {
+        Self {
+            lifecycle_terminal: terminal.clone(),
+            terminal,
+            review_committed: false,
+        }
+    }
+}
+
 struct MonitorContext {
     agent_id: String,
     owner_epoch: u64,
@@ -2200,6 +2216,21 @@ fn minimal_task_result(outcome: CompletionOutcome, summary: &str, reason_code: &
         diff_stat: None,
         checks: Vec::new(),
         residual_gaps: vec![reason_code.into()],
+        artifacts: Vec::new(),
+    }
+}
+
+fn finalized_review_task_result() -> TaskResult {
+    TaskResult {
+        outcome: TaskOutcome::Succeeded,
+        summary: "REVIEW_FINALIZED".into(),
+        partial: false,
+        base_commit: None,
+        head_commit: None,
+        changed_files: Vec::new(),
+        diff_stat: None,
+        checks: Vec::new(),
+        residual_gaps: Vec::new(),
         artifacts: Vec::new(),
     }
 }
@@ -3428,6 +3459,7 @@ impl Scheduler {
                     agent_id,
                     RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::SessionLost),
                     false,
+                    false,
                 );
                 if task.is_some() {
                     self.inner.store.store_task_result(
@@ -3656,8 +3688,8 @@ impl Scheduler {
                 .fail_claim(agent_id, owner_epoch, code, &message)
         });
         let terminal = runtime.stop(stop_grace);
-        let terminal = self.review_terminal(agent_id, terminal, false);
-        let finished = sink.finish(&terminal);
+        let terminal = self.review_terminal(agent_id, terminal, false, false);
+        let finished = sink.finish(&terminal.terminal);
         self.release_active(agent_id, owner_epoch);
 
         if let Some(result) = preclassified {
@@ -3724,27 +3756,66 @@ impl Scheduler {
         agent_id: &str,
         terminal: RuntimeTerminal,
         natural_completion: bool,
-    ) -> RuntimeTerminal {
+        completion_allowed: bool,
+    ) -> ReviewTerminalResolution {
         let Some(gate) = &self.inner.review_completion else {
-            return terminal;
+            return ReviewTerminalResolution::unchanged(terminal);
         };
         let job = match self.inner.store.get_job(agent_id) {
             Ok(Some(job)) => job,
             Ok(None) | Err(_) if natural_completion => {
-                return RuntimeTerminal::ReviewFailed(ReviewFailure::ReportMissing)
+                return ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(
+                    ReviewFailure::ReportMissing,
+                ))
             }
-            Ok(None) | Err(_) => return terminal,
+            Ok(None) | Err(_) => return ReviewTerminalResolution::unchanged(terminal),
         };
-        if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
+        if completion_allowed
+            && natural_completion
+            && matches!(terminal, RuntimeTerminal::Completed(_))
+        {
             return match gate.complete(&job) {
-                Ok(()) => terminal,
-                Err(failure) => RuntimeTerminal::ReviewFailed(failure),
+                Ok(()) => ReviewTerminalResolution {
+                    lifecycle_terminal: terminal.clone(),
+                    terminal,
+                    review_committed: true,
+                },
+                Err(failure) => {
+                    ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(failure))
+                }
             };
+        }
+        if completion_allowed {
+            if let RuntimeTerminal::Exited(exit) = &terminal {
+                match gate.has_durable_finalization(&job) {
+                    Ok(true) => {
+                        return match gate.complete(&job) {
+                            Ok(()) => ReviewTerminalResolution {
+                                terminal: RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                                    exit.clone(),
+                                )),
+                                lifecycle_terminal: terminal,
+                                review_committed: true,
+                            },
+                            Err(failure) => ReviewTerminalResolution::unchanged(
+                                RuntimeTerminal::ReviewFailed(failure),
+                            ),
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(failure) => {
+                        let _ = gate.cleanup_nonclean(&job);
+                        return ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(
+                            failure,
+                        ));
+                    }
+                }
+            }
         }
         if let Err(error) = gate.cleanup_nonclean(&job) {
             self.record_failure(agent_id, error.reason().into());
         }
-        terminal
+        ReviewTerminalResolution::unchanged(terminal)
     }
 
     fn finish_routed_terminal(
@@ -3815,25 +3886,38 @@ impl Scheduler {
                 }
             }
             TaskRoute::Review(_) | TaskRoute::Legacy => {
-                let terminal = self.review_terminal(agent_id, terminal, natural_completion);
+                let resolution = self.review_terminal(
+                    agent_id,
+                    terminal,
+                    natural_completion,
+                    forced_outcome.is_none(),
+                );
                 if task.is_some() {
                     let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
-                        let outcome = match &terminal {
-                            RuntimeTerminal::Completed(_) if natural_completion => {
+                        let outcome = match &resolution.terminal {
+                            RuntimeTerminal::Completed(_) if resolution.review_committed => {
                                 CompletionOutcome::Succeeded
                             }
                             RuntimeTerminal::Stopped(_) => CompletionOutcome::Cancelled,
                             RuntimeTerminal::FailedRuntimeLost(_)
                             | RuntimeTerminal::Orphaned(_)
                             | RuntimeTerminal::Exited(_) => CompletionOutcome::RuntimeLost,
-                            RuntimeTerminal::Completed(_)
-                            | RuntimeTerminal::FailedTurn(_)
-                            | RuntimeTerminal::ReviewFailed(_) => CompletionOutcome::Failed,
+                            RuntimeTerminal::ReviewFailed(failure) => {
+                                return (CompletionOutcome::Failed, failure.code().into())
+                            }
+                            RuntimeTerminal::Completed(_) | RuntimeTerminal::FailedTurn(_) => {
+                                CompletionOutcome::Failed
+                            }
                         };
                         (outcome, "RUNTIME_TERMINAL".into())
                     });
-                    let result = minimal_task_result(outcome, &reason, &reason);
-                    match sink.finish_task_result(&terminal, &result) {
+                    let result =
+                        if resolution.review_committed && outcome == CompletionOutcome::Succeeded {
+                            finalized_review_task_result()
+                        } else {
+                            minimal_task_result(outcome, &reason, &reason)
+                        };
+                    match sink.finish_task_result(&resolution.lifecycle_terminal, &result) {
                         Ok(state) => Ok(state),
                         Err(error) => {
                             self.record_failure(agent_id, error.to_string());
@@ -3853,7 +3937,7 @@ impl Scheduler {
                         }
                     }
                 } else {
-                    self.finish_terminal_or_fail(agent_id, owner_epoch, sink, &terminal)
+                    self.finish_terminal_or_fail(agent_id, owner_epoch, sink, &resolution.terminal)
                 }
             }
         }
@@ -4489,9 +4573,9 @@ impl Scheduler {
             self.record_failure(agent_id, error.to_string());
         }
         let terminal = runtime.stop(self.inner.config.stop_grace);
-        let terminal = self.review_terminal(agent_id, terminal, false);
+        let terminal = self.review_terminal(agent_id, terminal, false, false);
         if let Some(sink) = sink {
-            let _ = sink.finish(&terminal);
+            let _ = sink.finish(&terminal.terminal);
         }
         self.release_active(agent_id, owner_epoch);
     }
@@ -5445,9 +5529,14 @@ impl Drop for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use review_preparation::{BudgetLimits, GeneralProfile, GENERAL_TASK_SCHEMA};
+    use review_ledger::{REVIEW_CHECKPOINT, REVIEW_VALIDATION_RECORD};
+    use review_preparation::{
+        BudgetLimits, GeneralProfile, NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer,
+        RoundKind, ScratchPolicy, GENERAL_TASK_SCHEMA,
+    };
     use review_store::NewArtifact;
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
     use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
 
@@ -6422,6 +6511,508 @@ sleep 10
         )
         .unwrap();
         (directory, store, factory, scheduler)
+    }
+
+    struct ReviewExitFixture {
+        _directory: tempfile::TempDir,
+        store: Arc<Store>,
+        factory: Arc<FakeFactory>,
+        scheduler: Scheduler,
+        prepared: PreparedLaunchSpec,
+        execution_id: String,
+    }
+
+    impl ReviewExitFixture {
+        fn new(suffix: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().join("repository");
+            fs::create_dir_all(repository.join("src")).unwrap();
+            fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+            review_exit_git(&repository, &["init"]);
+            review_exit_git(&repository, &["config", "user.name", "Review Exit Test"]);
+            review_exit_git(
+                &repository,
+                &["config", "user.email", "review-exit@example.invalid"],
+            );
+            review_exit_git(&repository, &["add", "src/lib.rs"]);
+            review_exit_git(&repository, &["commit", "-m", "fixture"]);
+            fs::write(repository.join(".git/info/exclude"), ".agent-work/\n").unwrap();
+            fs::create_dir_all(repository.join(".agent-work/reviews/feature/S01")).unwrap();
+            fs::create_dir_all(repository.join(".agent-work/scratch/jobs")).unwrap();
+            fs::write(repository.join(".agent-work/PLAN.md"), "# plan\n").unwrap();
+            let repository = fs::canonicalize(repository).unwrap();
+            let head = review_exit_git(&repository, &["rev-parse", "HEAD"]);
+            let manifest = ReviewManifest {
+                schema: "sectioned-zcode-review/v1".into(),
+                review_kind: ReviewKind::Code,
+                feature_id: "review-evidence-commit-precedence".into(),
+                section_id: "S01".into(),
+                round_kind: RoundKind::InitialBounded,
+                repository: repository.clone(),
+                base_ref: head.clone(),
+                head_ref: head,
+                plan_path: ".agent-work/PLAN.md".into(),
+                context_paths: Vec::new(),
+                scope_paths: vec!["src/lib.rs".into()],
+                forbidden_input_globs: Vec::new(),
+                validation_commands: Default::default(),
+                report_target: format!(".agent-work/reviews/feature/S01/review-exit-{suffix}.md")
+                    .into(),
+                scratch_root: ".agent-work/scratch/jobs".into(),
+                model: None,
+                fresh_session: true,
+                network_policy: NetworkPolicy::Deny,
+                scratch_policy: ScratchPolicy::Isolated,
+                idempotency_key: format!("review-evidence-commit-precedence:S01:{suffix}"),
+            };
+            let prepared = ReviewPreparer.prepare(&manifest).unwrap();
+            let execution_id = format!("review-exit-{suffix}");
+            let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+            let mut job = NewJob::new(&execution_id, prepared.worktree.path.to_string_lossy());
+            job.idempotency_key = Some(prepared.idempotency_key.clone());
+            job.review_kind = Some(prepared.review_kind.as_str().into());
+            job.feature_id = Some(prepared.feature_id.clone());
+            job.section_id = Some(prepared.section_id.clone());
+            job.round_kind = Some(prepared.round_kind.as_str().into());
+            job.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
+            job.initial_prompt = "review the bounded fixture".into();
+            job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
+            job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+            store
+                .enqueue_task(&NewTask {
+                    job,
+                    public_agent_id: execution_id.clone(),
+                    task_kind: TaskKind::Review,
+                    review_id: Some(format!("review-id-{suffix}")),
+                    continuation_of: None,
+                    repository: repository.to_string_lossy().into_owned(),
+                    feature_id: prepared.feature_id.clone(),
+                    ownership_token: "review-exit-owner".into(),
+                    budget: BudgetRequest::Omitted,
+                    retain_partial: false,
+                })
+                .unwrap();
+            let factory = Arc::new(FakeFactory::default());
+            let scheduler = Scheduler::new(
+                format!("review-exit-owner-{suffix}"),
+                Arc::clone(&store),
+                factory.clone(),
+                SchedulerConfig::default(),
+            )
+            .unwrap()
+            .with_ledger(
+                Arc::new(LedgerManager::new(Arc::clone(&store))),
+                InternalLedgerMcpConfig {
+                    command: PathBuf::from("/usr/bin/false"),
+                    socket: directory.path().join(format!("{suffix}.sock")),
+                    runtime_sha256: Some("a".repeat(64)),
+                },
+            )
+            .unwrap();
+            assert_eq!(scheduler.start_ready().unwrap(), vec![execution_id.clone()]);
+            assert_eq!(
+                store.get_job(&execution_id).unwrap().unwrap().state,
+                JobState::Running
+            );
+            Self {
+                _directory: directory,
+                store,
+                factory,
+                scheduler,
+                prepared,
+                execution_id,
+            }
+        }
+
+        fn checkpoint(&self) {
+            self.scheduler
+                .call_task_review_tool(
+                    &self.execution_id,
+                    REVIEW_CHECKPOINT,
+                    serde_json::json!({
+                        "checkpoint_id":"scope-1","stage":"inspection",
+                        "summary":"bounded evidence observed",
+                        "inspected":[{"path":"src/lib.rs","line_ranges":["1"]}],
+                        "commands":[],"open_questions":[],"remaining_scope":[]
+                    }),
+                )
+                .unwrap();
+        }
+
+        fn validation(&self) {
+            self.scheduler
+                .call_task_review_tool(
+                    &self.execution_id,
+                    REVIEW_VALIDATION_RECORD,
+                    serde_json::json!({
+                        "validation_id":"validation-1","command":"cargo test",
+                        "cwd":".","exit_code":0,"duration_ms":1,
+                        "stdout_summary":"passed","stderr_summary":"",
+                        "related_findings":[]
+                    }),
+                )
+                .unwrap();
+        }
+
+        fn finalize(&self) {
+            self.scheduler
+                .call_task_review_tool(
+                    &self.execution_id,
+                    REVIEW_FINALIZE,
+                    serde_json::json!({
+                        "signal":"no_findings_observed","summary":"bounded review complete",
+                        "coverage":{"covered":["src/lib.rs"],"not_covered":[]},
+                        "uncertainties":[],"recommended_next_actions":[]
+                    }),
+                )
+                .unwrap();
+        }
+
+        fn finalize_valid(&self) {
+            self.checkpoint();
+            self.validation();
+            self.finalize();
+        }
+
+        fn finish(&self, terminal: RuntimeTerminal) -> review_store::StoredTaskResult {
+            self.factory.runtime(&self.execution_id).finish(terminal);
+            wait_for_task_result(&self.store, &self.execution_id)
+        }
+
+        fn force(
+            &self,
+            outcome: CompletionOutcome,
+            reason: &str,
+            request_intent: Option<&str>,
+        ) -> review_store::StoredTaskResult {
+            let (owner_epoch, sink, route, task, operation) = {
+                let state = self.scheduler.inner.state.lock().unwrap();
+                let active = state.active.get(&self.execution_id).unwrap();
+                (
+                    active.owner_epoch,
+                    Arc::clone(&active.sink),
+                    active.route.clone(),
+                    active.task.clone(),
+                    Arc::clone(&active.operation),
+                )
+            };
+            let guard = operation.lock().unwrap();
+            match request_intent {
+                Some("stop") => {
+                    assert_eq!(
+                        self.store.request_stop(&self.execution_id).unwrap().state,
+                        JobState::Stopping
+                    );
+                }
+                Some("close") => {
+                    assert_eq!(
+                        self.store.request_close(&self.execution_id).unwrap().state,
+                        JobState::Stopping
+                    );
+                }
+                None => {}
+                Some(other) => panic!("unknown forced request intent {other}"),
+            }
+            let terminal = RuntimeTerminal::Exited(ChildExit::Exited(Some(31)));
+            self.scheduler
+                .finish_routed_terminal(
+                    TerminalTarget {
+                        agent_id: &self.execution_id,
+                        owner_epoch,
+                        sink: &sink,
+                        route: &route,
+                        task: task.as_ref(),
+                    },
+                    TerminalDecision {
+                        terminal: terminal.clone(),
+                        natural_completion: false,
+                        general_submission: None,
+                        forced_outcome: Some((outcome, reason.into())),
+                    },
+                )
+                .unwrap();
+            self.factory.runtime(&self.execution_id).finish(terminal);
+            drop(guard);
+            wait_until_review_exit(|| (self.scheduler.active_count() == 0).then_some(()));
+            self.store.task_result(&self.execution_id).unwrap().unwrap()
+        }
+    }
+
+    fn review_exit_git(repository: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    fn wait_until_review_exit<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "review exit fixture did not converge"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn durable_finalized_review_commits_before_all_exited_variants() {
+        for (suffix, exit, expected_diagnostic) in [
+            ("exit-zero", ChildExit::Exited(Some(0)), "exited_success"),
+            (
+                "exit-nonzero",
+                ChildExit::Exited(Some(17)),
+                "exited_failure",
+            ),
+            ("exit-signal", ChildExit::Signaled(9), "signaled"),
+            ("exit-unknown", ChildExit::Unknown, "unknown"),
+        ] {
+            let fixture = ReviewExitFixture::new(suffix);
+            fixture.finalize_valid();
+            let result = fixture.finish(RuntimeTerminal::Exited(exit));
+            assert_eq!(result.result.outcome, TaskOutcome::Succeeded, "{suffix}");
+            assert_eq!(result.result.summary, "REVIEW_FINALIZED", "{suffix}");
+            assert!(!result.result.partial, "{suffix}");
+            assert!(result.result.residual_gaps.is_empty(), "{suffix}");
+            assert_eq!(
+                fixture
+                    .store
+                    .get_job(&fixture.execution_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                JobState::Completed,
+                "{suffix}"
+            );
+            assert!(!fixture.prepared.worktree.path.exists(), "{suffix}");
+            let events = fixture
+                .store
+                .task_events_after(&fixture.execution_id, 0, 100)
+                .unwrap();
+            assert!(
+                events.iter().any(|event| {
+                    event.event_type == "runtime.exited"
+                        && event.payload_json.contains(expected_diagnostic)
+                }),
+                "{suffix}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exited_without_durable_finalization_remains_runtime_lost() {
+        let fixture = ReviewExitFixture::new("unfinalized");
+        fixture.checkpoint();
+        fixture.validation();
+        let result = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(19))));
+        assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+        assert!(result.result.partial);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"RUNTIME_TERMINAL".into()));
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::FailedRuntimeLost
+        );
+    }
+
+    #[test]
+    fn finalized_exited_review_preserves_specific_completion_gate_failures() {
+        for (scenario, expected) in [
+            ("missing-checkpoint", "REVIEW_EVIDENCE_INCOMPLETE"),
+            ("missing-validation", "REVIEW_EVIDENCE_INCOMPLETE"),
+            ("report-invalid", "REVIEW_REPORT_INVALID"),
+            ("provenance-invalid", "REVIEW_PROVENANCE_MISMATCH"),
+            ("source-invalid", "SOURCE_INTEGRITY_FAILED"),
+            ("cleanup-invalid", "WORKTREE_CLEANUP_FAILED"),
+        ] {
+            let fixture = ReviewExitFixture::new(scenario);
+            match scenario {
+                "missing-checkpoint" => {
+                    fixture.validation();
+                    fixture.finalize();
+                }
+                "missing-validation" => {
+                    fixture.checkpoint();
+                    fixture.finalize();
+                }
+                _ => fixture.finalize_valid(),
+            }
+            match scenario {
+                "report-invalid" => {
+                    fs::write(&fixture.prepared.report_target, "substituted report").unwrap();
+                }
+                "provenance-invalid" => {
+                    rusqlite::Connection::open(fixture.store.database_path())
+                        .unwrap()
+                        .execute(
+                            "UPDATE review_provenance SET zcode_session_id='mismatched-session' WHERE agent_id=?1",
+                            [&fixture.execution_id],
+                        )
+                        .unwrap();
+                }
+                "source-invalid" => {
+                    fs::write(
+                        fixture.prepared.worktree.path.join("src/lib.rs"),
+                        "pub fn mutated() {}\n",
+                    )
+                    .unwrap();
+                }
+                "cleanup-invalid" => {
+                    fs::set_permissions(
+                        &fixture.prepared.worktree.diagnostic_root,
+                        fs::Permissions::from_mode(0o500),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let result = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(23))));
+            if scenario == "cleanup-invalid" {
+                fs::set_permissions(
+                    &fixture.prepared.worktree.diagnostic_root,
+                    fs::Permissions::from_mode(0o700),
+                )
+                .unwrap();
+            }
+            assert_eq!(result.result.outcome, TaskOutcome::Failed, "{scenario}");
+            assert!(
+                result.result.residual_gaps.contains(&expected.into()),
+                "{scenario}: {result:?}"
+            );
+            assert!(
+                !result
+                    .result
+                    .residual_gaps
+                    .contains(&"RUNTIME_TERMINAL".into()),
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_review_outcomes_win_before_finalized_exit_reconciliation() {
+        for (scenario, outcome, reason, request_intent, expected) in [
+            (
+                "forced-cancel",
+                CompletionOutcome::Cancelled,
+                "CANCELLED",
+                Some("stop"),
+                TaskOutcome::Cancelled,
+            ),
+            (
+                "forced-close",
+                CompletionOutcome::Cancelled,
+                "CANCELLED",
+                Some("close"),
+                TaskOutcome::Cancelled,
+            ),
+            (
+                "forced-timeout",
+                CompletionOutcome::TimedOut,
+                "SEMANTIC_PROGRESS_TIMEOUT",
+                None,
+                TaskOutcome::TimedOut,
+            ),
+            (
+                "forced-budget",
+                CompletionOutcome::BudgetExhausted,
+                "TOOL_CALL_BUDGET_EXHAUSTED",
+                None,
+                TaskOutcome::BudgetExhausted,
+            ),
+        ] {
+            let fixture = ReviewExitFixture::new(scenario);
+            fixture.finalize_valid();
+            fs::write(
+                fixture.prepared.worktree.path.join("src/lib.rs"),
+                "pub fn forced_outcome_wins() {}\n",
+            )
+            .unwrap();
+            let result = fixture.force(outcome, reason, request_intent);
+            assert_eq!(result.result.outcome, expected, "{scenario}");
+            assert!(
+                result.result.residual_gaps.contains(&reason.into()),
+                "{scenario}"
+            );
+            assert_ne!(result.result.summary, "REVIEW_FINALIZED", "{scenario}");
+        }
+    }
+
+    #[test]
+    fn late_exit_driver_and_response_cannot_replace_committed_review_evidence() {
+        let fixture = ReviewExitFixture::new("late-inputs");
+        fixture.finalize_valid();
+        fixture
+            .store
+            .insert_pending_request(
+                "late-response",
+                &fixture.execution_id,
+                "\"late-wire\"",
+                "permission",
+                &serde_json::json!({"toolName":"read","input":{}}).to_string(),
+            )
+            .unwrap();
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        let first = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(29))));
+        let artifact = fixture
+            .scheduler
+            .verify_review_artifact(&fixture.execution_id, 256)
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
+
+        assert_eq!(
+            runtime.finish(RuntimeTerminal::Exited(ChildExit::Signaled(15))),
+            RuntimeTerminal::Exited(ChildExit::Exited(Some(29)))
+        );
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Malformed(
+            "late-driver".into(),
+        )));
+        assert!(fixture
+            .scheduler
+            .respond_job(&fixture.execution_id, "late-response", "allow", None)
+            .is_err());
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            fixture
+                .store
+                .task_result(&fixture.execution_id)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            fixture
+                .scheduler
+                .verify_review_artifact(&fixture.execution_id, 256)
+                .unwrap()
+                .unwrap(),
+            artifact
+        );
     }
 
     fn general_manifest(

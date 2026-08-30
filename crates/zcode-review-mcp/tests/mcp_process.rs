@@ -7,7 +7,7 @@ use review_preparation::{
     NetworkPolicy, PreparedGeneralTask, PreparedLaunchSpec, ReviewKind, ReviewManifest, RoundKind,
     ScratchPolicy,
 };
-use review_store::{LifecycleWrite, Store};
+use review_store::{LifecycleWrite, Store, TaskOutcome};
 use sectioned_shadow::{
     run_shadow_v2, EvidenceClassification, RmcpFacadeClient, ShadowConfig, ShadowMode,
     SHADOW_SCHEMA,
@@ -547,6 +547,26 @@ fn complete_next_review_attempt(
     checkpoint_id: &str,
     inject_redacted_progress: bool,
 ) -> String {
+    complete_next_review_attempt_with_terminal(
+        store,
+        scheduler,
+        factory,
+        ledger,
+        checkpoint_id,
+        inject_redacted_progress,
+        completed_runtime_terminal(),
+    )
+}
+
+fn complete_next_review_attempt_with_terminal(
+    store: &Store,
+    scheduler: &Scheduler,
+    factory: &PublicFakeFactory,
+    ledger: &LedgerManager,
+    checkpoint_id: &str,
+    inject_redacted_progress: bool,
+    terminal: RuntimeTerminal,
+) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let execution_id = loop {
         let started = scheduler.start_ready().unwrap();
@@ -647,9 +667,7 @@ fn complete_next_review_attempt(
             }),
         )
         .unwrap();
-    factory
-        .runtime(&execution_id)
-        .finish(completed_runtime_terminal());
+    factory.runtime(&execution_id).finish(terminal);
     let terminal_deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         if store.task_result(&execution_id).unwrap().is_some() {
@@ -1076,13 +1094,14 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
     let shadow_factory = Arc::clone(&factory);
     let shadow_ledger = Arc::clone(&ledger);
     let review_worker = thread::spawn(move || {
-        complete_next_review_attempt(
+        complete_next_review_attempt_with_terminal(
             &shadow_store,
             &shadow_scheduler,
             &shadow_factory,
             &shadow_ledger,
             "fresh-public-checkpoint",
             true,
+            RuntimeTerminal::Exited(ChildExit::Exited(Some(17))),
         )
     });
     let facade =
@@ -1092,6 +1111,11 @@ async fn public_v2_composition_uses_terminal_evidence_and_survives_daemon_restar
     let shadow_run = run_shadow_v2(&facade, &shadow).await.unwrap();
     facade.shutdown().await.unwrap();
     let shadow_execution = review_worker.join().unwrap();
+    let reconciled = store.task_result(&shadow_execution).unwrap().unwrap();
+    assert_eq!(reconciled.result.outcome, TaskOutcome::Succeeded);
+    assert_eq!(reconciled.result.summary, "REVIEW_FINALIZED");
+    assert!(!reconciled.result.partial);
+    assert!(reconciled.result.residual_gaps.is_empty());
     assert_eq!(
         shadow_run.provenance.classification,
         EvidenceClassification::IndependentEvidence

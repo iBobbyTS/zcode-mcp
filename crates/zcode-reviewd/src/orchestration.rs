@@ -1526,6 +1526,15 @@ impl ReviewCompletionGate {
         Ok(())
     }
 
+    pub(crate) fn has_durable_finalization(&self, job: &Job) -> Result<bool, ReviewFailure> {
+        let snapshot = self
+            .ledger
+            .store()
+            .review_snapshot(&job.agent_id)
+            .map_err(|_| ReviewFailure::ReportInvalid)?;
+        Ok(snapshot.is_some_and(|snapshot| snapshot.finalization.is_some()))
+    }
+
     pub(crate) fn cleanup_nonclean(&self, job: &Job) -> Result<(), ReviewFailure> {
         let _guard = self.cleanup_lock.lock().unwrap();
         let prepared = self.prepared(job)?;
