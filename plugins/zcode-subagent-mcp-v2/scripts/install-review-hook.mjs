@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const pluginRoot = path.resolve(new URL('..', import.meta.url).pathname);
@@ -37,6 +38,7 @@ next.hooks.enabled = true;
 next.hooks.events ??= {};
 const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const canonicalSingleFile = path.join(hookRoot, 'single-file', 'check-bash-status.mjs');
+const canonicalLegacyPath = path.join(os.homedir(), '.zcode/hooks/check-bash-status.mjs');
 const canonicalSingleFileSize = fs.statSync(canonicalSingleFile).size;
 const canonicalSingleFileSha256 = hashFile(canonicalSingleFile);
 const events = {
@@ -72,7 +74,9 @@ function isRecognizedReviewHook(candidate, event, expectedScript) {
   // must remain unknown and fail closed.
   return event === 'PreToolUse' && args.some((arg) => {
     const resolved = path.resolve(arg);
-    return resolved === canonicalSingleFile || hasCanonicalSingleFileContent(resolved);
+    return resolved === canonicalLegacyPath ||
+      resolved === canonicalSingleFile ||
+      hasCanonicalSingleFileContent(resolved);
   });
 }
 

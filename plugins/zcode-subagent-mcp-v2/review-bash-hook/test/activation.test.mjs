@@ -10,8 +10,11 @@ const installScript = path.join(pluginRoot, 'scripts', 'install-review-hook.mjs'
 const checkScript = path.join(pluginRoot, 'scripts', 'check-review-hook.mjs');
 const preflightScript = path.join(pluginRoot, 'scripts', 'preflight-review-hook.mjs');
 
-function run(script, args) {
-  return spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+function run(script, args, env = {}) {
+  return spawnSync(process.execPath, [script, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  });
 }
 
 test('install/check/preflight are idempotent, isolated, and provenance-aware', () => {
@@ -145,6 +148,33 @@ test('does not replace an unknown same-name Bash hook', () => {
   assert.match(result.stderr, /unknown Bash hook/);
   assert.deepEqual(fs.readFileSync(config), before);
   assert.equal(fs.existsSync(provenance), false);
+});
+
+test('replaces a canonical HOME legacy hook regardless of historical content', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'review-hook-home-legacy-'));
+  const config = path.join(directory, 'config.json');
+  const provenance = path.join(directory, 'provenance.json');
+  const legacyHook = path.join(directory, '.zcode', 'hooks', 'check-bash-status.mjs');
+  fs.mkdirSync(path.dirname(legacyHook), { recursive: true });
+  fs.writeFileSync(legacyHook, '// historical user hook\n');
+  fs.writeFileSync(config, JSON.stringify({
+    hooks: {
+      enabled: true,
+      events: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'process', command: 'node', args: [legacyHook], timeoutMs: 5000 }] },
+        ],
+      },
+    },
+  }, null, 2));
+
+  const result = run(installScript, ['--config', config, '--provenance', provenance], { HOME: directory });
+  assert.equal(result.status, 0, result.stderr);
+  const installed = JSON.parse(fs.readFileSync(config, 'utf8'));
+  const entry = installed.hooks.events.PreToolUse.find((candidate) => candidate.matcher === 'Bash');
+  assert.equal(entry.hooks[0].args[0], path.join(pluginRoot, 'review-bash-hook', 'hooks', 'check-bash-readonly.mjs'));
+  assert.equal(fs.readFileSync(legacyHook, 'utf8'), '// historical user hook\n');
+  assert.equal(fs.existsSync(provenance), true);
 });
 
 test('does not treat the guard single-file as an audit hook', () => {
