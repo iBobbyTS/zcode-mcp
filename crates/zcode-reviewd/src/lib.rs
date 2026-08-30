@@ -2065,7 +2065,7 @@ impl StoreLifecycleSink {
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
-        self.store.append_lifecycle(&LifecycleWrite {
+        let terminal_write = self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
             owner_epoch: self.owner_epoch,
@@ -2076,7 +2076,11 @@ impl StoreLifecycleSink {
             redaction_level: projection.redaction_level.into(),
             terminal: None,
             turn_state: None,
-        })?;
+        });
+        if let Err(error) = terminal_write {
+            state.first_error = Some(error.to_string());
+            return Err(error);
+        }
         self.store.store_task_result(&self.agent_id, result)?;
         state.terminal_written = true;
         self.store
@@ -6873,6 +6877,61 @@ sleep 10
                     .contains(&"LIFECYCLE_SINK_FAILED".into()));
             }
             other => panic!("unexpected sink failure result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_append_failure_cannot_fallback_to_finalized_review_success() {
+        let fixture = ReviewExitFixture::new("terminal-append-failure");
+        fixture.finalize_valid();
+        rusqlite::Connection::open(fixture.store.database_path())
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_finalized_terminal_append BEFORE INSERT ON events
+                 WHEN NEW.agent_id='{}'
+                 BEGIN SELECT RAISE(FAIL, 'scripted finalized terminal append failure'); END;",
+                fixture.execution_id
+            ))
+            .unwrap();
+        let result = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(43))));
+
+        assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+        assert!(result.result.partial);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"LIFECYCLE_SINK_FAILED".into()));
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::FailedRuntimeLost
+        );
+        assert!(!fixture.prepared.worktree.path.exists());
+        assert_eq!(fixture.scheduler.active_count(), 0);
+        let service =
+            rpc::RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
+        match service
+            .dispatch(rpc::RpcMethod::TaskResult {
+                agent_id: fixture.execution_id.clone(),
+                attempt_sequence: Some(1),
+            })
+            .unwrap()
+        {
+            rpc::RpcSuccess::TaskResult {
+                result: Some(public),
+                ..
+            } => {
+                assert_eq!(public.outcome, TaskOutcome::RuntimeLost);
+                assert!(public.review_evidence.is_none());
+                assert!(public
+                    .residual_gaps
+                    .contains(&"LIFECYCLE_SINK_FAILED".into()));
+            }
+            other => panic!("unexpected terminal append failure result: {other:?}"),
         }
     }
 
