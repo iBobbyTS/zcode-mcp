@@ -1027,6 +1027,27 @@ def _propagate_binding_gaps(evidence: dict[str, Any], binding: Mapping[str, Any]
             target.append(gap)
 
 
+def _reconcile_fresh_session_attestation(evidence: dict[str, Any], terminal: Mapping[str, Any]) -> None:
+    """Promote a runtime fresh-session observation over PREPARING-time state.
+
+    ZCode 0.16.5 can return ``fresh_session_observed=false`` while a spawn is
+    still ``PREPARING`` and attest it only once the task is running/terminal.
+    Keep the initial value for raw evidence, but remove the provisional gap
+    after a later public task projection proves the session is fresh.
+    """
+    task = terminal.get("task") if isinstance(terminal, Mapping) else None
+    if not isinstance(task, Mapping) or task.get("fresh_session_observed") is not True:
+        return
+    provisional = "fresh session was not publicly attested"
+    gaps = evidence.get("gaps")
+    if isinstance(gaps, list):
+        evidence["gaps"] = [gap for gap in gaps if gap != provisional]
+    binding = evidence.get("spawn_identity_binding")
+    if isinstance(binding, dict):
+        binding["gaps"] = [gap for gap in binding.get("gaps", []) if gap != provisional]
+        binding["fresh_session_observed"] = True
+
+
 def _runtime_version(path: Path) -> str | None:
     # Standard app layout: ZCode.app/Contents/Resources/glm/zcode.cjs.
     info = path.parents[2] / "Info.plist" if len(path.parents) > 2 else None
@@ -1314,6 +1335,7 @@ def _call_case(
         lifecycle_timeout = min(MAX_LIFECYCLE_TIMEOUT_S, max(DEFAULT_LIFECYCLE_TIMEOUT_S, float(wall_ms) / 1000.0)) if isinstance(wall_ms, (int, float)) and wall_ms > 0 else DEFAULT_LIFECYCLE_TIMEOUT_S
         terminal = _poll_terminal(client, agent_id, evidence, expected_attempt=spawn_attempt, timeout_s=lifecycle_timeout)
         evidence["terminal"] = terminal
+        _reconcile_fresh_session_attestation(evidence, terminal)
         if enforce_gates and manifest.get("case_id") == "case-01-user-fuzzy-search":
             evidence["typed_permission_gate"] = _assert_typed_permission_gate(evidence)
         _assert_event_contract(evidence, expected_attempts={spawn_attempt})

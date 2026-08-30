@@ -37,6 +37,7 @@ pub struct ReviewPrompt {
 }
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
+const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: If a Bash command is rejected, do not try that Bash command again; continue the review with an allowed equivalent or document the limitation and proceed to the next review stage.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptError {
@@ -164,6 +165,8 @@ fn add_task_progress_instruction(
 ) -> Result<ReviewPrompt, PromptError> {
     prompt.text.push_str("\n\n");
     prompt.text.push_str(TASK_PROGRESS_INSTRUCTION);
+    prompt.text.push_str("\n");
+    prompt.text.push_str(TASK_PERMISSION_INSTRUCTION);
     if let Some(frozen_finding_ids) = frozen_finding_ids {
         validate_review_continuation_prompt(
             prompt.kind,
@@ -393,6 +396,9 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         let task = add_task_progress_instruction(prompt, None).unwrap();
         assert!(task.text.contains("TASK_SCOPED_SEMANTIC_PROGRESS"));
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
+        assert!(task
+            .text
+            .contains("If a Bash command is rejected, do not try that Bash command again"));
         assert_ne!(task.text, legacy);
         assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
     }

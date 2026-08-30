@@ -29,6 +29,7 @@ from run_matrix import (
     _call_case,
     _poll_terminal,
     _public_events,
+    _reconcile_fresh_session_attestation,
     main,
 )
 from run_matrix import REPOSITORY_ROOT, _sha256
@@ -40,6 +41,21 @@ from fixture_workspace import (
 
 
 class S02Tests(unittest.TestCase):
+    def test_fresh_session_attestation_is_reconciled_after_preparing_spawn(self):
+        evidence = {
+            "gaps": ["fresh session was not publicly attested", "other gap"],
+            "spawn_identity_binding": {
+                "gaps": ["fresh session was not publicly attested"],
+            },
+        }
+        _reconcile_fresh_session_attestation(
+            evidence,
+            {"task": {"phase": "RUNNING", "fresh_session_observed": True}},
+        )
+        self.assertEqual(evidence["gaps"], ["other gap"])
+        self.assertEqual(evidence["spawn_identity_binding"]["gaps"], [])
+        self.assertTrue(evidence["spawn_identity_binding"]["fresh_session_observed"])
+
     def materialized_case(self, name: str) -> tuple[Path, Path]:
         source = GIT_BASED_ROOT / name
         if not (source / "fixture-manifest.json").is_file():

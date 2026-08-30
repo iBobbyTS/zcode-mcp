@@ -281,6 +281,7 @@ impl PolicyLauncher {
         } else if matches!(
             tool_name,
             "mcp__review-ledger__review_checkpoint"
+                | "mcp__review-ledger__review_progress"
                 | "mcp__review-ledger__review_finding_upsert"
                 | "mcp__review-ledger__review_validation_record"
                 | "mcp__review-ledger__review_finalize"

@@ -546,6 +546,7 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
     );
     for tool in [
         "mcp__review-ledger__review_checkpoint",
+        "mcp__review-ledger__review_progress",
         "mcp__review-ledger__review_finding_upsert",
         "mcp__review-ledger__review_validation_record",
         "mcp__review-ledger__review_finalize",
