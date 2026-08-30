@@ -2,6 +2,7 @@ use serde_json::{json, Map, Value};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
+    thread,
 };
 
 const LEDGER_TOOLS: [&str; 5] = [
@@ -262,6 +263,13 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("ledger MCP stdout is missing"))?,
     );
     let stderr = child.stderr.take().unwrap();
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(8193).read_to_end(&mut bytes);
+        let truncated = bytes.len() > 8192;
+        bytes.truncate(8192);
+        (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+    });
 
     let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
         .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
@@ -299,15 +307,17 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
                 "summary":"fake runtime started semantic review",
                 "counters":{"files":0}
             }),
-        )?;
+        )
+        .map_err(|error| io::Error::other(format!("stage=progress: {error}")))?;
         next_id += 1;
     }
     if mode == "review-flow-progress-only" {
         drop(input);
         let status = child.wait()?;
+        let (stderr_text, stderr_truncated) = stderr_reader.join().unwrap_or_default();
         if !status.success() {
             return Err(io::Error::other(format!(
-                "stage=child-wait: ledger MCP process exited with {status}"
+                "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
             )));
         }
         return Ok(());
@@ -322,7 +332,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "inspected":[{"path":"src/approval.rs","line_ranges":["1"]}],
             "commands":[],"open_questions":[],"remaining_scope":[]
         }),
-    )?;
+    )
+    .map_err(|error| io::Error::other(format!("stage=checkpoint: {error}")))?;
     ledger_tool_call(
         &mut input,
         &mut output,
@@ -334,7 +345,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "evidence":["observable fixture"],"impact":"bounded","suggested_remediation":"none",
             "status":"open"
         }),
-    )?;
+    )
+    .map_err(|error| io::Error::other(format!("stage=finding-open: {error}")))?;
     ledger_tool_call(
         &mut input,
         &mut output,
@@ -346,7 +358,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "evidence":["later observable fixture"],"impact":"none","suggested_remediation":"none",
             "status":"withdrawn"
         }),
-    )?;
+    )
+    .map_err(|error| io::Error::other(format!("stage=finding-withdraw: {error}")))?;
     ledger_tool_call(
         &mut input,
         &mut output,
@@ -357,7 +370,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "exit_code":0,"duration_ms":1,"stdout_summary":"passed","stderr_summary":"",
             "related_findings":[]
         }),
-    )?;
+    )
+    .map_err(|error| io::Error::other(format!("stage=validation: {error}")))?;
     if finalize {
         ledger_tool_call(
             &mut input,
@@ -369,16 +383,15 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
                 "coverage":{"covered":["src"],"not_covered":[]},
                 "uncertainties":[],"recommended_next_actions":[]
             }),
-        )?;
+        )
+        .map_err(|error| io::Error::other(format!("stage=finalize: {error}")))?;
     }
     drop(input);
     let status = child.wait()?;
-    let mut stderr_bytes = Vec::new();
-    let _ = stderr.take(8192).read_to_end(&mut stderr_bytes);
-    let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+    let (stderr_text, stderr_truncated) = stderr_reader.join().unwrap_or_default();
     if !status.success() {
         return Err(io::Error::other(format!(
-            "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}"
+            "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
         )));
     }
     Ok(())
