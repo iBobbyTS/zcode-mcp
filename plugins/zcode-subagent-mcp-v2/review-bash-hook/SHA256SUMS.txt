@@ -27,7 +27,7 @@ dd7d01088610d1f083fc45f225e9292cc67b51638747342a2978c6700a47dd58  ./policy-corpu
 1530c94369ae92f7d84acf7934c9205b23e5ef615b9eb5c2219aa078a699ce5e  ./scripts/evaluate-command.mjs
 369b182297d4aacb79893cdc1aa46efa1edd62af99c147c72b9d004fe54f61fa  ./scripts/update-checksums.mjs
 7c42347fee9dc1e3766651d22d5b8b4eefb03fed24c6a17f7c19b4acfc152ee1  ./single-file/check-bash-status.mjs
-f8ee3b23842575030ce65563786121b512e025c72ca508bb4bebd91d10771edf  ./test/activation.test.mjs
+64a264b481667dc75c8eadef665e58334408282a27afe99aa55e2bc8650bffc3  ./test/activation.test.mjs
 c8c731e88d619b7660e36266da34df59be687060c8a897213424e8a2ea6fd724  ./test/execution.test.mjs
 a71cf8993bc0b5cacc738c48a15c06e694ca5acffaa171d91063a8f018a828b4  ./test/fuzz.test.mjs
 d3ba47b86973e6195f7d29cdac639b6aa42c55faa786abf84b2f65b3dfa0124d  ./test/hook.test.mjs
