@@ -770,7 +770,9 @@ fn injected_ledger_progress_only_records_progress_without_finalization() {
     assert!(snapshot.findings.is_empty());
     assert!(snapshot.validations.is_empty());
     assert!(!snapshot.report.finalized);
-    assert!(fixture.store.review_progress(&execution).unwrap().is_some());
+    let progress = fixture.store.review_progress(&execution).unwrap().unwrap();
+    assert_eq!(progress.stage, "inspection");
+    assert_eq!(progress.summary, "fake runtime started semantic review");
 }
 
 #[test]
