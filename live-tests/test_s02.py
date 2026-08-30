@@ -195,6 +195,15 @@ class S02Tests(unittest.TestCase):
         runtime = FakeRuntime("restart-loss")
         self.assertEqual(PublicV2Client(runtime).call("zcode_agent_get")["error_class"], "SERVICE_GENERATION_MISMATCH")
 
+    def test_readiness_timeout_remains_infrastructure_evidence(self):
+        self.assertEqual(
+            _computed_case_conclusion({
+                "case_id": "case-01-user-fuzzy-search",
+                "error": {"class": "InfrastructureConformanceError"},
+            }),
+            "NOT_EXERCISED",
+        )
+
     def test_pack_finalizer_is_atomic_and_excludes_junk(self):
         with tempfile.TemporaryDirectory() as d:
             source, destination = self._valid_pack_source(Path(d)), Path(d) / "pack.zip"

@@ -1746,12 +1746,27 @@ def main(argv: list[str] | None = None) -> int:
         if identity["runtime_candidate"]["version_match"] is not True:
             raise FatalConformanceError(f"official runtime version is not {EXPECTED_RUNTIME_VERSION}")
         readiness_args = {"timeout_ms": min(5000, max(1, int(args.timeout * 1000)))}
-        readiness = client.call(
-            "zcode_system_ensure_ready",
-            readiness_args,
-            launches=True,
-            retry_infrastructure=True,
-        )
+        readiness_attempts: list[Mapping[str, Any]] = []
+        # A prior run may already have consumed the original readiness probe.
+        # Keep the cumulative ledger truthful while permitting at most two
+        # retries for the same NOT_OBSERVED_WITHIN_TIMEOUT infrastructure state.
+        remaining_attempts = max(1, 3 - ledger.count)
+        readiness: Mapping[str, Any] = {}
+        for _ in range(remaining_attempts):
+            candidate = client.call(
+                "zcode_system_ensure_ready",
+                readiness_args,
+                launches=True,
+                retry_infrastructure=True,
+            )
+            if not isinstance(candidate, Mapping):
+                raise FatalConformanceError("official readiness response was not an object")
+            readiness = candidate
+            readiness_attempts.append(candidate)
+            if candidate.get("ready") is True:
+                break
+            if candidate.get("probe_result") != "NOT_OBSERVED_WITHIN_TIMEOUT":
+                break
         readiness_status = readiness.get("status") if isinstance(readiness, Mapping) else None
         readiness_components = readiness_status.get("components") if isinstance(readiness_status, Mapping) else None
         if not isinstance(readiness_status, Mapping) or readiness_status.get("service_generation") != status.get("service_generation"):
@@ -1761,8 +1776,16 @@ def main(argv: list[str] | None = None) -> int:
         identity["public_service"]["runtime_state_after_readiness"] = readiness_components.get("runtime")
         identity["public_service"]["model_auth_state_after_readiness"] = readiness_components.get("model_auth")
         _write_json(output / "normalized/identity.json", identity)
-        _write_json(output / "normalized/readiness.json", {"status": status, "readiness": readiness})
-        if isinstance(readiness, Mapping) and readiness.get("ready") is not True:
+        _write_json(output / "normalized/readiness.json", {
+            "status": status,
+            "readiness": readiness,
+            "attempts": readiness_attempts,
+        })
+        if readiness.get("ready") is not True:
+            if readiness.get("probe_result") == "NOT_OBSERVED_WITHIN_TIMEOUT":
+                raise InfrastructureConformanceError(
+                    "official runtime readiness was not observed after bounded retries"
+                )
             raise FatalConformanceError("official runtime did not report READY")
         for case_dir in sorted(REPOSITORY_ROOT.glob("case-*/fixture-manifest.json")):
             manifest = json.loads(case_dir.read_text(encoding="utf-8"))
