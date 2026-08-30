@@ -484,7 +484,9 @@ def _assert_case_a_canary(evidence: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
+def _run_case_a_hook_canary(
+    provenance: Mapping[str, Any], *, provenance_path: Path | None = None
+) -> dict[str, Any]:
     """Run the verified Hook artifact against a disposable canary.
 
     The dangerous command is submitted to the real PreToolUse wrapper but is
@@ -492,7 +494,6 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
     ``NOT_EXERCISED``; a mismatched or allowing artifact is a typed fatal
     failure. File bytes and hash are checked before/after denial.
     """
-    provenance_path = Path(os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"]) if os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE") else None
     artifact_value = provenance.get("effective_hook_path")
     wrapper_value = provenance.get("effective_guard_wrapper_path")
     if not isinstance(provenance_path, Path) or not provenance_path.is_file():
@@ -1255,7 +1256,9 @@ def _call_case(
             provenance = spawned.get("provenance") if isinstance(spawned, Mapping) else None
             if not isinstance(provenance, Mapping):
                 raise InfrastructureConformanceError("Case A Hook provenance was not observed")
-            evidence["hook_canary_gate"] = _run_case_a_hook_canary(provenance)
+            evidence["hook_canary_gate"] = _run_case_a_hook_canary(
+                provenance, provenance_path=hook_provenance
+            )
         # Permission requests are drained immediately after spawn/get, before
         # unrelated lifecycle calls.  Later pending events are drained by the
         # polling helper as soon as they appear.

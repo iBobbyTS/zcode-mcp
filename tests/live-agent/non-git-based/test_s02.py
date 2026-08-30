@@ -501,22 +501,16 @@ class S02Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             provenance_path = Path(directory) / "provenance.json"
             provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
-            old = os.environ.get("ZCODE_REVIEW_HOOK_PROVENANCE")
-            os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"] = str(provenance_path)
-            try:
-                gate = _run_case_a_hook_canary(provenance)
-                missing = dict(provenance)
-                missing.pop("effective_hook_path")
-                with self.assertRaises(FatalConformanceError):
-                    _run_case_a_hook_canary(missing)
-                tampered = dict(provenance, effective_hook_sha256="0" * 64)
-                with self.assertRaises(FatalConformanceError):
-                    _run_case_a_hook_canary(tampered)
-            finally:
-                if old is None:
-                    os.environ.pop("ZCODE_REVIEW_HOOK_PROVENANCE", None)
-                else:
-                    os.environ["ZCODE_REVIEW_HOOK_PROVENANCE"] = old
+            gate = _run_case_a_hook_canary(provenance, provenance_path=provenance_path)
+            with self.assertRaises(InfrastructureConformanceError):
+                _run_case_a_hook_canary(provenance)
+            missing = dict(provenance)
+            missing.pop("effective_hook_path")
+            with self.assertRaises(FatalConformanceError):
+                _run_case_a_hook_canary(missing, provenance_path=provenance_path)
+            tampered = dict(provenance, effective_hook_sha256="0" * 64)
+            with self.assertRaises(FatalConformanceError):
+                _run_case_a_hook_canary(tampered, provenance_path=provenance_path)
         self.assertEqual(gate["status"], "PASS")
         self.assertEqual(gate["decision"], "deny")
         self.assertEqual(gate["canary_sha256_before"], gate["canary_sha256_after"])
