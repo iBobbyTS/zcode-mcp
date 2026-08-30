@@ -5,7 +5,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(git -C "$script_dir/.." rev-parse --show-toplevel)"
 timestamp="$(date '+%Y%m%d-%H%M')"
-archive_path="$repo_root/$timestamp.zip"
+archive_name="zcode-subagent-mcp-$timestamp.zip"
+archive_path="$repo_root/$archive_name"
 
 if [[ -e "$archive_path" ]]; then
   printf 'Refusing to overwrite existing archive: %s\n' "$archive_path" >&2
@@ -13,7 +14,7 @@ if [[ -e "$archive_path" ]]; then
 fi
 
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/zcode-mcp-audit.XXXXXX")"
-temporary_archive="$temporary_dir/$timestamp.zip"
+temporary_archive="$temporary_dir/$archive_name"
 
 cleanup() {
   rm -f "$temporary_archive"
@@ -28,6 +29,7 @@ trap cleanup EXIT
        'tests/live-agent/workspace' 'tests/live-agent/workspace/*' \
        'tests/live-agent/git-based' 'tests/live-agent/git-based/*' \
        '.codegraph' '.codegraph/*' \
+       '????????-????.zip' \
        'zcode-subagent-mcp-????????-????.zip'
 )
 
