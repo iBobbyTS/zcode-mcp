@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from fixture_workspace import REPOSITORY_ROOT
+
 MAX_OFFICIAL_LAUNCHES = 8
 NOMINAL_OFFICIAL_LAUNCHES = 5
 MAX_RETRY_LAUNCHES = MAX_OFFICIAL_LAUNCHES - NOMINAL_OFFICIAL_LAUNCHES
@@ -702,7 +704,7 @@ class FakeRuntime:
 
     def _review_provenance(self, attempt_sequence: int) -> dict[str, Any]:
         digest = lambda label: hashlib.sha256(f"{label}-{attempt_sequence}".encode()).hexdigest()
-        hook_artifact = Path(__file__).resolve().parents[1] / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+        hook_artifact = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
         hook_wrapper = hook_artifact.parent.parent / "hooks/check-bash-readonly.mjs"
         hook_digest = hashlib.sha256(hook_artifact.read_bytes()).hexdigest() if hook_artifact.is_file() else digest("hook")
         return {

@@ -37,7 +37,7 @@ try:
         validate_artifact_chunk,
         PUBLIC_EVENT_TYPES,
     )
-except ImportError:  # script execution from live-tests/
+except ImportError:  # direct script execution from non-git-based/
     from conformance import (  # type: ignore
         FatalConformanceError,
         InfrastructureConformanceError,
@@ -53,8 +53,14 @@ except ImportError:  # script execution from live-tests/
         PUBLIC_EVENT_TYPES,
     )
 
+from fixture_workspace import (
+    REPOSITORY_ROOT,
+    WORKSPACE_ROOT,
+    create_execution_root,
+    materialize_git_cases,
+)
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
 DEFAULT_RUNTIME = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
 DEFAULT_PACK = Path.home() / "Desktop/audit-pack/zcode-mcp-official-runtime-conformance.zip"
 EXPECTED_RUNTIME_VERSION = "3.10.1"
@@ -475,7 +481,7 @@ def _run_case_a_hook_canary(provenance: Mapping[str, Any]) -> dict[str, Any]:
     # The artifact is harness-owned and verified locally.  A public review
     # provenance object may advertise its digest/version but need not expose a
     # filesystem path (that is not part of the public contract).
-    artifact = Path(__file__).resolve().parents[1] / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
+    artifact = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook/lib/readonly-bash-policy.mjs"
     artifact_digest = provenance.get("effective_hook_sha256")
     expected_digest = provenance.get("expected_hook_sha256")
     if not isinstance(artifact_digest, str) or not artifact_digest:
@@ -1484,7 +1490,7 @@ def _json_block(value: Any) -> str:
 
 def _render_reports(root: Path, output: Path, destination: Path) -> dict[str, Any]:
     """Render every report from normalized evidence; templates supply titles only."""
-    template = root / "live-tests/pack-template"
+    template = Path(__file__).resolve().parent / "pack-template"
     titles: dict[str, str] = {}
     for name in (
         "SUMMARY.md", "SYSTEM-IDENTITY.md", "SCENARIO-MATRIX.md", "PERMISSION-MATRIX.md",
@@ -1602,7 +1608,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mcp-binary", type=Path, default=None)
     parser.add_argument("--socket", type=Path, default=None)
     parser.add_argument("--runtime", type=Path, default=DEFAULT_RUNTIME)
-    parser.add_argument("--output", type=Path, default=REPOSITORY_ROOT / ".agent-work/s02-normalized")
+    parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--ledger", type=Path, default=None)
     parser.add_argument("--pack", type=Path, default=DEFAULT_PACK)
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -1610,11 +1616,31 @@ def main(argv: list[str] | None = None) -> int:
     if not args.official:
         parser.error("refusing official calls without explicit --official")
 
-    output = args.output.resolve()
+    if args.output:
+        output = args.output.resolve()
+        try:
+            output.relative_to(WORKSPACE_ROOT.resolve())
+        except ValueError:
+            parser.error(f"--output must be inside {WORKSPACE_ROOT}")
+        execution_root = output.parent
+        if execution_root == WORKSPACE_ROOT.resolve():
+            parser.error("--output must be inside a unique run directory")
+    else:
+        execution_root = create_execution_root("official-runtime-conformance-")
+        output = execution_root / "results"
+    cases_root = execution_root / "cases"
+    if cases_root.exists():
+        parser.error(f"run directory already contains materialized cases: {cases_root}")
+    cases_root.mkdir()
+    case_roots = materialize_git_cases(cases_root)
     output.mkdir(parents=True, exist_ok=True)
     for name in ("normalized", "raw-transcripts", "redacted-logs", "fixtures"):
         (output / name).mkdir(parents=True, exist_ok=True)
     ledger_path = (args.ledger or (output / "launch-ledger.json")).resolve()
+    try:
+        ledger_path.relative_to(WORKSPACE_ROOT.resolve())
+    except ValueError:
+        parser.error(f"--ledger must be inside {WORKSPACE_ROOT}")
     ledger = LaunchLedger(ledger_path)
     binary = args.mcp_binary or (Path(os.environ["ZCODE_REVIEW_MCP_PATH"]) if os.environ.get("ZCODE_REVIEW_MCP_PATH") else None)
     if binary is None:
@@ -1649,6 +1675,13 @@ def main(argv: list[str] | None = None) -> int:
     hook_policy = hook_root / "POLICY.md"
     identity = {
         "repository_head": _git_head(REPOSITORY_ROOT),
+        "fixture_execution": {
+            "source_root": str((REPOSITORY_ROOT / "tests/live-agent/git-based").resolve()),
+            "execution_root": str(execution_root),
+            "cases_root": str(cases_root),
+            "materialized_cases": [case.name for case in case_roots],
+            "source_mutation": "forbidden",
+        },
         "mcp_facade": {
             "binary": str(binary),
             "sha256": _sha256(binary),
@@ -1787,9 +1820,8 @@ def main(argv: list[str] | None = None) -> int:
                     "official runtime readiness was not observed after bounded retries"
                 )
             raise FatalConformanceError("official runtime did not report READY")
-        for case_dir in sorted(REPOSITORY_ROOT.glob("case-*/fixture-manifest.json")):
-            manifest = json.loads(case_dir.read_text(encoding="utf-8"))
-            case_root = case_dir.parent
+        for case_root in case_roots:
+            manifest = json.loads((case_root / "fixture-manifest.json").read_text(encoding="utf-8"))
             evidence = _call_case(
                 client,
                 case_root,
@@ -1829,7 +1861,7 @@ def main(argv: list[str] | None = None) -> int:
         identity["owned_daemon_cleanup"] = cleanup
         _write_json(output / "normalized/identity.json", identity)
 
-    pack_source = _copy_pack_inputs(REPOSITORY_ROOT, output)
+    pack_source = _copy_pack_inputs(cases_root, output)
     destination, digest = finalize_pack(pack_source, args.pack.expanduser().resolve())
     print(json.dumps({"pack": str(destination), "sha256": digest, "launches": ledger.count, "retries": ledger.retries, "exit_code": exit_code}, sort_keys=True))
     return exit_code

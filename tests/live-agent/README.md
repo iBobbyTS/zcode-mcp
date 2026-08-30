@@ -1,0 +1,16 @@
+# Live Agent Tests
+
+This directory separates committed small-scale tests from local Git-based
+review fixtures and disposable execution state.
+
+- `non-git-based/` is committed. It contains the small fake-runtime, transport,
+  renderer, and harness tests that do not require a fixture Git repository.
+- `git-based/` is local and ignored. It contains complex review scenario source
+  templates whose workspaces include independent Git repositories.
+- `workspace/` is local and ignored. Every test execution must copy its source
+  scenario here before reset, verification, review, or result collection.
+
+Source scenarios are immutable inputs. Test code must use
+`non-git-based/fixture_workspace.py` to create a unique execution directory and
+materialize a scenario. Results, transcripts, logs, stores, temporary Git
+repositories, and imported historical evidence stay under `workspace/`.

@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -27,9 +28,37 @@ from run_matrix import (
     _public_events,
     main,
 )
+from fixture_workspace import (
+    GIT_BASED_ROOT,
+    create_execution_root,
+    materialize,
+)
 
 
 class S02Tests(unittest.TestCase):
+    def materialized_case(self, name: str) -> tuple[Path, Path]:
+        source = GIT_BASED_ROOT / name
+        if not (source / "fixture-manifest.json").is_file():
+            self.skipTest(f"local Git-based fixture is not installed: {name}")
+        execution_root = create_execution_root("s02-unit-")
+        self.addCleanup(shutil.rmtree, execution_root, True)
+        output = execution_root / "results"
+        output.mkdir()
+        return materialize(source, execution_root), output
+
+    def require_git_fixtures(self) -> None:
+        missing = [
+            name
+            for name in (
+                "case-01-user-fuzzy-search",
+                "case-02-shared-group-members",
+                "case-03-agent-control-lifecycle",
+            )
+            if not (GIT_BASED_ROOT / name / "fixture-manifest.json").is_file()
+        ]
+        if missing:
+            self.skipTest(f"local Git-based fixtures are not installed: {', '.join(missing)}")
+
     def test_owned_daemon_unavailable_is_explicit_binding_gap(self):
         with tempfile.TemporaryDirectory() as d:
             daemon = OwnedDaemon(Path(d) / "missing-reviewd", Path(d) / "runtime.cjs", Path(d) / "run", 0.1)
@@ -233,10 +262,10 @@ class S02Tests(unittest.TestCase):
 
     def test_fake_case_c_continuation_and_full_artifact_reconstruction(self):
         runtime = FakeRuntime("case-c")
-        client = PublicV2Client(runtime, LaunchLedger(Path(tempfile.mkdtemp()) / "ledger.json"))
-        manifest = json.loads((Path(__file__).parents[1] / "case-03-agent-control-lifecycle/fixture-manifest.json").read_text())
-        with tempfile.TemporaryDirectory() as d:
-            evidence = _call_case(client, Path(__file__).parents[1] / "case-03-agent-control-lifecycle", manifest, Path(d))
+        case, output = self.materialized_case("case-03-agent-control-lifecycle")
+        client = PublicV2Client(runtime, LaunchLedger(output / "ledger.json"))
+        manifest = json.loads((case / "fixture-manifest.json").read_text())
+        evidence = _call_case(client, case, manifest, output)
         self.assertEqual(evidence["spawn"]["effective_budget"], CASE_C_BUDGET)
         self.assertEqual(evidence["continuation"]["agent_id"], evidence["spawn"]["agent_id"])
         self.assertEqual(evidence["continuation"]["review_id"], evidence["spawn"]["review_id"])
@@ -344,10 +373,10 @@ class S02Tests(unittest.TestCase):
                 return provenance
 
         runtime = UnverifiedHookRuntime()
-        manifest = json.loads((Path(__file__).parents[1] / "case-01-user-fuzzy-search/fixture-manifest.json").read_text())
-        with tempfile.TemporaryDirectory() as d:
-            client = PublicV2Client(runtime, LaunchLedger(Path(d) / "ledger.json"))
-            evidence = _call_case(client, Path(__file__).parents[1] / "case-01-user-fuzzy-search", manifest, Path(d))
+        case, output = self.materialized_case("case-01-user-fuzzy-search")
+        manifest = json.loads((case / "fixture-manifest.json").read_text())
+        client = PublicV2Client(runtime, LaunchLedger(output / "ledger.json"))
+        evidence = _call_case(client, case, manifest, output)
         self.assertEqual(evidence["conclusion"], "PASS_WITH_GAPS")
         self.assertIn("Hook activation was not publicly verified", evidence["gaps"])
         self.assertIn("Hook activation was not publicly verified", evidence["spawn_identity_binding"]["gaps"])
@@ -540,12 +569,12 @@ class S02Tests(unittest.TestCase):
                     return {"isError": True, "error": {"code": "PROTOCOL", "message": "fatal"}}
                 return super().call(tool, args)
         runtime = FailingRuntime()
-        client = PublicV2Client(runtime, LaunchLedger(Path(tempfile.mkdtemp()) / "ledger.json"))
-        manifest = json.loads((Path(__file__).parents[1] / "case-01-user-fuzzy-search/fixture-manifest.json").read_text())
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(Exception):
-                _call_case(client, Path(__file__).parents[1] / "case-01-user-fuzzy-search", manifest, Path(d))
-            self.assertTrue((Path(d) / "case-01-user-fuzzy-search.json").is_file())
+        case, output = self.materialized_case("case-01-user-fuzzy-search")
+        client = PublicV2Client(runtime, LaunchLedger(output / "ledger.json"))
+        manifest = json.loads((case / "fixture-manifest.json").read_text())
+        with self.assertRaises(Exception):
+            _call_case(client, case, manifest, output)
+        self.assertTrue((output / "case-01-user-fuzzy-search.json").is_file())
 
     def test_ambiguous_transport_keeps_one_reservation_and_retries_same_call(self):
         class BrokenTransport:
@@ -627,6 +656,7 @@ class S02Tests(unittest.TestCase):
             _poll_terminal(client, "missing-agent", {}, expected_attempt=1, timeout_s=0.001)
 
     def test_main_runner_uses_real_facade_restart_path_and_renders_pack(self):
+        self.require_git_fixtures()
         class FakeFacadeTransport:
             instances = []
             runtime = FakeRuntime("case-c")
@@ -655,10 +685,12 @@ class S02Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             temp = Path(d)
+            execution = create_execution_root("s02-main-")
+            self.addCleanup(shutil.rmtree, execution, True)
             binary, runtime = temp / "zcode-review-mcp", temp / "zcode.cjs"
             binary.write_text("facade")
             runtime.write_text("runtime")
-            output, pack_path = temp / "output", temp / "pack.zip"
+            output, pack_path = execution / "output", temp / "pack.zip"
             with patch.dict("os.environ", {"ZCODE_REVIEWD_PATH": str(temp / "missing-reviewd")}, clear=False), patch(
                 "run_matrix.StdioMCPTransport", FakeFacadeTransport
             ), patch(
@@ -669,7 +701,7 @@ class S02Tests(unittest.TestCase):
                     "--mcp-binary", str(binary),
                     "--runtime", str(runtime),
                     "--output", str(output),
-                    "--ledger", str(temp / "ledger.json"),
+                    "--ledger", str(execution / "ledger.json"),
                     "--pack", str(pack_path),
                     "--timeout", "0.1",
                 ])
@@ -683,6 +715,7 @@ class S02Tests(unittest.TestCase):
                 self.assertIn("INSUFFICIENT_EVIDENCE", summary)
 
     def test_main_runner_freezes_after_typed_fatal_without_next_case(self):
+        self.require_git_fixtures()
         class StatusFacade:
             runtime = FakeRuntime("ready")
 
@@ -701,6 +734,8 @@ class S02Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             temp = Path(d)
+            execution = create_execution_root("s02-main-fatal-")
+            self.addCleanup(shutil.rmtree, execution, True)
             binary, runtime = temp / "mcp", temp / "zcode.cjs"
             binary.write_text("facade")
             runtime.write_text("runtime")
@@ -712,12 +747,12 @@ class S02Tests(unittest.TestCase):
             ) as call_case:
                 exit_code = main([
                     "--official", "--mcp-binary", str(binary), "--runtime", str(runtime),
-                    "--output", str(temp / "output"), "--ledger", str(temp / "ledger.json"),
+                    "--output", str(execution / "output"), "--ledger", str(execution / "ledger.json"),
                     "--pack", str(temp / "pack.zip"), "--timeout", "0.1",
                 ])
             self.assertEqual(exit_code, 2)
             self.assertEqual(call_case.call_count, 1)
-            fatal = json.loads((temp / "output/redacted-logs/fatal.json").read_text())
+            fatal = json.loads((execution / "output/redacted-logs/fatal.json").read_text())
             self.assertEqual(fatal["error_class"], "PROTOCOL_ERROR")
 
 
