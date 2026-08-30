@@ -584,6 +584,48 @@ fn submit_and_complete_structured(
     (review, execution)
 }
 
+fn submit_fake_mode_and_wait(
+    fixture: &Fixture,
+    suffix: &str,
+) -> (StructuredReviewProjection, String, Job) {
+    let review = match fixture
+        .service
+        .dispatch(RpcMethod::SubmitStructuredReview {
+            input: fixture.structured_submission(suffix),
+        })
+        .unwrap()
+    {
+        RpcSuccess::StructuredReviewSubmitted { review } => review,
+        other => panic!("unexpected structured submission: {other:?}"),
+    };
+    let execution = fixture
+        .store
+        .get_task(&review.agent_id)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    assert_eq!(
+        fixture.scheduler.start_ready().unwrap(),
+        vec![execution.clone()]
+    );
+    let permission = fixture
+        .wait_pending(&execution)
+        .into_iter()
+        .find(|request| request.request_type == "permission")
+        .unwrap();
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: review.agent_id.clone(),
+            request_id: permission.request_id,
+            decision: ResponseDecision::Allow,
+            content: None,
+        }))
+        .unwrap();
+    let terminal = fixture.wait_terminal(&execution);
+    (review, execution, terminal)
+}
+
 #[test]
 fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
     let fixture = Fixture::new();
@@ -716,6 +758,33 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
         fixture.store.task_result(execution_id).unwrap().unwrap(),
         result
     );
+}
+
+#[test]
+fn injected_ledger_progress_only_records_progress_without_finalization() {
+    let fixture = Fixture::new();
+    let (_, execution, terminal) = submit_fake_mode_and_wait(&fixture, "progress-only");
+    assert_eq!(terminal.state, JobState::Failed);
+    let snapshot = fixture.store.review_snapshot(&execution).unwrap().unwrap();
+    assert!(snapshot.checkpoints.is_empty());
+    assert!(snapshot.findings.is_empty());
+    assert!(snapshot.validations.is_empty());
+    assert!(!snapshot.report.finalized);
+    assert!(fixture.store.review_progress(&execution).unwrap().is_some());
+}
+
+#[test]
+fn injected_ledger_without_progress_finalizes_without_progress_record() {
+    let fixture = Fixture::new();
+    let (_, execution, terminal) = submit_fake_mode_and_wait(&fixture, "ledger-without-progress");
+    assert_eq!(terminal.state, JobState::Completed);
+    let snapshot = fixture.store.review_snapshot(&execution).unwrap().unwrap();
+    assert_eq!(snapshot.checkpoints.len(), 1);
+    assert_eq!(snapshot.validations.len(), 1);
+    assert!(snapshot.report.finalized);
+    let progress = fixture.store.review_progress(&execution).unwrap().unwrap();
+    assert_eq!(progress.stage, "scope");
+    assert_eq!(progress.summary, "review started");
 }
 
 #[test]

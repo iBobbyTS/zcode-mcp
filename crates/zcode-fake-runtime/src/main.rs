@@ -3,6 +3,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     thread,
+    time::{Duration, Instant},
 };
 
 const LEDGER_TOOLS: [&str; 5] = [
@@ -202,6 +203,27 @@ fn ledger_tool_call(
     Ok(())
 }
 
+fn wait_ledger_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| io::Error::other(format!("stage=child-wait: {error}")))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait().map_err(|error| {
+                io::Error::other(format!(
+                    "stage=child-wait: timeout; kill wait failed: {error}"
+                ))
+            });
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     let mode = std::env::var("ZCODE_FAKE_MODE").unwrap_or_default();
     let server = server
@@ -251,7 +273,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|error| io::Error::other(format!("stage=spawn: {error}")))?;
     let mut input = child
         .stdin
         .take()
@@ -271,58 +294,53 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         (String::from_utf8_lossy(&bytes).into_owned(), truncated)
     });
 
-    let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
-        .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
-    if initialized["result"]["serverInfo"]["name"] != "zcode-review-ledger" {
-        return Err(io::Error::other(
-            "ledger MCP initialize response is invalid",
-        ));
-    }
-    let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))
-        .map_err(|error| io::Error::other(format!("stage=tools-list: {error}")))?;
-    let names = listed["result"]["tools"]
-        .as_array()
-        .ok_or_else(|| io::Error::other("ledger MCP tool list is missing"))?
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .collect::<Vec<_>>();
-    let expected_tools = if task_scoped {
-        LEDGER_TOOLS.as_slice()
-    } else {
-        &LEDGER_TOOLS[..4]
-    };
-    if names != expected_tools {
-        return Err(io::Error::other("ledger MCP tool list is not exact"));
-    }
-
-    let mut next_id = 3;
-    if task_scoped && mode != "review-flow-ledger-without-progress" {
-        ledger_tool_call(
-            &mut input,
-            &mut output,
-            next_id,
-            LEDGER_TOOLS[4],
-            json!({
-                "stage":"inspection",
-                "summary":"fake runtime started semantic review",
-                "counters":{"files":0}
-            }),
-        )
-        .map_err(|error| io::Error::other(format!("stage=progress: {error}")))?;
-        next_id += 1;
-    }
-    if mode == "review-flow-progress-only" {
-        drop(input);
-        let status = child.wait()?;
-        let (stderr_text, stderr_truncated) = stderr_reader.join().unwrap_or_default();
-        if !status.success() {
-            return Err(io::Error::other(format!(
-                "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
-            )));
+    let flow = (|| -> io::Result<()> {
+        let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
+            .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
+        if initialized["result"]["serverInfo"]["name"] != "zcode-review-ledger" {
+            return Err(io::Error::other(
+                "stage=initialize: ledger MCP response is invalid",
+            ));
         }
-        return Ok(());
-    }
-    ledger_tool_call(
+        let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))
+            .map_err(|error| io::Error::other(format!("stage=tools-list: {error}")))?;
+        let names = listed["result"]["tools"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("stage=tools-list: tool list is missing"))?
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let expected_tools = if task_scoped {
+            LEDGER_TOOLS.as_slice()
+        } else {
+            &LEDGER_TOOLS[..4]
+        };
+        if names != expected_tools {
+            return Err(io::Error::other(
+                "stage=tools-list: ledger MCP tool list is not exact",
+            ));
+        }
+
+        let mut next_id = 3;
+        if task_scoped && mode != "review-flow-ledger-without-progress" {
+            ledger_tool_call(
+                &mut input,
+                &mut output,
+                next_id,
+                LEDGER_TOOLS[4],
+                json!({
+                    "stage":"inspection",
+                    "summary":"fake runtime started semantic review",
+                    "counters":{"files":0}
+                }),
+            )
+            .map_err(|error| io::Error::other(format!("stage=progress: {error}")))?;
+            next_id += 1;
+        }
+        if mode == "review-flow-progress-only" {
+            return Ok(());
+        }
+        ledger_tool_call(
         &mut input,
         &mut output,
         next_id,
@@ -333,8 +351,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "commands":[],"open_questions":[],"remaining_scope":[]
         }),
     )
-    .map_err(|error| io::Error::other(format!("stage=checkpoint: {error}")))?;
-    ledger_tool_call(
+        .map_err(|error| io::Error::other(format!("stage=checkpoint: {error}")))?;
+        ledger_tool_call(
         &mut input,
         &mut output,
         next_id + 1,
@@ -346,8 +364,8 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "status":"open"
         }),
     )
-    .map_err(|error| io::Error::other(format!("stage=finding-open: {error}")))?;
-    ledger_tool_call(
+        .map_err(|error| io::Error::other(format!("stage=finding-open: {error}")))?;
+        ledger_tool_call(
         &mut input,
         &mut output,
         next_id + 2,
@@ -359,36 +377,44 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             "status":"withdrawn"
         }),
     )
-    .map_err(|error| io::Error::other(format!("stage=finding-withdraw: {error}")))?;
-    ledger_tool_call(
-        &mut input,
-        &mut output,
-        next_id + 3,
-        LEDGER_TOOLS[2],
-        json!({
-            "validation_id":"validation-1","command":"cargo test -p fixture","cwd":".",
-            "exit_code":0,"duration_ms":1,"stdout_summary":"passed","stderr_summary":"",
-            "related_findings":[]
-        }),
-    )
-    .map_err(|error| io::Error::other(format!("stage=validation: {error}")))?;
-    if finalize {
+        .map_err(|error| io::Error::other(format!("stage=finding-withdraw: {error}")))?;
         ledger_tool_call(
             &mut input,
             &mut output,
-            next_id + 4,
-            LEDGER_TOOLS[3],
+            next_id + 3,
+            LEDGER_TOOLS[2],
             json!({
-                "signal":"no_findings_observed","summary":"bounded review complete",
-                "coverage":{"covered":["src"],"not_covered":[]},
-                "uncertainties":[],"recommended_next_actions":[]
+                "validation_id":"validation-1","command":"cargo test -p fixture","cwd":".",
+                "exit_code":0,"duration_ms":1,"stdout_summary":"passed","stderr_summary":"",
+                "related_findings":[]
             }),
         )
-        .map_err(|error| io::Error::other(format!("stage=finalize: {error}")))?;
-    }
+        .map_err(|error| io::Error::other(format!("stage=validation: {error}")))?;
+        if finalize {
+            ledger_tool_call(
+                &mut input,
+                &mut output,
+                next_id + 4,
+                LEDGER_TOOLS[3],
+                json!({
+                    "signal":"no_findings_observed","summary":"bounded review complete",
+                    "coverage":{"covered":["src"],"not_covered":[]},
+                    "uncertainties":[],"recommended_next_actions":[]
+                }),
+            )
+            .map_err(|error| io::Error::other(format!("stage=finalize: {error}")))?;
+        }
+        Ok(())
+    })();
     drop(input);
-    let status = child.wait()?;
+    let status = wait_ledger_child(&mut child);
     let (stderr_text, stderr_truncated) = stderr_reader.join().unwrap_or_default();
+    let status = status?;
+    if let Err(error) = flow {
+        return Err(io::Error::other(format!(
+            "{error}; child_status={status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
+        )));
+    }
     if !status.success() {
         return Err(io::Error::other(format!(
             "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
