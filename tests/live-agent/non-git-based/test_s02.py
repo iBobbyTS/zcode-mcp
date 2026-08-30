@@ -755,11 +755,20 @@ class S02Tests(unittest.TestCase):
             binary, runtime = temp / "zcode-review-mcp", temp / "zcode.cjs"
             binary.write_text("facade")
             runtime.write_text("runtime")
+            fake_provenance = temp / "fake-hook-provenance.json"
+            fake_provenance.write_text(json.dumps({"hook_activation_verified": True}))
             output, pack_path = execution / "output", temp / "pack.zip"
             with patch.dict("os.environ", {"ZCODE_REVIEWD_PATH": str(temp / "missing-reviewd")}, clear=False), patch(
                 "run_matrix.StdioMCPTransport", FakeFacadeTransport
             ), patch(
                 "run_matrix._runtime_version", return_value="3.10.1"
+            ), patch(
+                "run_matrix._prepare_verified_hook",
+                return_value=(
+                    fake_provenance,
+                    lambda: {"restored": True},
+                    {"sha256": _sha256(fake_provenance), "backup": {}},
+                ),
             ):
                 exit_code = main([
                     "--official",
@@ -804,8 +813,17 @@ class S02Tests(unittest.TestCase):
             binary, runtime = temp / "mcp", temp / "zcode.cjs"
             binary.write_text("facade")
             runtime.write_text("runtime")
+            fake_provenance = temp / "fake-hook-provenance.json"
+            fake_provenance.write_text(json.dumps({"hook_activation_verified": True}))
             with patch("run_matrix.StdioMCPTransport", StatusFacade), patch(
                 "run_matrix._runtime_version", return_value="3.10.1"
+            ), patch(
+                "run_matrix._prepare_verified_hook",
+                return_value=(
+                    fake_provenance,
+                    lambda: {"restored": True},
+                    {"sha256": _sha256(fake_provenance), "backup": {}},
+                ),
             ), patch(
                 "run_matrix._call_case",
                 side_effect=FatalConformanceError("fatal public contract", error_class="PROTOCOL_ERROR"),
