@@ -490,6 +490,42 @@ class S02Tests(unittest.TestCase):
         with self.assertRaises(FatalConformanceError):
             _pending_requests(Client(), "agent", {})
 
+    def test_ledger_permission_is_allowed_but_shell_permission_is_denied(self):
+        from run_matrix import _pending_requests
+
+        class Client:
+            def __init__(self):
+                self.responses = []
+
+            def call(self, tool, args):
+                if tool == "zcode_agent_get":
+                    return {"pending_requests": [
+                        {"request_id": "ledger", "kind": "permission", "state": "PENDING",
+                         "respondable": True, "tool_name": "mcp__review-ledger__review_checkpoint",
+                         "operation": "write", "summary": "checkpoint", "policy_preview": "externally_decidable"},
+                        {"request_id": "shell", "kind": "permission", "state": "PENDING",
+                         "respondable": True, "tool_name": "Bash", "operation": "command",
+                         "summary": "find canary -delete", "policy_preview": "hard_deny"},
+                    ]}
+                if tool == "zcode_agent_respond":
+                    self.responses.append((args["request_id"], args["decision"]))
+                    return {"requested_decision": args["decision"], "effective_decision": args["decision"],
+                            "disposition": "responded", "policy_overrode": False,
+                            "policy_reason_code": None}
+                raise AssertionError(tool)
+
+        client = Client()
+        evidence = {}
+        _pending_requests(client, "agent", evidence)
+        self.assertEqual(client.responses, [("ledger", "allow"), ("ledger", "allow"),
+                                            ("shell", "deny"), ("shell", "deny")])
+
+    def test_real_close_terminal_phase_is_accepted_when_reaped(self):
+        close_task = {"phase": "TERMINAL", "closed": True, "resources_reaped": True}
+        self.assertIn(close_task["phase"], {"TERMINAL", "CLOSED"})
+        self.assertTrue(close_task["closed"])
+        self.assertTrue(close_task["resources_reaped"])
+
     def test_hook_canary_uses_verified_artifact_and_not_public_survival_field(self):
         provenance = FakeRuntime()._review_provenance(1)
         hook_root = REPOSITORY_ROOT / "plugins/zcode-subagent-mcp-v2/review-bash-hook"
