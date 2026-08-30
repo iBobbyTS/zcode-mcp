@@ -37,7 +37,7 @@ pub struct ReviewPrompt {
 }
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
-const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: If a Bash command is rejected, do not try that Bash command again; continue the review with an allowed equivalent or document the limitation and proceed to the next review stage.";
+const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: After the first Bash permission_denied, permanently stop all Bash calls for this review; do not retry the rejected command with another spelling, path, shell, or equivalent. Continue with Read and the existing mcp__review-ledger tools. For each denied Bash, record only a bounded safe descriptor in uncertainties: tool name, policy reason code, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. Put unreviewed paths in coverage.not_covered or recommended_next_actions. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptError {
@@ -398,7 +398,50 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
         assert!(task
             .text
-            .contains("If a Bash command is rejected, do not try that Bash command again"));
+            .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
+        assert!(task.text.contains(
+            "do not retry the rejected command with another spelling, path, shell, or equivalent"
+        ));
+        assert!(task
+            .text
+            .contains("Continue with Read and the existing mcp__review-ledger tools"));
+        assert!(task
+            .text
+            .contains("bounded safe descriptor in uncertainties"));
+        assert!(task.text.contains("tool name, policy reason code"));
+        assert!(task
+            .text
+            .contains("command category/program name or a one-way hash"));
+        assert!(task.text.contains("never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths"));
+        assert!(task
+            .text
+            .contains("coverage.not_covered or recommended_next_actions"));
+        assert!(task.text.contains("review_finalize exactly once"));
+        for signal in [
+            "findings_present",
+            "no_findings_observed",
+            "incomplete_evidence",
+            "unable_to_review",
+        ] {
+            assert!(task.text.contains(signal), "missing legal signal {signal}");
+        }
+        let safe_descriptor =
+            "tool=mcp__review-ledger__review_progress reason=permission_denied category=filesystem program=find hash=sha256:abc";
+        for forbidden in [
+            "--secret=",
+            "Bearer ",
+            "token=",
+            "/Users/",
+            "raw command text",
+            "raw arguments",
+        ] {
+            assert!(
+                !safe_descriptor.contains(forbidden),
+                "unsafe descriptor: {forbidden}"
+            );
+        }
+        assert!(task.text.contains("never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths"));
+        assert!(!legacy.contains("TASK_SCOPED_PERMISSION_HANDLING"));
         assert_ne!(task.text, legacy);
         assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
     }
@@ -418,6 +461,16 @@ PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\nCOUNTS_AS_INDEPENDENT: false\nFRO
         };
         let task = add_task_progress_instruction(prompt, Some(&frozen)).unwrap();
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
+        assert!(task
+            .text
+            .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
+        assert!(task
+            .text
+            .contains("bounded safe descriptor in uncertainties"));
+        assert!(task
+            .text
+            .contains("coverage.not_covered or recommended_next_actions"));
+        assert!(task.text.contains("review_finalize exactly once"));
         assert!(validate_review_continuation_prompt(
             task.kind,
             task.round_kind,
