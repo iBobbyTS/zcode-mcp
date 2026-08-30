@@ -225,7 +225,9 @@ impl Fixture {
                 (_, key) if key.ends_with("nudge-send-failure") => "review-flow-nudge-send-failure",
                 (_, key) if key.ends_with("semantic-timeout") => "review-flow-no-progress",
                 (_, key) if key.ends_with("progress-only") => "review-flow-progress-only",
-                (_, key) if key.ends_with("ledger-without-progress") => "review-flow-ledger-without-progress",
+                (_, key) if key.ends_with("ledger-without-progress") => {
+                    "review-flow-ledger-without-progress"
+                }
                 (_, key) if key.ends_with("missing-final") => "review-flow-no-finalize",
                 (_, key)
                     if [
@@ -678,10 +680,7 @@ fn injected_ledger_mcp_completes_v2_review_while_legacy_tool_stays_hidden() {
 
     let terminal = fixture.wait_terminal(execution_id);
     let snapshot = fixture.store.review_snapshot(execution_id).unwrap();
-    let events = fixture
-        .store
-        .task_events_after(public_id, 0, 100)
-        .unwrap();
+    let events = fixture.store.task_events_after(public_id, 0, 100).unwrap();
     assert_eq!(
         terminal.state,
         JobState::Completed,

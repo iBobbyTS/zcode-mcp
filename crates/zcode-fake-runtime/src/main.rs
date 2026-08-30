@@ -261,7 +261,7 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
             .take()
             .ok_or_else(|| io::Error::other("ledger MCP stdout is missing"))?,
     );
-    let mut stderr = child.stderr.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
 
     let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
         .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
@@ -306,7 +306,9 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
         drop(input);
         let status = child.wait()?;
         if !status.success() {
-            return Err(io::Error::other(format!("stage=child-wait: ledger MCP process exited with {status}")));
+            return Err(io::Error::other(format!(
+                "stage=child-wait: ledger MCP process exited with {status}"
+            )));
         }
         return Ok(());
     }
@@ -375,9 +377,9 @@ fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
     let _ = stderr.take(8192).read_to_end(&mut stderr_bytes);
     let stderr_text = String::from_utf8_lossy(&stderr_bytes);
     if !status.success() {
-        return Err(io::Error::other(
-            format!("stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}"),
-        ));
+        return Err(io::Error::other(format!(
+            "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}"
+        )));
     }
     Ok(())
 }
