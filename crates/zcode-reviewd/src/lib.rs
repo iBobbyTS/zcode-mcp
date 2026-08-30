@@ -3921,8 +3921,21 @@ impl Scheduler {
                         Ok(state) => Ok(state),
                         Err(error) => {
                             self.record_failure(agent_id, error.to_string());
+                            let fallback_result = if result.outcome == TaskOutcome::Succeeded
+                                && sink.error().is_some()
+                            {
+                                minimal_task_result(
+                                    CompletionOutcome::RuntimeLost,
+                                    "LIFECYCLE_SINK_FAILED",
+                                    "LIFECYCLE_SINK_FAILED",
+                                )
+                            } else {
+                                result.clone()
+                            };
                             if self.inner.store.task_result(agent_id)?.is_none() {
-                                self.inner.store.store_task_result(agent_id, &result)?;
+                                self.inner
+                                    .store
+                                    .store_task_result(agent_id, &fallback_result)?;
                             }
                             Ok(self
                                 .inner
@@ -4012,6 +4025,15 @@ impl Scheduler {
                 runtime.stop(self.inner.config.stop_grace),
                 false,
                 Some((CompletionOutcome::Cancelled, "CANCELLED".into())),
+            )
+        } else if forced_outcome.is_none() && sink.error().is_some() {
+            (
+                terminal,
+                false,
+                Some((
+                    CompletionOutcome::RuntimeLost,
+                    "LIFECYCLE_SINK_FAILED".into(),
+                )),
             )
         } else {
             (terminal, natural_completion, forced_outcome)
@@ -6524,6 +6546,10 @@ sleep 10
 
     impl ReviewExitFixture {
         fn new(suffix: &str) -> Self {
+            Self::new_with_budget(suffix, BudgetRequest::Omitted)
+        }
+
+        fn new_with_budget(suffix: &str, budget: BudgetRequest) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repository = directory.path().join("repository");
             fs::create_dir_all(repository.join("src")).unwrap();
@@ -6588,7 +6614,7 @@ sleep 10
                     repository: repository.to_string_lossy().into_owned(),
                     feature_id: prepared.feature_id.clone(),
                     ownership_token: "review-exit-owner".into(),
-                    budget: BudgetRequest::Omitted,
+                    budget,
                     retain_partial: false,
                 })
                 .unwrap();
@@ -6678,64 +6704,19 @@ sleep 10
             self.factory.runtime(&self.execution_id).finish(terminal);
             wait_for_task_result(&self.store, &self.execution_id)
         }
+    }
 
-        fn force(
-            &self,
-            outcome: CompletionOutcome,
-            reason: &str,
-            request_intent: Option<&str>,
-        ) -> review_store::StoredTaskResult {
-            let (owner_epoch, sink, route, task, operation) = {
-                let state = self.scheduler.inner.state.lock().unwrap();
-                let active = state.active.get(&self.execution_id).unwrap();
-                (
-                    active.owner_epoch,
-                    Arc::clone(&active.sink),
-                    active.route.clone(),
-                    active.task.clone(),
-                    Arc::clone(&active.operation),
-                )
-            };
-            let guard = operation.lock().unwrap();
-            match request_intent {
-                Some("stop") => {
-                    assert_eq!(
-                        self.store.request_stop(&self.execution_id).unwrap().state,
-                        JobState::Stopping
-                    );
-                }
-                Some("close") => {
-                    assert_eq!(
-                        self.store.request_close(&self.execution_id).unwrap().state,
-                        JobState::Stopping
-                    );
-                }
-                None => {}
-                Some(other) => panic!("unknown forced request intent {other}"),
-            }
-            let terminal = RuntimeTerminal::Exited(ChildExit::Exited(Some(31)));
-            self.scheduler
-                .finish_routed_terminal(
-                    TerminalTarget {
-                        agent_id: &self.execution_id,
-                        owner_epoch,
-                        sink: &sink,
-                        route: &route,
-                        task: task.as_ref(),
-                    },
-                    TerminalDecision {
-                        terminal: terminal.clone(),
-                        natural_completion: false,
-                        general_submission: None,
-                        forced_outcome: Some((outcome, reason.into())),
-                    },
-                )
-                .unwrap();
-            self.factory.runtime(&self.execution_id).finish(terminal);
-            drop(guard);
-            wait_until_review_exit(|| (self.scheduler.active_count() == 0).then_some(()));
-            self.store.task_result(&self.execution_id).unwrap().unwrap()
-        }
+    fn review_exit_budget(wall_time_ms: u64, max_tool_calls: u64) -> BudgetRequest {
+        BudgetRequest::Limits(EffectiveBudget {
+            wall_time_ms,
+            semantic_soft_timeout_ms: 300_000,
+            semantic_hard_timeout_ms: 600_000,
+            max_turns: 8,
+            max_tool_calls,
+            max_context_bytes: 1_048_576,
+            max_result_bytes: 262_144,
+            max_artifact_bytes: 2_097_152,
+        })
     }
 
     fn review_exit_git(repository: &Path, arguments: &[&str]) -> String {
@@ -6800,6 +6781,29 @@ sleep 10
                 JobState::Completed,
                 "{suffix}"
             );
+            let snapshot = fixture
+                .store
+                .review_snapshot(&fixture.execution_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                snapshot.report.final_signal.as_deref(),
+                Some("no_findings_observed"),
+                "{suffix}"
+            );
+            let artifact = fixture
+                .scheduler
+                .verify_review_artifact(&fixture.execution_id, 256)
+                .unwrap()
+                .unwrap();
+            assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
+            assert!(artifact.finalized, "{suffix}");
+            assert_eq!(artifact.expected_sha256, artifact.actual_sha256, "{suffix}");
+            assert_eq!(artifact.expected_bytes, artifact.actual_bytes, "{suffix}");
+            assert!(
+                artifact.actual_bytes.is_some_and(|bytes| bytes > 0),
+                "{suffix}"
+            );
             assert!(!fixture.prepared.worktree.path.exists(), "{suffix}");
             let events = fixture
                 .store
@@ -6812,6 +6816,63 @@ sleep 10
                 }),
                 "{suffix}: {events:?}"
             );
+        }
+    }
+
+    #[test]
+    fn lifecycle_sink_failure_cannot_fallback_to_finalized_review_success() {
+        let fixture = ReviewExitFixture::new("sink-failure");
+        fixture.finalize_valid();
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        rusqlite::Connection::open(fixture.store.database_path())
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_finalized_exit_sink BEFORE INSERT ON events
+                 WHEN NEW.agent_id='{}'
+                 BEGIN SELECT RAISE(FAIL, 'scripted finalized exit sink failure'); END;",
+                fixture.execution_id
+            ))
+            .unwrap();
+        runtime.emit_partial("scripted sink write failure");
+        let result = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(41))));
+
+        assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+        assert!(result.result.partial);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"LIFECYCLE_SINK_FAILED".into()));
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::FailedRuntimeLost
+        );
+        assert!(!fixture.prepared.worktree.path.exists());
+        assert_eq!(fixture.scheduler.active_count(), 0);
+        let service =
+            rpc::RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
+        match service
+            .dispatch(rpc::RpcMethod::TaskResult {
+                agent_id: fixture.execution_id.clone(),
+                attempt_sequence: Some(1),
+            })
+            .unwrap()
+        {
+            rpc::RpcSuccess::TaskResult {
+                result: Some(public),
+                ..
+            } => {
+                assert_eq!(public.outcome, TaskOutcome::RuntimeLost);
+                assert!(public.review_evidence.is_none());
+                assert!(public
+                    .residual_gaps
+                    .contains(&"LIFECYCLE_SINK_FAILED".into()));
+            }
+            other => panic!("unexpected sink failure result: {other:?}"),
         }
     }
 
@@ -6914,50 +6975,129 @@ sleep 10
 
     #[test]
     fn forced_review_outcomes_win_before_finalized_exit_reconciliation() {
-        for (scenario, outcome, reason, request_intent, expected) in [
+        for (scenario, budget, request_intent, expected_outcome, expected_state, reason) in [
             (
                 "forced-cancel",
-                CompletionOutcome::Cancelled,
-                "CANCELLED",
+                BudgetRequest::Omitted,
                 Some("stop"),
                 TaskOutcome::Cancelled,
+                JobState::Cancelled,
+                "CANCELLED",
             ),
             (
                 "forced-close",
-                CompletionOutcome::Cancelled,
-                "CANCELLED",
+                BudgetRequest::Omitted,
                 Some("close"),
                 TaskOutcome::Cancelled,
+                JobState::Cancelled,
+                "CANCELLED",
             ),
             (
                 "forced-timeout",
-                CompletionOutcome::TimedOut,
-                "SEMANTIC_PROGRESS_TIMEOUT",
+                review_exit_budget(500, 32),
                 None,
                 TaskOutcome::TimedOut,
+                JobState::Failed,
+                "WALL_TIME_DEADLINE_EXCEEDED",
             ),
             (
                 "forced-budget",
-                CompletionOutcome::BudgetExhausted,
-                "TOOL_CALL_BUDGET_EXHAUSTED",
+                review_exit_budget(10_000, 1),
                 None,
                 TaskOutcome::BudgetExhausted,
+                JobState::Failed,
+                "TOOL_CALL_BUDGET_EXHAUSTED",
             ),
         ] {
-            let fixture = ReviewExitFixture::new(scenario);
+            let fixture = ReviewExitFixture::new_with_budget(scenario, budget);
             fixture.finalize_valid();
             fs::write(
                 fixture.prepared.worktree.path.join("src/lib.rs"),
                 "pub fn forced_outcome_wins() {}\n",
             )
             .unwrap();
-            let result = fixture.force(outcome, reason, request_intent);
-            assert_eq!(result.result.outcome, expected, "{scenario}");
+            let (operation, check) = {
+                let state = fixture.scheduler.inner.state.lock().unwrap();
+                let active = state.active.get(&fixture.execution_id).unwrap();
+                (Arc::clone(&active.operation), Arc::clone(&active.check))
+            };
+            let guard = operation.lock().unwrap();
+            match request_intent {
+                Some("stop") => assert_eq!(
+                    fixture
+                        .store
+                        .request_stop(&fixture.execution_id)
+                        .unwrap()
+                        .state,
+                    JobState::Stopping
+                ),
+                Some("close") => assert_eq!(
+                    fixture
+                        .store
+                        .request_close(&fixture.execution_id)
+                        .unwrap()
+                        .state,
+                    JobState::Stopping
+                ),
+                None if scenario == "forced-timeout" => {
+                    wait_until_review_exit(|| {
+                        check.cancelled.load(Ordering::Acquire).then_some(())
+                    });
+                }
+                None if scenario == "forced-budget" => {
+                    let runtime = fixture.factory.runtime(&fixture.execution_id);
+                    for tool_call_id in ["tool-1", "tool-2"] {
+                        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                            WireMessage::Event(EventEnvelope {
+                                method: "session/event".into(),
+                                params: serde_json::json!({
+                                    "type":"tool.updated",
+                                    "payload":{"toolCallId":tool_call_id}
+                                }),
+                            }),
+                        )));
+                    }
+                    wait_until_review_exit(|| {
+                        check.cancelled.load(Ordering::Acquire).then_some(())
+                    });
+                }
+                Some(other) => panic!("unknown forced request intent {other}"),
+                None => unreachable!(),
+            }
+            let runtime = fixture.factory.runtime(&fixture.execution_id);
+            runtime.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(31))));
+            drop(guard);
+            let result = wait_for_task_result(&fixture.store, &fixture.execution_id);
+            wait_until_review_exit(|| (fixture.scheduler.active_count() == 0).then_some(()));
+            assert_eq!(result.result.outcome, expected_outcome, "{scenario}");
             assert!(
                 result.result.residual_gaps.contains(&reason.into()),
                 "{scenario}"
             );
             assert_ne!(result.result.summary, "REVIEW_FINALIZED", "{scenario}");
+            let job = fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.state, expected_state, "{scenario}");
+            assert_eq!(
+                job.closed_at.is_some(),
+                scenario == "forced-close",
+                "{scenario}"
+            );
+            assert!(runtime.stop_calls() >= 1, "{scenario}");
+            assert!(!fixture.prepared.worktree.path.exists(), "{scenario}");
+            let events = fixture
+                .store
+                .task_events_after(&fixture.execution_id, 0, 100)
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event_type == "runtime.exited"),
+                "{scenario}: {events:?}"
+            );
         }
     }
 
@@ -6975,19 +7115,56 @@ sleep 10
                 &serde_json::json!({"toolName":"read","input":{}}).to_string(),
             )
             .unwrap();
+        let (owner_epoch, sink, route, task, operation, managed_runtime) = {
+            let state = fixture.scheduler.inner.state.lock().unwrap();
+            let active = state.active.get(&fixture.execution_id).unwrap();
+            (
+                active.owner_epoch,
+                Arc::clone(&active.sink),
+                active.route.clone(),
+                active.task.clone(),
+                Arc::clone(&active.operation),
+                Arc::clone(&active.runtime),
+            )
+        };
         let runtime = fixture.factory.runtime(&fixture.execution_id);
         let first = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(29))));
+        let snapshot = fixture
+            .store
+            .review_snapshot(&fixture.execution_id)
+            .unwrap()
+            .unwrap();
         let artifact = fixture
             .scheduler
             .verify_review_artifact(&fixture.execution_id, 256)
             .unwrap()
             .unwrap();
         assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
+        let events = fixture
+            .store
+            .task_events_after(&fixture.execution_id, 0, 100)
+            .unwrap();
 
+        let guard = operation.lock().unwrap();
         assert_eq!(
-            runtime.finish(RuntimeTerminal::Exited(ChildExit::Signaled(15))),
-            RuntimeTerminal::Exited(ChildExit::Exited(Some(29)))
+            fixture
+                .scheduler
+                .finish_locked_monitor_terminal(
+                    &fixture.execution_id,
+                    owner_epoch,
+                    &managed_runtime,
+                    &sink,
+                    &route,
+                    task.as_ref(),
+                    RuntimeTerminal::Exited(ChildExit::Signaled(15)),
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            JobState::Completed
         );
+        drop(guard);
         runtime.emit_event(RuntimeEvent::Driver(Inbound::Malformed(
             "late-driver".into(),
         )));
@@ -7007,12 +7184,30 @@ sleep 10
         );
         assert_eq!(
             fixture
+                .store
+                .review_snapshot(&fixture.execution_id)
+                .unwrap()
+                .unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            fixture
                 .scheduler
                 .verify_review_artifact(&fixture.execution_id, 256)
                 .unwrap()
                 .unwrap(),
             artifact
         );
+        assert_eq!(
+            fixture
+                .store
+                .task_events_after(&fixture.execution_id, 0, 100)
+                .unwrap(),
+            events
+        );
+        assert!(sink
+            .error()
+            .is_some_and(|error| error.contains("late lifecycle record rejected")));
     }
 
     fn general_manifest(
