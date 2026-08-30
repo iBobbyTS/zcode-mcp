@@ -37,7 +37,7 @@ pub struct ReviewPrompt {
 }
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
-const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: After the first Bash permission_denied, permanently stop all Bash calls for this review; do not retry the rejected command with another spelling, path, shell, or equivalent. Continue with Read and the existing mcp__review-ledger tools. For each denied Bash, record only a bounded safe descriptor in uncertainties: tool name, policy reason code, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. Put unreviewed paths in coverage.not_covered or recommended_next_actions. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
+const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: After the first Bash permission_denied, permanently stop all Bash calls for this review; do not retry the rejected command with another spelling, path, shell, or equivalent. The next tool action must be review_finalize; do not Read or continue inspecting first. In that same review_finalize payload, put a bounded safe descriptor in uncertainties: tool name, policy reason code, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. Put unreviewed paths in coverage.not_covered or recommended_next_actions. If any Read call errors, the next tool action must also be review_finalize; use a truthful incomplete_evidence or unable_to_review signal and do not continue inspecting. Continue with Read and the existing mcp__review-ledger tools only when no Bash denial or Read error has occurred. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptError {
@@ -399,6 +399,15 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         assert!(task
             .text
             .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
+        assert!(task
+            .text
+            .contains("The next tool action must be review_finalize; do not Read or continue inspecting first"));
+        assert!(task.text.contains(
+            "In that same review_finalize payload, put a bounded safe descriptor in uncertainties"
+        ));
+        assert!(task.text.contains(
+            "If any Read call errors, the next tool action must also be review_finalize"
+        ));
         assert!(task.text.contains(
             "do not retry the rejected command with another spelling, path, shell, or equivalent"
         ));
@@ -442,6 +451,7 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         }
         assert!(task.text.contains("never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths"));
         assert!(!legacy.contains("TASK_SCOPED_PERMISSION_HANDLING"));
+        assert!(!legacy.contains("The next tool action must be review_finalize"));
         assert_ne!(task.text, legacy);
         assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
     }
@@ -464,6 +474,15 @@ PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\nCOUNTS_AS_INDEPENDENT: false\nFRO
         assert!(task
             .text
             .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
+        assert!(task
+            .text
+            .contains("The next tool action must be review_finalize; do not Read or continue inspecting first"));
+        assert!(task.text.contains(
+            "In that same review_finalize payload, put a bounded safe descriptor in uncertainties"
+        ));
+        assert!(task.text.contains(
+            "If any Read call errors, the next tool action must also be review_finalize"
+        ));
         assert!(task
             .text
             .contains("bounded safe descriptor in uncertainties"));
