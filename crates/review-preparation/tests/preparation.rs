@@ -1170,8 +1170,11 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
             "recovery corpus allowed {}",
             case.command
         );
-        let (feedback, fingerprint) =
-            review_preparation::PolicyLauncher::zcode_denial_feedback(&params, false).unwrap();
+        let denial = launcher
+            .validated_zcode_denial(&params, ExternalDecision::Allow)
+            .unwrap();
+        let feedback = denial.feedback(false);
+        let fingerprint = denial.fingerprint();
         assert!(
             feedback.contains(&format!("retry={}", case.retry_class)),
             "{}: {feedback}",
@@ -1245,6 +1248,56 @@ fn review_bash_rechecks_canonical_symlink_targets_for_secrets_and_prior_reviews(
         safe.allowed,
         "ordinary in-root symlink should remain readable"
     );
+}
+
+#[test]
+fn validated_read_denials_preserve_canonical_escape_and_missing_path_classes() {
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let launcher = prepared.launcher().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("outside.txt"), "outside\n").unwrap();
+    symlink(
+        outside.path().join("outside.txt"),
+        prepared.worktree.path.join("escape-read"),
+    )
+    .unwrap();
+
+    let escaped = serde_json::json!({
+        "toolName":"Read",
+        "input":{"path":"escape-read"}
+    });
+    let escaped_decision = launcher.decide_zcode_permission(&escaped, ExternalDecision::Allow);
+    assert!(!escaped_decision.allowed);
+    assert_eq!(escaped_decision.reason, "read_path_escape_denied");
+    let escaped_denial = launcher
+        .validated_zcode_denial(&escaped, ExternalDecision::Allow)
+        .unwrap();
+    assert!(escaped_denial.feedback(false).contains(
+        "code=read_path_escape_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+    ));
+
+    let missing = serde_json::json!({
+        "toolName":"Read",
+        "input":{"path":"missing-read"}
+    });
+    let missing_decision = launcher.decide_zcode_permission(&missing, ExternalDecision::Allow);
+    assert!(!missing_decision.allowed);
+    assert_eq!(missing_decision.reason, "read_path_unverifiable");
+    let missing_denial = launcher
+        .validated_zcode_denial(&missing, ExternalDecision::Allow)
+        .unwrap();
+    assert!(missing_denial
+        .feedback(false)
+        .contains("code=read_path_unverifiable;retry=simplify_once;next=correct_read_path_once"));
+    assert_ne!(escaped_denial.fingerprint(), missing_denial.fingerprint());
+
+    let external = launcher
+        .validated_zcode_denial(&escaped, ExternalDecision::Deny)
+        .unwrap();
+    assert!(external.feedback(false).contains(
+        "code=external_policy_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+    ));
 }
 
 #[test]

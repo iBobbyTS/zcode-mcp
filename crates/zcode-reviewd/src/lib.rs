@@ -43,7 +43,8 @@ use review_preparation::{
     CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
     GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, PreparedLaunchSpec,
-    ValidationCommand, ValidationOutput, MAX_VALIDATION_COMMAND_TIMEOUT_MS,
+    ValidatedPermissionDenial, ValidationCommand, ValidationOutput,
+    MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,16 +529,22 @@ impl OfferedPermissionCache {
         }
     }
 
-    fn response(&self, key: &str, decision: &str) -> Option<serde_json::Value> {
+    fn response(
+        &self,
+        key: &str,
+        decision: &str,
+        validated_denial: Option<&ValidatedPermissionDenial>,
+    ) -> Option<serde_json::Value> {
         let offered = self.requests.get(key)?;
         match decision {
             "allow" => Some(offered.allow.clone()),
             "deny" => {
-                let (_, fingerprint) =
-                    PolicyLauncher::zcode_denial_feedback(&offered.params, false)?;
+                let validated_denial = validated_denial
+                    .cloned()
+                    .or_else(|| PolicyLauncher::external_zcode_denial(&offered.params))?;
+                let fingerprint = validated_denial.fingerprint();
                 let repeated = self.denied_fingerprints.contains(&fingerprint);
-                let (feedback, _) =
-                    PolicyLauncher::zcode_denial_feedback(&offered.params, repeated)?;
+                let feedback = validated_denial.feedback(repeated);
                 let mut response = offered.deny.clone();
                 response.as_object_mut()?.insert(
                     "reason".into(),
@@ -559,10 +566,12 @@ impl OfferedPermissionCache {
         self.requests.remove(key);
     }
 
-    fn record_denial(&mut self, key: &str) {
+    fn record_denial(&mut self, key: &str, validated_denial: Option<&ValidatedPermissionDenial>) {
         let fingerprint = self.requests.get(key).and_then(|responses| {
-            PolicyLauncher::zcode_denial_feedback(&responses.params, false)
-                .map(|(_, fingerprint)| fingerprint)
+            validated_denial
+                .cloned()
+                .or_else(|| PolicyLauncher::external_zcode_denial(&responses.params))
+                .map(|denial| denial.fingerprint())
         });
         if let Some(fingerprint) = fingerprint {
             if self.denied_fingerprints.len() < MAX_PENDING_PERMISSION_RESPONSES {
@@ -772,6 +781,7 @@ impl RuntimeOwner {
         correlation_id: &str,
         decision: &str,
         content: Option<&str>,
+        validated_denial: Option<&ValidatedPermissionDenial>,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         let id = serde_json::from_str::<WireId>(correlation_id).map_err(|_| {
@@ -786,7 +796,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .response(&key, decision)
+                .response(&key, decision, validated_denial)
                 .ok_or_else(|| {
                     RuntimeCommandError::InvalidSession(
                         "runtime offered no matching permission response".into(),
@@ -801,7 +811,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .record_denial(&key);
+                .record_denial(&key, validated_denial);
         }
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
@@ -1173,6 +1183,7 @@ pub trait ManagedRuntime: Send + Sync + 'static {
         _correlation_id: &str,
         _decision: &str,
         _content: Option<&str>,
+        _validated_denial: Option<&ValidatedPermissionDenial>,
         _deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         Err(RuntimeCommandError::Unsupported)
@@ -1252,9 +1263,16 @@ impl ManagedRuntime for RuntimeOwner {
         correlation_id: &str,
         decision: &str,
         content: Option<&str>,
+        validated_denial: Option<&ValidatedPermissionDenial>,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
-        self.respond_request(correlation_id, decision, content, deadline)
+        self.respond_request(
+            correlation_id,
+            decision,
+            content,
+            validated_denial,
+            deadline,
+        )
     }
 
     fn close_session(
@@ -5035,7 +5053,8 @@ impl Scheduler {
         }
         let mut effective_decision = decision;
         let mut policy_reason = None;
-        if request.request_type == "permission" && decision == "allow" {
+        let mut validated_denial = None;
+        if request.request_type == "permission" {
             if let Some(launcher) = self.active_policy(agent_id) {
                 let params: serde_json::Value = serde_json::from_str(&request.payload_json)
                     .map_err(|error| {
@@ -5043,11 +5062,19 @@ impl Scheduler {
                             "permission request payload is invalid: {error}"
                         ))
                     })?;
-                let policy = launcher
-                    .decide_zcode_permission(&params, review_preparation::ExternalDecision::Allow);
-                if !policy.allowed {
+                let external = if decision == "allow" {
+                    review_preparation::ExternalDecision::Allow
+                } else {
+                    review_preparation::ExternalDecision::Deny
+                };
+                let (policy, denial) =
+                    launcher.decide_zcode_permission_validated(&params, external);
+                if external == review_preparation::ExternalDecision::Allow && !policy.allowed {
                     effective_decision = "deny";
                     policy_reason = Some(policy.reason.to_owned());
+                }
+                if effective_decision == "deny" {
+                    validated_denial = denial;
                 }
             }
         }
@@ -5124,6 +5151,7 @@ impl Scheduler {
             &request.correlation_id,
             effective_decision,
             effective_content,
+            validated_denial.as_ref(),
             response_deadline,
         ) {
             self.inner
@@ -5743,21 +5771,44 @@ sleep 10
         })
     }
 
+    fn permission_policy() -> (tempfile::TempDir, PolicyLauncher) {
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        let scratch = directory.path().join("scratch");
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(worktree.join("README.md"), "fixture\n").unwrap();
+        fs::write(worktree.join(".env"), "SECRET=x\n").unwrap();
+        let launcher = PolicyLauncher::new(
+            worktree,
+            scratch,
+            artifacts.join("report.json"),
+            Vec::new(),
+            BTreeMap::new(),
+            false,
+            review_preparation::PolicyCapabilities::default(),
+        )
+        .unwrap();
+        (directory, launcher)
+    }
+
     #[test]
     fn offered_permission_cache_is_bounded_retryable_and_evicts_whole_requests() {
         let valid = permission_offer("Read", serde_json::json!({"path":"missing.rs"}));
         let mut cache = OfferedPermissionCache::default();
         cache.observe("request-1".into(), &valid);
-        let first = cache.response("request-1", "deny").unwrap();
+        let first = cache.response("request-1", "deny", None).unwrap();
         assert_eq!(first["decision"], "deny");
-        assert_eq!(cache.response("request-1", "deny"), Some(first));
+        assert_eq!(cache.response("request-1", "deny", None), Some(first));
         cache.complete("request-1");
-        assert!(cache.response("request-1", "allow").is_none());
-        assert!(cache.response("request-1", "deny").is_none());
+        assert!(cache.response("request-1", "allow", None).is_none());
+        assert!(cache.response("request-1", "deny", None).is_none());
 
         cache.observe("reused".into(), &valid);
         cache.observe("reused".into(), &valid);
-        assert!(cache.response("reused", "deny").is_none());
+        assert!(cache.response("reused", "deny", None).is_none());
         cache.observe(
             "malformed".into(),
             &serde_json::json!({"toolName":"Read","input":{"path":"missing.rs"},"options":[
@@ -5765,7 +5816,7 @@ sleep 10
                 {"kind":"deny","response":{"decision":"allow"}}
             ]}),
         );
-        assert!(cache.response("malformed", "deny").is_none());
+        assert!(cache.response("malformed", "deny", None).is_none());
 
         for index in 0..MAX_PENDING_PERMISSION_RESPONSES + 1 {
             cache.observe(format!("bounded-{index}"), &valid);
@@ -5777,21 +5828,27 @@ sleep 10
 
     #[test]
     fn permission_denials_allow_one_split_or_simplification_and_unrelated_bash() {
+        let (_directory, policy) = permission_policy();
         let mut cache = OfferedPermissionCache::default();
         let compound = permission_offer("Bash", serde_json::json!({"command":"git status && pwd"}));
+        let compound_denial = policy
+            .validated_zcode_denial(&compound, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("compound".into(), &compound);
-        let denied = cache.response("compound", "deny").unwrap();
+        let denied = cache
+            .response("compound", "deny", Some(&compound_denial))
+            .unwrap();
         assert!(denied["reason"]
             .as_str()
             .unwrap()
             .contains("retry=split_once"));
-        cache.record_denial("compound");
+        cache.record_denial("compound", Some(&compound_denial));
         cache.complete("compound");
 
         let split = permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
         cache.observe("split".into(), &split);
         assert_eq!(
-            cache.response("split", "allow").unwrap()["decision"],
+            cache.response("split", "allow", None).unwrap()["decision"],
             "allow"
         );
         cache.complete("split");
@@ -5800,20 +5857,25 @@ sleep 10
             "Bash",
             serde_json::json!({"command":"git -C '/tmp' status --short"}),
         );
+        let git_c_denial = policy
+            .validated_zcode_denial(&git_c, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("git-c".into(), &git_c);
-        let denied = cache.response("git-c", "deny").unwrap();
+        let denied = cache
+            .response("git-c", "deny", Some(&git_c_denial))
+            .unwrap();
         assert!(denied["reason"]
             .as_str()
             .unwrap()
             .contains("retry=simplify_once"));
-        cache.record_denial("git-c");
+        cache.record_denial("git-c", Some(&git_c_denial));
         cache.complete("git-c");
 
         let simplified =
             permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
         cache.observe("simplified".into(), &simplified);
         assert_eq!(
-            cache.response("simplified", "allow").unwrap()["decision"],
+            cache.response("simplified", "allow", None).unwrap()["decision"],
             "allow"
         );
         cache.complete("simplified");
@@ -5821,27 +5883,38 @@ sleep 10
         let unrelated = permission_offer("Bash", serde_json::json!({"command":"pwd"}));
         cache.observe("unrelated".into(), &unrelated);
         assert_eq!(
-            cache.response("unrelated", "allow").unwrap()["decision"],
+            cache.response("unrelated", "allow", None).unwrap()["decision"],
             "allow"
         );
     }
 
     #[test]
     fn hard_denial_equivalents_repeat_without_merging_distinct_git_denials() {
+        let (_directory, policy) = permission_policy();
         let mut cache = OfferedPermissionCache::default();
         let first = permission_offer("Bash", serde_json::json!({"command":"cat .env"}));
+        let first_denial = policy
+            .validated_zcode_denial(&first, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("hard-1".into(), &first);
-        let response = cache.response("hard-1", "deny").unwrap();
+        let response = cache
+            .response("hard-1", "deny", Some(&first_denial))
+            .unwrap();
         assert!(response["reason"]
             .as_str()
             .unwrap()
             .contains("retry=do_not_retry_equivalent"));
-        cache.record_denial("hard-1");
+        cache.record_denial("hard-1", Some(&first_denial));
         cache.complete("hard-1");
 
         let equivalent = permission_offer("Bash", serde_json::json!({"command":"cat './.env'"}));
+        let equivalent_denial = policy
+            .validated_zcode_denial(&equivalent, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("hard-2".into(), &equivalent);
-        let repeated = cache.response("hard-2", "deny").unwrap();
+        let repeated = cache
+            .response("hard-2", "deny", Some(&equivalent_denial))
+            .unwrap();
         assert!(repeated["reason"]
             .as_str()
             .unwrap()
@@ -5851,15 +5924,23 @@ sleep 10
             "Bash",
             serde_json::json!({"command":"git -C /tmp status --short"}),
         );
+        let git_c_denial = policy
+            .validated_zcode_denial(&git_c, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("git-c".into(), &git_c);
-        cache.record_denial("git-c");
+        cache.record_denial("git-c", Some(&git_c_denial));
         cache.complete("git-c");
         let git_output = permission_offer(
             "Bash",
             serde_json::json!({"command":"git diff --output=leak.patch"}),
         );
+        let git_output_denial = policy
+            .validated_zcode_denial(&git_output, review_preparation::ExternalDecision::Allow)
+            .unwrap();
         cache.observe("git-output".into(), &git_output);
-        let independent = cache.response("git-output", "deny").unwrap();
+        let independent = cache
+            .response("git-output", "deny", Some(&git_output_denial))
+            .unwrap();
         assert!(!independent["reason"]
             .as_str()
             .unwrap()
@@ -5870,6 +5951,23 @@ sleep 10
     fn runtime_permission_feedback_ignores_free_text_and_ends_repeated_read_path() {
         let directory = tempfile::tempdir().unwrap();
         let response_log = directory.path().join("permission-responses.jsonl");
+        let worktree = directory.path().join("worktree");
+        let scratch = directory.path().join("scratch");
+        let artifacts = directory.path().join("artifacts");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(worktree.join(".env"), "SECRET=x\n").unwrap();
+        let policy = PolicyLauncher::new(
+            worktree,
+            scratch,
+            artifacts.join("report.json"),
+            Vec::new(),
+            BTreeMap::new(),
+            false,
+            review_preparation::PolicyCapabilities::default(),
+        )
+        .unwrap();
         let sink = Arc::new(MemorySink::default());
         let mut command = Command::new("sh");
         command.env("RESPONSE_LOG", &response_log).args([
@@ -5892,7 +5990,7 @@ exec tail -f /dev/null
 "#,
         ]);
         let owner = RuntimeOwner::spawn(command, sink).unwrap();
-        let respond = |id: &str, free_text: &str| {
+        let respond = |id: &str, params: serde_json::Value, free_text: &str| {
             let key = serde_json::to_string(&WireId::String(id.into())).unwrap();
             wait_until_review_exit(|| {
                 owner
@@ -5903,20 +6001,40 @@ exec tail -f /dev/null
                     .contains_key(&key)
                     .then_some(())
             });
+            let validated_denial = policy
+                .validated_zcode_denial(&params, review_preparation::ExternalDecision::Allow)
+                .unwrap();
             owner
                 .respond_request(
                     &key,
                     "deny",
                     Some(free_text),
+                    Some(&validated_denial),
                     Instant::now() + Duration::from_secs(1),
                 )
                 .unwrap();
         };
 
-        respond("read-1", "credential_read_denied");
-        respond("read-2", "different_free_text_reason");
-        respond("hard-1", "read_path_unverifiable");
-        respond("hard-2", "another_untrusted_reason");
+        respond(
+            "read-1",
+            permission_offer("Read", serde_json::json!({"path":"missing-a.rs"})),
+            "credential_read_denied",
+        );
+        respond(
+            "read-2",
+            permission_offer("Read", serde_json::json!({"path":"missing-b.rs"})),
+            "different_free_text_reason",
+        );
+        respond(
+            "hard-1",
+            permission_offer("Bash", serde_json::json!({"command":"cat .env"})),
+            "read_path_unverifiable",
+        );
+        respond(
+            "hard-2",
+            permission_offer("Bash", serde_json::json!({"command":"cat './.env'"})),
+            "another_untrusted_reason",
+        );
         let responses = wait_until_review_exit(|| {
             let contents = fs::read_to_string(&response_log).ok()?;
             let responses = contents
@@ -5937,7 +6055,7 @@ exec tail -f /dev/null
             .unwrap()
             .contains("Stop this evidence path"));
         assert!(responses[2]["result"]["reason"].as_str().unwrap().contains(
-            "code=credential_read_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+            "code=path_outside_review_roots;retry=do_not_retry_equivalent;next=stop_evidence_path"
         ));
         assert!(responses[3]["result"]["reason"]
             .as_str()
@@ -6486,7 +6604,7 @@ exec tail -f /dev/null
         timeout_send_after_write: AtomicBool,
         timeout_response_write: AtomicBool,
         response_write_deadlines: Mutex<Vec<(Instant, Instant)>>,
-        responses: Mutex<Vec<(String, String, Option<String>)>>,
+        responses: Mutex<Vec<(String, String, Option<String>, Option<(String, String)>)>>,
     }
 
     impl FakeRuntime {
@@ -6635,6 +6753,7 @@ exec tail -f /dev/null
             correlation_id: &str,
             decision: &str,
             content: Option<&str>,
+            validated_denial: Option<&ValidatedPermissionDenial>,
             deadline: Instant,
         ) -> Result<(), RuntimeCommandError> {
             if self.timeout_response_write.load(Ordering::Acquire) {
@@ -6654,6 +6773,7 @@ exec tail -f /dev/null
                 correlation_id.into(),
                 decision.into(),
                 content.map(str::to_owned),
+                validated_denial.map(|denial| (denial.fingerprint(), denial.feedback(false))),
             ));
             Ok(())
         }
@@ -7053,6 +7173,88 @@ exec tail -f /dev/null
             )
             .unwrap();
         assert!(semantic_progress.lock().unwrap().last_advanced > initial_lease);
+        let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+    }
+
+    #[test]
+    fn scheduler_separates_descriptive_reason_from_canonical_policy_identity() {
+        let fixture = ReviewExitFixture::new("canonical-denial-identity");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("outside.txt"), "outside\n").unwrap();
+        let escaped_path = fixture.prepared.worktree.path.join("escape-read");
+        std::os::unix::fs::symlink(outside.path().join("outside.txt"), &escaped_path).unwrap();
+        let respond =
+            |wire_id: &str, path: &str, decision: &str, content: Option<&str>| -> ResponseOutcome {
+                runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                    WireMessage::Request(RequestEnvelope {
+                        id: WireId::String(wire_id.into()),
+                        method: INTERACTION_REQUEST_PERMISSION.into(),
+                        params: permission_offer("Read", serde_json::json!({"path":path})),
+                    }),
+                )));
+                let request_id = wait_until_review_exit(|| {
+                    fixture
+                        .store
+                        .pending_requests(&fixture.execution_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|request| {
+                            request.state == PendingRequestState::Pending
+                                && request.payload_json.contains(path)
+                        })
+                        .map(|request| request.request_id)
+                });
+                fixture
+                    .scheduler
+                    .respond_job(&fixture.execution_id, &request_id, decision, content)
+                    .unwrap()
+            };
+
+        let escaped = respond("canonical-escape", "escape-read", "allow", None);
+        assert_eq!(escaped.effective_decision, "deny");
+        assert_eq!(
+            escaped.policy_reason_code.as_deref(),
+            Some("read_path_escape_denied")
+        );
+        let missing = respond("canonical-missing", "missing-read", "allow", None);
+        assert_eq!(missing.effective_decision, "deny");
+        assert_eq!(
+            missing.policy_reason_code.as_deref(),
+            Some("read_path_unverifiable")
+        );
+        let external = respond(
+            "external-description",
+            "src/lib.rs",
+            "deny",
+            Some("read_path_escape_denied"),
+        );
+        assert_eq!(external.effective_decision, "deny");
+        assert!(!external.policy_overrode);
+        assert!(external.policy_reason_code.is_none());
+
+        let responses = runtime.responses.lock().unwrap().clone();
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0].2.as_deref(), Some("read_path_escape_denied"));
+        assert!(responses[0].3.as_ref().unwrap().1.contains(
+            "code=read_path_escape_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+        ));
+        assert_eq!(responses[1].2.as_deref(), Some("read_path_unverifiable"));
+        assert!(responses[1].3.as_ref().unwrap().1.contains(
+            "code=read_path_unverifiable;retry=simplify_once;next=correct_read_path_once"
+        ));
+        assert_ne!(
+            responses[0].3.as_ref().unwrap().0,
+            responses[1].3.as_ref().unwrap().0
+        );
+        assert_eq!(responses[2].2.as_deref(), Some("read_path_escape_denied"));
+        assert!(responses[2].3.as_ref().unwrap().1.contains(
+            "code=external_policy_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+        ));
+
+        fs::remove_file(escaped_path).unwrap();
         let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));

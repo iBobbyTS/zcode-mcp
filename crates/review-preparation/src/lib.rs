@@ -286,7 +286,7 @@ pub use manifest::{
 };
 pub use policy::{
     ExternalDecision, PermissionDecision, PermissionRequest, PolicyCapabilities, PolicyLauncher,
-    PolicyMode, PreparedCommand, SandboxEnforcement, ValidationOutput,
+    PolicyMode, PreparedCommand, SandboxEnforcement, ValidatedPermissionDenial, ValidationOutput,
 };
 pub use worktree::{CleanupRecord, IntegrityDiagnostics, PreparedWorktree, WorktreeManager};
 

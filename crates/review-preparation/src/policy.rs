@@ -174,6 +174,21 @@ impl PermissionDenialSemantics {
     }
 }
 
+/// Daemon-authoritative denial identity. Its fields are private so callers
+/// cannot turn public descriptive text into policy metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedPermissionDenial(PermissionDenialSemantics);
+
+impl ValidatedPermissionDenial {
+    pub fn fingerprint(&self) -> String {
+        self.0.fingerprint()
+    }
+
+    pub fn feedback(&self, repeated: bool) -> String {
+        self.0.feedback(repeated)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationOutput {
     pub status_code: Option<i32>,
@@ -284,15 +299,38 @@ impl PolicyLauncher {
         &self.capabilities
     }
 
-    /// Returns a machine-parseable denial prefix and an attempt-local semantic
-    /// fingerprint for a ZCode permission request. The caller owns only the
-    /// transient retry state; policy classification remains in this owner.
-    pub fn zcode_denial_feedback(
+    /// Produces policy identity from the daemon's own closed decision result.
+    /// An external denial deliberately uses one stable fallback reason rather
+    /// than treating caller text as policy metadata.
+    pub fn validated_zcode_denial(
+        &self,
         params: &serde_json::Value,
-        repeated: bool,
-    ) -> Option<(String, String)> {
-        let semantics = permission_denial_semantics(params)?;
-        Some((semantics.feedback(repeated), semantics.fingerprint()))
+        external: ExternalDecision,
+    ) -> Option<ValidatedPermissionDenial> {
+        self.decide_zcode_permission_validated(params, external).1
+    }
+
+    pub fn decide_zcode_permission_validated(
+        &self,
+        params: &serde_json::Value,
+        external: ExternalDecision,
+    ) -> (PermissionDecision, Option<ValidatedPermissionDenial>) {
+        let decision = self.decide_zcode_permission(params, external);
+        let denial = (!decision.allowed)
+            .then(|| {
+                let reason = if external == ExternalDecision::Deny {
+                    "external_policy_denied"
+                } else {
+                    decision.reason
+                };
+                permission_denial_semantics(params, reason).map(ValidatedPermissionDenial)
+            })
+            .flatten();
+        (decision, denial)
+    }
+
+    pub fn external_zcode_denial(params: &serde_json::Value) -> Option<ValidatedPermissionDenial> {
+        permission_denial_semantics(params, "external_policy_denied").map(ValidatedPermissionDenial)
     }
 
     pub fn decide(
@@ -1715,7 +1753,10 @@ fn exact_command_id_input(input: &serde_json::Value) -> Option<String> {
     Some(command_id.to_owned())
 }
 
-fn permission_denial_semantics(params: &serde_json::Value) -> Option<PermissionDenialSemantics> {
+fn permission_denial_semantics(
+    params: &serde_json::Value,
+    validated_reason: &'static str,
+) -> Option<PermissionDenialSemantics> {
     let tool = params
         .get("toolName")
         .and_then(serde_json::Value::as_str)
@@ -1735,7 +1776,7 @@ fn permission_denial_semantics(params: &serde_json::Value) -> Option<PermissionD
                     "missing_command".into(),
                 )
             }),
-        "read" | "grep" | "glob" => read_denial_identity(&tool, input),
+        "read" | "grep" | "glob" => read_denial_identity(&tool, input, validated_reason),
         "write" | "edit" | "delete" | "move" => (
             tool.clone(),
             "write".into(),
@@ -1782,7 +1823,11 @@ fn permission_denial_semantics(params: &serde_json::Value) -> Option<PermissionD
             "unknown".into(),
         ),
     };
-    let reason_code = inferred_reason;
+    let reason_code = if validated_reason.is_empty() {
+        inferred_reason
+    } else {
+        validated_reason.into()
+    };
     let (retry_class, recommended_action) =
         denial_recovery(&tool, &program_family, &reason_code, &operand_class);
     Some(PermissionDenialSemantics {
@@ -1795,12 +1840,16 @@ fn permission_denial_semantics(params: &serde_json::Value) -> Option<PermissionD
     })
 }
 
-fn read_denial_identity(tool: &str, input: &serde_json::Value) -> (String, String, String, String) {
+fn read_denial_identity(
+    tool: &str,
+    input: &serde_json::Value,
+    validated_reason: &'static str,
+) -> (String, String, String, String) {
     let path = input
         .get("path")
         .and_then(serde_json::Value::as_str)
         .map(Path::new);
-    if path.is_some_and(is_credential_path) {
+    if validated_reason == "credential_read_denied" || path.is_some_and(is_credential_path) {
         return (
             tool.into(),
             "path".into(),
@@ -1808,11 +1857,12 @@ fn read_denial_identity(tool: &str, input: &serde_json::Value) -> (String, Strin
             "sensitive_path".into(),
         );
     }
-    if path.is_some_and(|path| {
-        path.is_absolute()
-            || path
-                .components()
-                .any(|component| component == Component::ParentDir)
+    if matches!(
+        validated_reason,
+        "read_path_escape_denied" | "prior_review_artifact_denied"
+    ) || path.is_some_and(|path| {
+        path.components()
+            .any(|component| component == Component::ParentDir)
     }) {
         return (
             tool.into(),
@@ -1824,7 +1874,7 @@ fn read_denial_identity(tool: &str, input: &serde_json::Value) -> (String, Strin
     (
         tool.into(),
         "path".into(),
-        "read_path_unverifiable".into(),
+        validated_reason.into(),
         if path.is_some() {
             "unavailable_path"
         } else {
