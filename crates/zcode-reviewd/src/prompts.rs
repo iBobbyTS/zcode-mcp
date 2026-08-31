@@ -37,7 +37,30 @@ pub struct ReviewPrompt {
 }
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
-const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: After the first Bash permission_denied, permanently stop all Bash calls for this review; do not retry the rejected command with another spelling, path, shell, or equivalent. The next tool action must be review_finalize; do not Read or continue inspecting first. In that same review_finalize payload, put a bounded safe descriptor in uncertainties: tool name, policy reason code, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. Put unreviewed paths in coverage.not_covered or recommended_next_actions. If any Read call errors, the next tool action must also be review_finalize; use a truthful incomplete_evidence or unable_to_review signal and do not continue inspecting. Continue with Read and the existing mcp__review-ledger tools only when no Bash denial or Read error has occurred. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
+const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: A denied operation is evidence about that semantic operation, not a ban on unrelated evidence. For a retryable denial, make at most one simpler retry (split_once or simplify_once); do not retry an equivalent spelling or variant. For program/command denials, use Read or a named check when available. For hard denials (write, secret, out-of-scope, or network), do_not_retry_equivalent and record a bounded safe descriptor in uncertainties: tool name, reason_code, retry_class, recommended_action, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. A Read error permits one corrected path attempt; repeated failure ends that evidence path without a loop. Continue with unrelated legal Read, Bash, and existing mcp__review-ledger tools. Keep Bash calls simple: one command, no shell composition. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
+
+fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
+    let families = review_preparation::REVIEW_BASH_COMMAND_FAMILIES.join(",");
+    let checks = prepared
+        .validation_commands
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let inputs = prepared
+        .context
+        .iter()
+        .map(|artifact| artifact.prepared_path.to_string_lossy().into_owned())
+        .chain(std::iter::once(prepared.plan.prepared_path.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    format!(
+        "TASK_SCOPED_CAPABILITIES: cwd is the prepared review worktree; prefer Read/Grep/Glob. policy_version={} policy_sha256={} allowed_bash_command_families=[{}] named_check_ids={} prepared_review_inputs={}. Bash is only for missing repository-level facts; do not use cd, git -C, chaining, backgrounding, pipes, redirects, substitution, multiline commands, shell wrappers, builds, tests, Docker, package managers, or network.",
+        review_preparation::REVIEW_BASH_POLICY_VERSION,
+        review_preparation::review_bash_daemon_policy_sha256(),
+        families,
+        serde_json::to_string(&checks).unwrap_or_else(|_| "[]".into()),
+        serde_json::to_string(&inputs).unwrap_or_else(|_| "[]".into()),
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptError {
@@ -146,17 +169,35 @@ LIVE_STEER: false"
 pub fn build_task_review_prompt(
     prepared: &PreparedLaunchSpec,
 ) -> Result<ReviewPrompt, PromptError> {
-    add_task_progress_instruction(build_review_prompt(prepared)?, None)
+    let prompt = add_task_progress_instruction(build_review_prompt(prepared)?, None)?;
+    append_capability_instruction(prompt, prepared, None)
 }
 
 pub fn build_task_review_continuation_prompt(
     prepared: &PreparedLaunchSpec,
     frozen_finding_ids: &[String],
 ) -> Result<ReviewPrompt, PromptError> {
-    add_task_progress_instruction(
+    let prompt = add_task_progress_instruction(
         build_review_continuation_prompt(prepared, frozen_finding_ids)?,
         Some(frozen_finding_ids),
-    )
+    )?;
+    append_capability_instruction(prompt, prepared, Some(frozen_finding_ids))
+}
+
+fn append_capability_instruction(
+    mut prompt: ReviewPrompt,
+    prepared: &PreparedLaunchSpec,
+    frozen_finding_ids: Option<&[String]>,
+) -> Result<ReviewPrompt, PromptError> {
+    prompt.text.push_str("\n");
+    prompt.text.push_str(&task_capability_instruction(prepared));
+    if let Some(ids) = frozen_finding_ids {
+        validate_review_continuation_prompt(prompt.kind, prompt.round_kind, &prompt.text, ids)?;
+    } else {
+        validate_review_prompt(prompt.kind, prompt.round_kind, &prompt.text)?;
+    }
+    prompt.sha256 = format!("{:x}", Sha256::digest(prompt.text.as_bytes()));
+    Ok(prompt)
 }
 
 fn add_task_progress_instruction(
@@ -396,35 +437,21 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         let task = add_task_progress_instruction(prompt, None).unwrap();
         assert!(task.text.contains("TASK_SCOPED_SEMANTIC_PROGRESS"));
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
-        assert!(task
-            .text
-            .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
-        assert!(task
-            .text
-            .contains("The next tool action must be review_finalize; do not Read or continue inspecting first"));
-        assert!(task.text.contains(
-            "In that same review_finalize payload, put a bounded safe descriptor in uncertainties"
-        ));
-        assert!(task.text.contains(
-            "If any Read call errors, the next tool action must also be review_finalize"
-        ));
-        assert!(task.text.contains(
-            "do not retry the rejected command with another spelling, path, shell, or equivalent"
-        ));
-        assert!(task
-            .text
-            .contains("Continue with Read and the existing mcp__review-ledger tools"));
+        assert!(task.text.contains("A denied operation is evidence about that semantic operation"));
+        assert!(task.text.contains("at most one simpler retry"));
+        assert!(task.text.contains("split_once or simplify_once"));
+        assert!(task.text.contains("A Read error permits one corrected path attempt"));
+        assert!(task.text.contains("do not retry an equivalent spelling or variant"));
+        assert!(task.text.contains("Continue with unrelated legal Read, Bash"));
         assert!(task
             .text
             .contains("bounded safe descriptor in uncertainties"));
-        assert!(task.text.contains("tool name, policy reason code"));
+        assert!(task.text.contains("tool name, reason_code, retry_class, recommended_action"));
         assert!(task
             .text
             .contains("command category/program name or a one-way hash"));
         assert!(task.text.contains("never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths"));
-        assert!(task
-            .text
-            .contains("coverage.not_covered or recommended_next_actions"));
+        assert!(task.text.contains("record a bounded safe descriptor"));
         assert!(task.text.contains("review_finalize exactly once"));
         for signal in [
             "findings_present",
@@ -451,7 +478,7 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         }
         assert!(task.text.contains("never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths"));
         assert!(!legacy.contains("TASK_SCOPED_PERMISSION_HANDLING"));
-        assert!(!legacy.contains("The next tool action must be review_finalize"));
+        assert!(!legacy.contains("A denied operation is evidence about that semantic operation"));
         assert_ne!(task.text, legacy);
         assert!(validate_review_prompt(task.kind, task.round_kind, &task.text).is_ok());
     }
@@ -471,24 +498,12 @@ PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\nCOUNTS_AS_INDEPENDENT: false\nFRO
         };
         let task = add_task_progress_instruction(prompt, Some(&frozen)).unwrap();
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
-        assert!(task
-            .text
-            .contains("After the first Bash permission_denied, permanently stop all Bash calls"));
-        assert!(task
-            .text
-            .contains("The next tool action must be review_finalize; do not Read or continue inspecting first"));
-        assert!(task.text.contains(
-            "In that same review_finalize payload, put a bounded safe descriptor in uncertainties"
-        ));
-        assert!(task.text.contains(
-            "If any Read call errors, the next tool action must also be review_finalize"
-        ));
+        assert!(task.text.contains("A denied operation is evidence about that semantic operation"));
+        assert!(task.text.contains("at most one simpler retry"));
         assert!(task
             .text
             .contains("bounded safe descriptor in uncertainties"));
-        assert!(task
-            .text
-            .contains("coverage.not_covered or recommended_next_actions"));
+        assert!(task.text.contains("record a bounded safe descriptor"));
         assert!(task.text.contains("review_finalize exactly once"));
         assert!(validate_review_continuation_prompt(
             task.kind,

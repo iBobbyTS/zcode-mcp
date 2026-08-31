@@ -500,6 +500,7 @@ pub struct RuntimeOwner {
 struct PermissionResponses {
     allow: serde_json::Value,
     deny: serde_json::Value,
+    semantic_fingerprint: Option<String>,
 }
 
 const MAX_PENDING_PERMISSION_RESPONSES: usize = 128;
@@ -507,14 +508,33 @@ const MAX_PENDING_PERMISSION_RESPONSES: usize = 128;
 #[derive(Debug, Default)]
 struct OfferedPermissionCache {
     requests: HashMap<String, PermissionResponses>,
+    denied_fingerprints: HashSet<String>,
 }
 
 impl OfferedPermissionCache {
     fn observe(&mut self, key: String, params: &serde_json::Value) {
         let reused = self.requests.remove(&key).is_some();
+        let fingerprint = permission_semantic_fingerprint(params);
+        let repeated = fingerprint
+            .as_ref()
+            .is_some_and(|value| self.denied_fingerprints.contains(value));
         let offered = offered_permission_response(params, "allow")
             .zip(offered_permission_response(params, "deny"))
-            .map(|(allow, deny)| PermissionResponses { allow, deny });
+            .map(|(allow, mut deny)| {
+                if repeated {
+                    if let Some(object) = deny.as_object_mut() {
+                        object.insert(
+                            "reason".into(),
+                            serde_json::Value::String("REPEATED_DENIED_OPERATION".into()),
+                        );
+                    }
+                }
+                PermissionResponses {
+                    allow,
+                    deny,
+                    semantic_fingerprint: fingerprint,
+                }
+            });
         if !reused && self.requests.len() < MAX_PENDING_PERMISSION_RESPONSES {
             if let Some(offered) = offered {
                 self.requests.insert(key, offered);
@@ -535,9 +555,41 @@ impl OfferedPermissionCache {
         self.requests.remove(key);
     }
 
+    fn record_denial(&mut self, key: &str) {
+        let fingerprint = self
+            .requests
+            .get(key)
+            .and_then(|responses| responses.semantic_fingerprint.clone());
+        if let Some(fingerprint) = fingerprint {
+            self.denied_fingerprints.insert(fingerprint.clone());
+        }
+    }
+
     fn clear(&mut self) {
         self.requests.clear();
+        self.denied_fingerprints.clear();
     }
+}
+
+fn permission_semantic_fingerprint(params: &serde_json::Value) -> Option<String> {
+    let tool = params.get("toolName")?.as_str()?.to_ascii_lowercase();
+    let input = params.get("input")?;
+    let category = match tool.as_str() {
+        "bash" => input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| command.split_whitespace().next().unwrap_or("unknown")),
+        "read" | "grep" | "glob" => Some("read"),
+        "write" | "edit" | "delete" | "move" => Some("write"),
+        "execute" | "terminal" => input
+            .get("program")
+            .and_then(serde_json::Value::as_str)
+            .map(|program| program.rsplit('/').next().unwrap_or(program)),
+        "network" => Some("network"),
+        "git_ref_mutation" => Some("git_ref_mutation"),
+        _ => None,
+    }?;
+    Some(format!("{tool}:{category}"))
 }
 
 impl RuntimeOwner {
@@ -760,6 +812,9 @@ impl RuntimeOwner {
         self.driver
             .respond_before(id, result, deadline)
             .map_err(RuntimeCommandError::from)?;
+        if decision == "deny" {
+            self.permission_responses.lock().unwrap().record_denial(&key);
+        }
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
     }
@@ -5722,6 +5777,29 @@ sleep 10
         assert_eq!(cache.requests.len(), MAX_PENDING_PERMISSION_RESPONSES);
         cache.clear();
         assert!(cache.requests.is_empty());
+    }
+
+    #[test]
+    fn offered_permission_cache_records_denied_semantic_fingerprint() {
+        let request = serde_json::json!({
+            "toolName": "bash",
+            "input": {"command": "git status --short"},
+            "options": [
+                {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
+                {"kind":"deny","response":{"decision":"deny","reason":"denied"}}
+            ]
+        });
+        let mut cache = OfferedPermissionCache::default();
+        cache.observe("first".into(), &request);
+        assert_eq!(cache.response("first", "deny").unwrap()["reason"], "denied");
+        cache.record_denial("first");
+        cache.complete("first");
+
+        cache.observe("second".into(), &request);
+        assert_eq!(
+            cache.response("second", "deny").unwrap()["reason"],
+            "REPEATED_DENIED_OPERATION"
+        );
     }
 
     #[derive(Default)]

@@ -3,6 +3,8 @@ mod manifest;
 mod policy;
 mod worktree;
 
+pub use policy::REVIEW_BASH_COMMAND_FAMILIES;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
