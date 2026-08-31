@@ -37,10 +37,9 @@ pub struct ReviewPrompt {
 }
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
-const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: A denied operation is evidence about that semantic operation, not a ban on unrelated evidence. For a retryable denial, make at most one simpler retry (split_once or simplify_once); do not retry an equivalent spelling or variant. For program/command denials, use Read or a named check when available. For hard denials (write, secret, out-of-scope, or network), do_not_retry_equivalent and record a bounded safe descriptor in uncertainties: tool name, reason_code, retry_class, recommended_action, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. A Read error permits one corrected path attempt; repeated failure ends that evidence path without a loop. Continue with unrelated legal Read, Bash, and existing mcp__review-ledger tools. Keep Bash calls simple: one command, no shell composition. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
+const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: Permission denials use DENY[policy_version=...;code=...;retry=...;next=...] metadata. A denied operation is evidence about that semantic operation, not a ban on unrelated evidence. For a retryable denial, make at most one simpler retry (split_once or simplify_once); do not retry an equivalent spelling or variant. For program/command denials, follow use_read or use_named_check. For hard denials (write, secret, out-of-scope, or network), do_not_retry_equivalent and record a bounded safe descriptor in uncertainties: tool name, reason_code, retry_class, recommended_action, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. A Read error permits one corrected path attempt; repeated failure ends that evidence path without a loop. Continue with unrelated legal Read, Bash, and existing mcp__review-ledger tools. Keep Bash calls simple: one command, no shell composition. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
 
 fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
-    let families = review_preparation::REVIEW_BASH_COMMAND_FAMILIES.join(",");
     let checks = prepared
         .validation_commands
         .keys()
@@ -54,10 +53,15 @@ fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
             prepared.plan.prepared_path.to_string_lossy().into_owned(),
         ))
         .collect::<Vec<_>>();
+    render_task_capability_instruction(&checks, &inputs)
+}
+
+fn render_task_capability_instruction(checks: &[String], inputs: &[String]) -> String {
+    let families = review_preparation::REVIEW_BASH_COMMAND_FAMILIES.join(",");
     format!(
         "TASK_SCOPED_CAPABILITIES: cwd is the prepared review worktree; prefer Read/Grep/Glob. policy_version={} policy_sha256={} allowed_bash_command_families=[{}] named_check_ids={} prepared_review_inputs={}. Bash is only for missing repository-level facts; do not use cd, git -C, chaining, backgrounding, pipes, redirects, substitution, multiline commands, shell wrappers, builds, tests, Docker, package managers, or network.",
         review_preparation::REVIEW_BASH_POLICY_VERSION,
-        review_preparation::review_bash_daemon_policy_sha256(),
+        review_preparation::review_bash_policy_sha256(),
         families,
         serde_json::to_string(&checks).unwrap_or_else(|_| "[]".into()),
         serde_json::to_string(&inputs).unwrap_or_else(|_| "[]".into()),
@@ -381,6 +385,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_capability_snapshot_uses_combined_effective_policy_metadata() {
+        let checks = vec!["lint".to_owned(), "unit".to_owned()];
+        let inputs = vec![
+            "context/REVIEW-DIFF.patch".to_owned(),
+            "context/PLAN.md".to_owned(),
+        ];
+        let combined = review_preparation::review_bash_policy_sha256();
+        assert_ne!(
+            combined,
+            review_preparation::review_bash_daemon_policy_sha256()
+        );
+        let rendered = render_task_capability_instruction(&checks, &inputs);
+        assert_eq!(
+            rendered,
+            format!(
+                "TASK_SCOPED_CAPABILITIES: cwd is the prepared review worktree; prefer Read/Grep/Glob. policy_version={} policy_sha256={} allowed_bash_command_families=[{}] named_check_ids=[\"lint\",\"unit\"] prepared_review_inputs=[\"context/REVIEW-DIFF.patch\",\"context/PLAN.md\"]. Bash is only for missing repository-level facts; do not use cd, git -C, chaining, backgrounding, pipes, redirects, substitution, multiline commands, shell wrappers, builds, tests, Docker, package managers, or network.",
+                review_preparation::REVIEW_BASH_POLICY_VERSION,
+                combined,
+                review_preparation::REVIEW_BASH_COMMAND_FAMILIES.join(",")
+            )
+        );
+    }
+
+    #[test]
     fn validator_rejects_hidden_and_caller_owned_language() {
         let base = format!(
             "PROMPT_SCHEMA: {PROMPT_SCHEMA}\nREVIEW_KIND: code\nROUND_KIND: INITIAL_BOUNDED\nFRESH_SESSION_REQUIRED: true\n\
@@ -444,6 +472,10 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
             .contains("A denied operation is evidence about that semantic operation"));
         assert!(task.text.contains("at most one simpler retry"));
         assert!(task.text.contains("split_once or simplify_once"));
+        assert!(task.text.contains("use_read or use_named_check"));
+        assert!(task
+            .text
+            .contains("DENY[policy_version=...;code=...;retry=...;next=...]"));
         assert!(task
             .text
             .contains("A Read error permits one corrected path attempt"));

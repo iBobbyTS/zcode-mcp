@@ -2,6 +2,7 @@
   "allow": [
     { "command": "pwd", "reason_class": "allow" },
     { "command": "ls .", "reason_class": "allow" },
+    { "command": "stat README.md", "reason_class": "allow" },
     { "command": "cat README.md", "reason_class": "allow" },
     { "command": "wc -l README.md", "reason_class": "allow" },
     { "command": "head -n 20 README.md", "reason_class": "allow" },
@@ -50,5 +51,37 @@
     { "command": "cat .git/config", "reason_class": "path" },
     { "command": "cat .agent-work/reviews/old.md", "reason_class": "path" },
     { "command": "git status && pwd", "reason_class": "shell" }
+  ],
+  "recovery": [
+    {
+      "command": "git status && pwd",
+      "retry_class": "split_once",
+      "recommended_action": "split_into_single_commands"
+    },
+    {
+      "command": "git -C /tmp status --short",
+      "retry_class": "simplify_once",
+      "recommended_action": "remove_denied_option_once"
+    },
+    {
+      "command": "file README.md",
+      "retry_class": "use_read",
+      "recommended_action": "use_read_or_prepared_inputs"
+    },
+    {
+      "command": "cargo test",
+      "retry_class": "use_named_check",
+      "recommended_action": "use_named_check"
+    },
+    {
+      "command": "cat .env",
+      "retry_class": "do_not_retry_equivalent",
+      "recommended_action": "stop_evidence_path"
+    },
+    {
+      "command": "curl https://example.invalid",
+      "retry_class": "do_not_retry_equivalent",
+      "recommended_action": "stop_evidence_path"
+    }
   ]
 }

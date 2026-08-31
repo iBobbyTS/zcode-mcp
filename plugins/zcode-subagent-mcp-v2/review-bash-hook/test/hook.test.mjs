@@ -39,6 +39,10 @@ test('hook denies shell composition', () => {
   const output = runHook('git status & touch /tmp/pwn', root);
   assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
   assert.match(output.hookSpecificOutput.permissionDecisionReason, /shell_background/u);
+  assert.match(
+    output.hookSpecificOutput.permissionDecisionReason,
+    /^DENY\[policy_version=zcode-readonly-bash\/v1\.0\.0;code=shell_composition_or_expansion_denied;retry=split_once;next=split_into_single_commands\]/u
+  );
   assert.equal('updatedInput' in output.hookSpecificOutput, false);
 });
 

@@ -5,7 +5,7 @@ use review_preparation::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
@@ -1074,6 +1074,13 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
     struct Corpus {
         allow: Vec<Case>,
         deny: Vec<Case>,
+        recovery: Vec<RecoveryCase>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RecoveryCase {
+        command: String,
+        retry_class: String,
+        recommended_action: String,
     }
 
     fn reason_class(reason: &str) -> &'static str {
@@ -1115,6 +1122,18 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
             ExternalDecision::Allow,
         )
     };
+    let corpus_families = corpus
+        .allow
+        .iter()
+        .filter_map(|case| case.command.split_whitespace().next())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        review_preparation::REVIEW_BASH_COMMAND_FAMILIES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        corpus_families
+    );
     for case in corpus.allow {
         let decision = decide(&case.command);
         assert!(
@@ -1138,6 +1157,54 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
             "{}: {}",
             case.command,
             decision.reason
+        );
+    }
+    for case in corpus.recovery {
+        let params = serde_json::json!({
+            "toolName":"Bash",
+            "input":{"command":case.command}
+        });
+        let decision = launcher.decide_zcode_permission(&params, ExternalDecision::Allow);
+        assert!(
+            !decision.allowed,
+            "recovery corpus allowed {}",
+            case.command
+        );
+        let (feedback, fingerprint) = review_preparation::PolicyLauncher::zcode_denial_feedback(
+            &params,
+            Some(decision.reason),
+            false,
+        )
+        .unwrap();
+        assert!(
+            feedback.contains(&format!("retry={}", case.retry_class)),
+            "{}: {feedback}",
+            case.command
+        );
+        assert!(
+            feedback.contains(&format!("next={}", case.recommended_action)),
+            "{}: {feedback}",
+            case.command
+        );
+        assert!(
+            fingerprint.contains("family="),
+            "{}: {fingerprint}",
+            case.command
+        );
+        assert!(
+            fingerprint.contains("category="),
+            "{}: {fingerprint}",
+            case.command
+        );
+        assert!(
+            fingerprint.contains("reason="),
+            "{}: {fingerprint}",
+            case.command
+        );
+        assert!(
+            fingerprint.contains("operand="),
+            "{}: {fingerprint}",
+            case.command
         );
     }
 }

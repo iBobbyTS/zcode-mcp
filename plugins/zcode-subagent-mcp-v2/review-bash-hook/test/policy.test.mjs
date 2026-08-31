@@ -151,6 +151,43 @@ test('policy metadata is stable and nonempty', () => {
   const metadata = policyMetadata();
   assert.match(metadata.version, /^zcode-readonly-bash\//u);
   assert.match(metadata.sha256, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(metadata.descriptor.denialRecoveryClasses, [
+    'split_once',
+    'simplify_once',
+    'use_read',
+    'use_named_check',
+    'do_not_retry_equivalent',
+  ]);
+});
+
+test('denial recovery permits one split or simplification without disabling unrelated Bash', () => {
+  const root = fixture();
+  const compound = evaluateCommand({ command: 'git status && pwd', cwd: root });
+  assert.equal(compound.decision, 'deny');
+  assert.equal(compound.retryClass, 'split_once');
+  assert.equal(evaluateCommand({ command: 'git status --short', cwd: root }).decision, 'allow');
+
+  const gitC = evaluateCommand({ command: `git -C '${root}' status --short`, cwd: root });
+  assert.equal(gitC.decision, 'deny');
+  assert.equal(gitC.retryClass, 'simplify_once');
+  assert.equal(evaluateCommand({ command: 'git status --short', cwd: root }).decision, 'allow');
+  assert.equal(evaluateCommand({ command: 'pwd', cwd: root }).decision, 'allow');
+});
+
+test('semantic denial fingerprints normalize quoted hard denials and separate Git categories', () => {
+  const root = fixture();
+  const andSequence = evaluateCommand({ command: 'git status && pwd', cwd: root });
+  const semicolonSequence = evaluateCommand({ command: 'git status; pwd', cwd: root });
+  assert.equal(andSequence.semanticFingerprint, semicolonSequence.semanticFingerprint);
+
+  const plain = evaluateCommand({ command: 'cat .env', cwd: root });
+  const quoted = evaluateCommand({ command: "cat './.env'", cwd: root });
+  assert.equal(plain.retryClass, 'do_not_retry_equivalent');
+  assert.equal(quoted.semanticFingerprint, plain.semanticFingerprint);
+
+  const cwdOverride = evaluateCommand({ command: `git -C '${root}' status --short`, cwd: root });
+  const outputWrite = evaluateCommand({ command: 'git diff --output=leak.patch', cwd: root });
+  assert.notEqual(cwdOverride.semanticFingerprint, outputWrite.semanticFingerprint);
 });
 
 test('denies Git object paths that escape or target sensitive files', () => {

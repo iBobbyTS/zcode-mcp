@@ -120,13 +120,59 @@ pub struct PermissionDecision {
     pub reason: &'static str,
 }
 
-/// The canonical command families exposed to review prompts. Keep this list
-/// adjacent to the policy implementation so guidance cannot drift into a
-/// second, prompt-only allowlist.
-pub const REVIEW_BASH_COMMAND_FAMILIES: &[&str] = &[
+macro_rules! define_review_bash_command_families {
+    ($($program:literal),+ $(,)?) => {
+        /// The command families enforced by the Rust review Bash policy and
+        /// projected into task capability guidance.
+        pub const REVIEW_BASH_COMMAND_FAMILIES: &[&str] = &[$($program),+];
+
+        fn review_bash_program_allowed(program: &str) -> bool {
+            matches!(program, $($program)|+)
+        }
+    };
+}
+
+define_review_bash_command_families!(
     "pwd", "ls", "stat", "wc", "head", "tail", "cat", "grep", "rg", "sed", "find", "git", "shasum",
     "cksum",
-];
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionDenialSemantics {
+    program_family: String,
+    category: String,
+    reason_code: String,
+    operand_class: String,
+    retry_class: &'static str,
+    recommended_action: &'static str,
+}
+
+impl PermissionDenialSemantics {
+    fn fingerprint(&self) -> String {
+        format!(
+            "family={};category={};reason={};operand={}",
+            self.program_family, self.category, self.reason_code, self.operand_class
+        )
+    }
+
+    fn feedback(&self, repeated: bool) -> String {
+        if repeated {
+            format!(
+                "DENY[policy_version={};code=REPEATED_DENIED_OPERATION;retry=do_not_retry_equivalent;next=use_read_or_existing_inputs;original_code={}]",
+                crate::REVIEW_BASH_POLICY_VERSION,
+                self.reason_code
+            )
+        } else {
+            format!(
+                "DENY[policy_version={};code={};retry={};next={}]",
+                crate::REVIEW_BASH_POLICY_VERSION,
+                self.reason_code,
+                self.retry_class,
+                self.recommended_action
+            )
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationOutput {
@@ -236,6 +282,18 @@ impl PolicyLauncher {
 
     pub fn capabilities(&self) -> &PolicyCapabilities {
         &self.capabilities
+    }
+
+    /// Returns a machine-parseable denial prefix and an attempt-local semantic
+    /// fingerprint for a ZCode permission request. The caller owns only the
+    /// transient retry state; policy classification remains in this owner.
+    pub fn zcode_denial_feedback(
+        params: &serde_json::Value,
+        supplied_reason: Option<&str>,
+        repeated: bool,
+    ) -> Option<(String, String)> {
+        let semantics = permission_denial_semantics(params, supplied_reason)?;
+        Some((semantics.feedback(repeated), semantics.fingerprint()))
     }
 
     pub fn decide(
@@ -410,23 +468,7 @@ impl PolicyLauncher {
             };
         };
         let program = argv.first().map(String::as_str).unwrap_or_default();
-        if !matches!(
-            program,
-            "pwd"
-                | "ls"
-                | "stat"
-                | "wc"
-                | "head"
-                | "tail"
-                | "cat"
-                | "grep"
-                | "rg"
-                | "sed"
-                | "find"
-                | "git"
-                | "shasum"
-                | "cksum"
-        ) {
+        if !review_bash_program_allowed(program) {
             return PermissionDecision {
                 allowed: false,
                 reason: "command_not_allowlisted",
@@ -1672,6 +1714,372 @@ fn exact_command_id_input(input: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(command_id.to_owned())
+}
+
+fn permission_denial_semantics(
+    params: &serde_json::Value,
+    supplied_reason: Option<&str>,
+) -> Option<PermissionDenialSemantics> {
+    let tool = params
+        .get("toolName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let input = params.get("input").unwrap_or(&serde_json::Value::Null);
+    let supplied_reason = supplied_reason.and_then(normalized_supplied_reason);
+    let (program_family, category, inferred_reason, operand_class) = match tool.as_str() {
+        "bash" => input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(bash_denial_identity)
+            .unwrap_or_else(|| {
+                (
+                    "bash".into(),
+                    "command".into(),
+                    "bash_command_missing".into(),
+                    "missing_command".into(),
+                )
+            }),
+        "read" | "grep" | "glob" => (
+            tool.clone(),
+            "path".into(),
+            "external_policy_denied".into(),
+            "unavailable_path".into(),
+        ),
+        "write" | "edit" | "delete" | "move" => (
+            tool.clone(),
+            "write".into(),
+            "write_denied".into(),
+            "mutation".into(),
+        ),
+        "execute" | "terminal" => {
+            let program = input
+                .get("program")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|program| Path::new(program).file_name())
+                .and_then(OsStr::to_str)
+                .unwrap_or("unknown")
+                .to_ascii_lowercase();
+            (
+                program,
+                "execute".into(),
+                "command_not_allowlisted".into(),
+                "program".into(),
+            )
+        }
+        "network" => (
+            "network".into(),
+            "network".into(),
+            "network_not_enforced_and_request_denied".into(),
+            "network".into(),
+        ),
+        "git_ref_mutation" => (
+            "git".into(),
+            "ref_mutation".into(),
+            "git_ref_mutation_denied".into(),
+            "mutation".into(),
+        ),
+        _ if tool.starts_with("mcp__") => (
+            "named_check".into(),
+            "named_check".into(),
+            "permission_request_unrecognized".into(),
+            "named_check".into(),
+        ),
+        _ => (
+            tool.clone(),
+            "unknown".into(),
+            "permission_request_unrecognized".into(),
+            "unknown".into(),
+        ),
+    };
+    let reason_code = supplied_reason.unwrap_or(inferred_reason);
+    let (retry_class, recommended_action) =
+        denial_recovery(&tool, &program_family, &reason_code, &operand_class);
+    Some(PermissionDenialSemantics {
+        program_family,
+        category,
+        reason_code,
+        operand_class,
+        retry_class,
+        recommended_action,
+    })
+}
+
+fn normalized_supplied_reason(reason: &str) -> Option<String> {
+    let trimmed = reason.trim();
+    if let Some(metadata) = trimmed
+        .strip_prefix("DENY[")
+        .and_then(|value| value.split_once(']'))
+    {
+        let fields = metadata
+            .0
+            .split(';')
+            .filter_map(|field| field.split_once('='));
+        let mut code = None;
+        let mut original_code = None;
+        for (key, value) in fields {
+            match key {
+                "code" => code = stable_reason_token(value),
+                "original_code" => original_code = stable_reason_token(value),
+                _ => {}
+            }
+        }
+        return original_code
+            .or(code)
+            .filter(|value| value != "REPEATED_DENIED_OPERATION")
+            .map(canonical_reason_code);
+    }
+    stable_reason_token(trimmed)
+        .filter(|value| value.contains('_'))
+        .map(canonical_reason_code)
+}
+
+fn stable_reason_token(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then(|| value.to_owned())
+}
+
+fn canonical_reason_code(value: String) -> String {
+    if value.starts_with("shell_") {
+        "shell_composition_or_expansion_denied".into()
+    } else if value == "git_global_option_denied" {
+        "git_option_or_mutation_denied".into()
+    } else {
+        value
+    }
+}
+
+fn bash_denial_identity(command: &str) -> (String, String, String, String) {
+    let Some(argv) = tokenize_review_bash(command) else {
+        let operand_class = if command.contains('\n') || command.contains('\r') {
+            "multiline"
+        } else {
+            "compound_command"
+        };
+        return (
+            "shell".into(),
+            "composition".into(),
+            "shell_composition_or_expansion_denied".into(),
+            operand_class.into(),
+        );
+    };
+    let family = argv
+        .first()
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(OsStr::to_str)
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    if !review_bash_program_allowed(&family) {
+        return (
+            family,
+            "program".into(),
+            "command_not_allowlisted".into(),
+            "program".into(),
+        );
+    }
+    if family == "git" {
+        let category = git_denial_category(&argv[1..]);
+        let operand_class = git_denial_operand_class(&argv[1..]);
+        let reason = if matches!(operand_class.as_str(), "sensitive_path") {
+            "git_sensitive_path_denied"
+        } else if matches!(
+            operand_class.as_str(),
+            "cwd_override" | "config_override" | "repository_override"
+        ) {
+            "git_option_or_mutation_denied"
+        } else {
+            "git_option_or_mutation_denied"
+        };
+        return (family, category, reason.into(), operand_class);
+    }
+    let operand_class = if argv[1..].iter().any(|value| {
+        is_credential_path(Path::new(value)) || is_prior_review_artifact(Path::new(value))
+    }) {
+        "sensitive_path"
+    } else if argv[1..].iter().any(|value| value.starts_with('-')) {
+        "option"
+    } else if argv.len() <= 1 {
+        "missing_path"
+    } else {
+        "path"
+    };
+    let inferred_reason = match operand_class {
+        "sensitive_path" => "credential_read_denied",
+        "missing_path" => "command_option_not_allowlisted",
+        _ => "external_policy_denied",
+    };
+    (
+        family.clone(),
+        family,
+        inferred_reason.into(),
+        operand_class.into(),
+    )
+}
+
+fn git_denial_category(args: &[String]) -> String {
+    let mut index = 0;
+    while let Some(value) = args.get(index) {
+        if matches!(value.as_str(), "-C" | "-c" | "--git-dir" | "--work-tree") {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if value.starts_with("--git-dir=")
+            || value.starts_with("--work-tree=")
+            || value.starts_with("-c")
+            || value == "--no-pager"
+        {
+            index = index.saturating_add(1);
+            continue;
+        }
+        return value.trim_start_matches('-').to_ascii_lowercase();
+    }
+    "unknown".into()
+}
+
+fn git_denial_operand_class(args: &[String]) -> String {
+    if args.iter().any(|value| value == "-C") {
+        return "cwd_override".into();
+    }
+    if args
+        .iter()
+        .any(|value| value == "-c" || value.starts_with("-c"))
+    {
+        return "config_override".into();
+    }
+    if args.iter().any(|value| {
+        matches!(value.as_str(), "--git-dir" | "--work-tree")
+            || value.starts_with("--git-dir=")
+            || value.starts_with("--work-tree=")
+    }) {
+        return "repository_override".into();
+    }
+    if args.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "--output" | "--ext-diff" | "--textconv" | "--no-index"
+        ) || value.starts_with("--output=")
+    }) {
+        return "write_option".into();
+    }
+    if args.iter().any(|value| {
+        is_credential_path(Path::new(value)) || is_prior_review_artifact(Path::new(value))
+    }) {
+        return "sensitive_path".into();
+    }
+    if args.first().is_some_and(|value| {
+        matches!(
+            value.as_str(),
+            "add"
+                | "apply"
+                | "branch"
+                | "checkout"
+                | "clean"
+                | "commit"
+                | "merge"
+                | "mv"
+                | "rebase"
+                | "reset"
+                | "restore"
+                | "rm"
+                | "switch"
+                | "tag"
+        )
+    }) {
+        return "mutation".into();
+    }
+    "option_or_operand".into()
+}
+
+fn denial_recovery(
+    tool: &str,
+    program_family: &str,
+    reason_code: &str,
+    operand_class: &str,
+) -> (&'static str, &'static str) {
+    if reason_code.starts_with("shell_")
+        || reason_code.contains("multiline")
+        || reason_code == "shell_composition_or_expansion_denied"
+    {
+        return ("split_once", "split_into_single_commands");
+    }
+    if tool == "read"
+        && matches!(
+            reason_code,
+            "read_path_unverifiable" | "permission_request_unrecognized"
+        )
+    {
+        return ("simplify_once", "correct_read_path_once");
+    }
+    if program_family == "git"
+        && matches!(
+            operand_class,
+            "cwd_override" | "config_override" | "repository_override"
+        )
+    {
+        return ("simplify_once", "remove_denied_option_once");
+    }
+    if reason_code.contains("option_not_allowlisted")
+        && !matches!(
+            operand_class,
+            "write_option" | "mutation" | "sensitive_path"
+        )
+    {
+        return ("simplify_once", "remove_denied_option_once");
+    }
+    if matches!(
+        reason_code,
+        "command_not_allowlisted" | "program_not_allowlisted"
+    ) {
+        if matches!(
+            program_family,
+            "curl" | "wget" | "ssh" | "scp" | "sftp" | "nc" | "ncat" | "telnet"
+        ) {
+            return ("do_not_retry_equivalent", "stop_evidence_path");
+        }
+        if matches!(
+            program_family,
+            "cargo"
+                | "rustc"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "docker"
+                | "make"
+                | "cmake"
+                | "pytest"
+                | "python"
+                | "python3"
+                | "go"
+        ) {
+            return ("use_named_check", "use_named_check");
+        }
+        return ("use_read", "use_read_or_prepared_inputs");
+    }
+    if reason_code.contains("credential")
+        || reason_code.contains("sensitive")
+        || reason_code.contains("secret")
+        || reason_code.contains("network")
+        || reason_code.contains("write")
+        || reason_code.contains("mutation")
+        || reason_code.contains("outside")
+        || reason_code.contains("escape")
+        || reason_code.contains("protected")
+        || reason_code.contains("prior_review")
+        || reason_code == "external_policy_denied"
+        || matches!(
+            operand_class,
+            "write_option" | "mutation" | "sensitive_path" | "outside_scope"
+        )
+    {
+        return ("do_not_retry_equivalent", "stop_evidence_path");
+    }
+    ("use_read", "use_read_or_prepared_inputs")
 }
 
 fn tokenize_review_bash(command: &str) -> Option<Vec<String>> {

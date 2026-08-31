@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { evaluateCommand } from '../lib/readonly-bash-policy.mjs';
+import { evaluateCommand, policyMetadata } from '../lib/readonly-bash-policy.mjs';
 
 const corpus = JSON.parse(fs.readFileSync(new URL('../policy-corpus.json', import.meta.url), 'utf8'));
 
@@ -31,6 +31,8 @@ function fixture() {
 
 test('Rust and JavaScript evaluate the shared bounded policy corpus', () => {
   const root = fixture();
+  const corpusFamilies = [...new Set(corpus.allow.map((entry) => entry.command.split(/\s+/u)[0]))].sort();
+  assert.deepEqual([...policyMetadata().descriptor.programs].sort(), corpusFamilies);
   for (const entry of corpus.allow) {
     const result = evaluateCommand({ command: entry.command, cwd: root });
     assert.equal(result.decision, 'allow', `${entry.command}: ${result.code} ${result.reason}`);
@@ -40,5 +42,12 @@ test('Rust and JavaScript evaluate the shared bounded policy corpus', () => {
     const result = evaluateCommand({ command: entry.command, cwd: root });
     assert.equal(result.decision, 'deny', `${entry.command}: unexpectedly ${result.code}`);
     assert.equal(reasonClass(result, entry.command), entry.reason_class, `${entry.command}: ${result.code}`);
+  }
+  for (const entry of corpus.recovery) {
+    const result = evaluateCommand({ command: entry.command, cwd: root });
+    assert.notEqual(result.decision, 'allow', entry.command);
+    assert.equal(result.retryClass, entry.retry_class, entry.command);
+    assert.equal(result.recommendedAction, entry.recommended_action, entry.command);
+    assert.match(result.semanticFingerprint, /^family=.*;category=.*;reason=.*;operand=.*$/u);
   }
 });

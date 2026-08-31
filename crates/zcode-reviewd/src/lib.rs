@@ -500,7 +500,7 @@ pub struct RuntimeOwner {
 struct PermissionResponses {
     allow: serde_json::Value,
     deny: serde_json::Value,
-    semantic_fingerprint: Option<String>,
+    params: serde_json::Value,
 }
 
 const MAX_PENDING_PERMISSION_RESPONSES: usize = 128;
@@ -514,26 +514,12 @@ struct OfferedPermissionCache {
 impl OfferedPermissionCache {
     fn observe(&mut self, key: String, params: &serde_json::Value) {
         let reused = self.requests.remove(&key).is_some();
-        let fingerprint = permission_semantic_fingerprint(params);
-        let repeated = fingerprint
-            .as_ref()
-            .is_some_and(|value| self.denied_fingerprints.contains(value));
         let offered = offered_permission_response(params, "allow")
             .zip(offered_permission_response(params, "deny"))
-            .map(|(allow, mut deny)| {
-                if repeated {
-                    if let Some(object) = deny.as_object_mut() {
-                        object.insert(
-                            "reason".into(),
-                            serde_json::Value::String("REPEATED_DENIED_OPERATION".into()),
-                        );
-                    }
-                }
-                PermissionResponses {
-                    allow,
-                    deny,
-                    semantic_fingerprint: fingerprint,
-                }
+            .map(|(allow, deny)| PermissionResponses {
+                allow,
+                deny,
+                params: params.clone(),
             });
         if !reused && self.requests.len() < MAX_PENDING_PERMISSION_RESPONSES {
             if let Some(offered) = offered {
@@ -542,11 +528,37 @@ impl OfferedPermissionCache {
         }
     }
 
-    fn response(&self, key: &str, decision: &str) -> Option<serde_json::Value> {
+    fn response(
+        &self,
+        key: &str,
+        decision: &str,
+        supplied_reason: Option<&str>,
+    ) -> Option<serde_json::Value> {
         let offered = self.requests.get(key)?;
         match decision {
             "allow" => Some(offered.allow.clone()),
-            "deny" => Some(offered.deny.clone()),
+            "deny" => {
+                let (_, fingerprint) =
+                    PolicyLauncher::zcode_denial_feedback(&offered.params, supplied_reason, false)?;
+                let repeated = self.denied_fingerprints.contains(&fingerprint);
+                let (feedback, _) = PolicyLauncher::zcode_denial_feedback(
+                    &offered.params,
+                    supplied_reason,
+                    repeated,
+                )?;
+                let mut response = offered.deny.clone();
+                response.as_object_mut()?.insert(
+                    "reason".into(),
+                    serde_json::Value::String(if repeated {
+                        format!(
+                            "{feedback} Stop this evidence path; use Read, prepared inputs, or record a coverage gap."
+                        )
+                    } else {
+                        feedback
+                    }),
+                );
+                Some(response)
+            }
             _ => None,
         }
     }
@@ -555,11 +567,11 @@ impl OfferedPermissionCache {
         self.requests.remove(key);
     }
 
-    fn record_denial(&mut self, key: &str) {
-        let fingerprint = self
-            .requests
-            .get(key)
-            .and_then(|responses| responses.semantic_fingerprint.clone());
+    fn record_denial(&mut self, key: &str, supplied_reason: Option<&str>) {
+        let fingerprint = self.requests.get(key).and_then(|responses| {
+            PolicyLauncher::zcode_denial_feedback(&responses.params, supplied_reason, false)
+                .map(|(_, fingerprint)| fingerprint)
+        });
         if let Some(fingerprint) = fingerprint {
             if self.denied_fingerprints.len() < MAX_PENDING_PERMISSION_RESPONSES {
                 self.denied_fingerprints.insert(fingerprint);
@@ -571,27 +583,6 @@ impl OfferedPermissionCache {
         self.requests.clear();
         self.denied_fingerprints.clear();
     }
-}
-
-fn permission_semantic_fingerprint(params: &serde_json::Value) -> Option<String> {
-    let tool = params.get("toolName")?.as_str()?.to_ascii_lowercase();
-    let input = params.get("input")?;
-    let category = match tool.as_str() {
-        "bash" => input
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .map(|command| command.split_whitespace().next().unwrap_or("unknown")),
-        "read" | "grep" | "glob" => Some("read"),
-        "write" | "edit" | "delete" | "move" => Some("write"),
-        "execute" | "terminal" => input
-            .get("program")
-            .and_then(serde_json::Value::as_str)
-            .map(|program| program.rsplit('/').next().unwrap_or(program)),
-        "network" => Some("network"),
-        "git_ref_mutation" => Some("git_ref_mutation"),
-        _ => None,
-    }?;
-    Some(format!("{tool}:{category}"))
 }
 
 impl RuntimeOwner {
@@ -803,7 +794,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .response(&key, decision)
+                .response(&key, decision, content)
                 .ok_or_else(|| {
                     RuntimeCommandError::InvalidSession(
                         "runtime offered no matching permission response".into(),
@@ -818,7 +809,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .record_denial(&key);
+                .record_denial(&key, content);
         }
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
@@ -5749,32 +5740,45 @@ sleep 10
         store.enqueue_job(&job).unwrap()
     }
 
+    fn permission_offer(tool: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "toolName": tool,
+            "input": input,
+            "options": [
+                {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
+                {"kind":"deny","response":{"decision":"deny","reason":"denied"}}
+            ]
+        })
+    }
+
     #[test]
     fn offered_permission_cache_is_bounded_retryable_and_evicts_whole_requests() {
-        let valid = serde_json::json!({"options":[
-            {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
-            {"kind":"deny","response":{"decision":"deny","reason":"denied"}}
-        ]});
+        let valid = permission_offer("Read", serde_json::json!({"path":"missing.rs"}));
         let mut cache = OfferedPermissionCache::default();
         cache.observe("request-1".into(), &valid);
-        let first = cache.response("request-1", "deny").unwrap();
+        let first = cache
+            .response("request-1", "deny", Some("read_path_unverifiable"))
+            .unwrap();
         assert_eq!(first["decision"], "deny");
-        assert_eq!(cache.response("request-1", "deny"), Some(first));
+        assert_eq!(
+            cache.response("request-1", "deny", Some("read_path_unverifiable")),
+            Some(first)
+        );
         cache.complete("request-1");
-        assert!(cache.response("request-1", "allow").is_none());
-        assert!(cache.response("request-1", "deny").is_none());
+        assert!(cache.response("request-1", "allow", None).is_none());
+        assert!(cache.response("request-1", "deny", None).is_none());
 
         cache.observe("reused".into(), &valid);
         cache.observe("reused".into(), &valid);
-        assert!(cache.response("reused", "deny").is_none());
+        assert!(cache.response("reused", "deny", None).is_none());
         cache.observe(
             "malformed".into(),
-            &serde_json::json!({"options":[
+            &serde_json::json!({"toolName":"Read","input":{"path":"missing.rs"},"options":[
                 {"kind":"allow_once","response":{"decision":"allow"}},
                 {"kind":"deny","response":{"decision":"allow"}}
             ]}),
         );
-        assert!(cache.response("malformed", "deny").is_none());
+        assert!(cache.response("malformed", "deny", None).is_none());
 
         for index in 0..MAX_PENDING_PERMISSION_RESPONSES + 1 {
             cache.observe(format!("bounded-{index}"), &valid);
@@ -5785,26 +5789,148 @@ sleep 10
     }
 
     #[test]
-    fn offered_permission_cache_records_denied_semantic_fingerprint() {
-        let request = serde_json::json!({
-            "toolName": "bash",
-            "input": {"command": "git status --short"},
-            "options": [
-                {"kind":"allow_once","response":{"decision":"allow","reason":"once"}},
-                {"kind":"deny","response":{"decision":"deny","reason":"denied"}}
-            ]
-        });
+    fn permission_denials_allow_one_split_or_simplification_and_unrelated_bash() {
         let mut cache = OfferedPermissionCache::default();
-        cache.observe("first".into(), &request);
-        assert_eq!(cache.response("first", "deny").unwrap()["reason"], "denied");
-        cache.record_denial("first");
-        cache.complete("first");
+        let compound = permission_offer("Bash", serde_json::json!({"command":"git status && pwd"}));
+        cache.observe("compound".into(), &compound);
+        let denied = cache
+            .response(
+                "compound",
+                "deny",
+                Some("shell_composition_or_expansion_denied"),
+            )
+            .unwrap();
+        assert!(denied["reason"]
+            .as_str()
+            .unwrap()
+            .contains("retry=split_once"));
+        cache.record_denial("compound", Some("shell_composition_or_expansion_denied"));
+        cache.complete("compound");
 
-        cache.observe("second".into(), &request);
+        let split = permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
+        cache.observe("split".into(), &split);
         assert_eq!(
-            cache.response("second", "deny").unwrap()["reason"],
-            "REPEATED_DENIED_OPERATION"
+            cache.response("split", "allow", None).unwrap()["decision"],
+            "allow"
         );
+        cache.complete("split");
+
+        let git_c = permission_offer(
+            "Bash",
+            serde_json::json!({"command":"git -C '/tmp' status --short"}),
+        );
+        cache.observe("git-c".into(), &git_c);
+        let denied = cache
+            .response("git-c", "deny", Some("git_option_or_mutation_denied"))
+            .unwrap();
+        assert!(denied["reason"]
+            .as_str()
+            .unwrap()
+            .contains("retry=simplify_once"));
+        cache.record_denial("git-c", Some("git_option_or_mutation_denied"));
+        cache.complete("git-c");
+
+        let simplified =
+            permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
+        cache.observe("simplified".into(), &simplified);
+        assert_eq!(
+            cache.response("simplified", "allow", None).unwrap()["decision"],
+            "allow"
+        );
+        cache.complete("simplified");
+
+        let unrelated = permission_offer("Bash", serde_json::json!({"command":"pwd"}));
+        cache.observe("unrelated".into(), &unrelated);
+        assert_eq!(
+            cache.response("unrelated", "allow", None).unwrap()["decision"],
+            "allow"
+        );
+    }
+
+    #[test]
+    fn hard_denial_equivalents_repeat_without_merging_distinct_git_denials() {
+        let mut cache = OfferedPermissionCache::default();
+        let first = permission_offer("Bash", serde_json::json!({"command":"cat .env"}));
+        cache.observe("hard-1".into(), &first);
+        let response = cache
+            .response("hard-1", "deny", Some("credential_read_denied"))
+            .unwrap();
+        assert!(response["reason"]
+            .as_str()
+            .unwrap()
+            .contains("retry=do_not_retry_equivalent"));
+        cache.record_denial("hard-1", Some("credential_read_denied"));
+        cache.complete("hard-1");
+
+        let equivalent = permission_offer("Bash", serde_json::json!({"command":"cat './.env'"}));
+        cache.observe("hard-2".into(), &equivalent);
+        let repeated = cache
+            .response("hard-2", "deny", Some("credential_read_denied"))
+            .unwrap();
+        assert!(repeated["reason"]
+            .as_str()
+            .unwrap()
+            .contains("code=REPEATED_DENIED_OPERATION"));
+
+        let git_c = permission_offer(
+            "Bash",
+            serde_json::json!({"command":"git -C /tmp status --short"}),
+        );
+        cache.observe("git-c".into(), &git_c);
+        cache.record_denial("git-c", Some("git_option_or_mutation_denied"));
+        cache.complete("git-c");
+        let git_output = permission_offer(
+            "Bash",
+            serde_json::json!({"command":"git diff --output=leak.patch"}),
+        );
+        cache.observe("git-output".into(), &git_output);
+        let independent = cache
+            .response("git-output", "deny", Some("git_option_or_mutation_denied"))
+            .unwrap();
+        assert!(!independent["reason"]
+            .as_str()
+            .unwrap()
+            .contains("REPEATED_DENIED_OPERATION"));
+    }
+
+    #[test]
+    fn read_correction_repeats_once_without_advancing_semantic_lease_and_resets() {
+        let semantic_progress = SemanticProgressClock {
+            last_advanced: Duration::from_secs(17),
+        };
+        let mut cache = OfferedPermissionCache::default();
+        let first = permission_offer("Read", serde_json::json!({"path":"missing-a.rs"}));
+        cache.observe("read-1".into(), &first);
+        let response = cache
+            .response("read-1", "deny", Some("read_path_unverifiable"))
+            .unwrap();
+        assert!(response["reason"]
+            .as_str()
+            .unwrap()
+            .contains("next=correct_read_path_once"));
+        cache.record_denial("read-1", Some("read_path_unverifiable"));
+        cache.complete("read-1");
+
+        let corrected = permission_offer("Read", serde_json::json!({"path":"missing-b.rs"}));
+        cache.observe("read-2".into(), &corrected);
+        let repeated = cache
+            .response("read-2", "deny", Some("read_path_unverifiable"))
+            .unwrap();
+        assert!(repeated["reason"]
+            .as_str()
+            .unwrap()
+            .contains("REPEATED_DENIED_OPERATION"));
+        assert_eq!(semantic_progress.last_advanced, Duration::from_secs(17));
+
+        cache.clear();
+        cache.observe("continuation-read".into(), &corrected);
+        let fresh_attempt = cache
+            .response("continuation-read", "deny", Some("read_path_unverifiable"))
+            .unwrap();
+        assert!(!fresh_attempt["reason"]
+            .as_str()
+            .unwrap()
+            .contains("REPEATED_DENIED_OPERATION"));
     }
 
     #[derive(Default)]

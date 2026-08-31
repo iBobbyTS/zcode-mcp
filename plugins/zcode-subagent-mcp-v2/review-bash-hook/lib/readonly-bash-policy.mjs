@@ -22,6 +22,9 @@ const POLICY_DESCRIPTOR = Object.freeze({
   pathScope: 'hook cwd or ZCODE_READONLY_BASH_ROOT',
   executableResolution: 'fixed trusted directories; never caller PATH',
   gitHardening: ['GIT_OPTIONAL_LOCKS=0', 'core.fsmonitor=false', 'core.untrackedCache=false', '--no-pager'],
+  denialRecoveryClasses: [
+    'split_once', 'simplify_once', 'use_read', 'use_named_check', 'do_not_retry_equivalent'
+  ],
 });
 
 function stableJson(value) {
@@ -109,6 +112,128 @@ function result(decision, code, reason, extra = {}) {
     policyVersion: POLICY_VERSION,
     policySha256: POLICY_SHA256,
     ...extra,
+  };
+}
+
+function denialRecovery(code, programFamily, operandClass) {
+  if (code.startsWith('shell_') || code.includes('multiline')) {
+    return ['split_once', 'split_into_single_commands'];
+  }
+  if (programFamily === 'git' && ['cwd_override', 'config_override', 'repository_override'].includes(operandClass)) {
+    return ['simplify_once', 'remove_denied_option_once'];
+  }
+  if (code.includes('option_not_allowlisted') && !['write_option', 'mutation', 'sensitive_path'].includes(operandClass)) {
+    return ['simplify_once', 'remove_denied_option_once'];
+  }
+  if (code === 'program_not_allowlisted') {
+    if (['curl', 'wget', 'ssh', 'scp', 'sftp', 'nc', 'ncat', 'telnet'].includes(programFamily)) {
+      return ['do_not_retry_equivalent', 'stop_evidence_path'];
+    }
+    if ([
+      'cargo', 'rustc', 'npm', 'npx', 'pnpm', 'yarn', 'bun', 'docker', 'make', 'cmake',
+      'pytest', 'python', 'python3', 'go'
+    ].includes(programFamily)) {
+      return ['use_named_check', 'use_named_check'];
+    }
+    return ['use_read', 'use_read_or_prepared_inputs'];
+  }
+  if (
+    code.includes('credential') || code.includes('sensitive') || code.includes('secret') ||
+    code.includes('network') || code.includes('write') || code.includes('mutation') ||
+    code.includes('outside') || code.includes('escape') || code.includes('protected') ||
+    code.includes('prior_review') || code === 'external_policy_denied' ||
+    ['write_option', 'mutation', 'sensitive_path', 'outside_scope'].includes(operandClass)
+  ) {
+    return ['do_not_retry_equivalent', 'stop_evidence_path'];
+  }
+  return ['use_read', 'use_read_or_prepared_inputs'];
+}
+
+function gitDenialCategory(tokens) {
+  let index = 1;
+  while (index < tokens.length) {
+    const value = tokens[index].value;
+    if (['-C', '-c', '--git-dir', '--work-tree'].includes(value)) {
+      index += 2;
+      continue;
+    }
+    if (
+      value.startsWith('--git-dir=') || value.startsWith('--work-tree=') ||
+      (value.startsWith('-c') && value !== '-C') || value === '--no-pager'
+    ) {
+      index += 1;
+      continue;
+    }
+    return value.replace(/^-+/u, '').toLowerCase() || 'unknown';
+  }
+  return 'unknown';
+}
+
+function gitDenialOperandClass(tokens) {
+  const values = tokens.slice(1).map((token) => token.value);
+  if (values.includes('-C')) return 'cwd_override';
+  if (values.some((value) => value === '-c' || (value.startsWith('-c') && value !== '-C'))) return 'config_override';
+  if (values.some((value) => ['--git-dir', '--work-tree'].includes(value) || value.startsWith('--git-dir=') || value.startsWith('--work-tree='))) {
+    return 'repository_override';
+  }
+  if (values.some((value) => ['--output', '--ext-diff', '--textconv', '--no-index'].includes(value) || value.startsWith('--output='))) {
+    return 'write_option';
+  }
+  if (values.some((value) => secretPathReason(value))) return 'sensitive_path';
+  if (['add', 'apply', 'branch', 'checkout', 'clean', 'commit', 'merge', 'mv', 'rebase', 'reset', 'restore', 'rm', 'switch', 'tag'].includes(values[0])) {
+    return 'mutation';
+  }
+  return 'option_or_operand';
+}
+
+function commandFamily(command, tokens) {
+  if (tokens?.[0]?.value) return path.basename(tokens[0].value).toLowerCase();
+  if (typeof command !== 'string') return 'unknown';
+  const match = command.trim().match(/^['"]?([A-Za-z][A-Za-z0-9-]*)/u);
+  return match?.[1]?.toLowerCase() ?? 'shell';
+}
+
+function canonicalReasonCode(code) {
+  if (code.startsWith('shell_')) return 'shell_composition_or_expansion_denied';
+  if (code === 'git_global_option_denied') return 'git_option_or_mutation_denied';
+  return code;
+}
+
+function attachDenialRecovery(evaluated, command, tokens) {
+  if (!evaluated || evaluated.decision === 'allow' || evaluated.decision === 'parsed') return evaluated;
+  const programFamily = evaluated.code.startsWith('shell_') ? 'shell' : commandFamily(command, tokens);
+  const subcommandCategory = programFamily === 'git'
+    ? gitDenialCategory(tokens ?? [])
+    : (evaluated.code.startsWith('shell_') ? 'composition' : programFamily);
+  let normalizedOperandClass = 'option_or_operand';
+  if (evaluated.code.startsWith('shell_')) {
+    normalizedOperandClass = evaluated.code === 'command_multiline' ? 'multiline' : 'compound_command';
+  } else if (programFamily === 'git') {
+    normalizedOperandClass = gitDenialOperandClass(tokens ?? []);
+  } else if (evaluated.code.includes('sensitive') || evaluated.code.includes('credential')) {
+    normalizedOperandClass = 'sensitive_path';
+  } else if (evaluated.code.includes('outside') || evaluated.code.includes('escape')) {
+    normalizedOperandClass = 'outside_scope';
+  } else if (evaluated.code === 'program_not_allowlisted') {
+    normalizedOperandClass = 'program';
+  } else if (evaluated.code.includes('path_required') || evaluated.code === 'stdin_path') {
+    normalizedOperandClass = 'missing_path';
+  }
+  const [retryClass, recommendedAction] = denialRecovery(
+    evaluated.code,
+    programFamily,
+    normalizedOperandClass
+  );
+  const reasonCode = canonicalReasonCode(evaluated.code);
+  return {
+    ...evaluated,
+    reasonCode,
+    retryClass,
+    recommendedAction,
+    programFamily,
+    subcommandCategory,
+    normalizedOperandClass,
+    semanticFingerprint: `family=${programFamily};category=${subcommandCategory};reason=${reasonCode};operand=${normalizedOperandClass}`,
   };
 }
 
@@ -1143,9 +1268,9 @@ const VALIDATORS = new Map([
 
 export function evaluateCommand({ command, cwd, root, unknownDecision = 'deny', trustedBinDirs }) {
   const parsed = tokenizeSimpleCommand(command);
-  if (parsed.decision === 'deny') return parsed;
+  if (parsed.decision === 'deny') return attachDenialRecovery(parsed, command);
   const pathContext = createPathContext(cwd, root);
-  if (pathContext.decision === 'deny') return pathContext;
+  if (pathContext.decision === 'deny') return attachDenialRecovery(pathContext, command, parsed.tokens);
   const context = {
     cwd: pathContext.cwd,
     root: pathContext.root,
@@ -1155,13 +1280,25 @@ export function evaluateCommand({ command, cwd, root, unknownDecision = 'deny', 
 
   const [programToken, ...args] = parsed.tokens;
   const invalidProgram = assertSafeProgram(programToken.value);
-  if (invalidProgram) return invalidProgram;
+  if (invalidProgram) return attachDenialRecovery(invalidProgram, command, parsed.tokens);
   const validator = VALIDATORS.get(programToken.value);
-  if (!validator) return unsupported(context, 'program_not_allowlisted', `program ${programToken.value} is not in the read-only allowlist`);
+  if (!validator) {
+    return attachDenialRecovery(
+      unsupported(context, 'program_not_allowlisted', `program ${programToken.value} is not in the read-only allowlist`),
+      command,
+      parsed.tokens
+    );
+  }
   const evaluated = validator(args, context);
   if (evaluated.decision === 'allow') {
     const resolvedProgram = resolveTrustedProgram(programToken.value, trustedBinDirs);
-    if (!resolvedProgram) return hardDeny('trusted_executable_not_found', `no trusted executable found for ${programToken.value}`);
+    if (!resolvedProgram) {
+      return attachDenialRecovery(
+        hardDeny('trusted_executable_not_found', `no trusted executable found for ${programToken.value}`),
+        command,
+        parsed.tokens
+      );
+    }
     const argv = [...evaluated.argv];
     argv[0] = resolvedProgram;
     return {
@@ -1173,7 +1310,7 @@ export function evaluateCommand({ command, cwd, root, unknownDecision = 'deny', 
       root: context.root,
     };
   }
-  return evaluated;
+  return attachDenialRecovery(evaluated, command, parsed.tokens);
 }
 
 export function evaluateHookInput(input, env = process.env) {
@@ -1198,7 +1335,11 @@ export function evaluateHookInput(input, env = process.env) {
 }
 
 export function createHookOutput(evaluated) {
-  const reason = `${evaluated.policyVersion ?? POLICY_VERSION}@${(evaluated.policySha256 ?? POLICY_SHA256).slice(0, 12)} ${evaluated.code}: ${evaluated.reason}`;
+  const policyVersion = evaluated.policyVersion ?? POLICY_VERSION;
+  const policySha256 = evaluated.policySha256 ?? POLICY_SHA256;
+  const reason = evaluated.decision === 'deny'
+    ? `DENY[policy_version=${policyVersion};code=${evaluated.reasonCode ?? evaluated.code};retry=${evaluated.retryClass ?? 'do_not_retry_equivalent'};next=${evaluated.recommendedAction ?? 'stop_evidence_path'}] ${policyVersion}@${policySha256.slice(0, 12)} ${evaluated.code}: ${evaluated.reason}`
+    : `${policyVersion}@${policySha256.slice(0, 12)} ${evaluated.code}: ${evaluated.reason}`;
   const output = {
     hookSpecificOutput: {
       hookEventName: evaluated.hookEventName ?? 'PreToolUse',
