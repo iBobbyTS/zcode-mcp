@@ -528,24 +528,16 @@ impl OfferedPermissionCache {
         }
     }
 
-    fn response(
-        &self,
-        key: &str,
-        decision: &str,
-        supplied_reason: Option<&str>,
-    ) -> Option<serde_json::Value> {
+    fn response(&self, key: &str, decision: &str) -> Option<serde_json::Value> {
         let offered = self.requests.get(key)?;
         match decision {
             "allow" => Some(offered.allow.clone()),
             "deny" => {
                 let (_, fingerprint) =
-                    PolicyLauncher::zcode_denial_feedback(&offered.params, supplied_reason, false)?;
+                    PolicyLauncher::zcode_denial_feedback(&offered.params, false)?;
                 let repeated = self.denied_fingerprints.contains(&fingerprint);
-                let (feedback, _) = PolicyLauncher::zcode_denial_feedback(
-                    &offered.params,
-                    supplied_reason,
-                    repeated,
-                )?;
+                let (feedback, _) =
+                    PolicyLauncher::zcode_denial_feedback(&offered.params, repeated)?;
                 let mut response = offered.deny.clone();
                 response.as_object_mut()?.insert(
                     "reason".into(),
@@ -567,9 +559,9 @@ impl OfferedPermissionCache {
         self.requests.remove(key);
     }
 
-    fn record_denial(&mut self, key: &str, supplied_reason: Option<&str>) {
+    fn record_denial(&mut self, key: &str) {
         let fingerprint = self.requests.get(key).and_then(|responses| {
-            PolicyLauncher::zcode_denial_feedback(&responses.params, supplied_reason, false)
+            PolicyLauncher::zcode_denial_feedback(&responses.params, false)
                 .map(|(_, fingerprint)| fingerprint)
         });
         if let Some(fingerprint) = fingerprint {
@@ -794,7 +786,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .response(&key, decision, content)
+                .response(&key, decision)
                 .ok_or_else(|| {
                     RuntimeCommandError::InvalidSession(
                         "runtime offered no matching permission response".into(),
@@ -809,7 +801,7 @@ impl RuntimeOwner {
             self.permission_responses
                 .lock()
                 .unwrap()
-                .record_denial(&key, content);
+                .record_denial(&key);
         }
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
@@ -5756,21 +5748,16 @@ sleep 10
         let valid = permission_offer("Read", serde_json::json!({"path":"missing.rs"}));
         let mut cache = OfferedPermissionCache::default();
         cache.observe("request-1".into(), &valid);
-        let first = cache
-            .response("request-1", "deny", Some("read_path_unverifiable"))
-            .unwrap();
+        let first = cache.response("request-1", "deny").unwrap();
         assert_eq!(first["decision"], "deny");
-        assert_eq!(
-            cache.response("request-1", "deny", Some("read_path_unverifiable")),
-            Some(first)
-        );
+        assert_eq!(cache.response("request-1", "deny"), Some(first));
         cache.complete("request-1");
-        assert!(cache.response("request-1", "allow", None).is_none());
-        assert!(cache.response("request-1", "deny", None).is_none());
+        assert!(cache.response("request-1", "allow").is_none());
+        assert!(cache.response("request-1", "deny").is_none());
 
         cache.observe("reused".into(), &valid);
         cache.observe("reused".into(), &valid);
-        assert!(cache.response("reused", "deny", None).is_none());
+        assert!(cache.response("reused", "deny").is_none());
         cache.observe(
             "malformed".into(),
             &serde_json::json!({"toolName":"Read","input":{"path":"missing.rs"},"options":[
@@ -5778,7 +5765,7 @@ sleep 10
                 {"kind":"deny","response":{"decision":"allow"}}
             ]}),
         );
-        assert!(cache.response("malformed", "deny", None).is_none());
+        assert!(cache.response("malformed", "deny").is_none());
 
         for index in 0..MAX_PENDING_PERMISSION_RESPONSES + 1 {
             cache.observe(format!("bounded-{index}"), &valid);
@@ -5793,24 +5780,18 @@ sleep 10
         let mut cache = OfferedPermissionCache::default();
         let compound = permission_offer("Bash", serde_json::json!({"command":"git status && pwd"}));
         cache.observe("compound".into(), &compound);
-        let denied = cache
-            .response(
-                "compound",
-                "deny",
-                Some("shell_composition_or_expansion_denied"),
-            )
-            .unwrap();
+        let denied = cache.response("compound", "deny").unwrap();
         assert!(denied["reason"]
             .as_str()
             .unwrap()
             .contains("retry=split_once"));
-        cache.record_denial("compound", Some("shell_composition_or_expansion_denied"));
+        cache.record_denial("compound");
         cache.complete("compound");
 
         let split = permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
         cache.observe("split".into(), &split);
         assert_eq!(
-            cache.response("split", "allow", None).unwrap()["decision"],
+            cache.response("split", "allow").unwrap()["decision"],
             "allow"
         );
         cache.complete("split");
@@ -5820,21 +5801,19 @@ sleep 10
             serde_json::json!({"command":"git -C '/tmp' status --short"}),
         );
         cache.observe("git-c".into(), &git_c);
-        let denied = cache
-            .response("git-c", "deny", Some("git_option_or_mutation_denied"))
-            .unwrap();
+        let denied = cache.response("git-c", "deny").unwrap();
         assert!(denied["reason"]
             .as_str()
             .unwrap()
             .contains("retry=simplify_once"));
-        cache.record_denial("git-c", Some("git_option_or_mutation_denied"));
+        cache.record_denial("git-c");
         cache.complete("git-c");
 
         let simplified =
             permission_offer("Bash", serde_json::json!({"command":"git status --short"}));
         cache.observe("simplified".into(), &simplified);
         assert_eq!(
-            cache.response("simplified", "allow", None).unwrap()["decision"],
+            cache.response("simplified", "allow").unwrap()["decision"],
             "allow"
         );
         cache.complete("simplified");
@@ -5842,7 +5821,7 @@ sleep 10
         let unrelated = permission_offer("Bash", serde_json::json!({"command":"pwd"}));
         cache.observe("unrelated".into(), &unrelated);
         assert_eq!(
-            cache.response("unrelated", "allow", None).unwrap()["decision"],
+            cache.response("unrelated", "allow").unwrap()["decision"],
             "allow"
         );
     }
@@ -5852,21 +5831,17 @@ sleep 10
         let mut cache = OfferedPermissionCache::default();
         let first = permission_offer("Bash", serde_json::json!({"command":"cat .env"}));
         cache.observe("hard-1".into(), &first);
-        let response = cache
-            .response("hard-1", "deny", Some("credential_read_denied"))
-            .unwrap();
+        let response = cache.response("hard-1", "deny").unwrap();
         assert!(response["reason"]
             .as_str()
             .unwrap()
             .contains("retry=do_not_retry_equivalent"));
-        cache.record_denial("hard-1", Some("credential_read_denied"));
+        cache.record_denial("hard-1");
         cache.complete("hard-1");
 
         let equivalent = permission_offer("Bash", serde_json::json!({"command":"cat './.env'"}));
         cache.observe("hard-2".into(), &equivalent);
-        let repeated = cache
-            .response("hard-2", "deny", Some("credential_read_denied"))
-            .unwrap();
+        let repeated = cache.response("hard-2", "deny").unwrap();
         assert!(repeated["reason"]
             .as_str()
             .unwrap()
@@ -5877,16 +5852,14 @@ sleep 10
             serde_json::json!({"command":"git -C /tmp status --short"}),
         );
         cache.observe("git-c".into(), &git_c);
-        cache.record_denial("git-c", Some("git_option_or_mutation_denied"));
+        cache.record_denial("git-c");
         cache.complete("git-c");
         let git_output = permission_offer(
             "Bash",
             serde_json::json!({"command":"git diff --output=leak.patch"}),
         );
         cache.observe("git-output".into(), &git_output);
-        let independent = cache
-            .response("git-output", "deny", Some("git_option_or_mutation_denied"))
-            .unwrap();
+        let independent = cache.response("git-output", "deny").unwrap();
         assert!(!independent["reason"]
             .as_str()
             .unwrap()
@@ -5894,43 +5867,83 @@ sleep 10
     }
 
     #[test]
-    fn read_correction_repeats_once_without_advancing_semantic_lease_and_resets() {
-        let semantic_progress = SemanticProgressClock {
-            last_advanced: Duration::from_secs(17),
+    fn runtime_permission_feedback_ignores_free_text_and_ends_repeated_read_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let response_log = directory.path().join("permission-responses.jsonl");
+        let sink = Arc::new(MemorySink::default());
+        let mut command = Command::new("sh");
+        command.env("RESPONSE_LOG", &response_log).args([
+            "-c",
+            r#"
+emit_permission() {
+  request_id="$1"
+  tool_name="$2"
+  input_json="$3"
+  printf '%s\n' "{\"id\":\"$request_id\",\"method\":\"interaction/requestPermission\",\"params\":{\"toolName\":\"$tool_name\",\"input\":$input_json,\"options\":[{\"kind\":\"allow_once\",\"response\":{\"decision\":\"allow\",\"reason\":\"once\"}},{\"kind\":\"deny\",\"response\":{\"decision\":\"deny\",\"reason\":\"denied\"}}]}}"
+  IFS= read -r response || exit 11
+  printf '%s\n' "$response" >> "$RESPONSE_LOG"
+}
+emit_permission read-1 Read '{"path":"missing-a.rs"}'
+emit_permission read-2 Read '{"path":"missing-b.rs"}'
+emit_permission hard-1 Bash '{"command":"cat .env"}'
+emit_permission hard-2 Bash '{"command":"cat '\''./.env'\''"}'
+trap '' TERM
+exec tail -f /dev/null
+"#,
+        ]);
+        let owner = RuntimeOwner::spawn(command, sink).unwrap();
+        let respond = |id: &str, free_text: &str| {
+            let key = serde_json::to_string(&WireId::String(id.into())).unwrap();
+            wait_until_review_exit(|| {
+                owner
+                    .permission_responses
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .contains_key(&key)
+                    .then_some(())
+            });
+            owner
+                .respond_request(
+                    &key,
+                    "deny",
+                    Some(free_text),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
         };
-        let mut cache = OfferedPermissionCache::default();
-        let first = permission_offer("Read", serde_json::json!({"path":"missing-a.rs"}));
-        cache.observe("read-1".into(), &first);
-        let response = cache
-            .response("read-1", "deny", Some("read_path_unverifiable"))
-            .unwrap();
-        assert!(response["reason"]
-            .as_str()
-            .unwrap()
-            .contains("next=correct_read_path_once"));
-        cache.record_denial("read-1", Some("read_path_unverifiable"));
-        cache.complete("read-1");
 
-        let corrected = permission_offer("Read", serde_json::json!({"path":"missing-b.rs"}));
-        cache.observe("read-2".into(), &corrected);
-        let repeated = cache
-            .response("read-2", "deny", Some("read_path_unverifiable"))
-            .unwrap();
-        assert!(repeated["reason"]
+        respond("read-1", "credential_read_denied");
+        respond("read-2", "different_free_text_reason");
+        respond("hard-1", "read_path_unverifiable");
+        respond("hard-2", "another_untrusted_reason");
+        let responses = wait_until_review_exit(|| {
+            let contents = fs::read_to_string(&response_log).ok()?;
+            let responses = contents
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            (responses.len() == 4).then_some(responses)
+        });
+        assert!(responses[0]["result"]["reason"].as_str().unwrap().contains(
+            "code=read_path_unverifiable;retry=simplify_once;next=correct_read_path_once"
+        ));
+        assert!(responses[1]["result"]["reason"]
             .as_str()
             .unwrap()
-            .contains("REPEATED_DENIED_OPERATION"));
-        assert_eq!(semantic_progress.last_advanced, Duration::from_secs(17));
-
-        cache.clear();
-        cache.observe("continuation-read".into(), &corrected);
-        let fresh_attempt = cache
-            .response("continuation-read", "deny", Some("read_path_unverifiable"))
-            .unwrap();
-        assert!(!fresh_attempt["reason"]
+            .contains("code=REPEATED_DENIED_OPERATION"));
+        assert!(responses[1]["result"]["reason"]
             .as_str()
             .unwrap()
-            .contains("REPEATED_DENIED_OPERATION"));
+            .contains("Stop this evidence path"));
+        assert!(responses[2]["result"]["reason"].as_str().unwrap().contains(
+            "code=credential_read_denied;retry=do_not_retry_equivalent;next=stop_evidence_path"
+        ));
+        assert!(responses[3]["result"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("code=REPEATED_DENIED_OPERATION"));
+        let _ = owner.stop(Duration::from_millis(100));
     }
 
     #[derive(Default)]
@@ -6963,6 +6976,86 @@ sleep 10
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn scheduler_repeated_permission_denials_do_not_refresh_semantic_lease() {
+        let fixture = ReviewExitFixture::new("denial-lease");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        let semantic_progress = {
+            let state = fixture.scheduler.inner.state.lock().unwrap();
+            state
+                .active
+                .get(&fixture.execution_id)
+                .unwrap()
+                .semantic_progress
+                .as_ref()
+                .map(Arc::clone)
+                .unwrap()
+        };
+        let initial_lease = semantic_progress.lock().unwrap().last_advanced;
+        let deny = |wire_id: &str, path: &str, free_text: &str| {
+            runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::Request(RequestEnvelope {
+                    id: WireId::String(wire_id.into()),
+                    method: INTERACTION_REQUEST_PERMISSION.into(),
+                    params: permission_offer("Read", serde_json::json!({"path":path})),
+                }),
+            )));
+            let request_id = wait_until_review_exit(|| {
+                fixture
+                    .store
+                    .pending_requests(&fixture.execution_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|request| {
+                        request.state == PendingRequestState::Pending
+                            && request.payload_json.contains(path)
+                    })
+                    .map(|request| request.request_id)
+            });
+            let outcome = fixture
+                .scheduler
+                .respond_job(&fixture.execution_id, &request_id, "deny", Some(free_text))
+                .unwrap();
+            assert_eq!(outcome.disposition, ResponseDisposition::Responded);
+        };
+
+        deny("lease-read-1", "missing-a.rs", "credential_read_denied");
+        assert_eq!(
+            semantic_progress.lock().unwrap().last_advanced,
+            initial_lease
+        );
+        deny("lease-read-2", "missing-b.rs", "different_free_text_reason");
+        assert_eq!(
+            semantic_progress.lock().unwrap().last_advanced,
+            initial_lease
+        );
+
+        thread::sleep(Duration::from_millis(2));
+        let job = fixture
+            .store
+            .get_job(&fixture.execution_id)
+            .unwrap()
+            .unwrap();
+        fixture
+            .scheduler
+            .call_task_review_tool(
+                &fixture.execution_id,
+                review_ledger::REVIEW_PROGRESS,
+                serde_json::json!({
+                    "attempt_sequence":1,
+                    "run_idempotency_key":job.runtime_agent_id.unwrap(),
+                    "stage":"inspection",
+                    "summary":"connected lease advancement",
+                    "counters":{"denials":2}
+                }),
+            )
+            .unwrap();
+        assert!(semantic_progress.lock().unwrap().last_advanced > initial_lease);
+        let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
     }
 
     #[test]

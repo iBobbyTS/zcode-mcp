@@ -1170,12 +1170,8 @@ fn rust_and_javascript_share_the_bounded_review_bash_policy_corpus() {
             "recovery corpus allowed {}",
             case.command
         );
-        let (feedback, fingerprint) = review_preparation::PolicyLauncher::zcode_denial_feedback(
-            &params,
-            Some(decision.reason),
-            false,
-        )
-        .unwrap();
+        let (feedback, fingerprint) =
+            review_preparation::PolicyLauncher::zcode_denial_feedback(&params, false).unwrap();
         assert!(
             feedback.contains(&format!("retry={}", case.retry_class)),
             "{}: {feedback}",

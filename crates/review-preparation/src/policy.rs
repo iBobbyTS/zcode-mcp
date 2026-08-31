@@ -289,10 +289,9 @@ impl PolicyLauncher {
     /// transient retry state; policy classification remains in this owner.
     pub fn zcode_denial_feedback(
         params: &serde_json::Value,
-        supplied_reason: Option<&str>,
         repeated: bool,
     ) -> Option<(String, String)> {
-        let semantics = permission_denial_semantics(params, supplied_reason)?;
+        let semantics = permission_denial_semantics(params)?;
         Some((semantics.feedback(repeated), semantics.fingerprint()))
     }
 
@@ -1716,17 +1715,13 @@ fn exact_command_id_input(input: &serde_json::Value) -> Option<String> {
     Some(command_id.to_owned())
 }
 
-fn permission_denial_semantics(
-    params: &serde_json::Value,
-    supplied_reason: Option<&str>,
-) -> Option<PermissionDenialSemantics> {
+fn permission_denial_semantics(params: &serde_json::Value) -> Option<PermissionDenialSemantics> {
     let tool = params
         .get("toolName")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_ascii_lowercase();
     let input = params.get("input").unwrap_or(&serde_json::Value::Null);
-    let supplied_reason = supplied_reason.and_then(normalized_supplied_reason);
     let (program_family, category, inferred_reason, operand_class) = match tool.as_str() {
         "bash" => input
             .get("command")
@@ -1740,12 +1735,7 @@ fn permission_denial_semantics(
                     "missing_command".into(),
                 )
             }),
-        "read" | "grep" | "glob" => (
-            tool.clone(),
-            "path".into(),
-            "external_policy_denied".into(),
-            "unavailable_path".into(),
-        ),
+        "read" | "grep" | "glob" => read_denial_identity(&tool, input),
         "write" | "edit" | "delete" | "move" => (
             tool.clone(),
             "write".into(),
@@ -1792,7 +1782,7 @@ fn permission_denial_semantics(
             "unknown".into(),
         ),
     };
-    let reason_code = supplied_reason.unwrap_or(inferred_reason);
+    let reason_code = inferred_reason;
     let (retry_class, recommended_action) =
         denial_recovery(&tool, &program_family, &reason_code, &operand_class);
     Some(PermissionDenialSemantics {
@@ -1805,52 +1795,43 @@ fn permission_denial_semantics(
     })
 }
 
-fn normalized_supplied_reason(reason: &str) -> Option<String> {
-    let trimmed = reason.trim();
-    if let Some(metadata) = trimmed
-        .strip_prefix("DENY[")
-        .and_then(|value| value.split_once(']'))
-    {
-        let fields = metadata
-            .0
-            .split(';')
-            .filter_map(|field| field.split_once('='));
-        let mut code = None;
-        let mut original_code = None;
-        for (key, value) in fields {
-            match key {
-                "code" => code = stable_reason_token(value),
-                "original_code" => original_code = stable_reason_token(value),
-                _ => {}
-            }
+fn read_denial_identity(tool: &str, input: &serde_json::Value) -> (String, String, String, String) {
+    let path = input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new);
+    if path.is_some_and(is_credential_path) {
+        return (
+            tool.into(),
+            "path".into(),
+            "credential_read_denied".into(),
+            "sensitive_path".into(),
+        );
+    }
+    if path.is_some_and(|path| {
+        path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == Component::ParentDir)
+    }) {
+        return (
+            tool.into(),
+            "path".into(),
+            "read_path_escape_denied".into(),
+            "outside_scope".into(),
+        );
+    }
+    (
+        tool.into(),
+        "path".into(),
+        "read_path_unverifiable".into(),
+        if path.is_some() {
+            "unavailable_path"
+        } else {
+            "missing_path"
         }
-        return original_code
-            .or(code)
-            .filter(|value| value != "REPEATED_DENIED_OPERATION")
-            .map(canonical_reason_code);
-    }
-    stable_reason_token(trimmed)
-        .filter(|value| value.contains('_'))
-        .map(canonical_reason_code)
-}
-
-fn stable_reason_token(value: &str) -> Option<String> {
-    (!value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
-    .then(|| value.to_owned())
-}
-
-fn canonical_reason_code(value: String) -> String {
-    if value.starts_with("shell_") {
-        "shell_composition_or_expansion_denied".into()
-    } else if value == "git_global_option_denied" {
-        "git_option_or_mutation_denied".into()
-    } else {
-        value
-    }
+        .into(),
+    )
 }
 
 fn bash_denial_identity(command: &str) -> (String, String, String, String) {
