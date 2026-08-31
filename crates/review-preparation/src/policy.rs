@@ -124,8 +124,8 @@ pub struct PermissionDecision {
 /// adjacent to the policy implementation so guidance cannot drift into a
 /// second, prompt-only allowlist.
 pub const REVIEW_BASH_COMMAND_FAMILIES: &[&str] = &[
-    "pwd", "ls", "stat", "wc", "head", "tail", "cat", "grep", "rg", "sed", "find",
-    "git", "shasum", "cksum",
+    "pwd", "ls", "stat", "wc", "head", "tail", "cat", "grep", "rg", "sed", "find", "git", "shasum",
+    "cksum",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

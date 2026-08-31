@@ -50,7 +50,9 @@ fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
         .context
         .iter()
         .map(|artifact| artifact.prepared_path.to_string_lossy().into_owned())
-        .chain(std::iter::once(prepared.plan.prepared_path.to_string_lossy().into_owned()))
+        .chain(std::iter::once(
+            prepared.plan.prepared_path.to_string_lossy().into_owned(),
+        ))
         .collect::<Vec<_>>();
     format!(
         "TASK_SCOPED_CAPABILITIES: cwd is the prepared review worktree; prefer Read/Grep/Glob. policy_version={} policy_sha256={} allowed_bash_command_families=[{}] named_check_ids={} prepared_review_inputs={}. Bash is only for missing repository-level facts; do not use cd, git -C, chaining, backgrounding, pipes, redirects, substitution, multiline commands, shell wrappers, builds, tests, Docker, package managers, or network.",
@@ -437,16 +439,26 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         let task = add_task_progress_instruction(prompt, None).unwrap();
         assert!(task.text.contains("TASK_SCOPED_SEMANTIC_PROGRESS"));
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
-        assert!(task.text.contains("A denied operation is evidence about that semantic operation"));
+        assert!(task
+            .text
+            .contains("A denied operation is evidence about that semantic operation"));
         assert!(task.text.contains("at most one simpler retry"));
         assert!(task.text.contains("split_once or simplify_once"));
-        assert!(task.text.contains("A Read error permits one corrected path attempt"));
-        assert!(task.text.contains("do not retry an equivalent spelling or variant"));
-        assert!(task.text.contains("Continue with unrelated legal Read, Bash"));
+        assert!(task
+            .text
+            .contains("A Read error permits one corrected path attempt"));
+        assert!(task
+            .text
+            .contains("do not retry an equivalent spelling or variant"));
+        assert!(task
+            .text
+            .contains("Continue with unrelated legal Read, Bash"));
         assert!(task
             .text
             .contains("bounded safe descriptor in uncertainties"));
-        assert!(task.text.contains("tool name, reason_code, retry_class, recommended_action"));
+        assert!(task
+            .text
+            .contains("tool name, reason_code, retry_class, recommended_action"));
         assert!(task
             .text
             .contains("command category/program name or a one-way hash"));
@@ -498,7 +510,9 @@ PRIOR_REVIEW_CONTEXT: frozen_finding_ids_only\nCOUNTS_AS_INDEPENDENT: false\nFRO
         };
         let task = add_task_progress_instruction(prompt, Some(&frozen)).unwrap();
         assert!(task.text.contains("mcp__review-ledger__review_progress"));
-        assert!(task.text.contains("A denied operation is evidence about that semantic operation"));
+        assert!(task
+            .text
+            .contains("A denied operation is evidence about that semantic operation"));
         assert!(task.text.contains("at most one simpler retry"));
         assert!(task
             .text

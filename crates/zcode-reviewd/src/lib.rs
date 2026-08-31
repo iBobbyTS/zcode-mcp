@@ -561,7 +561,9 @@ impl OfferedPermissionCache {
             .get(key)
             .and_then(|responses| responses.semantic_fingerprint.clone());
         if let Some(fingerprint) = fingerprint {
-            self.denied_fingerprints.insert(fingerprint.clone());
+            if self.denied_fingerprints.len() < MAX_PENDING_PERMISSION_RESPONSES {
+                self.denied_fingerprints.insert(fingerprint);
+            }
         }
     }
 
@@ -813,7 +815,10 @@ impl RuntimeOwner {
             .respond_before(id, result, deadline)
             .map_err(RuntimeCommandError::from)?;
         if decision == "deny" {
-            self.permission_responses.lock().unwrap().record_denial(&key);
+            self.permission_responses
+                .lock()
+                .unwrap()
+                .record_denial(&key);
         }
         self.permission_responses.lock().unwrap().complete(&key);
         Ok(())
