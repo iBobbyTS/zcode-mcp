@@ -1832,16 +1832,16 @@ impl AttemptRuntimeLifecycle {
         }
     }
 
-    fn fence_late_event(&self) -> bool {
+    fn admit_event(&self) -> Option<MutexGuard<'_, AttemptRuntimeSnapshot>> {
         let mut state = self.state.lock().unwrap();
         if state.phase == AttemptRuntimePhase::Running {
-            return false;
+            return Some(state);
         }
         state.late_event_count = state
             .late_event_count
             .saturating_add(1)
             .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
-        true
+        None
     }
 }
 
@@ -2113,6 +2113,8 @@ struct StoreLifecycleSink {
     budget: Option<Arc<AttemptBudget>>,
     attempt: Arc<AttemptRuntimeLifecycle>,
     write_state: Mutex<SinkWriteState>,
+    #[cfg(test)]
+    after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -2147,7 +2149,14 @@ impl StoreLifecycleSink {
             budget,
             attempt,
             write_state: Mutex::new(SinkWriteState::default()),
+            #[cfg(test)]
+            after_admission_hook: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    fn set_after_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_admission_hook.lock().unwrap() = Some(hook);
     }
 
     fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
@@ -2458,8 +2467,12 @@ fn finalized_general(
 
 impl LifecycleSink for StoreLifecycleSink {
     fn emit(&self, record: LifecycleRecord) {
-        if self.attempt.fence_late_event() {
+        let Some(_admission) = self.attempt.admit_event() else {
             return;
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.after_admission_hook.lock().unwrap().clone() {
+            hook();
         }
         if let RuntimeEvent::Driver(inbound) = &record.event {
             if let Some(budget) = &self.budget {
@@ -10016,6 +10029,108 @@ exec tail -f /dev/null
                 .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn sink_event_admission_and_stop_share_one_linearization_boundary() {
+        let fixture = ReviewExitFixture::new("sink-admission-stop-race");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        let (sink, attempt) = {
+            let state = fixture.scheduler.inner.state.lock().unwrap();
+            let active = state.active.get(&fixture.execution_id).unwrap();
+            (Arc::clone(&active.sink), Arc::clone(&active.attempt))
+        };
+        let admitted = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        sink.set_after_admission_hook({
+            let admitted = Arc::clone(&admitted);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                admitted.wait();
+                release.wait();
+            })
+        });
+        let events_before = fixture
+            .store
+            .task_events_after(&fixture.execution_id, 0, 100)
+            .unwrap();
+        let emitter = {
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                    WireMessage::Request(zcode_protocol::RequestEnvelope::new(
+                        WireId::String("admitted-permission".into()),
+                        INTERACTION_REQUEST_PERMISSION,
+                        serde_json::json!({
+                            "toolName":"Read","input":{"path":"src/lib.rs"}
+                        }),
+                    )),
+                )))
+            })
+        };
+        admitted.wait();
+
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let stopper = {
+            let scheduler = fixture.scheduler.clone();
+            let execution_id = fixture.execution_id.clone();
+            thread::spawn(move || {
+                stopped_tx.send(scheduler.stop_job(&execution_id)).unwrap();
+            })
+        };
+        assert!(matches!(
+            attempt.state.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+        assert!(fixture
+            .store
+            .pending_requests(&fixture.execution_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .task_events_after(&fixture.execution_id, 0, 100)
+                .unwrap(),
+            events_before
+        );
+        assert!(matches!(
+            stopped_rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release.wait();
+        emitter.join().unwrap();
+        assert_eq!(stopped_rx.recv().unwrap().unwrap(), JobState::Cancelled);
+        stopper.join().unwrap();
+        let events = fixture
+            .store
+            .task_events_after(&fixture.execution_id, 0, 100)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type == "driver.message"
+                && event.payload_json.contains("\"kind\":\"request\"")
+        }));
+        assert!(events
+            .last()
+            .is_some_and(|event| event.event_type == "runtime.stopped"));
+        assert!(fixture
+            .store
+            .pending_requests(&fixture.execution_id)
+            .unwrap()
+            .iter()
+            .any(|request| request.correlation_id.contains("admitted-permission")));
+        assert_eq!(attempt.snapshot().phase, AttemptRuntimePhase::Terminal);
     }
 
     #[test]
