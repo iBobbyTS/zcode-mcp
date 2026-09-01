@@ -4260,7 +4260,11 @@ impl Scheduler {
                         .as_ref()
                         .is_some_and(|budget| budget.finalization_reserve_due())
                 {
-                    let _guard = operation.lock().unwrap();
+                    let Ok(_guard) = operation.try_lock() else {
+                        // A control operation already owns precedence. Do not
+                        // block the monitor before its next budget/cancel poll.
+                        continue;
+                    };
                     let current = scheduler.inner.store.get_job(&agent_id);
                     let still_current = current
                         .as_ref()

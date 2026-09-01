@@ -1045,3 +1045,38 @@ fn git(path: &Path, arguments: &[&str]) -> PreparationResult<Output> {
         .env("LC_ALL", "C")
         .output()?)
 }
+
+#[cfg(test)]
+mod review_input_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_git_output_marks_truncation_without_silent_data_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path();
+        git(repository, &["init"]).unwrap();
+        git(repository, &["config", "user.name", "Prepared Input Test"]).unwrap();
+        git(
+            repository,
+            &["config", "user.email", "prepared@example.invalid"],
+        )
+        .unwrap();
+        fs::write(repository.join("large.txt"), "base\n").unwrap();
+        git(repository, &["add", "large.txt"]).unwrap();
+        git(repository, &["commit", "-m", "base"]).unwrap();
+        let base = git_text(repository, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repository.join("large.txt"), "changed".repeat(128)).unwrap();
+        git(repository, &["add", "large.txt"]).unwrap();
+        git(repository, &["commit", "-m", "head"]).unwrap();
+        let head = git_text(repository, &["rev-parse", "HEAD"]).unwrap();
+        let range = format!("{base}..{head}");
+        let output = bounded_git_output(
+            repository,
+            &["diff", "--no-ext-diff", "--no-textconv", &range, "--"],
+            64,
+        )
+        .unwrap();
+        assert_eq!(output.bytes.len(), 64);
+        assert!(!output.complete);
+    }
+}

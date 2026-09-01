@@ -48,3 +48,12 @@ Wave 4 final validation: 20/20 stdlib tests passed; py_compile, diff-check, and 
 
 Wave 5 validation: 24/24 stdlib tests passed; py_compile, diff-check, and
 CodeGraph sync passed; official calls remained 0.
+
+## Case 3 convergence implementation (2026-08-31)
+
+- Product commit: `6049d28aff6a13382a1826eaf892558f30c8e11a` (pending one local monitor microfix at handoff time).
+- `ReviewPreparer` now creates confined, hashed `REVIEW-CHANGED-FILES.json`, `REVIEW-DIFF-STAT.txt`, and `REVIEW-DIFF.patch` from the frozen base/head using `--no-ext-diff --no-textconv`; caps are explicit and patch truncation carries a non-completeness marker.
+- The prepared-input records are part of `PreparedLaunchSpec` and therefore its canonical `prepared_sha256`; the task capability prompt lists all three paths.
+- The existing semantic soft nudge now directs convergence through Read/prepared inputs and truthful finalization. The existing monitor sends one attempt-local finalization reserve at <=20% wall budget or <=2 turns, without changing hard timeout or cancellation precedence.
+- Concurrency regression investigation: prediction was that a blocking reserve acquisition could prevent the monitor from reaching a later wall-budget violation while a control-path test held the operation lock. The exact forced-outcome test reproduced this. Changing the reserve to non-blocking `try_lock` restored the original forced-outcome test and the complete 109-test zcode-reviewd lib contract; it neither sleeps nor swallows control errors.
+- Deterministic validation so far: review-preparation 20 tests; prompt tests 4; zcode-reviewd lib 109; workspace all-target check; CodeGraph sync. No official runtime call was made by the writer.
