@@ -2781,6 +2781,28 @@ impl Scheduler {
         Some("active turn had no matching stop boundary".into())
     }
 
+    fn stop_attempt_after_failure(
+        &self,
+        agent_id: &str,
+        runtime: &Arc<dyn ManagedRuntime>,
+        session_id: &str,
+        attempt: &AttemptRuntimeLifecycle,
+        deadline: ControlDeadline,
+    ) -> RuntimeTerminal {
+        let control_error = match self.runtime_phase_timeout(agent_id, deadline) {
+            Ok(timeout) => Self::request_cooperative_stop(runtime, session_id, attempt, timeout),
+            Err(error) => {
+                attempt.request_stop(&runtime.turn_snapshot());
+                attempt.force_terminating();
+                Some(error.to_string())
+            }
+        };
+        if let Some(error) = control_error {
+            self.record_failure(agent_id, error);
+        }
+        runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace))
+    }
+
     fn control_deadline(&self) -> ControlDeadline {
         ControlDeadline::new(self.inner.config.control_timeout)
     }
@@ -4727,9 +4749,50 @@ impl Scheduler {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<ToolResult, SchedulerError> {
-        self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+        let durable_job = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
             SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
         })?;
+        let deadline = self.control_deadline();
+        let (owner_epoch, runtime, sink, session_id, operation, attempt) = {
+            let state = self.inner.state.lock().unwrap();
+            let active = state.active.get(agent_id).ok_or_else(|| {
+                if durable_job.state != JobState::Running
+                    || durable_job.stop_requested
+                    || durable_job.close_requested
+                {
+                    Self::late_ingress_error(agent_id, "LATE_AFTER_STOP")
+                } else {
+                    SchedulerError::RuntimeCommand {
+                        agent_id: agent_id.into(),
+                        message: "review runtime is not active".into(),
+                    }
+                }
+            })?;
+            (
+                active.owner_epoch,
+                Arc::clone(&active.runtime),
+                Arc::clone(&active.sink),
+                active.session_id.clone(),
+                Arc::clone(&active.operation),
+                Arc::clone(&active.attempt),
+            )
+        };
+        let _guard = self.lock_operation(agent_id, &operation, deadline)?;
+        Self::require_attempt_ingress(agent_id, &attempt)?;
+        let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+        })?;
+        if current.owner_epoch != owner_epoch
+            || current.state != JobState::Running
+            || current.stop_requested
+            || current.close_requested
+        {
+            attempt.request_stop(&runtime.turn_snapshot());
+            return Err(Self::late_ingress_error(agent_id, "ATTEMPT_STOPPING"));
+        }
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
         let ledger = self.inner.ledger.as_ref().ok_or_else(|| {
             SchedulerError::InvalidConfig("internal review ledger is unavailable".into())
         })?;
@@ -4742,7 +4805,16 @@ impl Scheduler {
                     } else {
                         ReviewFailure::LedgerMalformed
                     };
-                self.fail_active_review(agent_id, failure);
+                self.fail_active_review_locked(
+                    agent_id,
+                    owner_epoch,
+                    &runtime,
+                    &session_id,
+                    &attempt,
+                    &sink,
+                    failure,
+                    deadline,
+                );
                 Err(SchedulerError::InvalidConfig(error.to_string()))
             }
         }
@@ -4777,7 +4849,17 @@ impl Scheduler {
             )))
         })?;
         let deadline = self.control_deadline();
-        let (owner_epoch, runtime, sink, operation, attempt, route, task, semantic_clock) = {
+        let (
+            owner_epoch,
+            runtime,
+            sink,
+            session_id,
+            operation,
+            attempt,
+            route,
+            task,
+            semantic_clock,
+        ) = {
             let state = self.inner.state.lock().unwrap();
             let active = state.active.get(agent_id).ok_or_else(|| {
                 if durable_job.state != JobState::Running
@@ -4808,6 +4890,7 @@ impl Scheduler {
                 active.owner_epoch,
                 Arc::clone(&active.runtime),
                 Arc::clone(&active.sink),
+                active.session_id.clone(),
                 Arc::clone(&active.operation),
                 Arc::clone(&active.attempt),
                 active.route.clone(),
@@ -4916,7 +4999,13 @@ impl Scheduler {
                     } else {
                         ReviewFailure::LedgerMalformed
                     };
-                let _ = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
+                let _ = self.stop_attempt_after_failure(
+                    agent_id,
+                    &runtime,
+                    &session_id,
+                    &attempt,
+                    deadline,
+                );
                 let finish = self.finish_routed_terminal(
                     TerminalTarget {
                         agent_id,
@@ -4944,20 +5033,20 @@ impl Scheduler {
         }
     }
 
-    fn fail_active_review(&self, agent_id: &str, failure: ReviewFailure) {
-        let Some((owner_epoch, runtime, _session_id, operation, _attempt)) =
-            self.active_session(agent_id)
-        else {
-            return;
-        };
-        let _guard = operation.lock().unwrap();
-        let sink = {
-            let state = self.inner.state.lock().unwrap();
-            state
-                .active
-                .get(agent_id)
-                .map(|active| Arc::clone(&active.sink))
-        };
+    #[allow(clippy::too_many_arguments)]
+    fn fail_active_review_locked(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        session_id: &str,
+        attempt: &AttemptRuntimeLifecycle,
+        sink: &StoreLifecycleSink,
+        failure: ReviewFailure,
+        deadline: ControlDeadline,
+    ) {
+        let terminal =
+            self.stop_attempt_after_failure(agent_id, runtime, session_id, attempt, deadline);
         let update = terminal_update(&RuntimeTerminal::ReviewFailed(failure));
         if let Err(error) = self
             .inner
@@ -4966,11 +5055,8 @@ impl Scheduler {
         {
             self.record_failure(agent_id, error.to_string());
         }
-        let terminal = runtime.stop(self.inner.config.stop_grace);
         let terminal = self.review_terminal(agent_id, terminal, false, false);
-        if let Some(sink) = sink {
-            let _ = sink.finish(&terminal.terminal);
-        }
+        let _ = sink.finish(&terminal.terminal);
         self.release_active(agent_id, owner_epoch);
     }
 
@@ -7306,6 +7392,19 @@ exec tail -f /dev/null
             budget: BudgetRequest,
             clock: Option<Arc<dyn MonotonicClock>>,
         ) -> Self {
+            Self::new_with_route(suffix, budget, clock, true)
+        }
+
+        fn new_legacy(suffix: &str) -> Self {
+            Self::new_with_route(suffix, BudgetRequest::Omitted, None, false)
+        }
+
+        fn new_with_route(
+            suffix: &str,
+            budget: BudgetRequest,
+            clock: Option<Arc<dyn MonotonicClock>>,
+            task_scoped: bool,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repository = directory.path().join("repository");
             fs::create_dir_all(repository.join("src")).unwrap();
@@ -7360,20 +7459,22 @@ exec tail -f /dev/null
             job.initial_prompt = "review the bounded fixture".into();
             job.prepared_launch_json = Some(prepared.canonical_json().unwrap());
             job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
-            store
-                .enqueue_task(&NewTask {
-                    job,
-                    public_agent_id: execution_id.clone(),
-                    task_kind: TaskKind::Review,
-                    review_id: Some(format!("review-id-{suffix}")),
-                    continuation_of: None,
-                    repository: repository.to_string_lossy().into_owned(),
-                    feature_id: prepared.feature_id.clone(),
-                    ownership_token: "review-exit-owner".into(),
-                    budget,
-                    retain_partial: false,
-                })
-                .unwrap();
+            if task_scoped {
+                store
+                    .enqueue_task(&NewTask {
+                        job,
+                        public_agent_id: execution_id.clone(),
+                        task_kind: TaskKind::Review,
+                        review_id: Some(format!("review-id-{suffix}")),
+                        continuation_of: None,
+                        repository: repository.to_string_lossy().into_owned(),
+                        feature_id: prepared.feature_id.clone(),
+                        ownership_token: "review-exit-owner".into(),
+                        budget,
+                        retain_partial: false,
+                    })
+                    .unwrap();
+            }
             let factory = Arc::new(FakeFactory::default());
             let mut scheduler = Scheduler::new(
                 format!("review-exit-owner-{suffix}"),
@@ -7395,6 +7496,11 @@ exec tail -f /dev/null
                     },
                 )
                 .unwrap();
+            if !task_scoped {
+                scheduler
+                    .enqueue_prepared(&execution_id, "review", &prepared)
+                    .unwrap();
+            }
             assert_eq!(scheduler.start_ready().unwrap(), vec![execution_id.clone()]);
             assert_eq!(
                 store.get_job(&execution_id).unwrap().unwrap().state,
@@ -9909,6 +10015,191 @@ exec tail -f /dev/null
                 .unwrap()
                 .unwrap(),
             first
+        );
+    }
+
+    #[test]
+    fn legacy_review_tool_waits_for_stop_and_rejects_without_mutation() {
+        let fixture = ReviewExitFixture::new_legacy("legacy-stop-fence");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        runtime.delay_stop_turn(Duration::from_millis(120));
+        let (attempt, runtime_agent_id) = {
+            let state = fixture.scheduler.inner.state.lock().unwrap();
+            let active = state.active.get(&fixture.execution_id).unwrap();
+            (
+                Arc::clone(&active.attempt),
+                fixture
+                    .store
+                    .get_job(&fixture.execution_id)
+                    .unwrap()
+                    .unwrap()
+                    .runtime_agent_id
+                    .unwrap(),
+            )
+        };
+        let review_before = fixture
+            .store
+            .review_snapshot(&fixture.execution_id)
+            .unwrap()
+            .unwrap();
+        let stopper = {
+            let scheduler = fixture.scheduler.clone();
+            let execution_id = fixture.execution_id.clone();
+            thread::spawn(move || scheduler.stop_job(&execution_id))
+        };
+        wait_until_review_exit(|| {
+            (attempt.snapshot().phase == AttemptRuntimePhase::StopRequested).then_some(())
+        });
+        let events_before = fixture
+            .store
+            .events_after(&fixture.execution_id, &runtime_agent_id, 0, 100)
+            .unwrap();
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Request(zcode_protocol::RequestEnvelope::new(
+                WireId::String("legacy-late-permission".into()),
+                INTERACTION_REQUEST_PERMISSION,
+                serde_json::json!({"toolName":"Read","input":{"path":"src/lib.rs"}}),
+            )),
+        )));
+        assert!(fixture
+            .store
+            .pending_requests(&fixture.execution_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .events_after(&fixture.execution_id, &runtime_agent_id, 0, 100)
+                .unwrap(),
+            events_before
+        );
+
+        let error = fixture
+            .scheduler
+            .call_review_tool(
+                &fixture.execution_id,
+                REVIEW_CHECKPOINT,
+                serde_json::json!({
+                    "checkpoint_id":"late-checkpoint","stage":"inspection",
+                    "summary":"must be fenced","inspected":[],"commands":[],
+                    "open_questions":[],"remaining_scope":[]
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("LATE_AFTER_STOP"));
+        assert_eq!(stopper.join().unwrap().unwrap(), JobState::Cancelled);
+        assert_eq!(
+            fixture
+                .store
+                .review_snapshot(&fixture.execution_id)
+                .unwrap()
+                .unwrap(),
+            review_before
+        );
+    }
+
+    #[test]
+    fn ledger_failures_revoke_ingress_before_task_and_legacy_runtime_stop() {
+        let task = ReviewExitFixture::new_with_budget(
+            "task-ledger-failure-fence",
+            review_exit_budget(10_000, 1),
+        );
+        let task_runtime = task.factory.runtime(&task.execution_id);
+        task_runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        task_runtime.delay_stop_turn(Duration::from_millis(120));
+        let (task_attempt, task_budget) = {
+            let state = task.scheduler.inner.state.lock().unwrap();
+            let active = state.active.get(&task.execution_id).unwrap();
+            (
+                Arc::clone(&active.attempt),
+                Arc::clone(active.budget.as_ref().unwrap()),
+            )
+        };
+        let task_failure = {
+            let scheduler = task.scheduler.clone();
+            let execution_id = task.execution_id.clone();
+            thread::spawn(move || {
+                scheduler.call_task_review_tool(
+                    &execution_id,
+                    REVIEW_CHECKPOINT,
+                    serde_json::json!({}),
+                )
+            })
+        };
+        wait_until_review_exit(|| {
+            (task_attempt.snapshot().phase == AttemptRuntimePhase::StopRequested).then_some(())
+        });
+        let task_events_before = task
+            .store
+            .task_events_after(&task.execution_id, 0, 100)
+            .unwrap();
+        task_runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Request(zcode_protocol::RequestEnvelope::new(
+                WireId::String("task-failure-late-permission".into()),
+                INTERACTION_REQUEST_PERMISSION,
+                serde_json::json!({"toolName":"Read","input":{"path":"src/lib.rs"}}),
+            )),
+        )));
+        for tool_call_id in ["late-tool-1", "late-tool-2"] {
+            task_runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                EventEnvelope {
+                    method: "session/event".into(),
+                    params: serde_json::json!({
+                        "type":"tool.updated","payload":{"toolCallId":tool_call_id}
+                    }),
+                },
+            ))));
+        }
+        assert!(task
+            .store
+            .pending_requests(&task.execution_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            task.store
+                .task_events_after(&task.execution_id, 0, 100)
+                .unwrap(),
+            task_events_before
+        );
+        assert_eq!(task_budget.violation(), None);
+        assert!(task_failure.join().unwrap().is_err());
+        assert_eq!(task_attempt.snapshot().phase, AttemptRuntimePhase::Terminal);
+
+        let legacy = ReviewExitFixture::new_legacy("legacy-ledger-failure-fence");
+        let legacy_runtime = legacy.factory.runtime(&legacy.execution_id);
+        legacy_runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        legacy_runtime.delay_stop_turn(Duration::from_millis(120));
+        let legacy_attempt = {
+            let state = legacy.scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&legacy.execution_id).unwrap().attempt)
+        };
+        let legacy_failure = {
+            let scheduler = legacy.scheduler.clone();
+            let execution_id = legacy.execution_id.clone();
+            thread::spawn(move || {
+                scheduler.call_review_tool(&execution_id, REVIEW_CHECKPOINT, serde_json::json!({}))
+            })
+        };
+        wait_until_review_exit(|| {
+            (legacy_attempt.snapshot().phase == AttemptRuntimePhase::StopRequested).then_some(())
+        });
+        legacy_runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Request(zcode_protocol::RequestEnvelope::new(
+                WireId::String("legacy-failure-late-permission".into()),
+                INTERACTION_REQUEST_PERMISSION,
+                serde_json::json!({"toolName":"Read","input":{"path":"src/lib.rs"}}),
+            )),
+        )));
+        assert!(legacy
+            .store
+            .pending_requests(&legacy.execution_id)
+            .unwrap()
+            .is_empty());
+        assert!(legacy_failure.join().unwrap().is_err());
+        assert_eq!(
+            legacy_attempt.snapshot().phase,
+            AttemptRuntimePhase::Terminal
         );
     }
 

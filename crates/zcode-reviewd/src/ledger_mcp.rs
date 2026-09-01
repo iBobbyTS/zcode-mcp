@@ -400,21 +400,59 @@ mod tests {
     use super::*;
     use crate::{
         rpc::{RpcServer, RpcService, ServerOptions},
-        LifecycleSink, ManagedRuntime, RuntimeFactory, Scheduler, SchedulerConfig,
+        LifecycleSink, ManagedRuntime, RuntimeCommandError, RuntimeFactory, RuntimeTerminal,
+        Scheduler, SchedulerConfig, SessionReady, TurnSnapshot,
     };
     use review_ledger::{validate_tool_arguments, LedgerManager};
     use review_store::{NewJob, ReviewInitialization, Store};
     use std::{io::Cursor, sync::Arc};
+    use zcode_driver::{ChildExit, StopOutcome};
 
-    struct UnusedFactory;
+    struct ActiveRuntime;
 
-    impl RuntimeFactory for UnusedFactory {
+    impl ManagedRuntime for ActiveRuntime {
+        fn identity(&self) -> Option<zcode_driver::ProcessIdentity> {
+            None
+        }
+
+        fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+        }
+
+        fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+            None
+        }
+
+        fn bootstrap_session(
+            &self,
+            _job: &review_store::Job,
+            _timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: "ledger-mcp-session".into(),
+                initial_turn_id: Some("turn-1".into()),
+                observed_model: None,
+            })
+        }
+
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            TurnSnapshot {
+                generation: 1,
+                active: true,
+                boundary: None,
+            }
+        }
+    }
+
+    struct ActiveFactory;
+
+    impl RuntimeFactory for ActiveFactory {
         fn spawn(
             &self,
             _job: &review_store::Job,
             _sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
-            Err(io::Error::other("runtime is unused"))
+            Ok(Arc::new(ActiveRuntime))
         }
     }
 
@@ -671,7 +709,7 @@ mod tests {
         let scheduler = Scheduler::new(
             "ledger-mcp-test",
             Arc::clone(&store),
-            Arc::new(UnusedFactory),
+            Arc::new(ActiveFactory),
             SchedulerConfig::default(),
         )
         .unwrap()
@@ -684,7 +722,8 @@ mod tests {
             },
         )
         .unwrap();
-        let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+        assert_eq!(scheduler.start_ready().unwrap(), vec!["bound-job"]);
+        let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
         let server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
         let input = format!(
             "{}\n{}\n{}\n{}\n",
@@ -740,5 +779,6 @@ mod tests {
         let snapshot = store.review_snapshot("bound-job").unwrap().unwrap();
         assert_eq!(snapshot.checkpoints.len(), 1);
         assert_eq!(snapshot.checkpoints[0].stable_id, "cp-1");
+        scheduler.close_job("bound-job").unwrap();
     }
 }

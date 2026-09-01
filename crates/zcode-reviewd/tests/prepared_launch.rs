@@ -726,9 +726,21 @@ impl ManagedRuntime for CapturingRuntime {
     fn turn_snapshot(&self) -> TurnSnapshot {
         TurnSnapshot {
             generation: 1,
+            active: true,
+            boundary: None,
+        }
+    }
+
+    fn stop_turn(
+        &self,
+        _session_id: &str,
+        _timeout: Duration,
+    ) -> Result<TurnSnapshot, zcode_reviewd::RuntimeCommandError> {
+        Ok(TurnSnapshot {
+            generation: 1,
             active: false,
             boundary: Some(TurnBoundary::Completed),
-        }
+        })
     }
 }
 
@@ -846,16 +858,10 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
         .contains("substituted"));
     spawn_release.wait();
     assert_eq!(starter.join().unwrap().unwrap(), vec!["ledger-job"]);
-    for _ in 0..100 {
-        if store
-            .get_job("ledger-job")
-            .unwrap()
-            .is_some_and(|job| job.state.is_terminal())
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
+    assert_eq!(
+        store.get_job("ledger-job").unwrap().unwrap().state,
+        review_store::JobState::Running
+    );
     let servers = captured.lock().unwrap().clone();
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].name, "review-ledger");
@@ -900,6 +906,7 @@ fn prepared_job_gets_one_job_scoped_internal_ledger_and_verified_report() {
     assert!(final_report.contains("real\\-session\\-id"));
     assert!(final_report.contains("requested\\-model"));
     assert!(final_report.contains("FINALIZED: true"));
+    scheduler.close_job("ledger-job").unwrap();
 }
 
 fn create_repository(directory: &TempDir) -> PathBuf {
