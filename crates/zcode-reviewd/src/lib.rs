@@ -1,9 +1,10 @@
 use review_ledger::{LedgerError, LedgerManager, ToolResult, VerifiedArtifact, REVIEW_FINALIZE};
 use review_store::{
-    ArtifactKind, BudgetRequest, DeliveryClaim, EffectiveBudget, Job, JobClaim, JobState,
-    LifecycleWrite, MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
-    ResultArtifact, Store, StoreError, StoredMessage, StoredProcessIdentity, TaskKind, TaskOutcome,
-    TaskRecord, TaskResult, TaskSubmissionDisposition, TerminalUpdate, TurnState,
+    ArtifactKind, BudgetRequest, EffectiveBudget, Job, JobClaim, JobState, LifecycleWrite,
+    MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
+    PendingResponseClaimDisposition, ResultArtifact, Store, StoreError, StoredMessage,
+    StoredProcessIdentity, TaskKind, TaskOutcome, TaskRecord, TaskResult,
+    TaskSubmissionDisposition, TerminalUpdate, TurnState,
 };
 use serde::Deserialize;
 use std::{
@@ -1721,7 +1722,19 @@ struct SchedulerInner {
     general_commands: Arc<GeneralCommandCatalog>,
     #[cfg(test)]
     preflight_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    response_claim_hook: Mutex<Option<Arc<ResponseClaimHook>>>,
     state: Mutex<SchedulerState>,
+}
+
+#[cfg(test)]
+type ResponseClaimHook = dyn Fn(ResponseClaimHookStage, &str) + Send + Sync;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseClaimHookStage {
+    BeforeClaim,
+    AfterClaim,
 }
 
 #[derive(Default)]
@@ -1830,6 +1843,10 @@ impl AttemptRuntimeLifecycle {
             | AttemptRuntimePhase::ForceTerminating => Some("ATTEMPT_STOPPING"),
             AttemptRuntimePhase::Terminal => Some("LATE_AFTER_STOP"),
         }
+    }
+
+    fn attempt_sequence(&self) -> u64 {
+        self.state.lock().unwrap().attempt_sequence
     }
 
     fn admit_event(&self) -> Option<MutexGuard<'_, AttemptRuntimeSnapshot>> {
@@ -2925,6 +2942,8 @@ impl Scheduler {
                 general_commands: Arc::new(GeneralCommandCatalog::default()),
                 #[cfg(test)]
                 preflight_hook: None,
+                #[cfg(test)]
+                response_claim_hook: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
@@ -2988,6 +3007,21 @@ impl Scheduler {
             .expect("preflight hook must attach before scheduler cloning")
             .preflight_hook = Some(Arc::new(hook));
         self
+    }
+
+    #[cfg(test)]
+    fn set_response_claim_hook(
+        &self,
+        hook: impl Fn(ResponseClaimHookStage, &str) + Send + Sync + 'static,
+    ) {
+        *self.inner.response_claim_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_response_claim_hook(&self, stage: ResponseClaimHookStage, agent_id: &str) {
+        if let Some(hook) = self.inner.response_claim_hook.lock().unwrap().clone() {
+            hook(stage, agent_id);
+        }
     }
 
     pub fn ledger(&self) -> Option<Arc<LedgerManager>> {
@@ -3839,6 +3873,8 @@ impl Scheduler {
         failure: Option<(&str, String)>,
         stop_grace: Duration,
     ) -> Result<JobState, SchedulerError> {
+        let stop_decision = self.inner.store.request_runtime_stop(agent_id)?;
+        let cancellation_wins = stop_decision.prior_stop_or_close || failure.is_none();
         {
             let state = self.inner.state.lock().unwrap();
             if let Some(active) = state
@@ -3873,9 +3909,6 @@ impl Scheduler {
                     JobState::Running | JobState::Stopping | JobState::Orphaned
                 )
             }) {
-                let cancellation_wins = current
-                    .as_ref()
-                    .is_some_and(|job| job.stop_requested || job.close_requested);
                 let forced = if cancellation_wins {
                     Some((CompletionOutcome::Cancelled, "CANCELLED".into()))
                 } else {
@@ -3904,10 +3937,7 @@ impl Scheduler {
                     "GENERAL_START_CANCELLED",
                     "general task stopped before entering its runtime phase".into(),
                 ));
-                let outcome = if current
-                    .as_ref()
-                    .is_some_and(|job| job.stop_requested || job.close_requested)
-                {
+                let outcome = if cancellation_wins {
                     CompletionOutcome::Cancelled
                 } else {
                     CompletionOutcome::Failed
@@ -3935,10 +3965,6 @@ impl Scheduler {
             sink.attempt.request_stop(&runtime.turn_snapshot());
             sink.attempt.force_terminating();
             let terminal = runtime.stop(stop_grace);
-            let current = self.inner.store.get_job(agent_id)?;
-            let cancellation_wins = current
-                .as_ref()
-                .is_some_and(|job| job.stop_requested || job.close_requested);
             let (outcome, reason) = if cancellation_wins {
                 (CompletionOutcome::Cancelled, "CANCELLED".into())
             } else if let Some((code, _)) = failure {
@@ -4308,9 +4334,7 @@ impl Scheduler {
         if current.state.is_terminal() || current.owner_epoch != owner_epoch {
             return Ok(current.state);
         }
-        let cancellation_wins = current.stop_requested
-            || current.close_requested
-            || current.state == JobState::Stopping;
+        let cancellation_wins = current.stop_requested || current.close_requested;
         let (terminal, natural_completion, forced_outcome) = if cancellation_wins {
             sink.attempt.request_stop(&runtime.turn_snapshot());
             sink.attempt.force_terminating();
@@ -5544,15 +5568,41 @@ impl Scheduler {
             }
         }
         let effective_content = policy_reason.as_deref().or(content);
-        let existing_disposition = match self.inner.store.claim_pending_response(
-            agent_id,
-            request_id,
-            effective_decision,
-            effective_content,
-        )? {
-            DeliveryClaim::AlreadyDelivered => Some(ResponseDisposition::AlreadyResponded),
-            DeliveryClaim::InFlight => Some(ResponseDisposition::InFlight),
-            DeliveryClaim::Claimed => None,
+        #[cfg(test)]
+        self.run_response_claim_hook(ResponseClaimHookStage::BeforeClaim, agent_id);
+        let existing_disposition = match self
+            .inner
+            .store
+            .claim_pending_response_if_attempt_accepting(
+                agent_id,
+                request_id,
+                attempt.attempt_sequence(),
+                effective_decision,
+                effective_content,
+            )? {
+            PendingResponseClaimDisposition::Claimed => None,
+            PendingResponseClaimDisposition::AttemptStopping => {
+                return Err(Self::late_ingress_error(agent_id, "ATTEMPT_STOPPING"));
+            }
+            PendingResponseClaimDisposition::AttemptMismatch => {
+                return Err(Self::late_ingress_error(agent_id, "LATE_AFTER_STOP"));
+            }
+            PendingResponseClaimDisposition::NotFound => {
+                return Err(SchedulerError::Store(StoreError::InvalidState(format!(
+                    "unknown request {request_id}"
+                ))));
+            }
+            PendingResponseClaimDisposition::NotPending(PendingRequestState::Sending) => {
+                Some(ResponseDisposition::InFlight)
+            }
+            PendingResponseClaimDisposition::NotPending(PendingRequestState::Responded) => {
+                Some(ResponseDisposition::AlreadyResponded)
+            }
+            PendingResponseClaimDisposition::NotPending(PendingRequestState::Pending) => {
+                return Err(SchedulerError::Store(StoreError::Conflict(format!(
+                    "request {request_id} claim did not change pending state"
+                ))));
+            }
         };
         if let Some(disposition) = existing_disposition {
             return Ok(ResponseOutcome {
@@ -5562,6 +5612,26 @@ impl Scheduler {
                 policy_overrode: effective_decision != decision,
                 policy_reason_code: policy_reason,
             });
+        }
+        #[cfg(test)]
+        self.run_response_claim_hook(ResponseClaimHookStage::AfterClaim, agent_id);
+        if let Err(error) = Self::require_attempt_ingress(agent_id, &attempt) {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(error);
+        }
+        let current = self.inner.store.get_job(agent_id)?;
+        if current.as_ref().is_none_or(|job| {
+            job.owner_epoch != owner_epoch
+                || job.state != JobState::Running
+                || job.stop_requested
+                || job.close_requested
+        }) {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(Self::late_ingress_error(agent_id, "ATTEMPT_STOPPING"));
         }
         let response_deadline = match self.runtime_phase_deadline(agent_id, deadline) {
             Ok(deadline) => deadline,
@@ -5643,31 +5713,24 @@ impl Scheduler {
         close_session: bool,
         deadline: ControlDeadline,
     ) -> Result<JobState, SchedulerError> {
+        let active = self.active_session(agent_id);
+        deadline
+            .remaining()
+            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
+        let decision = if close_session {
+            self.inner.store.request_close(agent_id)?
+        } else {
+            self.inner.store.request_stop(agent_id)?
+        };
         {
             let state = self.inner.state.lock().unwrap();
             if let Some(active) = state.active.get(agent_id) {
                 active.check.cancel();
             }
         }
-        let active = self.active_session(agent_id);
-        let operation = active
-            .as_ref()
-            .map(|(_, _, _, operation, _)| Arc::clone(operation));
-        let _guard = operation
-            .as_ref()
-            .map(|operation| self.lock_operation(agent_id, operation, deadline))
-            .transpose()?;
-        deadline
-            .remaining()
-            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
         if let Some((_, runtime, _, _, attempt)) = active.as_ref() {
             attempt.request_stop(&runtime.turn_snapshot());
         }
-        let decision = if close_session {
-            self.inner.store.request_close(agent_id)?
-        } else {
-            self.inner.store.request_stop(agent_id)?
-        };
         if !decision.needs_runtime_stop {
             if decision.state == JobState::Stopping && active.is_none() {
                 let job = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
@@ -5727,7 +5790,21 @@ impl Scheduler {
         if owner_epoch != decision.owner_epoch {
             return Ok(decision.state);
         }
-        let (sink, route, task, submission) = {
+        let _guard = match self.lock_operation(agent_id, &operation, deadline) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.fail_closed_control(
+                    agent_id,
+                    owner_epoch,
+                    &runtime,
+                    deadline,
+                    "CONTROL_DEADLINE_EXCEEDED",
+                    error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
+        let active_route = {
             let state = self.inner.state.lock().unwrap();
             state.active.get(agent_id).map(|active| {
                 (
@@ -5737,12 +5814,15 @@ impl Scheduler {
                     active.general_submission.lock().unwrap().take(),
                 )
             })
-        }
-        .ok_or_else(|| SchedulerError::RuntimeCommand {
-            agent_id: agent_id.into(),
-            message: "active runtime disappeared".into(),
-        })?;
-        let _ = operation;
+        };
+        let Some((sink, route, task, submission)) = active_route else {
+            return Ok(self
+                .inner
+                .store
+                .get_job(agent_id)?
+                .map(|job| job.state)
+                .unwrap_or(decision.state));
+        };
         let control_error = match self.runtime_phase_timeout(agent_id, deadline) {
             Ok(timeout) => Self::request_cooperative_stop(&runtime, &session_id, &attempt, timeout),
             Err(error) => {
@@ -10508,6 +10588,208 @@ exec tail -f /dev/null
         scheduler.close_job("locked-control").unwrap();
     }
 
+    fn run_permission_claim_stop_interleaving(label: &str, claim_before_stop: bool) {
+        let (_directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        );
+        let execution_id = format!("permission-interleaving-{label}");
+        let request_id = format!("{execution_id}-request");
+        scheduler
+            .enqueue(&NewJob::new(&execution_id, format!("workspace-{label}")))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                &request_id,
+                &execution_id,
+                &format!("\"wire-{label}\""),
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let runtime = factory.runtime(&execution_id);
+        let blocked_stage = if claim_before_stop {
+            ResponseClaimHookStage::AfterClaim
+        } else {
+            ResponseClaimHookStage::BeforeClaim
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        scheduler.set_response_claim_hook({
+            let execution_id = execution_id.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |stage, agent_id| {
+                if agent_id == execution_id && stage == blocked_stage {
+                    entered.wait();
+                    release.wait();
+                }
+            }
+        });
+        let responder = {
+            let scheduler = scheduler.clone();
+            let execution_id = execution_id.clone();
+            let request_id = request_id.clone();
+            thread::spawn(move || scheduler.respond_job(&execution_id, &request_id, "deny", None))
+        };
+        entered.wait();
+        assert_eq!(
+            store
+                .pending_request(&execution_id, &request_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            if claim_before_stop {
+                PendingRequestState::Sending
+            } else {
+                PendingRequestState::Pending
+            }
+        );
+
+        let started = Instant::now();
+        let stopper = {
+            let scheduler = scheduler.clone();
+            let execution_id = execution_id.clone();
+            thread::spawn(move || scheduler.stop_job(&execution_id))
+        };
+        wait_until_review_exit(|| {
+            store
+                .get_job(&execution_id)
+                .unwrap()
+                .is_some_and(|job| job.stop_requested)
+                .then_some(())
+        });
+        assert_eq!(
+            store
+                .pending_request(&execution_id, &request_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        release.wait();
+
+        let error = responder.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("ATTEMPT_STOPPING"));
+        assert_eq!(stopper.join().unwrap().unwrap(), JobState::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            store
+                .pending_request(&execution_id, &request_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        assert!(runtime.responses.lock().unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn stop_before_permission_claim_is_rejected_without_sending() {
+        run_permission_claim_stop_interleaving("stop-before-claim", false);
+    }
+
+    #[test]
+    fn fail_closed_cleanup_durably_stops_before_permission_claim() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        );
+        scheduler
+            .enqueue(&NewJob::new("cleanup-before-claim", "workspace"))
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                "cleanup-before-claim-request",
+                "cleanup-before-claim",
+                "\"cleanup-before-claim-wire\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        let (owner_epoch, runtime, _, _, _) =
+            scheduler.active_session("cleanup-before-claim").unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        scheduler.set_response_claim_hook({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |stage, agent_id| {
+                if agent_id == "cleanup-before-claim"
+                    && stage == ResponseClaimHookStage::BeforeClaim
+                {
+                    entered.wait();
+                    release.wait();
+                }
+            }
+        });
+        let responder = {
+            let scheduler = scheduler.clone();
+            thread::spawn(move || {
+                scheduler.respond_job(
+                    "cleanup-before-claim",
+                    "cleanup-before-claim-request",
+                    "deny",
+                    None,
+                )
+            })
+        };
+        entered.wait();
+        let cleanup = {
+            let scheduler = scheduler.clone();
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                scheduler.fail_closed_control(
+                    "cleanup-before-claim",
+                    owner_epoch,
+                    &runtime,
+                    ControlDeadline::new(Duration::from_millis(500)),
+                    "CONTROL_DELIVERY_FAILED",
+                    "scripted cleanup".into(),
+                )
+            })
+        };
+        wait_until_review_exit(|| {
+            store
+                .get_job("cleanup-before-claim")
+                .unwrap()
+                .is_some_and(|job| {
+                    job.state != JobState::Running && !job.stop_requested && !job.close_requested
+                })
+                .then_some(())
+        });
+        assert_eq!(
+            store
+                .pending_request("cleanup-before-claim", "cleanup-before-claim-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
+        release.wait();
+
+        cleanup.join().unwrap().unwrap();
+        let error = responder.join().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("ATTEMPT_STOPPING")
+                || error.to_string().contains("LATE_AFTER_STOP")
+        );
+        assert!(factory
+            .runtime("cleanup-before-claim")
+            .responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+    }
+
     #[test]
     fn respond_lock_timeout_releases_claim_and_later_retry_progresses() {
         let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
@@ -10590,89 +10872,84 @@ exec tail -f /dev/null
 
     #[test]
     fn durable_cancel_intent_wins_over_claimed_late_response() {
-        let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+        run_permission_claim_stop_interleaving("claim-before-stop", true);
+    }
+
+    #[test]
+    fn permission_delivery_before_stop_is_responded_once() {
+        let (_directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
             1,
             1,
             Duration::from_millis(5),
-            Duration::from_millis(200),
+            Duration::from_millis(500),
         );
-        let submitted = scheduler
-            .enqueue_general(
-                &general_manifest(directory.path(), "respond-cancel-winner", None),
-                "feature",
-                "owner-group",
-            )
+        scheduler
+            .enqueue(&NewJob::new("delivery-before-stop", "workspace"))
             .unwrap();
-        let execution_id = submitted.job.agent_id;
         scheduler.start_ready().unwrap();
         store
             .insert_pending_request(
-                "respond-cancel-request",
-                &execution_id,
-                "\"runtime-cancel-winner\"",
+                "delivery-before-stop-request",
+                "delivery-before-stop",
+                "\"delivery-before-stop-wire\"",
                 "permission",
                 "{}",
             )
             .unwrap();
-        let (runtime, operation, attempt) = {
-            let active = scheduler.active_session(&execution_id).unwrap();
-            (active.1, active.3, active.4)
-        };
-        let guard = operation.lock().unwrap();
-        attempt.request_stop(&runtime.turn_snapshot());
-        let decision = store.request_stop(&execution_id).unwrap();
-        assert!(decision.needs_runtime_stop);
-        let entered = Arc::new(Barrier::new(2));
-        let caller = {
-            let scheduler = scheduler.clone();
-            let execution_id = execution_id.clone();
-            let entered = Arc::clone(&entered);
-            thread::spawn(move || {
-                entered.wait();
-                scheduler.respond_job(&execution_id, "respond-cancel-request", "deny", None)
-            })
-        };
-        entered.wait();
+        let runtime = factory.runtime("delivery-before-stop");
+        assert_eq!(
+            scheduler
+                .respond_job(
+                    "delivery-before-stop",
+                    "delivery-before-stop-request",
+                    "allow",
+                    None,
+                )
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        assert_eq!(runtime.responses.lock().unwrap().len(), 1);
         assert_eq!(
             store
-                .pending_request(&execution_id, "respond-cancel-request")
+                .pending_request("delivery-before-stop", "delivery-before-stop-request")
                 .unwrap()
                 .unwrap()
                 .state,
-            PendingRequestState::Pending
+            PendingRequestState::Responded
         );
-        drop(guard);
-
-        assert!(matches!(
-            caller.join().unwrap(),
-            Err(SchedulerError::RuntimeCommand { .. })
-        ));
         assert_eq!(
-            store
-                .pending_request(&execution_id, "respond-cancel-request")
-                .unwrap()
-                .unwrap()
-                .state,
-            PendingRequestState::Pending
-        );
-        assert!(factory
-            .runtime(&execution_id)
-            .responses
-            .lock()
-            .unwrap()
-            .is_empty());
-
-        assert_eq!(
-            scheduler.stop_job(&execution_id).unwrap(),
+            scheduler.stop_job("delivery-before-stop").unwrap(),
             JobState::Cancelled
         );
-        let result = store.task_result(&execution_id).unwrap().unwrap();
-        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
-        assert_eq!(scheduler.active_count(), 0);
-        assert_eq!(store.active_count().unwrap(), 0);
-        scheduler.close_job(&execution_id).unwrap();
-        scheduler.reap_job(&execution_id).unwrap();
-        assert_eq!(store.task_result(&execution_id).unwrap().unwrap(), result);
+        assert_eq!(
+            scheduler
+                .respond_job(
+                    "delivery-before-stop",
+                    "delivery-before-stop-request",
+                    "allow",
+                    None,
+                )
+                .unwrap()
+                .disposition,
+            ResponseDisposition::AlreadyResponded
+        );
+        assert_eq!(runtime.responses.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_stop_and_permission_response_contention_is_bounded() {
+        run_permission_claim_stop_interleaving("bounded-contention", false);
+    }
+
+    #[test]
+    fn permission_stop_claim_exact_interleavings_repeat_one_hundred_times() {
+        for iteration in 0..100 {
+            run_permission_claim_stop_interleaving(
+                &format!("repeat-{iteration:03}"),
+                iteration % 2 == 1,
+            );
+        }
     }
 
     #[test]
@@ -10706,10 +10983,11 @@ exec tail -f /dev/null
         runtime.timeout_response_write();
 
         let started = Instant::now();
-        assert!(matches!(
-            scheduler.respond_job(&execution_id, "respond-write-request", "deny", None,),
-            Err(SchedulerError::RuntimeCommand { .. })
-        ));
+        let response = scheduler.respond_job(&execution_id, "respond-write-request", "deny", None);
+        assert!(
+            matches!(response, Err(SchedulerError::RuntimeCommand { .. })),
+            "unexpected response result: {response:?}"
+        );
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(100));
         assert!(elapsed < Duration::from_secs(2));
@@ -11036,9 +11314,15 @@ exec tail -f /dev/null
             .unwrap();
         assert_eq!(
             store
-                .claim_pending_response("responded-job", "request-1", "allow", None)
+                .claim_pending_response_if_attempt_accepting(
+                    "responded-job",
+                    "request-1",
+                    1,
+                    "allow",
+                    None,
+                )
                 .unwrap(),
-            DeliveryClaim::Claimed
+            PendingResponseClaimDisposition::Claimed
         );
         assert!(store
             .complete_pending_response("responded-job", "request-1")

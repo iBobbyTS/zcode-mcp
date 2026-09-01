@@ -949,6 +949,7 @@ pub struct CloseDecision {
     pub state: JobState,
     pub owner_epoch: u64,
     pub needs_runtime_stop: bool,
+    pub prior_stop_or_close: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -990,10 +991,12 @@ pub struct StoredPendingRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryClaim {
+pub enum PendingResponseClaimDisposition {
     Claimed,
-    AlreadyDelivered,
-    InFlight,
+    AttemptStopping,
+    NotPending(PendingRequestState),
+    AttemptMismatch,
+    NotFound,
 }
 
 pub struct Store {
@@ -2284,7 +2287,7 @@ impl Store {
     pub fn request_close(&self, agent_id: &str) -> StoreResult<CloseDecision> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
+        let (state, epoch, close_requested, stop_requested) = query_guard(&transaction, agent_id)?;
         let is_v2 = transaction
             .query_row(
                 "SELECT 1 FROM task_attempts WHERE execution_agent_id=?1",
@@ -2334,13 +2337,26 @@ impl Store {
             state: next,
             owner_epoch: epoch,
             needs_runtime_stop,
+            prior_stop_or_close: close_requested || stop_requested,
         })
     }
 
     pub fn request_stop(&self, agent_id: &str) -> StoreResult<CloseDecision> {
+        self.request_stop_with_intent(agent_id, true)
+    }
+
+    pub fn request_runtime_stop(&self, agent_id: &str) -> StoreResult<CloseDecision> {
+        self.request_stop_with_intent(agent_id, false)
+    }
+
+    fn request_stop_with_intent(
+        &self,
+        agent_id: &str,
+        cancellation_intent: bool,
+    ) -> StoreResult<CloseDecision> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, epoch, _, _) = query_guard(&transaction, agent_id)?;
+        let (state, epoch, close_requested, stop_requested) = query_guard(&transaction, agent_id)?;
         let is_v2 = transaction
             .query_row(
                 "SELECT 1 FROM task_attempts WHERE execution_agent_id=?1",
@@ -2358,11 +2374,18 @@ impl Store {
         };
         if !state.is_terminal() {
             transaction.execute(
-                "UPDATE agents SET state = ?1, stop_requested = 1,
-                     completed_at = CASE WHEN ?2 = 1 THEN COALESCE(completed_at, ?3)
+                "UPDATE agents SET state = ?1,
+                     stop_requested = CASE WHEN ?2 = 1 THEN 1 ELSE stop_requested END,
+                     completed_at = CASE WHEN ?3 = 1 THEN COALESCE(completed_at, ?4)
                                          ELSE completed_at END
-                 WHERE agent_id = ?4",
-                params![next.as_str(), next.is_terminal(), now_millis(), agent_id],
+                 WHERE agent_id = ?5",
+                params![
+                    next.as_str(),
+                    cancellation_intent,
+                    next.is_terminal(),
+                    now_millis(),
+                    agent_id
+                ],
             )?;
             settle_terminal_commands(&transaction, agent_id, "STOP_REQUESTED")?;
             if state != next {
@@ -2382,6 +2405,7 @@ impl Store {
             state: next,
             owner_epoch: epoch,
             needs_runtime_stop,
+            prior_stop_or_close: close_requested || stop_requested,
         })
     }
 
@@ -2695,18 +2719,29 @@ impl Store {
             .collect()
     }
 
-    pub fn claim_pending_response(
+    pub fn claim_pending_response_if_attempt_accepting(
         &self,
-        agent_id: &str,
+        execution_agent_id: &str,
         request_id: &str,
+        expected_attempt_sequence: u64,
         decision: &str,
         content: Option<&str>,
-    ) -> StoreResult<DeliveryClaim> {
+    ) -> StoreResult<PendingResponseClaimDisposition> {
+        if expected_attempt_sequence == 0 {
+            return Err(StoreError::InvalidState(
+                "expected attempt sequence must be positive".into(),
+            ));
+        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let request = query_pending_request(&transaction, request_id)?
-            .filter(|request| request.agent_id == agent_id)
-            .ok_or_else(|| StoreError::InvalidState(format!("unknown request {request_id}")))?;
+        let Some(request) = query_pending_request(&transaction, request_id)? else {
+            transaction.commit()?;
+            return Ok(PendingResponseClaimDisposition::NotFound);
+        };
+        if request.agent_id != execution_agent_id {
+            transaction.commit()?;
+            return Ok(PendingResponseClaimDisposition::NotFound);
+        }
         if request.state != PendingRequestState::Pending
             && (request.response_decision.as_deref() != Some(decision)
                 || request.response_content.as_deref() != content)
@@ -2715,18 +2750,69 @@ impl Store {
                 "request {request_id} response was changed"
             )));
         }
-        let claim = match request.state {
-            PendingRequestState::Pending => {
-                transaction.execute(
-                    "UPDATE pending_requests SET state = 'SENDING',
-                         response_decision = ?1, response_content = ?2
-                     WHERE request_id = ?3 AND agent_id = ?4 AND state = 'PENDING'",
-                    params![decision, content, request_id, agent_id],
+        if request.state != PendingRequestState::Pending {
+            let state = request.state;
+            transaction.commit()?;
+            return Ok(PendingResponseClaimDisposition::NotPending(state));
+        }
+
+        let attempt = transaction
+            .query_row(
+                "SELECT attempt_sequence, phase, public_agent_id
+                 FROM task_attempts WHERE execution_agent_id=?1",
+                [execution_agent_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let attempt_accepting = match attempt {
+            Some((attempt_sequence, phase, public_agent_id)) => {
+                if i64_to_u64(attempt_sequence)? != expected_attempt_sequence {
+                    transaction.commit()?;
+                    return Ok(PendingResponseClaimDisposition::AttemptMismatch);
+                }
+                let latest: i64 = transaction.query_row(
+                    "SELECT MAX(attempt_sequence) FROM task_attempts WHERE public_agent_id=?1",
+                    [&public_agent_id],
+                    |row| row.get(0),
                 )?;
-                DeliveryClaim::Claimed
+                if i64_to_u64(latest)? != expected_attempt_sequence {
+                    transaction.commit()?;
+                    return Ok(PendingResponseClaimDisposition::AttemptMismatch);
+                }
+                matches!(phase.as_str(), "RUNNING" | "WAITING_INPUT")
             }
-            PendingRequestState::Sending => DeliveryClaim::InFlight,
-            PendingRequestState::Responded => DeliveryClaim::AlreadyDelivered,
+            None if expected_attempt_sequence == 1 => true,
+            None => {
+                transaction.commit()?;
+                return Ok(PendingResponseClaimDisposition::AttemptMismatch);
+            }
+        };
+        let (state, _, close_requested, stop_requested) =
+            query_guard(&transaction, execution_agent_id)?;
+        if !attempt_accepting || state != JobState::Running || stop_requested || close_requested {
+            transaction.commit()?;
+            return Ok(PendingResponseClaimDisposition::AttemptStopping);
+        }
+        let changed = transaction.execute(
+            "UPDATE pending_requests SET state = 'SENDING',
+                 response_decision = ?1, response_content = ?2
+             WHERE request_id = ?3 AND agent_id = ?4 AND state = 'PENDING'",
+            params![decision, content, request_id, execution_agent_id],
+        )?;
+        let claim = if changed == 1 {
+            PendingResponseClaimDisposition::Claimed
+        } else {
+            PendingResponseClaimDisposition::NotPending(
+                query_pending_request(&transaction, request_id)?
+                    .map(|request| request.state)
+                    .unwrap_or(PendingRequestState::Pending),
+            )
         };
         transaction.commit()?;
         Ok(claim)
@@ -5234,12 +5320,9 @@ mod tests {
                     "{}",
                 )
                 .unwrap();
-            store
-                .claim_pending_response("pending-bounded", &request_id, "deny", None)
-                .unwrap();
-            store
-                .complete_pending_response("pending-bounded", &request_id)
-                .unwrap();
+            assert!(store
+                .respond_pending_request_by_id("pending-bounded", &request_id)
+                .unwrap());
         }
         store
             .insert_pending_request(
@@ -5732,9 +5815,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .claim_pending_response("delivery-job", "request-1", "allow", None)
+                .claim_pending_response_if_attempt_accepting(
+                    "delivery-job",
+                    "request-1",
+                    1,
+                    "allow",
+                    None,
+                )
                 .unwrap(),
-            DeliveryClaim::Claimed
+            PendingResponseClaimDisposition::Claimed
         );
         assert_eq!(
             store
@@ -5749,14 +5838,136 @@ mod tests {
             .unwrap());
         assert_eq!(
             store
-                .claim_pending_response("delivery-job", "request-1", "allow", None)
+                .claim_pending_response_if_attempt_accepting(
+                    "delivery-job",
+                    "request-1",
+                    1,
+                    "allow",
+                    None,
+                )
                 .unwrap(),
-            DeliveryClaim::AlreadyDelivered
+            PendingResponseClaimDisposition::NotPending(PendingRequestState::Responded)
         );
         assert!(matches!(
-            store.claim_pending_response("delivery-job", "request-1", "deny", None),
+            store.claim_pending_response_if_attempt_accepting(
+                "delivery-job",
+                "request-1",
+                1,
+                "deny",
+                None,
+            ),
             Err(StoreError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn conditional_pending_response_claim_is_attempt_and_stop_aware() {
+        let (_directory, _path, store) = file_store();
+        let task = general_task("conditional-claim", "conditional-public", "conditional-key");
+        let (_, task_record) = store.enqueue_task(&task).unwrap();
+        let claim = claim(&store, "conditional-claim");
+        store
+            .mark_running("conditional-claim", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        store
+            .insert_pending_request(
+                "conditional-request",
+                "conditional-claim",
+                "conditional-wire",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "conditional-claim",
+                    "conditional-request",
+                    task_record.attempt_sequence + 1,
+                    "allow",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::AttemptMismatch
+        );
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "conditional-claim",
+                    "missing-request",
+                    task_record.attempt_sequence,
+                    "allow",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::NotFound
+        );
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "conditional-claim",
+                    "conditional-request",
+                    task_record.attempt_sequence,
+                    "allow",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::Claimed
+        );
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "conditional-claim",
+                    "conditional-request",
+                    task_record.attempt_sequence,
+                    "allow",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::NotPending(PendingRequestState::Sending)
+        );
+        assert!(store
+            .release_pending_response("conditional-claim", "conditional-request")
+            .unwrap());
+        let runtime_stop = store.request_runtime_stop("conditional-claim").unwrap();
+        assert_eq!(runtime_stop.state, JobState::Stopping);
+        assert!(!runtime_stop.prior_stop_or_close);
+        let runtime_stopping_job = store.get_job("conditional-claim").unwrap().unwrap();
+        assert!(!runtime_stopping_job.stop_requested);
+        assert!(!runtime_stopping_job.close_requested);
+        assert!(
+            !store
+                .request_stop("conditional-claim")
+                .unwrap()
+                .prior_stop_or_close
+        );
+        assert!(
+            store
+                .request_stop("conditional-claim")
+                .unwrap()
+                .prior_stop_or_close
+        );
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "conditional-claim",
+                    "conditional-request",
+                    task_record.attempt_sequence,
+                    "allow",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::AttemptStopping
+        );
+        assert_eq!(
+            store
+                .pending_request("conditional-claim", "conditional-request")
+                .unwrap()
+                .unwrap()
+                .state,
+            PendingRequestState::Pending
+        );
     }
 
     #[test]
