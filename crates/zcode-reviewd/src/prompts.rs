@@ -38,6 +38,7 @@ pub struct ReviewPrompt {
 
 const TASK_PROGRESS_INSTRUCTION: &str = "TASK_SCOPED_SEMANTIC_PROGRESS: This is a daemon-bound task review. After the initial scope checkpoint and whenever the semantic stage advances, call the private mcp__review-ledger__review_progress tool with only the bounded stage, summary, and optional counters. The daemon supplies attempt and run identity; do not invent or include private identity fields.";
 const TASK_PERMISSION_INSTRUCTION: &str = "TASK_SCOPED_PERMISSION_HANDLING: Permission denials use DENY[policy_version=...;code=...;retry=...;next=...] metadata. A denied operation is evidence about that semantic operation, not a ban on unrelated evidence. For a retryable denial, make at most one simpler retry (split_once or simplify_once); do not retry an equivalent spelling or variant. For program/command denials, follow use_read or use_named_check. For hard denials (write, secret, out-of-scope, or network), do_not_retry_equivalent and record a bounded safe descriptor in uncertainties: tool name, reason_code, retry_class, recommended_action, and command category/program name or a one-way hash; never record raw command text, raw arguments, secrets, bearer tokens, credentials, or absolute host paths. A Read error permits one corrected path attempt; repeated failure ends that evidence path without a loop. Continue with unrelated legal Read, Bash, and existing mcp__review-ledger tools. Keep Bash calls simple: one command, no shell composition. Regardless of findings or evidence completeness, invoke review_finalize one time with one legal signal: findings_present, no_findings_observed, incomplete_evidence, or unable_to_review; use a truthful incomplete signal and never fabricate findings or success.";
+const TASK_RUNTIME_CONVERGENCE_INSTRUCTION: &str = "TASK_SCOPED_RUNTIME_CONVERGENCE: A queued convergence message is delivered only after the current model turn reaches its natural boundary. After stop or cancel, do not invoke any tool or mutate the review ledger. Do not retry a denied semantic operation through an equivalent spelling. If evidence remains unavailable, record a truthful coverage gap and finalize without fabricating evidence.";
 
 fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
     let checks = prepared
@@ -234,6 +235,8 @@ fn add_task_progress_instruction(
     prompt.text.push_str(TASK_PROGRESS_INSTRUCTION);
     prompt.text.push_str("\n");
     prompt.text.push_str(TASK_PERMISSION_INSTRUCTION);
+    prompt.text.push_str("\n");
+    prompt.text.push_str(TASK_RUNTIME_CONVERGENCE_INSTRUCTION);
     if let Some(frozen_finding_ids) = frozen_finding_ids {
         validate_review_continuation_prompt(
             prompt.kind,
@@ -511,6 +514,16 @@ PRIOR_REVIEW_CONTEXT: forbidden\nLIVE_STEER: false\nLEGAL_FINAL_SIGNALS: finding
         assert!(task
             .text
             .contains("tool name, reason_code, retry_class, recommended_action"));
+        assert!(task
+            .text
+            .contains("queued convergence message is delivered only after the current model turn"));
+        assert!(task
+            .text
+            .contains("After stop or cancel, do not invoke any tool"));
+        assert!(task.text.contains("through an equivalent spelling"));
+        assert!(task
+            .text
+            .contains("record a truthful coverage gap and finalize"));
         assert!(task
             .text
             .contains("command category/program name or a one-way hash"));

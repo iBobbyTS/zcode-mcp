@@ -178,7 +178,7 @@ impl Fixture {
         fs::create_dir_all(repository.join("src")).unwrap();
         fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
         fs::write(
-            repository.join("src/approval.rs"),
+            repository.join("src/review_target.rs"),
             "pub fn metadata_word_is_legal() {}\n",
         )
         .unwrap();
@@ -188,7 +188,7 @@ impl Fixture {
             &repository,
             &["config", "user.email", "s06@example.invalid"],
         );
-        git(&repository, &["add", "src/lib.rs", "src/approval.rs"]);
+        git(&repository, &["add", "src/lib.rs", "src/review_target.rs"]);
         git(&repository, &["commit", "-m", "fixture"]);
         fs::write(repository.join(".git/info/exclude"), ".agent-work/\n").unwrap();
         fs::create_dir_all(repository.join(".agent-work/context")).unwrap();
@@ -200,8 +200,8 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
-            repository.join(".agent-work/context/admission.json"),
-            "# Current bounded context\n",
+            repository.join(".agent-work/context/bounded-context.json"),
+            "{}\n",
         )
         .unwrap();
         let repository = fs::canonicalize(repository).unwrap();
@@ -223,7 +223,7 @@ impl Fixture {
                 ("CRASH", _) => "crash",
                 ("SEND-FAIL", _) => "review-flow-send-failure",
                 (_, key) if key.ends_with("nudge-send-failure") => "review-flow-nudge-send-failure",
-                (_, key) if key.ends_with("semantic-timeout") => "review-flow-no-progress",
+                (_, key) if key.ends_with("semantic-timeout") => "review-flow-semantic-idle",
                 (_, key) if key.ends_with("progress-only") => "review-flow-progress-only",
                 (_, key) if key.ends_with("ledger-without-progress") => {
                     "review-flow-ledger-without-progress"
@@ -272,6 +272,7 @@ impl Fixture {
                 stop_grace: Duration::from_millis(100),
                 bootstrap_timeout: Duration::from_secs(2),
                 control_timeout: Duration::from_secs(2),
+                ..SchedulerConfig::default()
             },
         )
         .unwrap();
@@ -322,8 +323,8 @@ impl Fixture {
             base_ref: self.head.clone(),
             head_ref: self.head.clone(),
             plan_path: ".agent-work/PLAN.md".into(),
-            context_paths: vec![".agent-work/context/admission.json".into()],
-            scope_paths: vec!["src/approval.rs".into()],
+            context_paths: vec![".agent-work/context/bounded-context.json".into()],
+            scope_paths: vec!["src/review_target.rs".into()],
             forbidden_input_globs: vec![".agent-work/reviews/*".into()],
             validation_commands: Default::default(),
             report_target: format!(".agent-work/reviews/feature/S06/{suffix}.md").into(),
@@ -434,7 +435,7 @@ impl Fixture {
             REVIEW_CHECKPOINT,
             serde_json::json!({
                 "checkpoint_id":"scope-1","stage":"inspection","summary":"bounded evidence observed",
-                "inspected":[{"path":"src/approval.rs","line_ranges":["1"]}],
+                "inspected":[{"path":"src/review_target.rs","line_ranges":["1"]}],
                 "commands":[],"open_questions":[],"remaining_scope":[]
             }),
         )
@@ -444,7 +445,7 @@ impl Fixture {
             REVIEW_FINDING_UPSERT,
             serde_json::json!({
                 "finding_id":"S06-F1","severity":"P2","confidence":"medium",
-                "title":"candidate","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
+                "title":"candidate","locations":[{"path":"src/review_target.rs","start_line":1,"end_line":1}],
                 "evidence":["observable fixture"],"impact":"bounded","suggested_remediation":"none",
                 "status":"open"
             }),
@@ -455,7 +456,7 @@ impl Fixture {
             REVIEW_FINDING_UPSERT,
             serde_json::json!({
                 "finding_id":"S06-F1","severity":"P2","confidence":"high",
-                "title":"candidate disproved","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
+                "title":"candidate disproved","locations":[{"path":"src/review_target.rs","start_line":1,"end_line":1}],
                 "evidence":["later observable fixture"],"impact":"none","suggested_remediation":"none",
                 "status":"withdrawn"
             }),
@@ -817,32 +818,23 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
     let identity = running.process_identity.clone().unwrap();
     let worktree = PathBuf::from(&running.workspace_path);
     let clock = fixture.monotonic_clock.as_ref().unwrap();
-    clock.advance(Duration::from_millis(31));
+    // The fake initial turn reaches a natural boundary without ledger progress.
+    // Advancing beyond hard in one step proves this is the post-boundary semantic clock,
+    // without starting a convergence turn first.
     wait_until(|| {
         fixture
             .store
-            .review_progress(&execution)
-            .unwrap()
-            .filter(|progress| progress.nudge_sent)
-    });
-    wait_until(|| {
-        let events = fixture
-            .store
             .task_events_after(&review.agent_id, 0, 100)
-            .unwrap();
-        (events
+            .unwrap()
             .iter()
-            .filter(|event| {
+            .any(|event| {
                 event.event_type == "driver.lifecycle"
-                    && event.payload_json.contains("turn.started")
+                    && event.payload_json.contains("turn.completed")
             })
-            .count()
-            >= 2)
             .then_some(())
     });
-    // A much larger than 900s logical duration is represented with the
-    // injected monotonic clock; no wall-clock sleep is involved.
-    clock.advance(Duration::from_secs(901));
+    thread::sleep(Duration::from_millis(60));
+    clock.advance(Duration::from_millis(101));
     let terminal = fixture.wait_terminal(&execution);
     assert_eq!(terminal.state, JobState::Failed);
     assert_eq!(
@@ -860,7 +852,7 @@ fn semantic_no_progress_timeout_terminalizes_and_reaps_fake_runtime() {
     assert!(result
         .result
         .residual_gaps
-        .contains(&"SEMANTIC_PROGRESS_TIMEOUT".into()));
+        .contains(&"SEMANTIC_NO_PROGRESS_TIMEOUT".into()));
     assert_eq!(fixture.scheduler.active_count(), 0);
     assert!(observe_process_group(identity.process_group_id)
         .unwrap()
@@ -2193,8 +2185,12 @@ fn full_internal_fake_review_composes_all_accepted_owners_and_two_fresh_sessions
     assert!(first_running
         .initial_prompt
         .contains("LEGAL_FINAL_SIGNALS:"));
-    assert!(first_running.initial_prompt.contains("src/approval.rs"));
-    assert!(first_running.initial_prompt.contains("admission.json"));
+    assert!(first_running
+        .initial_prompt
+        .contains("src/review_target.rs"));
+    assert!(first_running
+        .initial_prompt
+        .contains("bounded-context.json"));
     let first_worktree = PathBuf::from(first_running.workspace_path.clone());
     let identity = first_running.process_identity.clone().unwrap();
     assert!(fs::read_to_string(&first_report)

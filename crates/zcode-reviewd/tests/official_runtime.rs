@@ -201,6 +201,7 @@ fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
             stop_grace: Duration::from_secs(2),
             bootstrap_timeout: Duration::from_secs(90),
             control_timeout: Duration::from_secs(5),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap()

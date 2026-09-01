@@ -1592,6 +1592,7 @@ fn official_public_v2_configured_readiness_is_truthful_bounded_and_reaped() {
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(5),
             control_timeout: Duration::from_secs(5),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap();
@@ -1647,6 +1648,7 @@ fn official_public_v2_general_permission_completion_and_result_are_bounded() {
             stop_grace: Duration::from_secs(2),
             bootstrap_timeout: Duration::from_secs(30),
             control_timeout: Duration::from_secs(5),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap()
@@ -1950,6 +1952,7 @@ fn official_public_v2_structured_fresh_and_continuation_finalize_and_reap() {
             stop_grace: Duration::from_secs(2),
             bootstrap_timeout: Duration::from_secs(90),
             control_timeout: Duration::from_secs(5),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap()

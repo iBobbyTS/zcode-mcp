@@ -275,6 +275,7 @@ fn fixture_with_options(options: ServerOptions, control_timeout: Duration) -> Fi
             stop_grace: Duration::from_millis(100),
             bootstrap_timeout: Duration::from_secs(1),
             control_timeout,
+            ..SchedulerConfig::default()
         },
     )
     .unwrap();
@@ -1914,6 +1915,7 @@ fn s05_readiness_absolute_deadline_reaps_term_resistant_process_group() {
             stop_grace: Duration::from_millis(100),
             bootstrap_timeout: Duration::from_secs(1),
             control_timeout: Duration::from_secs(1),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap();
@@ -3065,6 +3067,7 @@ fn concurrent_transport_stop_close_reap_kills_driver_owned_group() {
             stop_grace: Duration::from_millis(100),
             bootstrap_timeout: Duration::from_secs(1),
             control_timeout: Duration::from_secs(1),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap();
@@ -3215,6 +3218,7 @@ fn real_fake_session_delivers_responses_fifo_interrupt_and_distinct_close() {
             stop_grace: Duration::from_millis(100),
             bootstrap_timeout: Duration::from_secs(2),
             control_timeout: Duration::from_secs(2),
+            ..SchedulerConfig::default()
         },
     )
     .unwrap();

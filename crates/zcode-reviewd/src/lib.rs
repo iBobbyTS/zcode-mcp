@@ -131,6 +131,13 @@ pub struct TurnSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeActivitySnapshot {
+    pub turn: TurnSnapshot,
+    pub model_request_elapsed: Option<Duration>,
+    pub transport_idle_elapsed: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionReady {
     pub session_id: String,
     pub initial_turn_id: Option<String>,
@@ -238,6 +245,8 @@ struct TurnTrackerState {
     generation: u64,
     active: bool,
     boundary: Option<TurnBoundary>,
+    model_request_started_at: Option<Instant>,
+    last_stream_activity_at: Option<Instant>,
 }
 
 struct TurnTracker {
@@ -252,32 +261,44 @@ impl TurnTracker {
                 generation: 0,
                 active: false,
                 boundary: None,
+                model_request_started_at: None,
+                last_stream_activity_at: None,
             }),
             changed: Condvar::new(),
         }
     }
 
     fn observe(&self, inbound: &Inbound) {
+        let mut state = self.state.lock().unwrap();
+        if state.active {
+            state.last_stream_activity_at = Some(Instant::now());
+        }
         let Inbound::Message(WireMessage::Event(event)) = inbound else {
             return;
         };
         let Some(kind) = event_type(event) else {
             return;
         };
-        let mut state = self.state.lock().unwrap();
         match kind {
             "turn.started" => {
+                let now = Instant::now();
                 state.generation = state.generation.saturating_add(1);
                 state.active = true;
                 state.boundary = None;
+                state.model_request_started_at = Some(now);
+                state.last_stream_activity_at = Some(now);
             }
             "turn.completed" if state.active => {
                 state.active = false;
                 state.boundary = Some(TurnBoundary::Completed);
+                state.model_request_started_at = None;
+                state.last_stream_activity_at = None;
             }
             "turn.failed" if state.active => {
                 state.active = false;
                 state.boundary = Some(TurnBoundary::Failed);
+                state.model_request_started_at = None;
+                state.last_stream_activity_at = None;
             }
             _ => return,
         }
@@ -290,6 +311,24 @@ impl TurnTracker {
             generation: state.generation,
             active: state.active,
             boundary: state.boundary,
+        }
+    }
+
+    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
+        let state = self.state.lock().unwrap();
+        let now = Instant::now();
+        RuntimeActivitySnapshot {
+            turn: TurnSnapshot {
+                generation: state.generation,
+                active: state.active,
+                boundary: state.boundary,
+            },
+            model_request_elapsed: state
+                .model_request_started_at
+                .and_then(|started| now.checked_duration_since(started)),
+            transport_idle_elapsed: state
+                .last_stream_activity_at
+                .and_then(|activity| now.checked_duration_since(activity)),
         }
     }
 
@@ -1203,6 +1242,14 @@ pub trait ManagedRuntime: Send + Sync + 'static {
             boundary: None,
         }
     }
+    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
+        let turn = self.turn_snapshot();
+        RuntimeActivitySnapshot {
+            model_request_elapsed: turn.active.then_some(Duration::ZERO),
+            transport_idle_elapsed: turn.active.then_some(Duration::ZERO),
+            turn,
+        }
+    }
     fn stop_boundary_count(&self) -> u64 {
         0
     }
@@ -1286,6 +1333,10 @@ impl ManagedRuntime for RuntimeOwner {
 
     fn turn_snapshot(&self) -> TurnSnapshot {
         self.turn_snapshot()
+    }
+
+    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
+        self.turn_tracker.activity_snapshot()
     }
 
     fn stop_boundary_count(&self) -> u64 {
@@ -1589,6 +1640,8 @@ pub struct SchedulerConfig {
     pub stop_grace: Duration,
     pub bootstrap_timeout: Duration,
     pub control_timeout: Duration,
+    pub transport_idle_timeout: Duration,
+    pub model_call_timeout: Duration,
 }
 
 pub trait MonotonicClock: Send + Sync + 'static {
@@ -1613,6 +1666,8 @@ impl Default for SchedulerConfig {
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(2),
             control_timeout: Duration::from_secs(2),
+            transport_idle_timeout: Duration::from_secs(90),
+            model_call_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -2922,6 +2977,8 @@ impl Scheduler {
             || config.per_workspace_max_agents == 0
             || config.bootstrap_timeout.is_zero()
             || config.control_timeout.is_zero()
+            || config.transport_idle_timeout.is_zero()
+            || config.model_call_timeout.is_zero()
         {
             return Err(SchedulerError::InvalidConfig(
                 "scheduler limits and deadlines must be positive".into(),
@@ -4372,6 +4429,72 @@ impl Scheduler {
         )
     }
 
+    fn queue_monitor_message(
+        &self,
+        agent_id: &str,
+        attempt_sequence: u64,
+        kind: &str,
+        content: &str,
+    ) -> Result<bool, SchedulerError> {
+        let message_id = format!("daemon-{kind}-{agent_id}-attempt-{attempt_sequence}");
+        Ok(self
+            .inner
+            .store
+            .insert_message(&message_id, agent_id, "queue", content)?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_monitor_timeout(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &Arc<StoreLifecycleSink>,
+        session_id: &str,
+        operation: &Arc<Mutex<()>>,
+        attempt: &Arc<AttemptRuntimeLifecycle>,
+        route: &TaskRoute,
+        task: Option<&TaskRecord>,
+        check: &Arc<ActiveCheck>,
+        reason_code: &str,
+    ) -> Result<(), SchedulerError> {
+        let stop = self.inner.store.request_runtime_stop(agent_id)?;
+        check.cancel();
+        attempt.request_stop(&runtime.turn_snapshot());
+        let _guard = operation.lock().unwrap();
+        if let Some(error) = Self::request_cooperative_stop(
+            runtime,
+            session_id,
+            attempt,
+            self.inner.config.stop_grace,
+        ) {
+            self.record_failure(agent_id, error);
+        }
+        let terminal = runtime.stop(self.inner.config.stop_grace);
+        let forced = if stop.prior_stop_or_close {
+            (CompletionOutcome::Cancelled, "CANCELLED".into())
+        } else {
+            (CompletionOutcome::TimedOut, reason_code.into())
+        };
+        self.finish_locked_monitor_terminal(
+            agent_id,
+            owner_epoch,
+            runtime,
+            sink,
+            route,
+            task,
+            terminal,
+            false,
+            None,
+            Some(forced),
+        )?;
+        self.release_active(agent_id, owner_epoch);
+        if let Err(error) = self.start_ready() {
+            self.record_failure(agent_id, error.to_string());
+        }
+        Ok(())
+    }
+
     fn spawn_monitor(&self, context: MonitorContext) {
         let MonitorContext {
             agent_id,
@@ -4392,9 +4515,32 @@ impl Scheduler {
         thread::spawn(move || {
             let mut handled_generation = 0;
             let mut finalization_reserve_sent = false;
+            let mut semantic_idle_since = None;
             loop {
                 if let Some(violation) = budget.as_ref().and_then(|budget| budget.violation()) {
+                    if violation == budget::BudgetViolation::WallTime {
+                        if let Err(error) = scheduler.finish_monitor_timeout(
+                            &agent_id,
+                            owner_epoch,
+                            &runtime,
+                            &sink,
+                            &session_id,
+                            &operation,
+                            &attempt,
+                            &route,
+                            task.as_ref(),
+                            &check,
+                            violation.reason_code(),
+                        ) {
+                            scheduler.record_failure(&agent_id, error.to_string());
+                        }
+                        return;
+                    }
+                    if let Err(error) = scheduler.inner.store.request_runtime_stop(&agent_id) {
+                        scheduler.record_failure(&agent_id, error.to_string());
+                    }
                     check.cancel();
+                    attempt.request_stop(&runtime.turn_snapshot());
                     let _guard = operation.lock().unwrap();
                     if budget.as_ref().and_then(|budget| budget.violation()) != Some(violation) {
                         continue;
@@ -4419,11 +4565,7 @@ impl Scheduler {
                         false,
                         None,
                         Some((
-                            if violation == budget::BudgetViolation::WallTime {
-                                CompletionOutcome::TimedOut
-                            } else {
-                                CompletionOutcome::BudgetExhausted
-                            },
+                            CompletionOutcome::BudgetExhausted,
                             violation.reason_code().into(),
                         )),
                     ) {
@@ -4435,24 +4577,67 @@ impl Scheduler {
                     }
                     return;
                 }
+                let activity = runtime.activity_snapshot();
+                if activity.turn.active {
+                    semantic_idle_since = None;
+                    let timeout_reason = if activity.transport_idle_elapsed.is_some_and(|elapsed| {
+                        elapsed >= scheduler.inner.config.transport_idle_timeout
+                    }) {
+                        Some("TRANSPORT_IDLE_TIMEOUT")
+                    } else if activity
+                        .model_request_elapsed
+                        .is_some_and(|elapsed| elapsed >= scheduler.inner.config.model_call_timeout)
+                    {
+                        Some("MODEL_CALL_TIMEOUT")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = timeout_reason {
+                        if let Err(error) = scheduler.finish_monitor_timeout(
+                            &agent_id,
+                            owner_epoch,
+                            &runtime,
+                            &sink,
+                            &session_id,
+                            &operation,
+                            &attempt,
+                            &route,
+                            task.as_ref(),
+                            &check,
+                            reason,
+                        ) {
+                            scheduler.record_failure(&agent_id, error.to_string());
+                        }
+                        return;
+                    }
+                } else if activity.turn.boundary.is_some() && semantic_idle_since.is_none() {
+                    semantic_idle_since = Some(scheduler.inner.monotonic_clock.now());
+                }
                 if let (Some(task), Some(semantic_progress)) =
                     (task.as_ref(), semantic_progress.as_ref())
                 {
                     let now = scheduler.inner.monotonic_clock.now();
-                    let elapsed =
-                        now.saturating_sub(semantic_progress.lock().unwrap().last_advanced);
+                    let last_advanced = semantic_progress.lock().unwrap().last_advanced;
+                    let semantic_start = semantic_idle_since
+                        .map(|idle| idle.max(last_advanced))
+                        .unwrap_or(now);
+                    let elapsed = now.saturating_sub(semantic_start);
                     let soft =
                         Duration::from_millis(task.effective_budget.semantic_soft_timeout_ms);
                     let hard =
                         Duration::from_millis(task.effective_budget.semantic_hard_timeout_ms);
-                    if elapsed >= soft {
-                        let _guard = operation.lock().unwrap();
+                    if !activity.turn.active && elapsed >= soft {
+                        let Ok(_guard) = operation.try_lock() else {
+                            continue;
+                        };
                         let current = scheduler.inner.store.get_job(&agent_id);
-                        let latest_elapsed = scheduler
-                            .inner
-                            .monotonic_clock
-                            .now()
-                            .saturating_sub(semantic_progress.lock().unwrap().last_advanced);
+                        let latest_now = scheduler.inner.monotonic_clock.now();
+                        let latest_progress = semantic_progress.lock().unwrap().last_advanced;
+                        let latest_elapsed = latest_now.saturating_sub(
+                            semantic_idle_since
+                                .map(|idle| idle.max(latest_progress))
+                                .unwrap_or(latest_now),
+                        );
                         let still_current = current
                             .as_ref()
                             .ok()
@@ -4467,35 +4652,20 @@ impl Scheduler {
                             continue;
                         }
                         if latest_elapsed >= hard {
-                            check.cancel();
-                            if let Some(error) = Self::request_cooperative_stop(
-                                &runtime,
-                                &session_id,
-                                &attempt,
-                                scheduler.inner.config.stop_grace,
-                            ) {
-                                scheduler.record_failure(&agent_id, error);
-                            }
-                            let terminal = runtime.stop(scheduler.inner.config.stop_grace);
-                            if let Err(error) = scheduler.finish_locked_monitor_terminal(
+                            drop(_guard);
+                            if let Err(error) = scheduler.finish_monitor_timeout(
                                 &agent_id,
                                 owner_epoch,
                                 &runtime,
                                 &sink,
+                                &session_id,
+                                &operation,
+                                &attempt,
                                 &route,
                                 Some(task),
-                                terminal,
-                                false,
-                                None,
-                                Some((
-                                    CompletionOutcome::TimedOut,
-                                    "SEMANTIC_PROGRESS_TIMEOUT".into(),
-                                )),
+                                &check,
+                                "SEMANTIC_NO_PROGRESS_TIMEOUT",
                             ) {
-                                scheduler.record_failure(&agent_id, error.to_string());
-                            }
-                            scheduler.release_active(&agent_id, owner_epoch);
-                            if let Err(error) = scheduler.start_ready() {
                                 scheduler.record_failure(&agent_id, error.to_string());
                             }
                             return;
@@ -4503,21 +4673,30 @@ impl Scheduler {
                         if !finalization_reserve_sent {
                             match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
                                 Ok(true) => {
-                                    let nudge_timeout = scheduler.inner.config.control_timeout / 2;
-                                    let stopped = if runtime.turn_snapshot().active {
-                                        runtime.stop_turn(&session_id, nudge_timeout)
-                                    } else {
-                                        Ok(runtime.turn_snapshot())
-                                    };
-                                    if let Err(error) = stopped.and_then(|_| runtime.send_turn(
-                                        &session_id,
+                                    if let Err(error) = scheduler.queue_monitor_message(
+                                        &agent_id,
+                                        attempt.attempt_sequence(),
+                                        "convergence-nudge",
                                         "CONVERGENCE_NUDGE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write findings and validation, and reserve time for one truthful review_finalize. If evidence remains unavailable, record a coverage gap and finalize rather than fabricating it.",
-                                        nudge_timeout,
-                                    )) {
+                                    ) {
                                         scheduler.record_failure(
                                             &agent_id,
                                             format!("semantic progress nudge failed: {error}"),
                                         );
+                                    } else if !runtime.turn_snapshot().active {
+                                        let deadline = scheduler.control_deadline();
+                                        if let Err(error) = scheduler.deliver_next_message(
+                                            &agent_id,
+                                            &session_id,
+                                            &runtime,
+                                            &attempt,
+                                            deadline,
+                                        ) {
+                                            scheduler.record_failure(
+                                                &agent_id,
+                                                format!("semantic progress nudge failed: {error}"),
+                                            );
+                                        }
                                     }
                                 }
                                 Ok(false) => {}
@@ -4566,21 +4745,30 @@ impl Scheduler {
                         });
                     if still_current && !finalized {
                         finalization_reserve_sent = true;
-                        let timeout = scheduler.inner.config.control_timeout / 2;
-                        let stopped = if runtime.turn_snapshot().active {
-                            runtime.stop_turn(&session_id, timeout)
-                        } else {
-                            Ok(runtime.turn_snapshot())
-                        };
-                        if let Err(error) = stopped.and_then(|_| runtime.send_turn(
-                            &session_id,
+                        if let Err(error) = scheduler.queue_monitor_message(
+                            &agent_id,
+                            attempt.attempt_sequence(),
+                            "finalization-reserve",
                             "FINALIZATION_RESERVE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write truthful findings and validation, and call review_finalize with any unavailable evidence recorded as a coverage gap. You may finish one already-defined narrow check; do not begin broad exploration. This reminder does not prohibit unrelated legal Bash.",
-                            timeout,
-                        )) {
+                        ) {
                             scheduler.record_failure(
                                 &agent_id,
                                 format!("finalization reserve reminder failed: {error}"),
                             );
+                        } else if !runtime.turn_snapshot().active {
+                            let deadline = scheduler.control_deadline();
+                            if let Err(error) = scheduler.deliver_next_message(
+                                &agent_id,
+                                &session_id,
+                                &runtime,
+                                &attempt,
+                                deadline,
+                            ) {
+                                scheduler.record_failure(
+                                    &agent_id,
+                                    format!("finalization reserve reminder failed: {error}"),
+                                );
+                            }
                         }
                     }
                 }
@@ -4669,6 +4857,31 @@ impl Scheduler {
                     ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
+                            let review_waits_for_convergence = boundary == TurnBoundary::Completed
+                                && semantic_progress.is_some()
+                                && scheduler
+                                    .inner
+                                    .store
+                                    .get_job(&agent_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|job| {
+                                        scheduler
+                                            .inner
+                                            .review_completion
+                                            .as_ref()
+                                            .map(|gate| (gate, job))
+                                    })
+                                    .is_some_and(|(gate, job)| {
+                                        !gate.has_durable_finalization(&job).unwrap_or(false)
+                                    });
+                            if review_waits_for_convergence {
+                                // Ledger finalization may arrive just after the natural
+                                // boundary; revisit this boundary instead of terminalizing
+                                // or permanently suppressing the completion check.
+                                handled_generation = handled_generation.saturating_sub(1);
+                                continue;
+                            }
                             check.cancel();
                             let terminal = runtime.finish_turn(
                                 boundary,
@@ -7123,6 +7336,8 @@ exec tail -f /dev/null
         response_write_deadlines: Mutex<Vec<(Instant, Instant)>>,
         responses: Mutex<Vec<(String, String, Option<String>, Option<(String, String)>)>>,
         wait_terminal_calls: std::sync::atomic::AtomicUsize,
+        model_request_elapsed_ms: AtomicU64,
+        transport_idle_elapsed_ms: AtomicU64,
     }
 
     impl FakeRuntime {
@@ -7148,6 +7363,8 @@ exec tail -f /dev/null
                 response_write_deadlines: Mutex::new(Vec::new()),
                 responses: Mutex::new(Vec::new()),
                 wait_terminal_calls: std::sync::atomic::AtomicUsize::new(0),
+                model_request_elapsed_ms: AtomicU64::new(0),
+                transport_idle_elapsed_ms: AtomicU64::new(0),
             }
         }
 
@@ -7197,6 +7414,23 @@ exec tail -f /dev/null
 
         fn timeout_response_write(&self) {
             self.timeout_response_write.store(true, Ordering::Release);
+        }
+
+        fn set_runtime_activity(&self, model_elapsed: Duration, transport_idle: Duration) {
+            self.model_request_elapsed_ms.store(
+                u64::try_from(model_elapsed.as_millis()).unwrap(),
+                Ordering::Release,
+            );
+            self.transport_idle_elapsed_ms.store(
+                u64::try_from(transport_idle.as_millis()).unwrap(),
+                Ordering::Release,
+            );
+        }
+
+        fn complete_turn(&self, boundary: TurnBoundary) {
+            let mut turn = self.turn.lock().unwrap();
+            turn.active = false;
+            turn.boundary = Some(boundary);
         }
     }
 
@@ -7319,6 +7553,19 @@ exec tail -f /dev/null
         fn turn_snapshot(&self) -> TurnSnapshot {
             self.turn.lock().unwrap().clone()
         }
+
+        fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
+            let turn = self.turn_snapshot();
+            RuntimeActivitySnapshot {
+                model_request_elapsed: turn.active.then(|| {
+                    Duration::from_millis(self.model_request_elapsed_ms.load(Ordering::Acquire))
+                }),
+                transport_idle_elapsed: turn.active.then(|| {
+                    Duration::from_millis(self.transport_idle_elapsed_ms.load(Ordering::Acquire))
+                }),
+                turn,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -7433,6 +7680,7 @@ exec tail -f /dev/null
                 stop_grace,
                 bootstrap_timeout: Duration::from_secs(1),
                 control_timeout,
+                ..SchedulerConfig::default()
             },
         )
         .unwrap();
@@ -7756,6 +8004,8 @@ exec tail -f /dev/null
         let runtime = fixture.factory.runtime(&fixture.execution_id);
         fixture.progress("initial bounded inspection");
 
+        runtime.complete_turn(TurnBoundary::Completed);
+        wait_for_monitor_iterations(&runtime, 2);
         clock.advance(Duration::from_millis(101));
         wait_until_review_exit(|| {
             (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
@@ -7771,6 +8021,7 @@ exec tail -f /dev/null
         ] {
             emit_budget_turn(&runtime, turn_id);
         }
+        runtime.complete_turn(TurnBoundary::Completed);
         wait_until_review_exit(|| {
             (runtime.sent_turn_contents.lock().unwrap().len() == 2).then_some(())
         });
@@ -7795,6 +8046,7 @@ exec tail -f /dev/null
                 Some(clock.clone()),
             );
             let runtime = fixture.factory.runtime(&fixture.execution_id);
+            runtime.complete_turn(TurnBoundary::Completed);
             wait_until_review_exit(|| {
                 (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
             });
@@ -7826,18 +8078,21 @@ exec tail -f /dev/null
             Some(clock.clone()),
         );
         let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.complete_turn(TurnBoundary::Completed);
         wait_until_review_exit(|| {
             (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
         });
         assert!(runtime.sent_turn_contents.lock().unwrap()[0].starts_with("FINALIZATION_RESERVE:"));
 
+        runtime.complete_turn(TurnBoundary::Completed);
+        wait_for_monitor_iterations(&runtime, 2);
         clock.advance(Duration::from_millis(501));
         let result = wait_for_task_result(&fixture.store, &fixture.execution_id);
         assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
         assert!(result
             .result
             .residual_gaps
-            .contains(&"SEMANTIC_PROGRESS_TIMEOUT".into()));
+            .contains(&"SEMANTIC_NO_PROGRESS_TIMEOUT".into()));
         let sent = runtime.sent_turn_contents.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].starts_with("FINALIZATION_RESERVE:"));
@@ -7854,6 +8109,7 @@ exec tail -f /dev/null
             convergence_budget(1_500, 10_000, 20_000, 20),
         );
         let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.complete_turn(TurnBoundary::Completed);
         wait_until_review_exit(|| {
             runtime
                 .sent_turn_contents
@@ -7871,6 +8127,83 @@ exec tail -f /dev/null
         let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));
+    }
+
+    #[test]
+    fn active_stream_outlives_semantic_threshold_without_nudge_or_timeout() {
+        let clock = Arc::new(ManualMonotonicClock::default());
+        let fixture = ReviewExitFixture::new_with_budget_and_clock(
+            "active-stream-pauses-semantic-clock",
+            convergence_budget(10_000, 100, 500, 8),
+            Some(clock.clone()),
+        );
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.set_runtime_activity(Duration::from_secs(120), Duration::from_millis(1));
+        clock.advance(Duration::from_secs(901));
+        wait_for_monitor_iterations(&runtime, 3);
+
+        assert_eq!(runtime.stop_calls(), 0);
+        assert!(runtime.stop_turn_timeouts.lock().unwrap().is_empty());
+        assert!(runtime.sent_turn_contents.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .get_job(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+
+        let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+    }
+
+    #[test]
+    fn model_call_timeout_uses_authoritative_stop_and_stable_reason() {
+        let fixture = ReviewExitFixture::new("model-call-timeout");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        runtime.set_runtime_activity(Duration::from_secs(301), Duration::from_millis(1));
+
+        let result = wait_for_task_result(&fixture.store, &fixture.execution_id);
+        assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"MODEL_CALL_TIMEOUT".into()));
+        assert_eq!(runtime.stop_calls(), 1);
+        assert_eq!(runtime.stop_turn_timeouts.lock().unwrap().len(), 1);
+        assert_eq!(fixture.scheduler.active_count(), 0);
+    }
+
+    #[test]
+    fn transport_stall_and_semantic_stall_have_distinct_reasons() {
+        let transport = ReviewExitFixture::new("transport-idle-timeout");
+        let transport_runtime = transport.factory.runtime(&transport.execution_id);
+        transport_runtime.set_runtime_activity(Duration::from_secs(10), Duration::from_secs(91));
+        let transport_result = wait_for_task_result(&transport.store, &transport.execution_id);
+        assert!(transport_result
+            .result
+            .residual_gaps
+            .contains(&"TRANSPORT_IDLE_TIMEOUT".into()));
+
+        let clock = Arc::new(ManualMonotonicClock::default());
+        let semantic = ReviewExitFixture::new_with_budget_and_clock(
+            "semantic-idle-timeout",
+            convergence_budget(10_000, 100, 101, 8),
+            Some(clock.clone()),
+        );
+        let semantic_runtime = semantic.factory.runtime(&semantic.execution_id);
+        semantic_runtime.complete_turn(TurnBoundary::Completed);
+        wait_for_monitor_iterations(&semantic_runtime, 2);
+        clock.advance(Duration::from_millis(102));
+        let semantic_result = wait_for_task_result(&semantic.store, &semantic.execution_id);
+        assert!(semantic_result
+            .result
+            .residual_gaps
+            .contains(&"SEMANTIC_NO_PROGRESS_TIMEOUT".into()));
     }
 
     #[test]

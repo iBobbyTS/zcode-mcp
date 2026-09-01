@@ -608,7 +608,7 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if mode == "review-flow-nudge-send-failure"
-                    && content.contains("Provide one bounded semantic progress update")
+                    && content.starts_with("CONVERGENCE_NUDGE:")
                 {
                     let _ = write_value(&mut out, error(id, -32012, "SCRIPTED_NUDGE_FAILURE"));
                     continue;
@@ -638,7 +638,12 @@ fn main() {
                     ),
                 );
                 let review_flow_initial = is_review_flow(&mode) && next_turn == 2;
-                if content.contains("permission") || review_flow_initial {
+                let semantic_idle_fixture = matches!(
+                    mode.as_str(),
+                    "review-flow-semantic-idle" | "review-flow-nudge-send-failure"
+                );
+                if (content.contains("permission") || review_flow_initial) && !semantic_idle_fixture
+                {
                     let request_id = Value::String("server-1".into());
                     pending_permission = Some(request_id.clone());
                     let hard_deny = review_flow_initial;
@@ -706,6 +711,18 @@ fn main() {
                             &session_id,
                             "turn.completed",
                             json!({"response": "fixture complete"}),
+                        ),
+                    );
+                    active_turn = false;
+                }
+                if semantic_idle_fixture {
+                    let _ = write_value(
+                        &mut out,
+                        event(
+                            &mut sequence,
+                            &session_id,
+                            "turn.completed",
+                            json!({"response": "semantic idle fixture"}),
                         ),
                     );
                     active_turn = false;
