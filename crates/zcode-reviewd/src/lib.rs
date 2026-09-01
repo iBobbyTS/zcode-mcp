@@ -1730,12 +1730,128 @@ struct SchedulerState {
     failures: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptRuntimePhase {
+    Running,
+    StopRequested,
+    StopAcknowledged,
+    ForceTerminating,
+    Terminal,
+}
+
+#[derive(Debug, Clone)]
+struct AttemptRuntimeSnapshot {
+    phase: AttemptRuntimePhase,
+    attempt_sequence: u64,
+    runtime_generation: u64,
+    turn_generation: u64,
+    stop_requested_at: Option<Instant>,
+    observed_boundary: Option<TurnBoundary>,
+    force_termination_count: u64,
+    late_event_count: u64,
+}
+
+struct AttemptRuntimeLifecycle {
+    state: Mutex<AttemptRuntimeSnapshot>,
+}
+
+const MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS: u64 = 64;
+
+impl AttemptRuntimeLifecycle {
+    fn new(attempt_sequence: u64, runtime_generation: u64) -> Self {
+        Self {
+            state: Mutex::new(AttemptRuntimeSnapshot {
+                phase: AttemptRuntimePhase::Running,
+                attempt_sequence,
+                runtime_generation,
+                turn_generation: 0,
+                stop_requested_at: None,
+                observed_boundary: None,
+                force_termination_count: 0,
+                late_event_count: 0,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> AttemptRuntimeSnapshot {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn request_stop(&self, turn: &TurnSnapshot) {
+        let mut state = self.state.lock().unwrap();
+        if state.phase == AttemptRuntimePhase::Running {
+            state.phase = AttemptRuntimePhase::StopRequested;
+            state.turn_generation = turn.generation;
+            state.stop_requested_at = Some(Instant::now());
+        }
+    }
+
+    fn acknowledge_boundary(&self, turn: &TurnSnapshot) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(
+            state.phase,
+            AttemptRuntimePhase::StopRequested | AttemptRuntimePhase::StopAcknowledged
+        ) && turn.generation == state.turn_generation
+            && !turn.active
+            && turn.boundary.is_some()
+        {
+            state.phase = AttemptRuntimePhase::StopAcknowledged;
+            state.observed_boundary = turn.boundary;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn force_terminating(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(
+            state.phase,
+            AttemptRuntimePhase::ForceTerminating | AttemptRuntimePhase::Terminal
+        ) {
+            state.phase = AttemptRuntimePhase::ForceTerminating;
+            state.force_termination_count = state.force_termination_count.saturating_add(1);
+        }
+    }
+
+    fn terminalize(&self) {
+        self.state.lock().unwrap().phase = AttemptRuntimePhase::Terminal;
+    }
+
+    fn ingress_reason(&self) -> Option<&'static str> {
+        let state = self.state.lock().unwrap();
+        debug_assert!(state.attempt_sequence > 0);
+        debug_assert!(state.runtime_generation > 0);
+        match state.phase {
+            AttemptRuntimePhase::Running => None,
+            AttemptRuntimePhase::StopRequested
+            | AttemptRuntimePhase::StopAcknowledged
+            | AttemptRuntimePhase::ForceTerminating => Some("ATTEMPT_STOPPING"),
+            AttemptRuntimePhase::Terminal => Some("LATE_AFTER_STOP"),
+        }
+    }
+
+    fn fence_late_event(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.phase == AttemptRuntimePhase::Running {
+            return false;
+        }
+        state.late_event_count = state
+            .late_event_count
+            .saturating_add(1)
+            .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
+        true
+    }
+}
+
 struct ActiveRuntime {
     owner_epoch: u64,
     runtime: Arc<dyn ManagedRuntime>,
     sink: Arc<StoreLifecycleSink>,
     session_id: String,
     operation: Arc<Mutex<()>>,
+    attempt: Arc<AttemptRuntimeLifecycle>,
     route: TaskRoute,
     task: Option<TaskRecord>,
     policy: Option<Arc<PolicyLauncher>>,
@@ -1814,6 +1930,7 @@ struct MonitorContext {
     sink: Arc<StoreLifecycleSink>,
     session_id: String,
     operation: Arc<Mutex<()>>,
+    attempt: Arc<AttemptRuntimeLifecycle>,
     route: TaskRoute,
     task: Option<TaskRecord>,
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
@@ -1822,7 +1939,13 @@ struct MonitorContext {
     semantic_progress: Option<Arc<Mutex<SemanticProgressClock>>>,
 }
 
-type ActiveSession = (u64, Arc<dyn ManagedRuntime>, String, Arc<Mutex<()>>);
+type ActiveSession = (
+    u64,
+    Arc<dyn ManagedRuntime>,
+    String,
+    Arc<Mutex<()>>,
+    Arc<AttemptRuntimeLifecycle>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDisposition {
@@ -1988,6 +2111,7 @@ struct StoreLifecycleSink {
     runtime_agent_id: String,
     owner_epoch: u64,
     budget: Option<Arc<AttemptBudget>>,
+    attempt: Arc<AttemptRuntimeLifecycle>,
     write_state: Mutex<SinkWriteState>,
 }
 
@@ -2013,6 +2137,7 @@ impl StoreLifecycleSink {
         runtime_agent_id: String,
         owner_epoch: u64,
         budget: Option<Arc<AttemptBudget>>,
+        attempt: Arc<AttemptRuntimeLifecycle>,
     ) -> Self {
         Self {
             store,
@@ -2020,6 +2145,7 @@ impl StoreLifecycleSink {
             runtime_agent_id,
             owner_epoch,
             budget,
+            attempt,
             write_state: Mutex::new(SinkWriteState::default()),
         }
     }
@@ -2332,6 +2458,9 @@ fn finalized_general(
 
 impl LifecycleSink for StoreLifecycleSink {
     fn emit(&self, record: LifecycleRecord) {
+        if self.attempt.fence_late_event() {
+            return;
+        }
         if let RuntimeEvent::Driver(inbound) = &record.event {
             if let Some(budget) = &self.budget {
                 budget.observe(inbound);
@@ -2607,6 +2736,51 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
 }
 
 impl Scheduler {
+    fn late_ingress_error(agent_id: &str, reason: &'static str) -> SchedulerError {
+        SchedulerError::RuntimeCommand {
+            agent_id: agent_id.into(),
+            message: reason.into(),
+        }
+    }
+
+    fn require_attempt_ingress(
+        agent_id: &str,
+        attempt: &AttemptRuntimeLifecycle,
+    ) -> Result<(), SchedulerError> {
+        match attempt.ingress_reason() {
+            Some(reason) => Err(Self::late_ingress_error(agent_id, reason)),
+            None => Ok(()),
+        }
+    }
+
+    fn request_cooperative_stop(
+        runtime: &Arc<dyn ManagedRuntime>,
+        session_id: &str,
+        attempt: &AttemptRuntimeLifecycle,
+        timeout: Duration,
+    ) -> Option<String> {
+        let current = runtime.turn_snapshot();
+        attempt.request_stop(&current);
+        if attempt.acknowledge_boundary(&current) {
+            return None;
+        }
+        if current.active {
+            match runtime.stop_turn(session_id, timeout) {
+                Ok(boundary) if attempt.acknowledge_boundary(&boundary) => return None,
+                Ok(_) => {
+                    attempt.force_terminating();
+                    return Some("session/stop returned without a matching turn boundary".into());
+                }
+                Err(error) => {
+                    attempt.force_terminating();
+                    return Some(error.to_string());
+                }
+            }
+        }
+        attempt.force_terminating();
+        Some("active turn had no matching stop boundary".into())
+    }
+
     fn control_deadline(&self) -> ControlDeadline {
         ControlDeadline::new(self.inner.config.control_timeout)
     }
@@ -3156,12 +3330,17 @@ impl Scheduler {
             }
         };
         let runtime_agent_id = format!("{}:{}", claim.job.agent_id, claim.owner_epoch);
+        let attempt = Arc::new(AttemptRuntimeLifecycle::new(
+            task.as_ref().map(|task| task.attempt_sequence).unwrap_or(1),
+            claim.owner_epoch,
+        ));
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
             claim.job.agent_id.clone(),
             runtime_agent_id.clone(),
             claim.owner_epoch,
             budget.as_ref().map(Arc::clone),
+            Arc::clone(&attempt),
         ));
         let lifecycle_sink: Arc<dyn LifecycleSink> = sink.clone();
         if budget
@@ -3348,6 +3527,7 @@ impl Scheduler {
                     sink: Arc::clone(&sink),
                     session_id: session.session_id.clone(),
                     operation: Arc::clone(&operation),
+                    attempt: Arc::clone(&attempt),
                     route: route.clone(),
                     task: task.clone(),
                     policy: policy.clone(),
@@ -3491,6 +3671,7 @@ impl Scheduler {
             sink,
             session_id: session.session_id,
             operation,
+            attempt,
             route,
             task,
             general_submission,
@@ -3647,6 +3828,8 @@ impl Scheduler {
         };
         if let Some((TaskRoute::General(prepared), task, submission)) = route_and_submission.clone()
         {
+            sink.attempt.request_stop(&runtime.turn_snapshot());
+            sink.attempt.force_terminating();
             let terminal = runtime.stop(stop_grace);
             let current = self.inner.store.get_job(agent_id)?;
             let result = if current.as_ref().is_some_and(|job| {
@@ -3714,6 +3897,8 @@ impl Scheduler {
             return result;
         }
         if let Some((TaskRoute::Review(prepared), Some(task), _)) = route_and_submission {
+            sink.attempt.request_stop(&runtime.turn_snapshot());
+            sink.attempt.force_terminating();
             let terminal = runtime.stop(stop_grace);
             let current = self.inner.store.get_job(agent_id)?;
             let cancellation_wins = current
@@ -3752,6 +3937,8 @@ impl Scheduler {
                 .store
                 .fail_claim(agent_id, owner_epoch, code, &message)
         });
+        sink.attempt.request_stop(&runtime.turn_snapshot());
+        sink.attempt.force_terminating();
         let terminal = runtime.stop(stop_grace);
         let terminal = self.review_terminal(agent_id, terminal, false, false);
         let finished = sink.finish(&terminal.terminal);
@@ -3813,6 +4000,9 @@ impl Scheduler {
             Some((failure_code, message)),
             deadline.cleanup_grace(self.inner.config.stop_grace),
         )?;
+        if let Err(error) = self.start_ready() {
+            self.record_failure(agent_id, error.to_string());
+        }
         Ok(())
     }
 
@@ -3901,6 +4091,7 @@ impl Scheduler {
             general_submission,
             forced_outcome,
         } = decision;
+        sink.attempt.terminalize();
         match route {
             TaskRoute::General(prepared) => {
                 let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
@@ -4086,6 +4277,8 @@ impl Scheduler {
             || current.close_requested
             || current.state == JobState::Stopping;
         let (terminal, natural_completion, forced_outcome) = if cancellation_wins {
+            sink.attempt.request_stop(&runtime.turn_snapshot());
+            sink.attempt.force_terminating();
             (
                 runtime.stop(self.inner.config.stop_grace),
                 false,
@@ -4128,6 +4321,7 @@ impl Scheduler {
             sink,
             session_id,
             operation,
+            attempt,
             route,
             task,
             general_submission,
@@ -4145,6 +4339,14 @@ impl Scheduler {
                     let _guard = operation.lock().unwrap();
                     if budget.as_ref().and_then(|budget| budget.violation()) != Some(violation) {
                         continue;
+                    }
+                    if let Some(error) = Self::request_cooperative_stop(
+                        &runtime,
+                        &session_id,
+                        &attempt,
+                        scheduler.inner.config.stop_grace,
+                    ) {
+                        scheduler.record_failure(&agent_id, error);
                     }
                     let terminal = runtime.stop(scheduler.inner.config.stop_grace);
                     if let Err(error) = scheduler.finish_locked_monitor_terminal(
@@ -4207,6 +4409,14 @@ impl Scheduler {
                         }
                         if latest_elapsed >= hard {
                             check.cancel();
+                            if let Some(error) = Self::request_cooperative_stop(
+                                &runtime,
+                                &session_id,
+                                &attempt,
+                                scheduler.inner.config.stop_grace,
+                            ) {
+                                scheduler.record_failure(&agent_id, error);
+                            }
                             let terminal = runtime.stop(scheduler.inner.config.stop_grace);
                             if let Err(error) = scheduler.finish_locked_monitor_terminal(
                                 &agent_id,
@@ -4318,6 +4528,9 @@ impl Scheduler {
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
                     check.cancel();
                     let _guard = operation.lock().unwrap();
+                    if attempt.ingress_reason() == Some("LATE_AFTER_STOP") {
+                        return;
+                    }
                     let natural = matches!(terminal, RuntimeTerminal::Completed(_));
                     let submission = general_submission.lock().unwrap().take();
                     if let Err(error) = scheduler.finish_locked_monitor_terminal(
@@ -4346,6 +4559,8 @@ impl Scheduler {
                     let Some(error) = sink.error() else {
                         continue;
                     };
+                    attempt.request_stop(&runtime.turn_snapshot());
+                    attempt.force_terminating();
                     let terminal = runtime.stop(scheduler.inner.config.stop_grace);
                     if let Err(store_error) = scheduler.finish_locked_monitor_terminal(
                         &agent_id,
@@ -4374,6 +4589,9 @@ impl Scheduler {
                         continue;
                     };
                     let _guard = operation.lock().unwrap();
+                    if attempt.ingress_reason().is_some() {
+                        return;
+                    }
                     let current = runtime.turn_snapshot();
                     if current.active
                         || current.generation != turn.generation
@@ -4383,8 +4601,13 @@ impl Scheduler {
                     }
                     handled_generation = turn.generation;
                     let deadline = scheduler.control_deadline();
-                    match scheduler.deliver_next_message(&agent_id, &session_id, &runtime, deadline)
-                    {
+                    match scheduler.deliver_next_message(
+                        &agent_id,
+                        &session_id,
+                        &runtime,
+                        &attempt,
+                        deadline,
+                    ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
                             check.cancel();
@@ -4451,11 +4674,21 @@ impl Scheduler {
         agent_id: &str,
         session_id: &str,
         runtime: &Arc<dyn ManagedRuntime>,
+        attempt: &AttemptRuntimeLifecycle,
         deadline: ControlDeadline,
     ) -> Result<Option<StoredMessage>, SchedulerError> {
+        Self::require_attempt_ingress(agent_id, attempt)?;
         let Some(message) = self.inner.store.claim_next_message(agent_id)? else {
             return Ok(None);
         };
+        if let Err(error) = Self::require_attempt_ingress(agent_id, attempt) {
+            self.inner.store.fail_message(
+                &message.message_id,
+                "LATE_AFTER_STOP",
+                "attempt stopped before message delivery",
+            )?;
+            return Err(error);
+        }
         match runtime.send_turn(
             session_id,
             &message.content,
@@ -4538,17 +4771,27 @@ impl Scheduler {
                 "internal review ledger is unavailable for this task kind".into(),
             ));
         }
+        let durable_job = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!(
+                "unknown review task {agent_id}"
+            )))
+        })?;
         let deadline = self.control_deadline();
-        let (owner_epoch, runtime, sink, operation, route, task, semantic_clock) = {
+        let (owner_epoch, runtime, sink, operation, attempt, route, task, semantic_clock) = {
             let state = self.inner.state.lock().unwrap();
-            let active =
-                state
-                    .active
-                    .get(agent_id)
-                    .ok_or_else(|| SchedulerError::RuntimeCommand {
+            let active = state.active.get(agent_id).ok_or_else(|| {
+                if durable_job.state != JobState::Running
+                    || durable_job.stop_requested
+                    || durable_job.close_requested
+                {
+                    Self::late_ingress_error(agent_id, "LATE_AFTER_STOP")
+                } else {
+                    SchedulerError::RuntimeCommand {
                         agent_id: agent_id.into(),
                         message: "review runtime is not active".into(),
-                    })?;
+                    }
+                }
+            })?;
             if !matches!(active.route, TaskRoute::Review(_))
                 || active.task.as_ref().is_none_or(|task| {
                     !matches!(
@@ -4566,12 +4809,14 @@ impl Scheduler {
                 Arc::clone(&active.runtime),
                 Arc::clone(&active.sink),
                 Arc::clone(&active.operation),
+                Arc::clone(&active.attempt),
                 active.route.clone(),
                 active.task.clone(),
                 active.semantic_progress.as_ref().map(Arc::clone),
             )
         };
         let _guard = self.lock_operation(agent_id, &operation, deadline)?;
+        Self::require_attempt_ingress(agent_id, &attempt)?;
         let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
             SchedulerError::Store(StoreError::InvalidState(format!(
                 "unknown review task {agent_id}"
@@ -4700,7 +4945,8 @@ impl Scheduler {
     }
 
     fn fail_active_review(&self, agent_id: &str, failure: ReviewFailure) {
-        let Some((owner_epoch, runtime, _session_id, operation)) = self.active_session(agent_id)
+        let Some((owner_epoch, runtime, _session_id, operation, _attempt)) =
+            self.active_session(agent_id)
         else {
             return;
         };
@@ -4887,20 +5133,29 @@ impl Scheduler {
         agent_id: &str,
         submission: GeneralCompletionSubmission,
     ) -> Result<bool, SchedulerError> {
-        let (route, slot, operation, check) = {
+        let durable_job = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+        })?;
+        let (route, slot, operation, attempt, check) = {
             let state = self.inner.state.lock().unwrap();
-            let active =
-                state
-                    .active
-                    .get(agent_id)
-                    .ok_or_else(|| SchedulerError::RuntimeCommand {
+            let active = state.active.get(agent_id).ok_or_else(|| {
+                if durable_job.state != JobState::Running
+                    || durable_job.stop_requested
+                    || durable_job.close_requested
+                {
+                    Self::late_ingress_error(agent_id, "LATE_AFTER_STOP")
+                } else {
+                    SchedulerError::RuntimeCommand {
                         agent_id: agent_id.into(),
                         message: "runtime is not active".into(),
-                    })?;
+                    }
+                }
+            })?;
             (
                 active.route.clone(),
                 Arc::clone(&active.general_submission),
                 Arc::clone(&active.operation),
+                Arc::clone(&active.attempt),
                 Arc::clone(&active.check),
             )
         };
@@ -4918,6 +5173,7 @@ impl Scheduler {
         }
         let deadline = self.control_deadline();
         let _guard = self.lock_operation(agent_id, &operation, deadline)?;
+        Self::require_attempt_ingress(agent_id, &attempt)?;
         if check.in_flight.load(Ordering::Acquire) {
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: agent_id.into(),
@@ -4974,14 +5230,31 @@ impl Scheduler {
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
         let deadline = self.control_deadline();
+        if let Some(existing) = self.inner.store.message(message_id)? {
+            if existing.agent_id == agent_id && existing.mode == mode && existing.content == content
+            {
+                return Ok(match existing.state {
+                    MessageState::Delivered => MessageDisposition::AlreadyDelivered,
+                    MessageState::Failed => MessageDisposition::Failed,
+                    MessageState::Queued | MessageState::Sending => MessageDisposition::Queued,
+                });
+            }
+        }
         let active = self.active_session(agent_id);
         let operation = active
             .as_ref()
-            .map(|(_, _, _, operation)| Arc::clone(operation));
+            .map(|(_, _, _, operation, _)| Arc::clone(operation));
         let _operation = operation
             .as_ref()
             .map(|operation| self.lock_operation(agent_id, operation, deadline))
             .transpose()?;
+        if let Some((_, _, _, _, attempt)) = active.as_ref() {
+            Self::require_attempt_ingress(agent_id, attempt)?;
+        } else if self.inner.store.get_job(agent_id)?.is_some_and(|job| {
+            job.state != JobState::Running || job.stop_requested || job.close_requested
+        }) {
+            return Err(Self::late_ingress_error(agent_id, "LATE_AFTER_STOP"));
+        }
         deadline
             .remaining()
             .ok_or_else(|| Self::control_timeout_error(agent_id))?;
@@ -5006,7 +5279,7 @@ impl Scheduler {
         if mode != "interrupt_and_continue" {
             return Ok(MessageDisposition::Queued);
         }
-        let Some((owner_epoch, runtime, session_id, _)) = active else {
+        let Some((owner_epoch, runtime, session_id, _, attempt)) = active else {
             return Ok(MessageDisposition::Queued);
         };
         let turn = runtime.turn_snapshot();
@@ -5041,20 +5314,21 @@ impl Scheduler {
                 return Err(scheduler_error);
             }
         }
-        let delivered = match self.deliver_next_message(agent_id, &session_id, &runtime, deadline) {
-            Ok(delivered) => delivered,
-            Err(error) => {
-                self.fail_closed_control(
-                    agent_id,
-                    owner_epoch,
-                    &runtime,
-                    deadline,
-                    "CONTROL_DELIVERY_FAILED",
-                    error.to_string(),
-                )?;
-                return Err(error);
-            }
-        };
+        let delivered =
+            match self.deliver_next_message(agent_id, &session_id, &runtime, &attempt, deadline) {
+                Ok(delivered) => delivered,
+                Err(error) => {
+                    self.fail_closed_control(
+                        agent_id,
+                        owner_epoch,
+                        &runtime,
+                        deadline,
+                        "CONTROL_DELIVERY_FAILED",
+                        error.to_string(),
+                    )?;
+                    return Err(error);
+                }
+            };
         Ok(match delivered {
             Some(message) if message.message_id == message_id => {
                 MessageDisposition::InterruptedThenDelivered
@@ -5112,6 +5386,24 @@ impl Scheduler {
                     .flatten(),
             });
         }
+        let Some((owner_epoch, runtime, _session_id, operation, attempt)) =
+            self.active_session(agent_id)
+        else {
+            let reason = self
+                .inner
+                .store
+                .get_job(agent_id)?
+                .is_some_and(|job| {
+                    job.state != JobState::Running || job.stop_requested || job.close_requested
+                })
+                .then_some("LATE_AFTER_STOP")
+                .unwrap_or("runtime is not active");
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: reason.into(),
+            });
+        };
+        Self::require_attempt_ingress(agent_id, &attempt)?;
         let mut effective_decision = decision;
         let mut policy_reason = None;
         let mut validated_denial = None;
@@ -5159,16 +5451,6 @@ impl Scheduler {
                 policy_reason_code: policy_reason,
             });
         }
-        let Some((owner_epoch, runtime, _session_id, operation)) = self.active_session(agent_id)
-        else {
-            self.inner
-                .store
-                .release_pending_response(agent_id, request_id)?;
-            return Err(SchedulerError::RuntimeCommand {
-                agent_id: agent_id.into(),
-                message: "runtime is not active".into(),
-            });
-        };
         let _guard = match self.lock_operation(agent_id, &operation, deadline) {
             Ok(guard) => guard,
             Err(error) => {
@@ -5178,6 +5460,12 @@ impl Scheduler {
                 return Err(error);
             }
         };
+        if let Err(error) = Self::require_attempt_ingress(agent_id, &attempt) {
+            self.inner
+                .store
+                .release_pending_response(agent_id, request_id)?;
+            return Err(error);
+        }
         if deadline.remaining().is_none() {
             self.inner
                 .store
@@ -5288,7 +5576,7 @@ impl Scheduler {
         let active = self.active_session(agent_id);
         let operation = active
             .as_ref()
-            .map(|(_, _, _, operation)| Arc::clone(operation));
+            .map(|(_, _, _, operation, _)| Arc::clone(operation));
         let _guard = operation
             .as_ref()
             .map(|operation| self.lock_operation(agent_id, operation, deadline))
@@ -5296,6 +5584,9 @@ impl Scheduler {
         deadline
             .remaining()
             .ok_or_else(|| Self::control_timeout_error(agent_id))?;
+        if let Some((_, runtime, _, _, attempt)) = active.as_ref() {
+            attempt.request_stop(&runtime.turn_snapshot());
+        }
         let decision = if close_session {
             self.inner.store.request_close(agent_id)?
         } else {
@@ -5354,7 +5645,7 @@ impl Scheduler {
             }
             return Ok(decision.state);
         }
-        let Some((owner_epoch, runtime, session_id, operation)) = active else {
+        let Some((owner_epoch, runtime, session_id, operation, attempt)) = active else {
             return Ok(decision.state);
         };
         if owner_epoch != decision.owner_epoch {
@@ -5376,17 +5667,13 @@ impl Scheduler {
             message: "active runtime disappeared".into(),
         })?;
         let _ = operation;
-        let mut control_error = None;
-        if runtime.turn_snapshot().active {
-            match self.runtime_phase_timeout(agent_id, deadline) {
-                Ok(timeout) => {
-                    if let Err(error) = runtime.stop_turn(&session_id, timeout) {
-                        control_error = Some(error.to_string());
-                    }
-                }
-                Err(error) => control_error = Some(error.to_string()),
+        let control_error = match self.runtime_phase_timeout(agent_id, deadline) {
+            Ok(timeout) => Self::request_cooperative_stop(&runtime, &session_id, &attempt, timeout),
+            Err(error) => {
+                attempt.force_terminating();
+                Some(error.to_string())
             }
-        }
+        };
         let close_error = if close_session {
             match self.runtime_phase_timeout(agent_id, deadline) {
                 Ok(timeout) => runtime
@@ -5432,6 +5719,7 @@ impl Scheduler {
                 Arc::clone(&active.runtime),
                 active.session_id.clone(),
                 Arc::clone(&active.operation),
+                Arc::clone(&active.attempt),
             )
         })
     }
@@ -5462,7 +5750,7 @@ impl Scheduler {
 
     pub fn active_turn_observation(&self, agent_id: &str) -> Option<(TurnSnapshot, u64)> {
         self.active_session(agent_id)
-            .map(|(_, runtime, _, _)| (runtime.turn_snapshot(), runtime.stop_boundary_count()))
+            .map(|(_, runtime, _, _, _)| (runtime.turn_snapshot(), runtime.stop_boundary_count()))
     }
 
     pub fn last_error(&self, agent_id: &str) -> Option<String> {
@@ -5499,6 +5787,9 @@ impl Scheduler {
             .get(agent_id)
             .is_some_and(|active| active.owner_epoch == owner_epoch)
         {
+            if let Some(active) = state.active.get(agent_id) {
+                active.attempt.terminalize();
+            }
             state.active.remove(agent_id);
         }
     }
@@ -6652,6 +6943,13 @@ exec tail -f /dev/null
         );
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeStopTurnBehavior {
+        Cooperative,
+        AckWithoutBoundary,
+        IgnoreUntilTimeout,
+    }
+
     struct FakeRuntime {
         sink: Arc<dyn LifecycleSink>,
         next_sequence: std::sync::atomic::AtomicU64,
@@ -6659,6 +6957,7 @@ exec tail -f /dev/null
         changed: Condvar,
         stop_calls: std::sync::atomic::AtomicUsize,
         turn: Mutex<TurnSnapshot>,
+        stop_turn_behavior: Mutex<FakeStopTurnBehavior>,
         stop_turn_delay: Mutex<Duration>,
         stop_turn_timeouts: Mutex<Vec<Duration>>,
         send_timeouts: Mutex<Vec<Duration>>,
@@ -6683,6 +6982,7 @@ exec tail -f /dev/null
                     active: false,
                     boundary: None,
                 }),
+                stop_turn_behavior: Mutex::new(FakeStopTurnBehavior::Cooperative),
                 stop_turn_delay: Mutex::new(Duration::ZERO),
                 stop_turn_timeouts: Mutex::new(Vec::new()),
                 send_timeouts: Mutex::new(Vec::new()),
@@ -6729,6 +7029,10 @@ exec tail -f /dev/null
 
         fn delay_stop_turn(&self, delay: Duration) {
             *self.stop_turn_delay.lock().unwrap() = delay;
+        }
+
+        fn set_stop_turn_behavior(&self, behavior: FakeStopTurnBehavior) {
+            *self.stop_turn_behavior.lock().unwrap() = behavior;
         }
 
         fn timeout_send_after_write(&self) {
@@ -6810,6 +7114,16 @@ exec tail -f /dev/null
         ) -> Result<TurnSnapshot, RuntimeCommandError> {
             self.stop_turn_timeouts.lock().unwrap().push(timeout);
             thread::sleep(*self.stop_turn_delay.lock().unwrap());
+            match *self.stop_turn_behavior.lock().unwrap() {
+                FakeStopTurnBehavior::AckWithoutBoundary => {
+                    return Ok(self.turn.lock().unwrap().clone())
+                }
+                FakeStopTurnBehavior::IgnoreUntilTimeout => {
+                    thread::sleep(timeout);
+                    return Err(RuntimeCommandError::Timeout);
+                }
+                FakeStopTurnBehavior::Cooperative => {}
+            }
             let mut turn = self.turn.lock().unwrap();
             turn.active = false;
             turn.boundary = Some(TurnBoundary::Completed);
@@ -8073,7 +8387,7 @@ exec tail -f /dev/null
                 &serde_json::json!({"toolName":"read","input":{}}).to_string(),
             )
             .unwrap();
-        let (owner_epoch, sink, route, task, operation, managed_runtime) = {
+        let (owner_epoch, sink, route, task, operation, attempt, managed_runtime) = {
             let state = fixture.scheduler.inner.state.lock().unwrap();
             let active = state.active.get(&fixture.execution_id).unwrap();
             (
@@ -8082,6 +8396,7 @@ exec tail -f /dev/null
                 active.route.clone(),
                 active.task.clone(),
                 Arc::clone(&active.operation),
+                Arc::clone(&active.attempt),
                 Arc::clone(&active.runtime),
             )
         };
@@ -8163,9 +8478,8 @@ exec tail -f /dev/null
                 .unwrap(),
             events
         );
-        assert!(sink
-            .error()
-            .is_some_and(|error| error.contains("late lifecycle record rejected")));
+        assert!(sink.error().is_none());
+        assert!(attempt.snapshot().late_event_count >= 1);
     }
 
     fn general_manifest(
@@ -9361,6 +9675,240 @@ exec tail -f /dev/null
         assert_eq!(
             scheduler.stop_job(&execution_id).unwrap(),
             JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn stop_ack_without_matching_boundary_fences_late_events_and_forces_cleanup() {
+        let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+        );
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "stop-ack-false", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let execution_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        runtime.delay_stop_turn(Duration::from_millis(80));
+        let attempt = {
+            let state = scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&execution_id).unwrap().attempt)
+        };
+
+        let stopper = {
+            let scheduler = scheduler.clone();
+            let execution_id = execution_id.clone();
+            thread::spawn(move || scheduler.stop_job(&execution_id))
+        };
+        wait_until_review_exit(|| {
+            (attempt.snapshot().phase == AttemptRuntimePhase::StopRequested).then_some(())
+        });
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+            WireMessage::Request(zcode_protocol::RequestEnvelope::new(
+                WireId::String("late-permission".into()),
+                INTERACTION_REQUEST_PERMISSION,
+                serde_json::json!({"toolName":"Read","input":{"path":"src/lib.rs"}}),
+            )),
+        )));
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence: 91,
+            method: "turn.completed".into(),
+            order: LifecycleOrder::InOrder,
+        }));
+
+        assert_eq!(stopper.join().unwrap().unwrap(), JobState::Cancelled);
+        let snapshot = attempt.snapshot();
+        assert_eq!(snapshot.phase, AttemptRuntimePhase::Terminal);
+        assert_eq!(snapshot.force_termination_count, 1);
+        assert!(snapshot.observed_boundary.is_none());
+        assert!(snapshot.late_event_count >= 2);
+        assert!(store.pending_requests(&execution_id).unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(
+            scheduler.stop_job(&execution_id).unwrap(),
+            JobState::Cancelled
+        );
+        assert_eq!(runtime.stop_calls(), 1);
+    }
+
+    #[test]
+    fn ignored_stop_response_times_out_then_force_terminates_attempt() {
+        let (directory, _store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(5),
+            Duration::from_millis(80),
+        );
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "stop-ignored", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let execution_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::IgnoreUntilTimeout);
+        let attempt = {
+            let state = scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&execution_id).unwrap().attempt)
+        };
+
+        assert_eq!(
+            scheduler.stop_job(&execution_id).unwrap(),
+            JobState::Cancelled
+        );
+        let snapshot = attempt.snapshot();
+        assert_eq!(snapshot.phase, AttemptRuntimePhase::Terminal);
+        assert_eq!(snapshot.force_termination_count, 1);
+        assert!(snapshot.observed_boundary.is_none());
+        assert_eq!(runtime.stop_calls(), 1);
+    }
+
+    #[test]
+    fn cooperative_stop_boundary_avoids_force_termination_and_releases_slot() {
+        let (directory, _store, factory, scheduler) = scheduler_fixture_with_deadlines(
+            1,
+            1,
+            Duration::from_millis(10),
+            Duration::from_millis(200),
+        );
+        let first = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "cooperative-stop", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        let second = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "after-cooperative-stop", None),
+                "feature",
+                "owner-group",
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![first.job.agent_id.clone()]
+        );
+        let attempt = {
+            let state = scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&first.job.agent_id).unwrap().attempt)
+        };
+
+        assert_eq!(
+            scheduler.stop_job(&first.job.agent_id).unwrap(),
+            JobState::Cancelled
+        );
+        let snapshot = attempt.snapshot();
+        assert_eq!(snapshot.phase, AttemptRuntimePhase::Terminal);
+        assert_eq!(snapshot.force_termination_count, 0);
+        assert_eq!(snapshot.observed_boundary, Some(TurnBoundary::Completed));
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![second.job.agent_id.clone()]
+        );
+        assert_eq!(scheduler.active_count(), 1);
+        factory.runtime(&second.job.agent_id);
+        scheduler.close_job(&second.job.agent_id).unwrap();
+    }
+
+    #[test]
+    fn cancel_wins_before_finalize_and_late_ingress_cannot_start_another_turn() {
+        let fixture = ReviewExitFixture::new("cancel-before-finalize-fence");
+        fixture.checkpoint();
+        fixture.validation();
+        fixture
+            .scheduler
+            .message_job(
+                &fixture.execution_id,
+                "queued-before-stop",
+                "queue",
+                "do not deliver after cancellation",
+            )
+            .unwrap();
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        runtime.set_stop_turn_behavior(FakeStopTurnBehavior::AckWithoutBoundary);
+        runtime.delay_stop_turn(Duration::from_millis(60));
+        let attempt = {
+            let state = fixture.scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&fixture.execution_id).unwrap().attempt)
+        };
+        let stopper = {
+            let scheduler = fixture.scheduler.clone();
+            let execution_id = fixture.execution_id.clone();
+            thread::spawn(move || scheduler.stop_job(&execution_id))
+        };
+        wait_until_review_exit(|| {
+            (attempt.snapshot().phase == AttemptRuntimePhase::StopRequested).then_some(())
+        });
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence: 101,
+            method: "turn.completed".into(),
+            order: LifecycleOrder::InOrder,
+        }));
+        assert_eq!(stopper.join().unwrap().unwrap(), JobState::Cancelled);
+
+        let error = fixture
+            .scheduler
+            .call_task_review_tool(
+                &fixture.execution_id,
+                REVIEW_FINALIZE,
+                serde_json::json!({
+                    "signal":"no_findings_observed","summary":"late finalize",
+                    "coverage":{"covered":["src/lib.rs"],"not_covered":[]},
+                    "uncertainties":[],"recommended_next_actions":[]
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("LATE_AFTER_STOP"));
+        assert!(
+            !fixture
+                .store
+                .review_report_state(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .finalized
+        );
+        assert!(runtime.sent_turn_contents.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .task_result(&fixture.execution_id)
+                .unwrap()
+                .unwrap()
+                .result
+                .outcome,
+            TaskOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn finalized_before_later_stop_preserves_committed_success() {
+        let fixture = ReviewExitFixture::new("finalized-before-stop");
+        fixture.finalize_valid();
+        let first = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        assert_eq!(first.result.outcome, TaskOutcome::Succeeded);
+        assert_eq!(
+            fixture.scheduler.stop_job(&fixture.execution_id).unwrap(),
+            JobState::Completed
+        );
+        assert_eq!(
+            fixture
+                .store
+                .task_result(&fixture.execution_id)
+                .unwrap()
+                .unwrap(),
+            first
         );
     }
 
