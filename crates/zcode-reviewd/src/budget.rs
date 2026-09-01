@@ -42,6 +42,7 @@ struct BudgetState {
 #[derive(Debug)]
 pub(crate) struct AttemptBudget {
     deadline: Instant,
+    wall_time: Duration,
     max_turns: u64,
     max_tool_calls: u64,
     state: Mutex<BudgetState>,
@@ -62,6 +63,7 @@ impl AttemptBudget {
             deadline: Instant::now()
                 .checked_add(Duration::from_millis(wall_time_ms))
                 .unwrap_or_else(Instant::now),
+            wall_time: Duration::from_millis(wall_time_ms),
             max_turns,
             max_tool_calls,
             state: Mutex::new(BudgetState {
@@ -123,6 +125,15 @@ impl AttemptBudget {
 
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub(crate) fn finalization_reserve_due(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        let turns_remaining = self.max_turns.saturating_sub(state.turns.len() as u64);
+        let wall_due = self
+            .remaining()
+            .is_some_and(|remaining| remaining <= self.wall_time / 5);
+        wall_due || turns_remaining <= 2
     }
 
     #[cfg(test)]

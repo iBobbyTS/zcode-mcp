@@ -4138,6 +4138,7 @@ impl Scheduler {
         let scheduler = self.clone();
         thread::spawn(move || {
             let mut handled_generation = 0;
+            let mut finalization_reserve_sent = false;
             loop {
                 if let Some(violation) = budget.as_ref().and_then(|budget| budget.violation()) {
                     check.cancel();
@@ -4240,7 +4241,7 @@ impl Scheduler {
                                 };
                                 if let Err(error) = stopped.and_then(|_| runtime.send_turn(
                                     &session_id,
-                                    "Provide one bounded semantic progress update via review_progress.",
+                                    "CONVERGENCE_NUDGE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write findings and validation, and reserve time for one truthful review_finalize. If evidence remains unavailable, record a coverage gap and finalize rather than fabricating it.",
                                     nudge_timeout,
                                 )) {
                                     scheduler.record_failure(
@@ -4251,6 +4252,57 @@ impl Scheduler {
                             }
                             Ok(false) => {}
                             Err(error) => scheduler.record_failure(&agent_id, error.to_string()),
+                        }
+                    }
+                }
+                if !finalization_reserve_sent
+                    && budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.finalization_reserve_due())
+                {
+                    let _guard = operation.lock().unwrap();
+                    let current = scheduler.inner.store.get_job(&agent_id);
+                    let still_current = current
+                        .as_ref()
+                        .ok()
+                        .and_then(|job| job.as_ref())
+                        .is_some_and(|job| {
+                            job.owner_epoch == owner_epoch
+                                && job.state == JobState::Running
+                                && !job.stop_requested
+                                && !job.close_requested
+                        });
+                    let finalized = current
+                        .as_ref()
+                        .ok()
+                        .and_then(|job| job.as_ref())
+                        .and_then(|job| {
+                            scheduler
+                                .inner
+                                .review_completion
+                                .as_ref()
+                                .map(|gate| (gate, job))
+                        })
+                        .is_some_and(|(gate, job)| {
+                            gate.has_durable_finalization(job).unwrap_or(false)
+                        });
+                    if still_current && !finalized {
+                        finalization_reserve_sent = true;
+                        let timeout = scheduler.inner.config.control_timeout / 2;
+                        let stopped = if runtime.turn_snapshot().active {
+                            runtime.stop_turn(&session_id, timeout)
+                        } else {
+                            Ok(runtime.turn_snapshot())
+                        };
+                        if let Err(error) = stopped.and_then(|_| runtime.send_turn(
+                            &session_id,
+                            "FINALIZATION_RESERVE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write truthful findings and validation, and call review_finalize with any unavailable evidence recorded as a coverage gap. You may finish one already-defined narrow check; do not begin broad exploration. This reminder does not prohibit unrelated legal Bash.",
+                            timeout,
+                        )) {
+                            scheduler.record_failure(
+                                &agent_id,
+                                format!("finalization reserve reminder failed: {error}"),
+                            );
                         }
                     }
                 }

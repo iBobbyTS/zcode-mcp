@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Mutex,
@@ -78,6 +79,8 @@ pub struct ValidationCommand {
 }
 
 pub const MAX_VALIDATION_COMMAND_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_REVIEW_DIFF_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REVIEW_INDEX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,6 +131,16 @@ pub struct PreparedScopePath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedReviewInputs {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub changed_files: InputArtifact,
+    pub diff_stat: InputArtifact,
+    pub diff_patch: InputArtifact,
+    pub patch_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedLaunchSpec {
     pub schema: String,
     pub review_kind: ReviewKind,
@@ -140,6 +153,7 @@ pub struct PreparedLaunchSpec {
     pub worktree: PreparedWorktree,
     pub plan: InputArtifact,
     pub context: Vec<InputArtifact>,
+    pub review_inputs: PreparedReviewInputs,
     pub scope: Vec<PreparedScopePath>,
     pub forbidden_input_globs: Vec<String>,
     pub validation_commands: BTreeMap<String, PreparedCommand>,
@@ -299,6 +313,8 @@ impl ReviewPreparer {
                 .enumerate()
                 .map(|(index, path)| snapshot_input(path, &inputs_root, index + 1))
                 .collect::<PreparationResult<Vec<_>>>()?;
+            let review_inputs =
+                prepare_review_inputs(&repository, &base_sha, &head_sha, &inputs_root)?;
             let scope = scope_relative
                 .iter()
                 .cloned()
@@ -338,6 +354,7 @@ impl ReviewPreparer {
                 worktree: worktree.clone(),
                 plan,
                 context,
+                review_inputs,
                 scope,
                 forbidden_input_globs: manifest.forbidden_input_globs.clone(),
                 validation_commands,
@@ -375,6 +392,155 @@ impl ReviewPreparer {
             }
         }
     }
+}
+
+fn prepare_review_inputs(
+    repository: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    inputs_root: &Path,
+) -> PreparationResult<PreparedReviewInputs> {
+    let range = format!("{base_sha}..{head_sha}");
+    let names = bounded_git_output(
+        repository,
+        &[
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ],
+        MAX_REVIEW_INDEX_BYTES,
+    )?;
+    let changed = String::from_utf8(names.bytes)
+        .map_err(|_| PreparationError::Git("changed-file paths are not valid UTF-8".into()))?;
+    let changed_files = changed.lines().collect::<Vec<_>>();
+    let changed_json = serde_json::to_vec_pretty(&serde_json::json!({
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "files": changed_files,
+    }))?;
+    let changed_files =
+        snapshot_generated_input(inputs_root, "REVIEW-CHANGED-FILES.json", &changed_json)?;
+
+    let stat = bounded_git_output(
+        repository,
+        &[
+            "diff",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ],
+        MAX_REVIEW_INDEX_BYTES,
+    )?;
+    let mut stat_bytes = format!(
+        "base_sha={base_sha}\nhead_sha={head_sha}\ncomplete={}\n\n",
+        stat.complete
+    )
+    .into_bytes();
+    stat_bytes.extend_from_slice(&stat.bytes);
+    if !stat.complete {
+        stat_bytes.extend_from_slice(b"\n[REVIEW-DIFF-STAT TRUNCATED AT BYTE CAP]\n");
+    }
+    let diff_stat = snapshot_generated_input(inputs_root, "REVIEW-DIFF-STAT.txt", &stat_bytes)?;
+
+    let patch = bounded_git_output(
+        repository,
+        &[
+            "diff",
+            "--full-index",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &range,
+            "--",
+        ],
+        MAX_REVIEW_DIFF_BYTES,
+    )?;
+    let mut patch_bytes = patch.bytes;
+    if !patch.complete {
+        patch_bytes.extend_from_slice(
+            b"\n# REVIEW-DIFF.patch TRUNCATED AT BYTE CAP; DO NOT TREAT AS COMPLETE\n",
+        );
+    }
+    let diff_patch = snapshot_generated_input(inputs_root, "REVIEW-DIFF.patch", &patch_bytes)?;
+    Ok(PreparedReviewInputs {
+        base_sha: base_sha.into(),
+        head_sha: head_sha.into(),
+        changed_files,
+        diff_stat,
+        diff_patch,
+        patch_complete: patch.complete,
+    })
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    complete: bool,
+}
+
+fn bounded_git_output(
+    repository: &Path,
+    args: &[&str],
+    cap: usize,
+) -> PreparationResult<BoundedOutput> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| PreparationError::Git("git stdout was not captured".into()))?
+        .take((cap + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(PreparationError::Git(format!(
+            "safe git evidence command failed with {status}"
+        )));
+    }
+    let complete = bytes.len() <= cap;
+    bytes.truncate(cap);
+    Ok(BoundedOutput { bytes, complete })
+}
+
+fn snapshot_generated_input(
+    root: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> PreparationResult<InputArtifact> {
+    let target = root.join(filename);
+    atomic_write(&target, bytes)?;
+    let target = fs::canonicalize(target)?;
+    if !target.starts_with(fs::canonicalize(root)?) {
+        return Err(PreparationError::PathEscape {
+            path: target,
+            root: root.to_path_buf(),
+        });
+    }
+    Ok(InputArtifact {
+        source_path: PathBuf::from(format!("git:{filename}")),
+        prepared_path: target,
+        sha256: sha256(bytes),
+        bytes: bytes.len() as u64,
+    })
 }
 
 fn cleanup_failed_preparation(

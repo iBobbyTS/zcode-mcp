@@ -45,7 +45,7 @@ fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
         .keys()
         .cloned()
         .collect::<Vec<_>>();
-    let inputs = prepared
+    let mut inputs = prepared
         .context
         .iter()
         .map(|artifact| artifact.prepared_path.to_string_lossy().into_owned())
@@ -53,6 +53,26 @@ fn task_capability_instruction(prepared: &PreparedLaunchSpec) -> String {
             prepared.plan.prepared_path.to_string_lossy().into_owned(),
         ))
         .collect::<Vec<_>>();
+    inputs.extend([
+        prepared
+            .review_inputs
+            .changed_files
+            .prepared_path
+            .to_string_lossy()
+            .into_owned(),
+        prepared
+            .review_inputs
+            .diff_stat
+            .prepared_path
+            .to_string_lossy()
+            .into_owned(),
+        prepared
+            .review_inputs
+            .diff_patch
+            .prepared_path
+            .to_string_lossy()
+            .into_owned(),
+    ]);
     render_task_capability_instruction(&checks, &inputs)
 }
 

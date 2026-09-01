@@ -184,6 +184,30 @@ fn schema_and_valid_manifest_prepare_canonical_immutable_launch() {
 }
 
 #[test]
+fn prepared_review_inputs_are_confined_hashed_and_bound_to_base_head() {
+    let fixture = RepositoryFixture::new();
+    let prepared = ReviewPreparer.prepare(&fixture.manifest()).unwrap();
+    let inputs = &prepared.review_inputs;
+    assert_eq!(inputs.base_sha, prepared.base_sha);
+    assert_eq!(inputs.head_sha, prepared.head_sha);
+    let root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
+    for artifact in [&inputs.changed_files, &inputs.diff_stat, &inputs.diff_patch] {
+        assert!(artifact.prepared_path.starts_with(root));
+        assert!(artifact.prepared_path.is_file());
+        let bytes = fs::read(&artifact.prepared_path).unwrap();
+        assert_eq!(artifact.bytes, bytes.len() as u64);
+        assert_eq!(artifact.sha256, format!("{:x}", Sha256::digest(bytes)));
+    }
+    let stat = fs::read_to_string(&inputs.diff_stat.prepared_path).unwrap();
+    assert!(stat.contains(&format!("base_sha={}", prepared.base_sha)));
+    assert!(stat.contains(&format!("head_sha={}", prepared.head_sha)));
+    assert!(!fs::read(&inputs.diff_patch.prepared_path)
+        .unwrap()
+        .windows(b"TRUNCATED AT BYTE CAP".len())
+        .any(|window| window == b"TRUNCATED AT BYTE CAP"));
+}
+
+#[test]
 fn schema_and_rust_field_rules_have_table_parity() {
     let fixture = RepositoryFixture::new();
     let schema: serde_json::Value = serde_json::from_slice(include_bytes!(
