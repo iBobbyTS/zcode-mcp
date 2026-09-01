@@ -91,9 +91,7 @@ fn official_runtime_permission_and_unsupported_input_are_bounded() {
     assert!(validated_denial
         .feedback(false)
         .contains("code=external_policy_denied;"));
-    assert!(validated_denial
-        .fingerprint()
-        .contains("family="));
+    assert!(validated_denial.fingerprint().contains("family="));
     owner
         .respond_request(
             &correlation,
