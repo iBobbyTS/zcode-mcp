@@ -4184,7 +4184,7 @@ impl Scheduler {
                         Duration::from_millis(task.effective_budget.semantic_soft_timeout_ms);
                     let hard =
                         Duration::from_millis(task.effective_budget.semantic_hard_timeout_ms);
-                    if !finalization_reserve_sent && elapsed >= soft {
+                    if elapsed >= soft {
                         let _guard = operation.lock().unwrap();
                         let current = scheduler.inner.store.get_job(&agent_id);
                         let latest_elapsed = scheduler
@@ -4231,27 +4231,31 @@ impl Scheduler {
                             }
                             return;
                         }
-                        match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
-                            Ok(true) => {
-                                let nudge_timeout = scheduler.inner.config.control_timeout / 2;
-                                let stopped = if runtime.turn_snapshot().active {
-                                    runtime.stop_turn(&session_id, nudge_timeout)
-                                } else {
-                                    Ok(runtime.turn_snapshot())
-                                };
-                                if let Err(error) = stopped.and_then(|_| runtime.send_turn(
-                                    &session_id,
-                                    "CONVERGENCE_NUDGE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write findings and validation, and reserve time for one truthful review_finalize. If evidence remains unavailable, record a coverage gap and finalize rather than fabricating it.",
-                                    nudge_timeout,
-                                )) {
-                                    scheduler.record_failure(
-                                        &agent_id,
-                                        format!("semantic progress nudge failed: {error}"),
-                                    );
+                        if !finalization_reserve_sent {
+                            match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
+                                Ok(true) => {
+                                    let nudge_timeout = scheduler.inner.config.control_timeout / 2;
+                                    let stopped = if runtime.turn_snapshot().active {
+                                        runtime.stop_turn(&session_id, nudge_timeout)
+                                    } else {
+                                        Ok(runtime.turn_snapshot())
+                                    };
+                                    if let Err(error) = stopped.and_then(|_| runtime.send_turn(
+                                        &session_id,
+                                        "CONVERGENCE_NUDGE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write findings and validation, and reserve time for one truthful review_finalize. If evidence remains unavailable, record a coverage gap and finalize rather than fabricating it.",
+                                        nudge_timeout,
+                                    )) {
+                                        scheduler.record_failure(
+                                            &agent_id,
+                                            format!("semantic progress nudge failed: {error}"),
+                                        );
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    scheduler.record_failure(&agent_id, error.to_string())
                                 }
                             }
-                            Ok(false) => {}
-                            Err(error) => scheduler.record_failure(&agent_id, error.to_string()),
                         }
                     }
                 }
@@ -7320,6 +7324,36 @@ exec tail -f /dev/null
                 ChildExit::Exited(Some(0)),
             )));
         }
+    }
+
+    #[test]
+    fn semantic_hard_timeout_remains_authoritative_after_reserve() {
+        let clock = Arc::new(ManualMonotonicClock::default());
+        let fixture = ReviewExitFixture::new_with_budget_and_clock(
+            "reserve-hard-timeout",
+            convergence_budget(10_000, 100, 500, 2),
+            Some(clock.clone()),
+        );
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        wait_until_review_exit(|| {
+            (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
+        });
+        assert!(runtime.sent_turn_contents.lock().unwrap()[0].starts_with("FINALIZATION_RESERVE:"));
+
+        clock.advance(Duration::from_millis(501));
+        let result = wait_for_task_result(&fixture.store, &fixture.execution_id);
+        assert_eq!(result.result.outcome, TaskOutcome::TimedOut);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"SEMANTIC_PROGRESS_TIMEOUT".into()));
+        let sent = runtime.sent_turn_contents.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("FINALIZATION_RESERVE:"));
+        assert!(sent
+            .iter()
+            .all(|content| !content.starts_with("CONVERGENCE_NUDGE:")));
+        assert_eq!(fixture.scheduler.active_count(), 0);
     }
 
     #[test]
