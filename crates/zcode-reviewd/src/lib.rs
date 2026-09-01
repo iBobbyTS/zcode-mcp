@@ -4515,6 +4515,7 @@ impl Scheduler {
         thread::spawn(move || {
             let mut handled_generation = 0;
             let mut finalization_reserve_sent = false;
+            let mut convergence_handoff_pending = false;
             let mut semantic_idle_since = None;
             loop {
                 if let Some(violation) = budget.as_ref().and_then(|budget| budget.violation()) {
@@ -4683,19 +4684,22 @@ impl Scheduler {
                                             &agent_id,
                                             format!("semantic progress nudge failed: {error}"),
                                         );
-                                    } else if !runtime.turn_snapshot().active {
-                                        let deadline = scheduler.control_deadline();
-                                        if let Err(error) = scheduler.deliver_next_message(
-                                            &agent_id,
-                                            &session_id,
-                                            &runtime,
-                                            &attempt,
-                                            deadline,
-                                        ) {
-                                            scheduler.record_failure(
+                                    } else {
+                                        convergence_handoff_pending = true;
+                                        if !runtime.turn_snapshot().active {
+                                            let deadline = scheduler.control_deadline();
+                                            if let Err(error) = scheduler.deliver_next_message(
                                                 &agent_id,
-                                                format!("semantic progress nudge failed: {error}"),
-                                            );
+                                                &session_id,
+                                                &runtime,
+                                                &attempt,
+                                                deadline,
+                                            ) {
+                                                scheduler.record_failure(
+                                                    &agent_id,
+                                                    format!("semantic progress nudge failed: {error}"),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -4755,19 +4759,22 @@ impl Scheduler {
                                 &agent_id,
                                 format!("finalization reserve reminder failed: {error}"),
                             );
-                        } else if !runtime.turn_snapshot().active {
-                            let deadline = scheduler.control_deadline();
-                            if let Err(error) = scheduler.deliver_next_message(
-                                &agent_id,
-                                &session_id,
-                                &runtime,
-                                &attempt,
-                                deadline,
-                            ) {
-                                scheduler.record_failure(
+                        } else {
+                            convergence_handoff_pending = true;
+                            if !runtime.turn_snapshot().active {
+                                let deadline = scheduler.control_deadline();
+                                if let Err(error) = scheduler.deliver_next_message(
                                     &agent_id,
-                                    format!("finalization reserve reminder failed: {error}"),
-                                );
+                                    &session_id,
+                                    &runtime,
+                                    &attempt,
+                                    deadline,
+                                ) {
+                                    scheduler.record_failure(
+                                        &agent_id,
+                                        format!("finalization reserve reminder failed: {error}"),
+                                    );
+                                }
                             }
                         }
                     }
@@ -4857,28 +4864,8 @@ impl Scheduler {
                     ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            let review_waits_for_convergence = boundary == TurnBoundary::Completed
-                                && semantic_progress.is_some()
-                                && scheduler
-                                    .inner
-                                    .store
-                                    .get_job(&agent_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|job| {
-                                        scheduler
-                                            .inner
-                                            .review_completion
-                                            .as_ref()
-                                            .map(|gate| (gate, job))
-                                    })
-                                    .is_some_and(|(gate, job)| {
-                                        !gate.has_durable_finalization(&job).unwrap_or(false)
-                                    });
-                            if review_waits_for_convergence {
-                                // Ledger finalization may arrive just after the natural
-                                // boundary; revisit this boundary instead of terminalizing
-                                // or permanently suppressing the completion check.
+                            if convergence_handoff_pending {
+                                convergence_handoff_pending = false;
                                 handled_generation = handled_generation.saturating_sub(1);
                                 continue;
                             }

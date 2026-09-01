@@ -766,6 +766,12 @@ fn injected_ledger_progress_only_records_progress_without_finalization() {
     let fixture = Fixture::new();
     let (_, execution, terminal) = submit_fake_mode_and_wait(&fixture, "progress-only");
     assert_eq!(terminal.state, JobState::Failed);
+    assert!(fixture.store.task_result(&execution).unwrap().is_some());
+    assert!(fixture
+        .store
+        .get_task(&execution)
+        .unwrap()
+        .is_some_and(|task| task.phase == TaskPhase::Terminal));
     let snapshot = fixture.store.review_snapshot(&execution).unwrap().unwrap();
     assert!(snapshot.checkpoints.is_empty());
     assert!(snapshot.findings.is_empty());
@@ -781,6 +787,12 @@ fn injected_ledger_without_progress_finalizes_without_progress_record() {
     let fixture = Fixture::new();
     let (_, execution, terminal) = submit_fake_mode_and_wait(&fixture, "ledger-without-progress");
     assert_eq!(terminal.state, JobState::Completed);
+    assert!(fixture.store.task_result(&execution).unwrap().is_some());
+    assert!(fixture
+        .store
+        .get_task(&execution)
+        .unwrap()
+        .is_some_and(|task| task.phase == TaskPhase::Terminal));
     let snapshot = fixture.store.review_snapshot(&execution).unwrap().unwrap();
     assert_eq!(snapshot.checkpoints.len(), 1);
     assert_eq!(snapshot.validations.len(), 1);
