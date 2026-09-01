@@ -4260,6 +4260,7 @@ impl Scheduler {
                     }
                 }
                 if !finalization_reserve_sent
+                    && semantic_progress.is_some()
                     && budget
                         .as_ref()
                         .is_some_and(|budget| budget.finalization_reserve_due())
@@ -8903,6 +8904,33 @@ exec tail -f /dev/null
         assert!(listed.status.success());
         assert!(!String::from_utf8_lossy(&listed.stdout)
             .contains(prepared.worktree.path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn general_task_near_turn_limit_does_not_receive_review_finalization_reserve() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+        budget.max_turns = 2;
+        let manifest =
+            general_manifest(directory.path(), "general-no-review-reserve", Some(budget));
+        let submitted = scheduler
+            .enqueue_general(&manifest, "feature", "owner-group")
+            .unwrap();
+        let execution_id = submitted.job.agent_id;
+
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&execution_id);
+        wait_for_monitor_iterations(&runtime, 3);
+        assert!(
+            runtime.sent_turn_contents.lock().unwrap().is_empty(),
+            "general tasks must not receive review finalization guidance"
+        );
+
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        let _ = wait_for_task_result(&store, &execution_id);
+        wait_until_review_exit(|| (scheduler.active_count() == 0).then_some(()));
     }
 
     #[test]
