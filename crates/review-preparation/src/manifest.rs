@@ -137,6 +137,8 @@ pub struct PreparedReviewInputs {
     pub changed_files: InputArtifact,
     pub diff_stat: InputArtifact,
     pub diff_patch: InputArtifact,
+    pub changed_files_complete: bool,
+    pub diff_stat_complete: bool,
     pub patch_complete: bool,
 }
 
@@ -212,13 +214,18 @@ impl PreparedLaunchSpec {
 
     pub fn launcher(&self) -> PreparationResult<PolicyLauncher> {
         self.validate_digest()?;
-        let mut readable_inputs = Vec::with_capacity(self.context.len() + 1);
+        let mut readable_inputs = Vec::with_capacity(self.context.len() + 4);
         readable_inputs.push(self.plan.prepared_path.clone());
         readable_inputs.extend(
             self.context
                 .iter()
                 .map(|artifact| artifact.prepared_path.clone()),
         );
+        readable_inputs.extend([
+            self.review_inputs.changed_files.prepared_path.clone(),
+            self.review_inputs.diff_stat.prepared_path.clone(),
+            self.review_inputs.diff_patch.prepared_path.clone(),
+        ]);
         PolicyLauncher::new(
             self.worktree.path.clone(),
             self.scratch_root.clone(),
@@ -400,6 +407,24 @@ fn prepare_review_inputs(
     head_sha: &str,
     inputs_root: &Path,
 ) -> PreparationResult<PreparedReviewInputs> {
+    prepare_review_inputs_with_caps(
+        repository,
+        base_sha,
+        head_sha,
+        inputs_root,
+        MAX_REVIEW_INDEX_BYTES,
+        MAX_REVIEW_DIFF_BYTES,
+    )
+}
+
+fn prepare_review_inputs_with_caps(
+    repository: &Path,
+    base_sha: &str,
+    head_sha: &str,
+    inputs_root: &Path,
+    index_cap: usize,
+    diff_cap: usize,
+) -> PreparationResult<PreparedReviewInputs> {
     let range = format!("{base_sha}..{head_sha}");
     let names = bounded_git_output(
         repository,
@@ -411,14 +436,26 @@ fn prepare_review_inputs(
             &range,
             "--",
         ],
-        MAX_REVIEW_INDEX_BYTES,
+        index_cap,
     )?;
-    let changed = String::from_utf8(names.bytes)
-        .map_err(|_| PreparationError::Git("changed-file paths are not valid UTF-8".into()))?;
-    let changed_files = changed.lines().collect::<Vec<_>>();
+    let changed_prefix_sha256 = sha256(&names.bytes);
+    let changed_files = if names.complete {
+        String::from_utf8(names.bytes.clone())
+            .map_err(|_| PreparationError::Git("changed-file paths are not valid UTF-8".into()))?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let changed_json = serde_json::to_vec_pretty(&serde_json::json!({
         "base_sha": base_sha,
         "head_sha": head_sha,
+        "status": if names.complete { "complete" } else { "truncated" },
+        "complete": names.complete,
+        "omitted": !names.complete,
+        "byte_cap": index_cap,
+        "captured_prefix_sha256": changed_prefix_sha256,
         "files": changed_files,
     }))?;
     let changed_files =
@@ -434,7 +471,7 @@ fn prepare_review_inputs(
             &range,
             "--",
         ],
-        MAX_REVIEW_INDEX_BYTES,
+        index_cap,
     )?;
     let mut stat_bytes = format!(
         "base_sha={base_sha}\nhead_sha={head_sha}\ncomplete={}\n\n",
@@ -460,7 +497,7 @@ fn prepare_review_inputs(
             &range,
             "--",
         ],
-        MAX_REVIEW_DIFF_BYTES,
+        diff_cap,
     )?;
     let mut patch_bytes = patch.bytes;
     if !patch.complete {
@@ -475,6 +512,8 @@ fn prepare_review_inputs(
         changed_files,
         diff_stat,
         diff_patch,
+        changed_files_complete: names.complete,
+        diff_stat_complete: stat.complete,
         patch_complete: patch.complete,
     })
 }
@@ -503,13 +542,22 @@ fn bounded_git_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut bytes = Vec::with_capacity(cap.min(64 * 1024));
-    child
+    let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| PreparationError::Git("git stdout was not captured".into()))?
-        .take((cap + 1) as u64)
-        .read_to_end(&mut bytes)?;
+        .ok_or_else(|| PreparationError::Git("git stdout was not captured".into()))?;
+    let mut bytes = Vec::with_capacity((cap + 1).min(64 * 1024));
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = stdout.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() < cap + 1 {
+            let retained = (cap + 1 - bytes.len()).min(count);
+            bytes.extend_from_slice(&buffer[..retained]);
+        }
+    }
     let status = child.wait()?;
     if !status.success() {
         return Err(PreparationError::Git(format!(
@@ -1051,7 +1099,7 @@ mod review_input_tests {
     use super::*;
 
     #[test]
-    fn bounded_git_output_marks_truncation_without_silent_data_loss() {
+    fn capped_review_inputs_drain_and_mark_every_incomplete_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path();
         git(repository, &["init"]).unwrap();
@@ -1061,22 +1109,69 @@ mod review_input_tests {
             &["config", "user.email", "prepared@example.invalid"],
         )
         .unwrap();
-        fs::write(repository.join("large.txt"), "base\n").unwrap();
-        git(repository, &["add", "large.txt"]).unwrap();
+        fs::write(repository.join("seed.txt"), "base\n").unwrap();
+        git(repository, &["add", "seed.txt"]).unwrap();
         git(repository, &["commit", "-m", "base"]).unwrap();
         let base = git_text(repository, &["rev-parse", "HEAD"]).unwrap();
-        fs::write(repository.join("large.txt"), "changed".repeat(128)).unwrap();
-        git(repository, &["add", "large.txt"]).unwrap();
+        fs::write(repository.join("seed.txt"), "changed".repeat(128)).unwrap();
+        for index in 0..16 {
+            fs::write(
+                repository.join(format!("changed-file-{index:02}-with-a-long-name.txt")),
+                format!("changed-{index}\n").repeat(32),
+            )
+            .unwrap();
+        }
+        git(repository, &["add", "."]).unwrap();
         git(repository, &["commit", "-m", "head"]).unwrap();
         let head = git_text(repository, &["rev-parse", "HEAD"]).unwrap();
-        let range = format!("{base}..{head}");
-        let output = bounded_git_output(
-            repository,
-            &["diff", "--no-ext-diff", "--no-textconv", &range, "--"],
-            64,
-        )
-        .unwrap();
-        assert_eq!(output.bytes.len(), 64);
-        assert!(!output.complete);
+        let root = repository.join("generated");
+        fs::create_dir(&root).unwrap();
+        let inputs =
+            prepare_review_inputs_with_caps(repository, &base, &head, &root, 64, 64).unwrap();
+
+        assert!(!inputs.changed_files_complete);
+        assert!(!inputs.diff_stat_complete);
+        assert!(!inputs.patch_complete);
+        for artifact in [&inputs.changed_files, &inputs.diff_stat, &inputs.diff_patch] {
+            let bytes = fs::read(&artifact.prepared_path).unwrap();
+            assert_eq!(artifact.bytes, bytes.len() as u64);
+            assert_eq!(artifact.sha256, sha256(&bytes));
+        }
+
+        let changed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&inputs.changed_files.prepared_path).unwrap())
+                .unwrap();
+        assert_eq!(changed["status"], "truncated");
+        assert_eq!(changed["complete"], false);
+        assert_eq!(changed["omitted"], true);
+        assert_eq!(changed["byte_cap"], 64);
+        assert_eq!(changed["files"], serde_json::json!([]));
+        assert_eq!(
+            changed["captured_prefix_sha256"],
+            sha256(
+                &bounded_git_output(
+                    repository,
+                    &[
+                        "diff",
+                        "--name-only",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        &format!("{base}..{head}"),
+                        "--",
+                    ],
+                    64,
+                )
+                .unwrap()
+                .bytes
+            )
+        );
+
+        let stat = fs::read_to_string(&inputs.diff_stat.prepared_path).unwrap();
+        assert!(stat.contains("complete=false"));
+        assert!(stat.contains("[REVIEW-DIFF-STAT TRUNCATED AT BYTE CAP]"));
+        let patch = fs::read_to_string(&inputs.diff_patch.prepared_path).unwrap();
+        assert!(
+            patch.contains("# REVIEW-DIFF.patch TRUNCATED AT BYTE CAP; DO NOT TREAT AS COMPLETE")
+        );
     }
 }

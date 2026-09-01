@@ -4184,7 +4184,7 @@ impl Scheduler {
                         Duration::from_millis(task.effective_budget.semantic_soft_timeout_ms);
                     let hard =
                         Duration::from_millis(task.effective_budget.semantic_hard_timeout_ms);
-                    if elapsed >= soft {
+                    if !finalization_reserve_sent && elapsed >= soft {
                         let _guard = operation.lock().unwrap();
                         let current = scheduler.inner.store.get_job(&agent_id);
                         let latest_elapsed = scheduler
@@ -6657,10 +6657,12 @@ exec tail -f /dev/null
         stop_turn_delay: Mutex<Duration>,
         stop_turn_timeouts: Mutex<Vec<Duration>>,
         send_timeouts: Mutex<Vec<Duration>>,
+        sent_turn_contents: Mutex<Vec<String>>,
         timeout_send_after_write: AtomicBool,
         timeout_response_write: AtomicBool,
         response_write_deadlines: Mutex<Vec<(Instant, Instant)>>,
         responses: Mutex<Vec<(String, String, Option<String>, Option<(String, String)>)>>,
+        wait_terminal_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeRuntime {
@@ -6679,10 +6681,12 @@ exec tail -f /dev/null
                 stop_turn_delay: Mutex::new(Duration::ZERO),
                 stop_turn_timeouts: Mutex::new(Vec::new()),
                 send_timeouts: Mutex::new(Vec::new()),
+                sent_turn_contents: Mutex::new(Vec::new()),
                 timeout_send_after_write: AtomicBool::new(false),
                 timeout_response_write: AtomicBool::new(false),
                 response_write_deadlines: Mutex::new(Vec::new()),
                 responses: Mutex::new(Vec::new()),
+                wait_terminal_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -6745,6 +6749,8 @@ exec tail -f /dev/null
         }
 
         fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            self.wait_terminal_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let terminal = self.terminal.lock().unwrap();
             if terminal.is_some() {
                 return terminal.clone();
@@ -6776,10 +6782,11 @@ exec tail -f /dev/null
         fn send_turn(
             &self,
             _session_id: &str,
-            _content: &str,
+            content: &str,
             timeout: Duration,
         ) -> Result<Option<String>, RuntimeCommandError> {
             self.send_timeouts.lock().unwrap().push(timeout);
+            self.sent_turn_contents.lock().unwrap().push(content.into());
             if self.timeout_send_after_write.load(Ordering::Acquire) {
                 thread::sleep(timeout);
                 return Err(RuntimeCommandError::Timeout);
@@ -6836,6 +6843,26 @@ exec tail -f /dev/null
 
         fn turn_snapshot(&self) -> TurnSnapshot {
             self.turn.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Default)]
+    struct ManualMonotonicClock {
+        millis: AtomicU64,
+    }
+
+    impl ManualMonotonicClock {
+        fn advance(&self, duration: Duration) {
+            self.millis.fetch_add(
+                u64::try_from(duration.as_millis()).unwrap(),
+                Ordering::AcqRel,
+            );
+        }
+    }
+
+    impl MonotonicClock for ManualMonotonicClock {
+        fn now(&self) -> Duration {
+            Duration::from_millis(self.millis.load(Ordering::Acquire))
         }
     }
 
@@ -6952,6 +6979,14 @@ exec tail -f /dev/null
         }
 
         fn new_with_budget(suffix: &str, budget: BudgetRequest) -> Self {
+            Self::new_with_budget_and_clock(suffix, budget, None)
+        }
+
+        fn new_with_budget_and_clock(
+            suffix: &str,
+            budget: BudgetRequest,
+            clock: Option<Arc<dyn MonotonicClock>>,
+        ) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repository = directory.path().join("repository");
             fs::create_dir_all(repository.join("src")).unwrap();
@@ -7021,22 +7056,26 @@ exec tail -f /dev/null
                 })
                 .unwrap();
             let factory = Arc::new(FakeFactory::default());
-            let scheduler = Scheduler::new(
+            let mut scheduler = Scheduler::new(
                 format!("review-exit-owner-{suffix}"),
                 Arc::clone(&store),
                 factory.clone(),
                 SchedulerConfig::default(),
             )
-            .unwrap()
-            .with_ledger(
-                Arc::new(LedgerManager::new(Arc::clone(&store))),
-                InternalLedgerMcpConfig {
-                    command: PathBuf::from("/usr/bin/false"),
-                    socket: directory.path().join(format!("{suffix}.sock")),
-                    runtime_sha256: Some("a".repeat(64)),
-                },
-            )
             .unwrap();
+            if let Some(clock) = clock {
+                scheduler = scheduler.with_monotonic_clock(clock).unwrap();
+            }
+            let scheduler = scheduler
+                .with_ledger(
+                    Arc::new(LedgerManager::new(Arc::clone(&store))),
+                    InternalLedgerMcpConfig {
+                        command: PathBuf::from("/usr/bin/false"),
+                        socket: directory.path().join(format!("{suffix}.sock")),
+                        runtime_sha256: Some("a".repeat(64)),
+                    },
+                )
+                .unwrap();
             assert_eq!(scheduler.start_ready().unwrap(), vec![execution_id.clone()]);
             assert_eq!(
                 store.get_job(&execution_id).unwrap().unwrap().state,
@@ -7050,6 +7089,23 @@ exec tail -f /dev/null
                 prepared,
                 execution_id,
             }
+        }
+
+        fn progress(&self, summary: &str) {
+            let job = self.store.get_job(&self.execution_id).unwrap().unwrap();
+            self.scheduler
+                .call_task_review_tool(
+                    &self.execution_id,
+                    review_ledger::REVIEW_PROGRESS,
+                    serde_json::json!({
+                        "attempt_sequence":1,
+                        "run_idempotency_key":job.runtime_agent_id.unwrap(),
+                        "stage":"inspection",
+                        "summary":summary,
+                        "counters":{}
+                    }),
+                )
+                .unwrap();
         }
 
         fn checkpoint(&self) {
@@ -7121,6 +7177,24 @@ exec tail -f /dev/null
         })
     }
 
+    fn convergence_budget(
+        wall_time_ms: u64,
+        semantic_soft_timeout_ms: u64,
+        semantic_hard_timeout_ms: u64,
+        max_turns: u64,
+    ) -> BudgetRequest {
+        BudgetRequest::Limits(EffectiveBudget {
+            wall_time_ms,
+            semantic_soft_timeout_ms,
+            semantic_hard_timeout_ms,
+            max_turns,
+            max_tool_calls: 32,
+            max_context_bytes: 1_048_576,
+            max_result_bytes: 262_144,
+            max_artifact_bytes: 2_097_152,
+        })
+    }
+
     fn review_exit_git(repository: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -7152,6 +7226,126 @@ exec tail -f /dev/null
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_monitor_iterations(runtime: &FakeRuntime, additional: usize) {
+        let target = runtime
+            .wait_terminal_calls
+            .load(Ordering::Acquire)
+            .saturating_add(additional);
+        wait_until_review_exit(|| {
+            (runtime.wait_terminal_calls.load(Ordering::Acquire) >= target).then_some(())
+        });
+    }
+
+    fn emit_budget_turn(runtime: &FakeRuntime, turn_id: &str) {
+        runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type":"turn.started",
+                    "payload":{"turnId":turn_id}
+                }),
+            },
+        ))));
+    }
+
+    #[test]
+    fn convergence_nudge_precedes_reserve_and_each_is_sent_once() {
+        let clock = Arc::new(ManualMonotonicClock::default());
+        let fixture = ReviewExitFixture::new_with_budget_and_clock(
+            "ordered-convergence-reminders",
+            convergence_budget(10_000, 100, 5_000, 6),
+            Some(clock.clone()),
+        );
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        fixture.progress("initial bounded inspection");
+
+        clock.advance(Duration::from_millis(101));
+        wait_until_review_exit(|| {
+            (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
+        });
+        wait_for_monitor_iterations(&runtime, 3);
+        assert_eq!(runtime.sent_turn_contents.lock().unwrap().len(), 1);
+
+        for turn_id in [
+            "budget-turn-1",
+            "budget-turn-2",
+            "budget-turn-3",
+            "budget-turn-4",
+        ] {
+            emit_budget_turn(&runtime, turn_id);
+        }
+        wait_until_review_exit(|| {
+            (runtime.sent_turn_contents.lock().unwrap().len() == 2).then_some(())
+        });
+        wait_for_monitor_iterations(&runtime, 3);
+        let sent = runtime.sent_turn_contents.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].starts_with("CONVERGENCE_NUDGE:"));
+        assert!(sent[1].starts_with("FINALIZATION_RESERVE:"));
+
+        let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+    }
+
+    #[test]
+    fn reserve_precedes_soft_timeout_suppresses_nudge_and_resets_per_attempt() {
+        for suffix in ["reserve-first-a", "reserve-first-b"] {
+            let clock = Arc::new(ManualMonotonicClock::default());
+            let fixture = ReviewExitFixture::new_with_budget_and_clock(
+                suffix,
+                convergence_budget(10_000, 100, 5_000, 2),
+                Some(clock.clone()),
+            );
+            let runtime = fixture.factory.runtime(&fixture.execution_id);
+            wait_until_review_exit(|| {
+                (runtime.sent_turn_contents.lock().unwrap().len() == 1).then_some(())
+            });
+            fixture.progress("reserve already owns convergence");
+            clock.advance(Duration::from_millis(101));
+            wait_for_monitor_iterations(&runtime, 3);
+
+            let sent = runtime.sent_turn_contents.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "{suffix}");
+            assert!(sent[0].starts_with("FINALIZATION_RESERVE:"), "{suffix}");
+            assert!(
+                sent.iter()
+                    .all(|content| !content.starts_with("CONVERGENCE_NUDGE:")),
+                "{suffix}"
+            );
+
+            let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        }
+    }
+
+    #[test]
+    fn wall_reserve_is_sent_once_without_turn_pressure() {
+        let fixture = ReviewExitFixture::new_with_budget(
+            "wall-reserve",
+            convergence_budget(1_500, 10_000, 20_000, 20),
+        );
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        wait_until_review_exit(|| {
+            runtime
+                .sent_turn_contents
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|content| content.starts_with("FINALIZATION_RESERVE:"))
+                .then_some(())
+        });
+        wait_for_monitor_iterations(&runtime, 2);
+        let sent = runtime.sent_turn_contents.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with("FINALIZATION_RESERVE:"));
+
+        let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
     }
 
     #[test]
@@ -7314,6 +7508,112 @@ exec tail -f /dev/null
         let _ = fixture.finish(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));
+    }
+
+    #[test]
+    fn denied_path_can_converge_through_prepared_read_and_truthful_coverage_gap() {
+        let fixture = ReviewExitFixture::new("denial-prepared-read-finalize");
+        let runtime = fixture.factory.runtime(&fixture.execution_id);
+        let respond = |wire_id: &str, path: &str| -> ResponseOutcome {
+            runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::Request(RequestEnvelope {
+                    id: WireId::String(wire_id.into()),
+                    method: INTERACTION_REQUEST_PERMISSION.into(),
+                    params: permission_offer("Read", serde_json::json!({"path":path})),
+                }),
+            )));
+            let request_id = wait_until_review_exit(|| {
+                fixture
+                    .store
+                    .pending_requests(&fixture.execution_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|request| {
+                        request.state == PendingRequestState::Pending
+                            && request.payload_json.contains(path)
+                    })
+                    .map(|request| request.request_id)
+            });
+            fixture
+                .scheduler
+                .respond_job(&fixture.execution_id, &request_id, "allow", None)
+                .unwrap()
+        };
+
+        let denied = respond("denied-missing-read", "missing-evidence.rs");
+        assert_eq!(denied.effective_decision, "deny");
+        assert!(denied.policy_overrode);
+        assert_eq!(
+            denied.policy_reason_code.as_deref(),
+            Some("read_path_unverifiable")
+        );
+
+        let prepared_patch = fixture
+            .prepared
+            .review_inputs
+            .diff_patch
+            .prepared_path
+            .to_string_lossy()
+            .into_owned();
+        let prepared_read = respond("prepared-patch-read", &prepared_patch);
+        assert_eq!(prepared_read.effective_decision, "allow");
+        assert!(!prepared_read.policy_overrode);
+        assert!(prepared_read.policy_reason_code.is_none());
+
+        let responses = runtime.responses.lock().unwrap().clone();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].1, "deny");
+        assert!(responses[0].3.as_ref().unwrap().1.contains(
+            "code=read_path_unverifiable;retry=simplify_once;next=correct_read_path_once"
+        ));
+        assert_eq!(responses[1].1, "allow");
+        assert!(responses[1].3.is_none());
+
+        fixture.checkpoint();
+        fixture.validation();
+        fixture
+            .scheduler
+            .call_task_review_tool(
+                &fixture.execution_id,
+                REVIEW_FINALIZE,
+                serde_json::json!({
+                    "signal":"incomplete_evidence",
+                    "summary":"prepared diff reviewed; missing path remains unavailable",
+                    "coverage":{
+                        "covered":[prepared_patch],
+                        "not_covered":["missing-evidence.rs"]
+                    },
+                    "uncertainties":["missing-evidence.rs was unavailable after one corrected Read"],
+                    "recommended_next_actions":[]
+                }),
+            )
+            .unwrap();
+        let snapshot = fixture
+            .store
+            .review_snapshot(&fixture.execution_id)
+            .unwrap()
+            .unwrap();
+        let finalization: serde_json::Value =
+            serde_json::from_str(&snapshot.finalization.as_ref().unwrap().payload_json).unwrap();
+        assert_eq!(finalization["signal"], "incomplete_evidence");
+        assert_eq!(
+            finalization["coverage"]["not_covered"],
+            serde_json::json!(["missing-evidence.rs"])
+        );
+        let artifact = fixture
+            .scheduler
+            .verify_review_artifact(&fixture.execution_id, 8_192)
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.integrity, review_ledger::ArtifactIntegrity::Valid);
+        assert!(artifact.finalized);
+        let report = fs::read_to_string(&snapshot.report.expected_path).unwrap();
+        assert!(report.contains("missing\\-evidence\\.rs"));
+        assert!(report.contains("incomplete_evidence"));
+
+        let result = fixture.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(0))));
+        assert_eq!(result.result.outcome, TaskOutcome::Succeeded);
+        assert_eq!(result.result.summary, "REVIEW_FINALIZED");
     }
 
     #[test]
@@ -7684,6 +7984,10 @@ exec tail -f /dev/null
                 None => unreachable!(),
             }
             let runtime = fixture.factory.runtime(&fixture.execution_id);
+            assert!(
+                runtime.sent_turn_contents.lock().unwrap().is_empty(),
+                "control/budget outcome lost precedence in {scenario}"
+            );
             runtime.finish(RuntimeTerminal::Exited(ChildExit::Exited(Some(31))));
             drop(guard);
             let result = wait_for_task_result(&fixture.store, &fixture.execution_id);

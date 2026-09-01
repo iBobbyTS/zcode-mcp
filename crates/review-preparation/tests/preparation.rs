@@ -205,6 +205,35 @@ fn prepared_review_inputs_are_confined_hashed_and_bound_to_base_head() {
         .unwrap()
         .windows(b"TRUNCATED AT BYTE CAP".len())
         .any(|window| window == b"TRUNCATED AT BYTE CAP"));
+    let changed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&inputs.changed_files.prepared_path).unwrap()).unwrap();
+    assert_eq!(changed["status"], "complete");
+    assert_eq!(changed["complete"], true);
+    assert_eq!(changed["omitted"], false);
+    assert_eq!(
+        changed["byte_cap"],
+        review_preparation::MAX_REVIEW_DIFF_BYTES / 4
+    );
+
+    let launcher = prepared.launcher().unwrap();
+    for artifact in [&inputs.changed_files, &inputs.diff_stat, &inputs.diff_patch] {
+        assert!(
+            launcher
+                .decide(
+                    &PermissionRequest::Read(artifact.prepared_path.clone()),
+                    ExternalDecision::Allow,
+                )
+                .allowed
+        );
+    }
+    let unrelated = fixture
+        .repository
+        .join(".agent-work/scratch/unrelated-job/inputs/REVIEW-DIFF.patch");
+    fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+    fs::write(&unrelated, "unrelated\n").unwrap();
+    let decision = launcher.decide(&PermissionRequest::Read(unrelated), ExternalDecision::Allow);
+    assert!(!decision.allowed);
+    assert_eq!(decision.reason, "read_path_escape_denied");
 }
 
 #[test]
