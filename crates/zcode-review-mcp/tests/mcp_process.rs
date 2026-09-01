@@ -454,6 +454,7 @@ impl ManagedRuntime for PublicFakeRuntime {
         _correlation_id: &str,
         _decision: &str,
         _content: Option<&str>,
+        _validated_denial: Option<&review_preparation::ValidatedPermissionDenial>,
         _deadline: std::time::Instant,
     ) -> Result<(), RuntimeCommandError> {
         Ok(())

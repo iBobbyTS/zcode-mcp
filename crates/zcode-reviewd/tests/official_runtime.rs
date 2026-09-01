@@ -86,11 +86,20 @@ fn official_runtime_permission_and_unsupported_input_are_bounded() {
     assert!(params
         .get("options")
         .is_some_and(serde_json::Value::is_array));
+    let validated_denial = review_preparation::PolicyLauncher::external_zcode_denial(&params)
+        .expect("daemon denial identity must be derived from the permission payload");
+    assert!(validated_denial
+        .feedback(false)
+        .contains("code=external_policy_denied;"));
+    assert!(validated_denial
+        .fingerprint()
+        .contains("family="));
     owner
         .respond_request(
             &correlation,
             "deny",
             None,
+            Some(&validated_denial),
             std::time::Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
