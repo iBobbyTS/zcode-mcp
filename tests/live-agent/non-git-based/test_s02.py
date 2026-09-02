@@ -483,15 +483,29 @@ class S02Tests(unittest.TestCase):
         }
         self.assertEqual(_computed_case_conclusion(case), "FAIL")
 
-    def test_first_true_nudge_is_not_a_transition(self):
+    def test_first_true_nudge_is_observation_not_a_required_transition(self):
         from run_matrix import _assert_case_c_progress
         events = [{"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"}]
         for sequence, stage in enumerate(("inspection", "validation", "synthesis"), start=2):
             events.append({"sequence": sequence, "attempt_sequence": 1, "event_type": "review_progress",
                            "stage": stage, "summary": stage, "last_progress_at": 1,
                            "semantic_idle_ms": 120001, "nudge_sent": True})
-        with self.assertRaises(InfrastructureConformanceError):
-            _assert_case_c_progress({"event_snapshots": [{"events": events}]}, {1})
+        evidence = {"event_snapshots": [{"events": events}]}
+        _assert_case_c_progress(evidence, {1})
+        self.assertEqual(evidence["progress_metrics"]["nudge_transition_count"], {"1": 0})
+        self.assertEqual(evidence["progress_metrics"]["stage_sets"], {"1": ["inspection", "synthesis", "validation"]})
+
+    def test_sparse_progress_is_not_a_case_c_failure(self):
+        from run_matrix import _assert_case_c_progress
+        evidence = {"event_snapshots": [{"events": [
+            {"sequence": 1, "attempt_sequence": 1, "event_type": "attempt_started"},
+            {"sequence": 2, "attempt_sequence": 1, "event_type": "review_progress",
+             "stage": "inspection", "summary": "done", "last_progress_at": 1,
+             "semantic_idle_ms": 1, "nudge_sent": False},
+        ]}]}
+        _assert_case_c_progress(evidence, {1})
+        self.assertEqual(evidence["progress_metrics"]["status"], "OBSERVED")
+        self.assertEqual(evidence["progress_metrics"]["stage_sets"]["1"], ["inspection"])
 
     def test_permission_missing_disposition_is_fatal(self):
         from run_matrix import _pending_requests
