@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt, fs, io,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -2184,6 +2185,7 @@ struct StoreLifecycleSink {
     owner_epoch: u64,
     budget: Option<Arc<AttemptBudget>>,
     attempt: Arc<AttemptRuntimeLifecycle>,
+    event_capture_path: Option<PathBuf>,
     write_state: Mutex<SinkWriteState>,
     #[cfg(test)]
     after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -2220,10 +2222,51 @@ impl StoreLifecycleSink {
             owner_epoch,
             budget,
             attempt,
+            event_capture_path: std::env::var_os("ZCODE_RUNTIME_EVENT_CAPTURE_PATH")
+                .map(PathBuf::from),
             write_state: Mutex::new(SinkWriteState::default()),
             #[cfg(test)]
             after_admission_hook: Mutex::new(None),
         }
+    }
+
+    /// Optional analysis-only mirror, disabled unless explicitly configured.
+    /// The durable event path keeps its redacted projection; this local mirror
+    /// preserves the complete inbound wire payload (including model reasoning)
+    /// for post-run analysis of exactly what the runtime emitted.
+    fn capture_event(
+        &self,
+        record: &LifecycleRecord,
+        projection: &LifecycleProjection,
+        pending_request_id: Option<&str>,
+    ) {
+        let Some(path) = self.event_capture_path.as_ref() else {
+            return;
+        };
+        let (payload, redaction_level) =
+            capture_payload(&record.event, pending_request_id, projection);
+        let value = serde_json::json!({
+            "agent_id": self.agent_id,
+            "runtime_agent_id": self.runtime_agent_id,
+            "source_sequence": record.sequence,
+            "event_type": projection.event_type,
+            "payload": payload,
+            "redaction_level": redaction_level,
+        });
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{}", value);
+        }
+    }
+
+    fn capture_synthesized_terminal(&self, source_sequence: u64, terminal: &RuntimeTerminal) {
+        self.capture_event(
+            &LifecycleRecord {
+                sequence: source_sequence,
+                event: RuntimeEvent::Terminal(terminal.clone()),
+            },
+            &lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None),
+            None,
+        );
     }
 
     #[cfg(test)]
@@ -2251,6 +2294,9 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
+        if state.pending_terminal_sequence.is_none() {
+            self.capture_synthesized_terminal(source_sequence, terminal);
+        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2292,6 +2338,9 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
+        if state.pending_terminal_sequence.is_none() {
+            self.capture_synthesized_terminal(source_sequence, terminal);
+        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2332,6 +2381,9 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
+        if state.pending_terminal_sequence.is_none() {
+            self.capture_synthesized_terminal(source_sequence, terminal);
+        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         let terminal_write = self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2595,6 +2647,7 @@ impl LifecycleSink for StoreLifecycleSink {
             _ => None,
         };
         let projection = lifecycle_projection(&record.event, pending_request_id.as_deref());
+        self.capture_event(&record, &projection, pending_request_id.as_deref());
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -2618,6 +2671,55 @@ impl LifecycleSink for StoreLifecycleSink {
         if let Err(error) = self.store.append_lifecycle(&write) {
             state.first_error = Some(error.to_string());
         }
+    }
+}
+
+fn capture_payload(
+    event: &RuntimeEvent,
+    pending_request_id: Option<&str>,
+    durable: &LifecycleProjection,
+) -> (serde_json::Value, &'static str) {
+    match event {
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => (
+            serde_json::json!({
+                "kind": "unknown_event",
+                "method": method,
+                "raw": raw,
+            }),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(message))) => (
+            serde_json::json!({
+                "kind": "event",
+                "method": message.method,
+                "type": event_type(message),
+                "params": message.params,
+            }),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))) => (
+            serde_json::json!({
+                "kind": "request",
+                "method": request.method,
+                "request_id": pending_request_id,
+                "params": request.params,
+            }),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Response(response))) => (
+            serde_json::json!({
+                "kind": "response",
+                "outcome": if response.error.is_some() { "error" } else { "result" },
+                "result": response.result,
+                "error": response.error,
+            }),
+            "analysis_full",
+        ),
+        _ => (
+            serde_json::from_str::<serde_json::Value>(&durable.payload_json)
+                .unwrap_or_else(|_| serde_json::json!({"detail": "[REDACTED]"})),
+            durable.redaction_level,
+        ),
     }
 }
 
@@ -11823,6 +11925,53 @@ exec tail -f /dev/null
         let job = store.get_job("job-redaction").unwrap().unwrap();
         assert_eq!(job.failure_message.as_deref(), Some("stop_failed"));
         assert!(!job.failure_message.unwrap().contains(TOKEN));
+    }
+
+    #[test]
+    fn analysis_capture_preserves_wire_payload_while_durable_projection_stays_redacted() {
+        const REASONING: &str = "SENTINEL_REASONING_TEXT";
+        const COMMAND: &str = "rg SENTINEL_PATTERN";
+
+        let unknown = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
+            method: "future/event".into(),
+            raw: serde_json::json!({
+                "method": "future/event",
+                "reasoning": REASONING,
+            }),
+        }));
+        let durable_unknown = lifecycle_projection(&unknown, None);
+        assert_eq!(durable_unknown.event_type, "raw.unknown");
+        assert!(durable_unknown.payload_json.contains("[REDACTED]"));
+        let (captured_unknown, captured_unknown_level) =
+            capture_payload(&unknown, None, &durable_unknown);
+        assert_eq!(captured_unknown_level, "analysis_full");
+        assert_eq!(captured_unknown["method"], "future/event");
+        assert_eq!(captured_unknown["raw"]["reasoning"], REASONING);
+
+        let request =
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(RequestEnvelope {
+                id: WireId::String("request-id".into()),
+                method: INTERACTION_REQUEST_PERMISSION.into(),
+                params: serde_json::json!({"command": COMMAND}),
+            })));
+        let durable_request = lifecycle_projection(&request, Some("agent:request:7"));
+        assert!(!durable_request.payload_json.contains(COMMAND));
+        let (captured_request, captured_request_level) =
+            capture_payload(&request, Some("agent:request:7"), &durable_request);
+        assert_eq!(captured_request_level, "analysis_full");
+        assert_eq!(captured_request["request_id"], "agent:request:7");
+        assert_eq!(captured_request["params"]["command"], COMMAND);
+
+        let lifecycle = RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence: 1,
+            method: "turn.started".into(),
+            order: LifecycleOrder::InOrder,
+        });
+        let durable_lifecycle = lifecycle_projection(&lifecycle, None);
+        let (captured_lifecycle, captured_lifecycle_level) =
+            capture_payload(&lifecycle, None, &durable_lifecycle);
+        assert_eq!(captured_lifecycle_level, durable_lifecycle.redaction_level);
+        assert_eq!(captured_lifecycle["kind"], "lifecycle");
     }
 
     #[test]
