@@ -5,7 +5,7 @@
 Requirements are Rust 1.97 or compatible, Cargo, Git, and macOS or a compatible Unix host.
 
 ```text
-cargo build --release -p zcode-reviewd -p zcode-review-mcp -p sectioned-shadow
+cargo build --release -p zcode-reviewd -p zcode-review-mcp
 ```
 
 ## Daemon

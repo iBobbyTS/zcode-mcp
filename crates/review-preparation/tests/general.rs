@@ -1,9 +1,9 @@
 use review_preparation::{
     general_control_header, general_launch_prompt, AttachmentInput, CompletionOutcome,
-    ExternalDecision, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion,
-    GeneralCompletionSubmission, GeneralFinalizer, GeneralNamedCommand, GeneralProfile,
-    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PolicyCapabilities,
-    PolicyLauncher, PreparationError, PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
+    ExternalDecision, GeneralArtifactKind, GeneralCompletion, GeneralFinalizer,
+    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
+    PermissionRequest, PreparationError, PreparedGeneralTask, ValidationCommand,
+    GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -141,13 +141,12 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     assert!(header.starts_with("--- BEGIN DAEMON GENERAL CONTROL"));
     assert!(header.contains("\"profile\": \"test_runner\""));
     assert!(header.contains("\"command_id\": \"unit\""));
-    assert!(header.contains("Do not invoke private progress, checkpoint, finding, validation, completion, or finalize tools"));
     assert!(header.contains("daemon finalizes a matching turn.completed boundary"));
     assert!(header.contains("daemon owns outcome classification"));
     assert!(!header.contains("general-completion"));
-    assert!(header.contains("public result, status, or artifact content"));
-    assert!(header
-        .contains("hidden reasoning, credentials, absolute host paths, or low-level tool details"));
+    assert!(!header.contains("checkpoint"));
+    assert!(!header.contains("finding"));
+    assert!(header.contains("hidden reasoning, credentials, absolute host paths"));
     assert!(header.contains(&prepared.prompt_sha256));
     assert!(!header.contains("changes_patch"));
     assert!(!header.contains(&manifest.prompt));
@@ -185,7 +184,7 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     let implementation_header = general_control_header(&implementation).unwrap();
     assert!(implementation_header.contains("\"profile\": \"implementation_worktree\""));
     assert!(implementation_header.contains("\"write_manifest\": [\n    \"src\""));
-    assert!(implementation_header.contains("changes_patch"));
+    assert!(!implementation_header.contains("changes_patch"));
     assert_ne!(implementation.manifest_sha256, prepared.manifest_sha256);
 
     assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
@@ -673,16 +672,7 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
         "pub fn value() -> u8 { 2 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize_submission(
-        &prepared,
-        &GeneralCompletionSubmission {
-            requested_outcome: CompletionOutcome::Succeeded,
-            summary: "implemented".into(),
-            checks: vec!["unit".into()],
-            residual_gaps: vec![],
-            artifact_intents: vec![],
-        },
-    );
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
     assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
     assert!(completion.cleaned);
     let artifact = completion.artifact.unwrap();
@@ -777,7 +767,7 @@ fn implementation_context_outside_write_manifest_remains_immutable() {
 }
 
 #[test]
-fn readonly_change_and_result_limit_become_result_invalid() {
+fn readonly_change_becomes_result_invalid() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
@@ -794,24 +784,6 @@ fn readonly_change_and_result_limit_become_result_invalid() {
         completion.reason_code.as_deref(),
         Some("READONLY_PROFILE_MODIFIED_TRACKED_STATE")
     );
-    assert!(completion.cleaned);
-    let f = Fixture::new();
-    let mut m = f.manifest(GeneralProfile::AnalysisReadonly);
-    let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
-    budget.max_result_bytes = 1;
-    m.budget = Some(budget);
-    let prepared = f.preparer().prepare(&m).unwrap();
-    let completion = GeneralFinalizer::finalize_submission(
-        &prepared,
-        &GeneralCompletionSubmission {
-            requested_outcome: CompletionOutcome::Succeeded,
-            summary: "too long".into(),
-            checks: vec![],
-            residual_gaps: vec![],
-            artifact_intents: vec![],
-        },
-    );
-    assert_eq!(completion.reason_code.as_deref(), Some("RESULT_TOO_LARGE"));
     assert!(completion.cleaned);
 }
 
@@ -1175,7 +1147,7 @@ fn ordinary_filename_containing_gitlink_mode_digits_is_allowed() {
 }
 
 #[test]
-fn result_metadata_and_declared_artifact_inventory_are_preserved() {
+fn model_authored_scratch_files_never_become_public_artifacts() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
@@ -1183,67 +1155,41 @@ fn result_metadata_and_declared_artifact_inventory_are_preserved() {
         .unwrap();
     let output_root = prepared.scratch_root.join("agent-artifacts");
     fs::create_dir_all(&output_root).unwrap();
-    let report = b"# Analysis\n\nBounded result.\n";
-    fs::write(output_root.join("report.md"), report).unwrap();
-    let report_hash = format!("{:x}", Sha256::digest(report));
-    let completion = GeneralFinalizer::finalize_submission(
-        &prepared,
-        &GeneralCompletionSubmission {
-            requested_outcome: CompletionOutcome::Succeeded,
-            summary: "bounded summary".into(),
-            checks: vec!["cargo check".into()],
-            residual_gaps: vec!["owner decision".into()],
-            artifact_intents: vec![GeneralArtifactIntent {
-                kind: GeneralArtifactKind::ReportMarkdown,
-                sha256: Some(report_hash.clone()),
-                size_bytes: Some(report.len() as u64),
-            }],
-        },
-    );
+    fs::write(output_root.join("report.md"), "model supplied\n").unwrap();
+    fs::write(output_root.join("check-report.json"), "{}\n").unwrap();
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+
     assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
-    assert_eq!(completion.summary, "bounded summary");
-    assert_eq!(completion.checks, ["cargo check"]);
-    assert_eq!(completion.residual_gaps, ["owner decision"]);
-    assert_eq!(completion.artifacts.len(), 1);
-    assert_eq!(completion.artifacts[0].sha256, report_hash);
-    assert_eq!(
-        fs::read(prepared.artifact_root.join("report.md")).unwrap(),
-        report
-    );
-    assert!(prepared
-        .artifact_root
-        .join("artifacts.manifest.json")
-        .is_file());
+    assert!(completion.artifacts.is_empty());
+    assert!(completion.artifact.is_none());
+    assert!(!prepared.artifact_root.join("report.md").exists());
+    assert!(!prepared.artifact_root.join("check-report.json").exists());
     assert!(!prepared.prompt_path.exists());
     let job_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
     assert!(!job_root.exists());
+}
 
-    let replay = f
-        .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
-        .unwrap();
-    assert!(replay.worktree.path.exists());
-    let replay_completion = GeneralFinalizer::finalize(&replay, CompletionOutcome::Blocked);
-    assert_eq!(
-        replay_completion.reason_code.as_deref(),
-        Some("ARTIFACT_ROOT_NOT_EMPTY")
-    );
-    assert!(replay_completion.cleaned);
-
+#[test]
+fn preexisting_artifact_root_content_is_rejected_without_adoption() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::TestRunner))
+        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
         .unwrap();
-    let output_root = prepared.scratch_root.join("agent-artifacts");
-    fs::create_dir_all(&output_root).unwrap();
-    fs::write(output_root.join("undeclared.txt"), "unexpected").unwrap();
+    fs::write(prepared.artifact_root.join("foreign.txt"), "untrusted\n").unwrap();
+
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+
     assert_eq!(
         completion.reason_code.as_deref(),
-        Some("UNDECLARED_ARTIFACT")
+        Some("ARTIFACT_ROOT_NOT_EMPTY")
     );
     assert!(completion.cleaned);
+    assert_eq!(
+        fs::read_to_string(prepared.artifact_root.join("foreign.txt")).unwrap(),
+        "untrusted\n"
+    );
 }
 
 #[test]

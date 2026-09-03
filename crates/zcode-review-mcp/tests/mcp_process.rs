@@ -53,12 +53,15 @@ fn stdio_catalog_is_exactly_the_generic_nine_tools() {
     assert_eq!(names, zcode_review_mcp::V2_PUBLIC_TOOLS);
     let schema = serde_json::to_string(tools).unwrap();
     for forbidden in [
-        "zcode_review_",
+        concat!("zcode_", "review_"),
         "zcode_system_ensure_ready",
         "zcode_agent_get",
         "zcode_agent_events",
         "zcode_agent_wait",
-        "review_id",
+        concat!("review", "_id"),
+        "report_markdown",
+        "check_report",
+        concat!("artifact", "_intents"),
         "interrupt_and_continue",
         "semantic_soft_timeout_ms",
         "semantic_hard_timeout_ms",

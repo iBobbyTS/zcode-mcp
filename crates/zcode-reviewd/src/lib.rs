@@ -3,7 +3,7 @@ use review_store::{
     MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
     PendingResponseClaimDisposition, ResultArtifact, Store, StoreError, StoredMessage,
     StoredProcessIdentity, TaskKind, TaskOutcome, TaskRecord, TaskResult,
-    TaskSubmissionDisposition, TerminalUpdate, TurnState,
+    TaskSubmissionDisposition, TurnState,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,10 +37,10 @@ pub mod rpc;
 use budget::AttemptBudget;
 use review_preparation::{
     canonical_general_repository, general_launch_prompt, validate_general_named_command,
-    CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
-    GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
-    ValidationCommand, ValidationOutput, MAX_VALIDATION_COMMAND_TIMEOUT_MS,
+    CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralFinalizer,
+    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher,
+    PreparedGeneralTask, ValidatedPermissionDenial, ValidationCommand, ValidationOutput,
+    MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1965,27 +1965,6 @@ impl ManagedRuntime for RuntimeOwner {
 pub trait RuntimeFactory: Send + Sync + 'static {
     fn spawn(&self, job: &Job, sink: Arc<dyn LifecycleSink>)
         -> io::Result<Arc<dyn ManagedRuntime>>;
-
-    fn spawn_readiness(
-        &self,
-        job: &Job,
-        sink: Arc<dyn LifecycleSink>,
-        deadline: Instant,
-    ) -> io::Result<Arc<dyn ManagedRuntime>> {
-        ensure_readiness_deadline(deadline)?;
-        self.spawn(job, sink)
-    }
-}
-
-fn ensure_readiness_deadline(deadline: Instant) -> io::Result<()> {
-    if Instant::now() < deadline {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "readiness spawn deadline elapsed",
-        ))
-    }
 }
 
 pub struct CommandRuntimeFactory<F> {
@@ -2009,9 +1988,7 @@ impl<F> CommandRuntimeFactory<F> {
     }
 }
 
-/// Bind the daemon-owned policy envelope to every ZCode child.  The hook is
-/// intentionally activated only for daemon-launched runtimes; readiness jobs
-/// receive an empty manifest and therefore remain read-only.
+/// Bind the daemon-owned policy envelope to every ZCode child.
 fn apply_agent_policy_environment(command: &mut Command, job: &Job) -> io::Result<()> {
     const MAX_AGENT_WRITE_MANIFEST_ENTRIES: usize = 256;
     const MAX_AGENT_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
@@ -2079,19 +2056,6 @@ where
         }
         let mut command = (self.command)(job)?;
         apply_agent_policy_environment(&mut command, job)?;
-        Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
-    }
-
-    fn spawn_readiness(
-        &self,
-        job: &Job,
-        sink: Arc<dyn LifecycleSink>,
-        deadline: Instant,
-    ) -> io::Result<Arc<dyn ManagedRuntime>> {
-        ensure_readiness_deadline(deadline)?;
-        let mut command = (self.command)(job)?;
-        apply_agent_policy_environment(&mut command, job)?;
-        ensure_readiness_deadline(deadline)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
 }
@@ -2360,17 +2324,6 @@ impl ControlDeadline {
             .filter(|deadline| *deadline > Instant::now())
     }
 
-    fn readiness_probe_deadline(self, stop_grace: Duration) -> Option<Instant> {
-        let remaining = self.remaining()?;
-        let maximum_cleanup = stop_grace
-            .checked_mul(3)
-            .unwrap_or(remaining)
-            .min(remaining / 4);
-        self.expires_at
-            .checked_sub(maximum_cleanup)
-            .filter(|deadline| *deadline > Instant::now())
-    }
-
     fn cleanup_grace(self, configured: Duration) -> Duration {
         self.remaining()
             .map(|remaining| configured.min(remaining / 3))
@@ -2578,50 +2531,29 @@ struct ActiveRuntime {
     route: TaskRoute,
     task: Option<TaskRecord>,
     policy: Option<Arc<PolicyLauncher>>,
-    general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     check: Arc<ActiveCheck>,
-    budget: Option<Arc<AttemptBudget>>,
 }
 
 #[derive(Debug, Default)]
 struct ActiveCheck {
-    in_flight: AtomicBool,
     cancelled: AtomicBool,
 }
 
 impl ActiveCheck {
-    fn claim(self: &Arc<Self>) -> Result<ActiveCheckClaim, ()> {
-        self.in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| ())?;
-        Ok(ActiveCheckClaim(Arc::clone(self)))
-    }
-
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 }
 
-struct ActiveCheckClaim(Arc<ActiveCheck>);
-
-impl Drop for ActiveCheckClaim {
-    fn drop(&mut self) {
-        self.0.in_flight.store(false, Ordering::Release);
-    }
-}
-
 struct TerminalTarget<'a> {
     agent_id: &'a str,
-    owner_epoch: u64,
     sink: &'a StoreLifecycleSink,
     route: &'a TaskRoute,
-    task: Option<&'a TaskRecord>,
 }
 
 struct TerminalDecision {
     terminal: RuntimeTerminal,
     natural_completion: bool,
-    general_submission: Option<GeneralCompletionSubmission>,
     forced_outcome: Option<(CompletionOutcome, String)>,
 }
 
@@ -2635,7 +2567,6 @@ struct MonitorContext {
     attempt: Arc<AttemptRuntimeLifecycle>,
     route: TaskRoute,
     task: Option<TaskRecord>,
-    general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     budget: Option<Arc<AttemptBudget>>,
     check: Arc<ActiveCheck>,
 }
@@ -2686,125 +2617,6 @@ pub struct SubmittedTask {
     pub disposition: TaskSubmissionDisposition,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimePreflightResult {
-    Ready,
-    ConfigInvalid,
-    ZcodeStartFailed,
-    RuntimeProtocolFailed,
-    ModelAuthFailed,
-    RuntimeFailed,
-    NotObservedWithinTimeout,
-    CleanupFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimePreflight {
-    pub result: RuntimePreflightResult,
-}
-
-struct ReadinessSink;
-
-impl LifecycleSink for ReadinessSink {
-    fn emit(&self, _record: LifecycleRecord) {}
-}
-
-fn readiness_job(workspace: &Path) -> Job {
-    static NEXT_READINESS_ID: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_READINESS_ID.fetch_add(1, Ordering::AcqRel);
-    Job {
-        agent_id: format!("readiness-{}-{sequence}", std::process::id()),
-        idempotency_key: None,
-        state: JobState::Starting,
-        workspace_path: workspace.to_string_lossy().into_owned(),
-        initial_prompt:
-            "Runtime readiness preflight. Reply with a short acknowledgement; do not use tools or modify files."
-                .into(),
-        prepared_launch_json: None,
-        prepared_launch_sha256: None,
-        owner_id: None,
-        owner_epoch: 0,
-        close_requested: false,
-        stop_requested: false,
-        last_event_seq: 0,
-        failure_code: None,
-        failure_message: None,
-        runtime_agent_id: None,
-        zcode_session_id: None,
-        turn_state: TurnState::Idle,
-        process_identity: None,
-        closed_at: None,
-        reaped_at: None,
-        created_at: 0,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeObservation {
-    Ready,
-    RuntimeFailed,
-    TimedOut,
-}
-
-fn wait_for_probe(runtime: &dyn ManagedRuntime, deadline: Instant) -> ProbeObservation {
-    loop {
-        // Evidence is classified only while the observation window is open. A
-        // boundary first observed after this check is deliberately left for
-        // cleanup and cannot upgrade or reclassify the probe.
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return ProbeObservation::TimedOut;
-        };
-        if remaining.is_zero() {
-            return ProbeObservation::TimedOut;
-        }
-        let turn = runtime.turn_snapshot();
-        if Instant::now() >= deadline {
-            return ProbeObservation::TimedOut;
-        }
-        if !turn.active {
-            match turn.boundary {
-                Some(TurnBoundary::Completed) => return ProbeObservation::Ready,
-                Some(TurnBoundary::Failed) => return ProbeObservation::RuntimeFailed,
-                None => {}
-            }
-        }
-        let terminal = runtime.wait_terminal(Duration::ZERO);
-        if Instant::now() >= deadline {
-            return ProbeObservation::TimedOut;
-        }
-        if terminal.is_some() {
-            return ProbeObservation::RuntimeFailed;
-        }
-        thread::sleep(remaining.min(Duration::from_millis(5)));
-    }
-}
-
-fn classify_readiness_spawn_error(
-    error: &io::Error,
-    probe_deadline: Instant,
-) -> RuntimePreflightResult {
-    if Instant::now() >= probe_deadline || error.kind() == io::ErrorKind::TimedOut {
-        RuntimePreflightResult::NotObservedWithinTimeout
-    } else if matches!(
-        error.kind(),
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData
-    ) {
-        RuntimePreflightResult::ConfigInvalid
-    } else {
-        RuntimePreflightResult::ZcodeStartFailed
-    }
-}
-
-fn classify_readiness_runtime_error(error: &RuntimeCommandError) -> RuntimePreflightResult {
-    match error {
-        RuntimeCommandError::Timeout => RuntimePreflightResult::NotObservedWithinTimeout,
-        RuntimeCommandError::Remote(_) => RuntimePreflightResult::RuntimeFailed,
-        RuntimeCommandError::Unsupported
-        | RuntimeCommandError::Transport(_)
-        | RuntimeCommandError::InvalidSession(_) => RuntimePreflightResult::RuntimeProtocolFailed,
-    }
-}
-
 struct StoreLifecycleSink {
     store: Arc<Store>,
     agent_id: String,
@@ -2833,7 +2645,6 @@ struct SinkWriteState {
     last_source_sequence: u64,
     pending_terminal_sequence: Option<u64>,
     terminal_written: bool,
-    progress_source_sequence: u64,
 }
 
 struct LifecycleProjection {
@@ -2895,47 +2706,6 @@ impl StoreLifecycleSink {
         Ok(NaturalCompletionAdmission::Ready)
     }
 
-    fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
-        let mut state = self.write_state.lock().unwrap();
-        if let Some(error) = &state.first_error {
-            return self.store.fail_claim(
-                &self.agent_id,
-                self.owner_epoch,
-                "LIFECYCLE_SINK_FAILED",
-                error,
-            );
-        }
-        if state.terminal_written {
-            return self
-                .store
-                .get_job(&self.agent_id)?
-                .map(|job| job.state)
-                .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()));
-        }
-        let source_sequence = state
-            .pending_terminal_sequence
-            .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
-        let write = LifecycleWrite {
-            agent_id: self.agent_id.clone(),
-            runtime_agent_id: self.runtime_agent_id.clone(),
-            owner_epoch: self.owner_epoch,
-            source_sequence,
-            event_type: projection.event_type.into(),
-            turn_id: None,
-            payload_json: projection.payload_json,
-            redaction_level: projection.redaction_level.into(),
-            terminal: Some(terminal_update(terminal)),
-            turn_state: None,
-        };
-        self.store.append_lifecycle(&write)?;
-        state.terminal_written = true;
-        self.store
-            .get_job(&self.agent_id)?
-            .map(|job| job.state)
-            .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()))
-    }
-
     fn finish_general(
         &self,
         terminal: &RuntimeTerminal,
@@ -2977,50 +2747,6 @@ impl StoreLifecycleSink {
             .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()))
     }
 
-    fn finish_task_result(
-        &self,
-        terminal: &RuntimeTerminal,
-        result: &TaskResult,
-    ) -> Result<JobState, StoreError> {
-        let mut state = self.write_state.lock().unwrap();
-        if let Some(error) = &state.first_error {
-            return Err(StoreError::InvalidState(error.clone()));
-        }
-        if state.terminal_written {
-            return self
-                .store
-                .get_job(&self.agent_id)?
-                .map(|job| job.state)
-                .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()));
-        }
-        let source_sequence = state
-            .pending_terminal_sequence
-            .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
-        let terminal_write = self.store.append_lifecycle(&LifecycleWrite {
-            agent_id: self.agent_id.clone(),
-            runtime_agent_id: self.runtime_agent_id.clone(),
-            owner_epoch: self.owner_epoch,
-            source_sequence,
-            event_type: projection.event_type.into(),
-            turn_id: None,
-            payload_json: projection.payload_json,
-            redaction_level: projection.redaction_level.into(),
-            terminal: None,
-            turn_state: None,
-        });
-        if let Err(error) = terminal_write {
-            state.first_error = Some(error.to_string());
-            return Err(error);
-        }
-        self.store.store_task_result(&self.agent_id, result)?;
-        state.terminal_written = true;
-        self.store
-            .get_job(&self.agent_id)?
-            .map(|job| job.state)
-            .ok_or_else(|| StoreError::InvalidState("terminal job disappeared".into()))
-    }
-
     fn error(&self) -> Option<String> {
         self.write_state.lock().unwrap().first_error.clone()
     }
@@ -3041,7 +2767,6 @@ fn persist_general_result(
             path: path.to_string_lossy().into_owned(),
             sha256: artifact.sha256.clone(),
             bytes: artifact.size_bytes,
-            checkpoint_number: None,
         })?;
         if !inserted {
             let existing = store.artifacts(agent_id, completion.artifacts.len().max(1))?;
@@ -3063,17 +2788,13 @@ fn persist_general_result(
 
 fn general_artifact_type(kind: GeneralArtifactKind) -> &'static str {
     match kind {
-        GeneralArtifactKind::ReportMarkdown => "report_markdown",
         GeneralArtifactKind::ChangesPatch => "changes_patch",
-        GeneralArtifactKind::CheckReport => "check_report",
     }
 }
 
 fn general_artifact_path(prepared: &PreparedGeneralTask, kind: GeneralArtifactKind) -> PathBuf {
     match kind {
-        GeneralArtifactKind::ReportMarkdown => prepared.artifact_root.join("report.md"),
         GeneralArtifactKind::ChangesPatch => prepared.artifact_root.join("changes.patch"),
-        GeneralArtifactKind::CheckReport => prepared.artifact_root.join("check-report.json"),
     }
 }
 
@@ -3113,9 +2834,7 @@ fn task_result(completion: &GeneralCompletion) -> TaskResult {
             .iter()
             .map(|artifact| ResultArtifact {
                 kind: match artifact.kind {
-                    GeneralArtifactKind::ReportMarkdown => ArtifactKind::ReportMarkdown,
                     GeneralArtifactKind::ChangesPatch => ArtifactKind::ChangesPatch,
-                    GeneralArtifactKind::CheckReport => ArtifactKind::CheckReport,
                 },
                 artifact_id: artifact.artifact_id.clone(),
                 sha256: artifact.sha256.clone(),
@@ -3191,21 +2910,6 @@ fn minimal_task_result(outcome: CompletionOutcome, summary: &str, reason_code: &
         diff_stat: None,
         checks: Vec::new(),
         residual_gaps: vec![reason_code.into()],
-        artifacts: Vec::new(),
-    }
-}
-
-fn finalized_review_task_result() -> TaskResult {
-    TaskResult {
-        outcome: TaskOutcome::Succeeded,
-        summary: "REVIEW_FINALIZED".into(),
-        partial: false,
-        base_commit: None,
-        head_commit: None,
-        changed_files: Vec::new(),
-        diff_stat: None,
-        checks: Vec::new(),
-        residual_gaps: Vec::new(),
         artifacts: Vec::new(),
     }
 }
@@ -3507,41 +3211,6 @@ fn runtime_loss_redaction(loss: &RuntimeLoss) -> &'static str {
     }
 }
 
-fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
-    match terminal {
-        RuntimeTerminal::Stopped(_) => TerminalUpdate {
-            state: JobState::Completed,
-            failure_code: None,
-            failure_message: None,
-        },
-        RuntimeTerminal::Completed(_) => TerminalUpdate {
-            state: JobState::Completed,
-            failure_code: None,
-            failure_message: None,
-        },
-        RuntimeTerminal::FailedTurn(_) => TerminalUpdate {
-            state: JobState::Failed,
-            failure_code: Some("TURN_FAILED".into()),
-            failure_message: Some("turn_failed".into()),
-        },
-        RuntimeTerminal::Exited(exit) => TerminalUpdate {
-            state: JobState::FailedRuntimeLost,
-            failure_code: Some("RUNTIME_EXITED".into()),
-            failure_message: Some(child_exit_name(exit).into()),
-        },
-        RuntimeTerminal::FailedRuntimeLost(loss) => TerminalUpdate {
-            state: JobState::FailedRuntimeLost,
-            failure_code: Some("FAILED_RUNTIME_LOST".into()),
-            failure_message: Some(runtime_loss_name(loss).into()),
-        },
-        RuntimeTerminal::Orphaned(loss) => TerminalUpdate {
-            state: JobState::Orphaned,
-            failure_code: Some("ORPHANED".into()),
-            failure_message: Some(runtime_loss_name(loss).into()),
-        },
-    }
-}
-
 impl Scheduler {
     fn late_ingress_error(agent_id: &str, reason: &'static str) -> SchedulerError {
         SchedulerError::RuntimeCommand {
@@ -3588,28 +3257,6 @@ impl Scheduler {
         Some("active turn had no matching stop boundary".into())
     }
 
-    fn stop_attempt_after_failure(
-        &self,
-        agent_id: &str,
-        runtime: &Arc<dyn ManagedRuntime>,
-        session_id: &str,
-        attempt: &AttemptRuntimeLifecycle,
-        deadline: ControlDeadline,
-    ) -> RuntimeTerminal {
-        let control_error = match self.runtime_phase_timeout(agent_id, deadline) {
-            Ok(timeout) => Self::request_cooperative_stop(runtime, session_id, attempt, timeout),
-            Err(error) => {
-                attempt.request_stop(&runtime.turn_snapshot());
-                attempt.force_terminating();
-                Some(error.to_string())
-            }
-        };
-        if let Some(error) = control_error {
-            self.record_failure(agent_id, error);
-        }
-        runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace))
-    }
-
     fn control_deadline(&self) -> ControlDeadline {
         ControlDeadline::new(self.inner.config.control_timeout)
     }
@@ -3637,34 +3284,6 @@ impl Scheduler {
                     };
                     thread::sleep(remaining.min(Duration::from_millis(1)));
                 }
-            }
-        }
-    }
-
-    fn lock_check_operation<'a>(
-        &self,
-        agent_id: &str,
-        operation: &'a Mutex<()>,
-        check: &ActiveCheck,
-        deadline: Instant,
-    ) -> Result<MutexGuard<'a, ()>, SchedulerError> {
-        loop {
-            if check.in_flight.load(Ordering::Acquire) {
-                return Err(SchedulerError::RuntimeCommand {
-                    agent_id: agent_id.into(),
-                    message: "another named check is already in flight".into(),
-                });
-            }
-            if check.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Err(SchedulerError::RuntimeCommand {
-                    agent_id: agent_id.into(),
-                    message: "named check was cancelled or exceeded the attempt deadline".into(),
-                });
-            }
-            match operation.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
-                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(1)),
             }
         }
     }
@@ -3760,14 +3379,6 @@ impl Scheduler {
     }
 
     #[cfg(test)]
-    fn set_response_claim_hook(
-        &self,
-        hook: impl Fn(ResponseClaimHookStage, &str) + Send + Sync + 'static,
-    ) {
-        *self.inner.response_claim_hook.lock().unwrap() = Some(Arc::new(hook));
-    }
-
-    #[cfg(test)]
     fn run_response_claim_hook(&self, stage: ResponseClaimHookStage, agent_id: &str) {
         if let Some(hook) = self.inner.response_claim_hook.lock().unwrap().clone() {
             hook(stage, agent_id);
@@ -3780,10 +3391,6 @@ impl Scheduler {
 
     pub fn store(&self) -> Arc<Store> {
         Arc::clone(&self.inner.store)
-    }
-
-    pub fn enqueue(&self, job: &NewJob) -> Result<Job, SchedulerError> {
-        Ok(self.inner.store.enqueue_job(job)?)
     }
 
     pub fn enqueue_general(
@@ -3869,75 +3476,6 @@ impl Scheduler {
             task: enqueued.task,
             disposition: enqueued.disposition,
         })
-    }
-
-    pub fn preflight_runtime(&self, timeout: Duration) -> RuntimePreflight {
-        if timeout.is_zero() {
-            return RuntimePreflight {
-                result: RuntimePreflightResult::ConfigInvalid,
-            };
-        }
-        let deadline = ControlDeadline::new(timeout);
-        let Some(probe_deadline) = deadline.readiness_probe_deadline(self.inner.config.stop_grace)
-        else {
-            return RuntimePreflight {
-                result: RuntimePreflightResult::NotObservedWithinTimeout,
-            };
-        };
-        let workspace = match tempfile::Builder::new()
-            .prefix("zcode-reviewd-readiness-")
-            .tempdir()
-        {
-            Ok(workspace) => workspace,
-            Err(_) => {
-                return RuntimePreflight {
-                    result: RuntimePreflightResult::ConfigInvalid,
-                }
-            }
-        };
-        let job = readiness_job(workspace.path());
-        let sink: Arc<dyn LifecycleSink> = Arc::new(ReadinessSink);
-        let runtime = match self
-            .inner
-            .factory
-            .spawn_readiness(&job, sink, probe_deadline)
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                return RuntimePreflight {
-                    result: classify_readiness_spawn_error(&error, probe_deadline),
-                }
-            }
-        };
-        let bootstrap = remaining_runtime_time(probe_deadline)
-            .and_then(|remaining| runtime.bootstrap_session(&job, remaining));
-        let observed = if Instant::now() >= probe_deadline {
-            RuntimePreflightResult::NotObservedWithinTimeout
-        } else {
-            match bootstrap {
-                Ok(_) => match wait_for_probe(runtime.as_ref(), probe_deadline) {
-                    ProbeObservation::Ready => RuntimePreflightResult::Ready,
-                    ProbeObservation::RuntimeFailed => RuntimePreflightResult::RuntimeFailed,
-                    ProbeObservation::TimedOut => RuntimePreflightResult::NotObservedWithinTimeout,
-                },
-                Err(error) => classify_readiness_runtime_error(&error),
-            }
-        };
-        let terminal = runtime.stop(deadline.cleanup_grace(self.inner.config.stop_grace));
-        let reaped = matches!(
-            terminal,
-            RuntimeTerminal::Stopped(_)
-                | RuntimeTerminal::Completed(_)
-                | RuntimeTerminal::FailedTurn(_)
-                | RuntimeTerminal::Exited(_)
-        );
-        RuntimePreflight {
-            result: if reaped {
-                observed
-            } else {
-                RuntimePreflightResult::CleanupFailed
-            },
-        }
     }
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, JobState)>, SchedulerError> {
@@ -4200,7 +3738,6 @@ impl Scheduler {
             start_token: identity.start_token,
         });
         let operation = Arc::new(Mutex::new(()));
-        let general_submission = Arc::new(Mutex::new(None));
         let check = Arc::new(ActiveCheck::default());
         let ready_turn_state = match runtime.turn_snapshot() {
             TurnSnapshot { active: true, .. } => TurnState::Active,
@@ -4227,9 +3764,7 @@ impl Scheduler {
                     route: route.clone(),
                     task: task.clone(),
                     policy: policy.clone(),
-                    general_submission: Arc::clone(&general_submission),
                     check: Arc::clone(&check),
-                    budget: budget.as_ref().map(Arc::clone),
                 },
             );
         }
@@ -4328,7 +3863,6 @@ impl Scheduler {
             attempt,
             route,
             task,
-            general_submission,
             budget,
             check,
         });
@@ -4338,9 +3872,9 @@ impl Scheduler {
     fn finish_unstarted_route(
         &self,
         agent_id: &str,
-        owner_epoch: u64,
+        _owner_epoch: u64,
         route: &TaskRoute,
-        task: Option<&TaskRecord>,
+        _task: Option<&TaskRecord>,
         terminal: UnstartedTerminal<'_>,
     ) -> Result<JobState, SchedulerError> {
         match route {
@@ -4428,21 +3962,14 @@ impl Scheduler {
                 active.check.cancel();
             }
         }
-        let route_and_submission = {
+        let active_route = {
             let state = self.inner.state.lock().unwrap();
             state.active.get(agent_id).and_then(|active| {
-                (active.owner_epoch == owner_epoch).then(|| {
-                    (
-                        active.route.clone(),
-                        active.task.clone(),
-                        active.general_submission.lock().unwrap().take(),
-                    )
-                })
+                (active.owner_epoch == owner_epoch)
+                    .then(|| (active.route.clone(), active.task.clone()))
             })
         };
-        if let Some((TaskRoute::General(prepared, required), task, submission)) =
-            route_and_submission.clone()
-        {
+        if let Some((TaskRoute::General(prepared, required), task)) = active_route.clone() {
             sink.attempt.request_stop(&runtime.turn_snapshot());
             sink.attempt.force_terminating();
             let terminal = runtime.stop(stop_grace);
@@ -4464,15 +3991,12 @@ impl Scheduler {
                 self.finish_routed_terminal(
                     TerminalTarget {
                         agent_id,
-                        owner_epoch,
                         sink,
                         route: &TaskRoute::General(prepared, required),
-                        task: task.as_ref(),
                     },
                     TerminalDecision {
                         terminal,
                         natural_completion: false,
-                        general_submission: submission,
                         forced_outcome: forced,
                     },
                 )
@@ -4550,15 +4074,12 @@ impl Scheduler {
     ) -> Result<JobState, SchedulerError> {
         let TerminalTarget {
             agent_id,
-            owner_epoch,
             sink,
             route,
-            task,
         } = target;
         let TerminalDecision {
             terminal,
             natural_completion,
-            general_submission,
             forced_outcome,
         } = decision;
         sink.attempt.terminalize();
@@ -4597,33 +4118,14 @@ impl Scheduler {
                     completion.reason_code = Some((*reason_code).into());
                     completion
                 } else if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
-                    match general_submission {
-                        Some(mut submission) => {
-                            if !required_command_ids.is_empty() {
-                                for command_id in required_checks.unwrap_or_default() {
-                                    if !submission.checks.contains(&command_id) {
-                                        submission.checks.push(command_id);
-                                    }
-                                }
-                            }
-                            GeneralFinalizer::finalize_submission(prepared, &submission)
-                        }
-                        None => {
-                            // Runtime completion is authoritative.  The model
-                            // no longer needs to call a private completion MCP
-                            // tool: a matching turn.completed is finalized by
-                            // the daemon.  Keep the bounded passive text tail
-                            // as the user-visible final text when available.
-                            let mut completion =
-                                GeneralFinalizer::finalize(prepared, CompletionOutcome::Succeeded);
-                            completion.checks = required_checks.unwrap_or_default();
-                            let tail = sink.activity.snapshot().latest_text_tail;
-                            if !tail.trim().is_empty() {
-                                completion.summary = tail;
-                            }
-                            completion
-                        }
+                    let mut completion =
+                        GeneralFinalizer::finalize(prepared, CompletionOutcome::Succeeded);
+                    completion.checks = required_checks.unwrap_or_default();
+                    let tail = sink.activity.snapshot().latest_text_tail;
+                    if !tail.trim().is_empty() {
+                        completion.summary = tail;
                     }
+                    completion
                 } else {
                     GeneralFinalizer::finalize(prepared, outcome)
                 };
@@ -4647,45 +4149,6 @@ impl Scheduler {
         }
     }
 
-    fn finish_terminal_or_fail(
-        &self,
-        agent_id: &str,
-        owner_epoch: u64,
-        sink: &StoreLifecycleSink,
-        terminal: &RuntimeTerminal,
-    ) -> Result<JobState, SchedulerError> {
-        match sink.finish(terminal) {
-            Ok(state) => Ok(state),
-            Err(error) => {
-                let message = error.to_string();
-                self.record_failure(
-                    agent_id,
-                    format!("terminal lifecycle persistence failed: {message}"),
-                );
-                match self.inner.store.fail_claim(
-                    agent_id,
-                    owner_epoch,
-                    "LIFECYCLE_SINK_FAILED",
-                    &message,
-                ) {
-                    Ok(_) => Err(SchedulerError::LifecycleSink {
-                        agent_id: agent_id.into(),
-                        message,
-                    }),
-                    Err(fallback) => {
-                        self.record_failure(
-                            agent_id,
-                            format!(
-                                "terminal failure classification was not persisted: {fallback}"
-                            ),
-                        );
-                        Err(SchedulerError::Store(fallback))
-                    }
-                }
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn finish_locked_monitor_terminal(
         &self,
@@ -4694,10 +4157,9 @@ impl Scheduler {
         runtime: &Arc<dyn ManagedRuntime>,
         sink: &StoreLifecycleSink,
         route: &TaskRoute,
-        task: Option<&TaskRecord>,
+        _task: Option<&TaskRecord>,
         terminal: RuntimeTerminal,
         natural_completion: bool,
-        general_submission: Option<GeneralCompletionSubmission>,
         forced_outcome: Option<(CompletionOutcome, String)>,
     ) -> Result<JobState, SchedulerError> {
         let current = self.inner.store.get_job(agent_id)?.ok_or_else(|| {
@@ -4732,32 +4194,15 @@ impl Scheduler {
         self.finish_routed_terminal(
             TerminalTarget {
                 agent_id,
-                owner_epoch,
                 sink,
                 route,
-                task,
             },
             TerminalDecision {
                 terminal,
                 natural_completion,
-                general_submission,
                 forced_outcome,
             },
         )
-    }
-
-    fn queue_monitor_message(
-        &self,
-        agent_id: &str,
-        attempt_sequence: u64,
-        kind: &str,
-        content: &str,
-    ) -> Result<bool, SchedulerError> {
-        let message_id = format!("daemon-{kind}-{agent_id}-attempt-{attempt_sequence}");
-        Ok(self
-            .inner
-            .store
-            .insert_message(&message_id, agent_id, "queue", content)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4802,7 +4247,6 @@ impl Scheduler {
             task,
             terminal,
             false,
-            None,
             Some(forced),
         )?;
         self.release_active(agent_id, owner_epoch);
@@ -4823,7 +4267,6 @@ impl Scheduler {
             attempt,
             route,
             task,
-            general_submission,
             budget,
             check,
         } = context;
@@ -4877,7 +4320,6 @@ impl Scheduler {
                         task.as_ref(),
                         terminal,
                         false,
-                        None,
                         Some((
                             CompletionOutcome::BudgetExhausted,
                             violation.reason_code().into(),
@@ -4983,7 +4425,6 @@ impl Scheduler {
                         }
                     }
                     check.cancel();
-                    let submission = general_submission.lock().unwrap().take();
                     if let Err(error) = scheduler.finish_locked_monitor_terminal(
                         &agent_id,
                         owner_epoch,
@@ -4993,7 +4434,6 @@ impl Scheduler {
                         task.as_ref(),
                         terminal,
                         natural,
-                        submission,
                         None,
                     ) {
                         scheduler.record_failure(&agent_id, error.to_string());
@@ -5022,7 +4462,6 @@ impl Scheduler {
                         task.as_ref(),
                         terminal,
                         false,
-                        general_submission.lock().unwrap().take(),
                         Some((
                             CompletionOutcome::RuntimeLost,
                             "LIFECYCLE_SINK_FAILED".into(),
@@ -5088,7 +4527,6 @@ impl Scheduler {
                                 boundary,
                                 deadline.cleanup_grace(scheduler.inner.config.stop_grace),
                             );
-                            let submission = general_submission.lock().unwrap().take();
                             if let Err(error) = scheduler.finish_locked_monitor_terminal(
                                 &agent_id,
                                 owner_epoch,
@@ -5098,7 +4536,6 @@ impl Scheduler {
                                 task.as_ref(),
                                 terminal,
                                 boundary == TurnBoundary::Completed,
-                                submission,
                                 None,
                             ) {
                                 scheduler.record_failure(&agent_id, error.to_string());
@@ -5125,7 +4562,6 @@ impl Scheduler {
                                 task.as_ref(),
                                 terminal,
                                 false,
-                                None,
                                 Some((CompletionOutcome::Failed, "MESSAGE_DELIVERY_FAILED".into())),
                             ) {
                                 scheduler.record_failure(&agent_id, finish_error.to_string());
@@ -5607,11 +5043,10 @@ impl Scheduler {
                     Arc::clone(&active.sink),
                     active.route.clone(),
                     active.task.clone(),
-                    active.general_submission.lock().unwrap().take(),
                 )
             })
         };
-        let Some((sink, route, task, submission)) = active_route else {
+        let Some((sink, route, _task)) = active_route else {
             return Ok(self
                 .inner
                 .store
@@ -5641,15 +5076,12 @@ impl Scheduler {
         let result = self.finish_routed_terminal(
             TerminalTarget {
                 agent_id,
-                owner_epoch: decision.owner_epoch,
                 sink: &sink,
                 route: &route,
-                task: task.as_ref(),
             },
             TerminalDecision {
                 terminal,
                 natural_completion: false,
-                general_submission: submission,
                 forced_outcome: Some((CompletionOutcome::Cancelled, "CANCELLED".into())),
             },
         );
@@ -5944,40 +5376,9 @@ impl Drop for Daemon {
 mod tests {
     use super::*;
     use review_preparation::{BudgetLimits, GeneralProfile, GENERAL_TASK_SCHEMA};
-    use review_store::NewArtifact;
     use std::collections::BTreeMap;
     use std::sync::Barrier;
-    use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
-
-    #[test]
-    fn command_runtime_binds_agent_policy_environment_for_readiness() {
-        let workspace = tempfile::tempdir().unwrap();
-        let job = readiness_job(workspace.path());
-        let mut command = Command::new("true");
-        apply_agent_policy_environment(&mut command, &job).unwrap();
-        let values = command
-            .get_envs()
-            .filter_map(|(key, value)| {
-                Some((
-                    key.to_string_lossy().into_owned(),
-                    value?.to_string_lossy().into_owned(),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-        assert_eq!(values.get("ZCODE_AGENT_POLICY"), Some(&"1".to_owned()));
-        assert_eq!(
-            values.get("ZCODE_AGENT_BOOTSTRAP_ROOTS"),
-            Some(&"/Applications/ZCode.app".to_owned())
-        );
-        assert_eq!(
-            values.get("ZCODE_AGENT_WORKTREE_ROOT"),
-            Some(&workspace.path().to_string_lossy().into_owned())
-        );
-        assert_eq!(
-            values.get("ZCODE_AGENT_WRITE_MANIFEST"),
-            Some(&"[]".to_owned())
-        );
-    }
+    use zcode_protocol::{EventEnvelope, RequestEnvelope, WireId};
 
     #[test]
     fn command_runtime_binds_manifest_from_a_prepared_general_job() {
@@ -7244,25 +6645,6 @@ exec tail -f /dev/null
             *self.stop_turn_behavior.lock().unwrap() = behavior;
         }
 
-        fn timeout_send_after_write(&self) {
-            self.timeout_send_after_write.store(true, Ordering::Release);
-        }
-
-        fn timeout_response_write(&self) {
-            self.timeout_response_write.store(true, Ordering::Release);
-        }
-
-        fn set_runtime_activity(&self, model_elapsed: Duration, transport_idle: Duration) {
-            self.model_request_elapsed_ms.store(
-                u64::try_from(model_elapsed.as_millis()).unwrap(),
-                Ordering::Release,
-            );
-            self.transport_idle_elapsed_ms.store(
-                u64::try_from(transport_idle.as_millis()).unwrap(),
-                Ordering::Release,
-            );
-        }
-
         fn complete_turn(&self, boundary: TurnBoundary) {
             let mut turn = self.turn.lock().unwrap();
             turn.active = false;
@@ -7401,26 +6783,6 @@ exec tail -f /dev/null
                 }),
                 turn,
             }
-        }
-    }
-
-    #[derive(Default)]
-    struct ManualMonotonicClock {
-        millis: AtomicU64,
-    }
-
-    impl ManualMonotonicClock {
-        fn advance(&self, duration: Duration) {
-            self.millis.fetch_add(
-                u64::try_from(duration.as_millis()).unwrap(),
-                Ordering::AcqRel,
-            );
-        }
-    }
-
-    impl MonotonicClock for ManualMonotonicClock {
-        fn now(&self) -> Duration {
-            Duration::from_millis(self.millis.load(Ordering::Acquire))
         }
     }
 
@@ -7758,9 +7120,7 @@ exec tail -f /dev/null
         let agent_id = submitted.job.agent_id.clone();
         let prepared = prepared_general(&submitted.job);
         let route = task_route(&submitted.job).unwrap();
-        let TaskRoute::General(_, required) = route else {
-            panic!("generic route was not prepared");
-        };
+        let TaskRoute::General(_, required) = route;
         assert_eq!(required, vec!["required"]);
 
         scheduler.start_ready().unwrap();
@@ -7819,7 +7179,7 @@ exec tail -f /dev/null
         assert!(submitted.job.initial_prompt[..caller_marker]
             .contains("The daemon finalizes a matching turn.completed boundary"));
         assert!(submitted.job.initial_prompt[..caller_marker]
-            .contains("public result, status, or artifact content"));
+            .contains("complete control block, caller prompt, or attachment contents"));
         assert!(submitted.job.initial_prompt[..caller_marker].contains(
             "hidden reasoning, credentials, absolute host paths, or low-level tool details"
         ));
@@ -8642,21 +8002,6 @@ exec tail -f /dev/null
         scheduler.close_job(&second_id).unwrap();
     }
 
-    fn wait_for_job_state(store: &Store, agent_id: &str, expected: JobState) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let state = store.get_job(agent_id).unwrap().unwrap().state;
-            if state == expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "job {agent_id} remained {state:?} instead of {expected:?}"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
     #[test]
     fn respond_lock_timeout_releases_claim_and_later_retry_progresses() {
         let (directory, store, factory, scheduler) = scheduler_fixture_with_deadlines(
@@ -8743,7 +8088,7 @@ exec tail -f /dev/null
         let mut job = NewJob::new("unknown-task-kind", "workspace");
         job.prepared_launch_json = Some(r#"{"schema":"unknown-task/v9"}"#.into());
         job.prepared_launch_sha256 = Some("a".repeat(64));
-        scheduler.enqueue(&job).unwrap();
+        store.enqueue_job(&job).unwrap();
 
         assert!(matches!(
             scheduler.start_ready(),

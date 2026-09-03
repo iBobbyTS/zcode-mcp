@@ -2,14 +2,13 @@
 
 ## Private daemon/facade compatibility
 
-S06 uses fail-closed private RPC version 9. It extends the S05 version 8 contract
-with daemon-owned named-check selection, execution, result, and capability fields.
-A version 8 facade/daemon pairing is rejected before method dispatch; there is no
-version negotiation or mixed-version fallback.
+The generic facade and daemon use fail-closed private RPC version 11. A facade
+or daemon with a different private version is rejected before method dispatch;
+there is no version negotiation or mixed-version fallback.
 
-This private version is not the public MCP protocol version. Both the legacy
-ten-tool and V2 fourteen-tool catalogs still use rmcp framing, but a single
-facade process exposes exactly one startup-selected catalog.
+This private version is not the public MCP protocol version. One facade process
+exposes the fixed nine-tool generic catalog; there is no catalog selector or
+legacy RPC surface.
 
 ## Evidence boundary
 
@@ -18,15 +17,12 @@ Fake app-server tests in later sections are kept separate and never imply real
 runtime compatibility. The runtime is never downloaded or modified by this
 project.
 
-## Preflight command
+## Compatibility checks
 
-```text
-cargo run -p runtime-preflight
-```
-
-The command reads `ZCODE_RUNTIME_PATH` only. It emits JSON with a redacted path
-token, byte size, SHA-256, Node version, and an app-server probe result.
-Authentication tokens and provider secrets are not read or emitted.
+Runtime protocol shapes and cleanup behavior are exercised through the Driver
+and daemon test suites. There is no separate production preflight executable;
+the generic `zcode_system_status` tool reports bounded daemon status without
+starting an additional ZCode runtime.
 
 ## Pinned 3.8.1 event and request shapes
 
@@ -74,20 +70,6 @@ Observed client request parameters are:
 The fake rejects unobserved extra keys, including `afterSeq`, `inputId`, and
 `queryId`.
 
-When the variable is absent, or the path is not a regular file, the result is
-`compatibility_status: "untested"` with a reason. This is an explicit evidence
-gap, not a compatibility claim.
-
-When a regular file is supplied, the probe starts `node <runtime> app-server`,
-sends the current typed nested-workspace `workspace/readState` diagnostic
-request through `zcode-driver`, and records only observed response method names
-and the typed model-catalog projection. Driver remains the single owner of
-strict NDJSON parsing, request correlation, stderr draining, process identity,
-and bounded TERM/KILL/reap. Startup, malformed output, timeout, remote error,
-unsupported server requests, and cleanup failure are classified as `failed`;
-payloads are never persisted. A successful exchange is marked `tested` only
-when the correlated Driver response matches the pinned read-state projection.
-
 Production session bootstrap does not require this diagnostic. The pinned
 3.8.1 create-without-readState gate succeeded, including the three-false
 `session/requestRuntimePreferences` response and complete process-group reap,
@@ -103,7 +85,6 @@ when present. Direct/top-level legacy alternates, missing or malformed
 authoritative session data, consistency-only model fallback, and conflicting
 model values fail closed.
 
-`runtime_version` remains `unknown`. Current and available model IDs are
-emitted only from `settings.model.current.modelId` and
-`modelCatalog.available[].ref.modelId`. The record includes Node `node_version`
-for provenance. The implementation and tests are Rust-only.
+Current and available model IDs are accepted only from the typed protocol
+projections described above. The deterministic implementation and tests are
+Rust-only.

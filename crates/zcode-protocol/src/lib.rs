@@ -793,9 +793,9 @@ mod tests {
     #[test]
     fn session_create_serializes_the_observed_acp_mcp_array_shape() {
         let servers = vec![StdioMcpServer {
-            name: "review-ledger".into(),
-            command: "/usr/bin/reviewd".into(),
-            args: vec!["--ledger-mcp".into(), "--agent-id".into(), "job".into()],
+            name: "fixture-helper".into(),
+            command: "/usr/bin/helperd".into(),
+            args: vec!["--fixture".into(), "job".into()],
             env: Vec::new(),
         }];
         let value = serde_json::to_value(CreateSessionParams {
@@ -811,8 +811,8 @@ mod tests {
             serde_json::json!({
                 "workspace":{"workspaceKey":"/work","workspacePath":"/work"},
                 "mcpServers":[{
-                    "name":"review-ledger","command":"/usr/bin/reviewd",
-                    "args":["--ledger-mcp","--agent-id","job"],"env":[]
+                    "name":"fixture-helper","command":"/usr/bin/helperd",
+                    "args":["--fixture","job"],"env":[]
                 }]
             })
         );

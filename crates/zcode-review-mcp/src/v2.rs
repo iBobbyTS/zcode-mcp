@@ -21,11 +21,11 @@ use std::{
 };
 use zcode_reviewd::rpc::{
     AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
-    MessageInput, ReadinessResultView, RespondInput, ResponseDecision, ResponseOutcomeView,
-    RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess, SubmissionDispositionView,
-    SystemStatusView, TaskActivityStateView, TaskActivityView, TaskArtifactMetadataView,
-    TaskArtifactQuery, TaskListQuery, TaskPhaseFilter, TaskPollQuery, TaskResultView, TaskView,
-    TelemetryStatusView, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+    MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView, RpcClient, RpcMethod,
+    RpcOutcome, RpcRequest, RpcSuccess, SubmissionDispositionView, SystemStatusView,
+    TaskActivityStateView, TaskActivityView, TaskArtifactMetadataView, TaskArtifactQuery,
+    TaskListQuery, TaskPhaseFilter, TaskPollQuery, TaskResultView, TaskView, TelemetryStatusView,
+    MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
 };
 
 use crate::{
@@ -167,73 +167,6 @@ pub enum PublicComponentState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PublicReadinessResult {
-    Ready,
-    ConfigInvalid,
-    ZcodeStartFailed,
-    RuntimeProtocolFailed,
-    ModelAuthFailed,
-    RuntimeFailed,
-    NotObservedWithinTimeout,
-    CleanupFailed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PublicReadinessReason {
-    ConfigInvalid,
-    ZcodeStartFailed,
-    RuntimeProtocolFailed,
-    ModelAuthFailed,
-    RuntimeFailed,
-    NotObservedWithinTimeout,
-    CleanupFailed,
-}
-
-impl PublicReadinessReason {
-    fn from_result(value: ReadinessResultView) -> Option<Self> {
-        match value {
-            ReadinessResultView::Ready => None,
-            ReadinessResultView::ConfigInvalid => Some(Self::ConfigInvalid),
-            ReadinessResultView::ZcodeStartFailed => Some(Self::ZcodeStartFailed),
-            ReadinessResultView::RuntimeProtocolFailed => Some(Self::RuntimeProtocolFailed),
-            ReadinessResultView::ModelAuthFailed => Some(Self::ModelAuthFailed),
-            ReadinessResultView::RuntimeFailed => Some(Self::RuntimeFailed),
-            ReadinessResultView::NotObservedWithinTimeout => Some(Self::NotObservedWithinTimeout),
-            ReadinessResultView::CleanupFailed => Some(Self::CleanupFailed),
-        }
-    }
-
-    fn as_wire_code(self) -> &'static str {
-        match self {
-            Self::ConfigInvalid => "CONFIG_INVALID",
-            Self::ZcodeStartFailed => "ZCODE_START_FAILED",
-            Self::RuntimeProtocolFailed => "RUNTIME_PROTOCOL_FAILED",
-            Self::ModelAuthFailed => "MODEL_AUTH_FAILED",
-            Self::RuntimeFailed => "RUNTIME_FAILED",
-            Self::NotObservedWithinTimeout => "NOT_OBSERVED_WITHIN_TIMEOUT",
-            Self::CleanupFailed => "CLEANUP_FAILED",
-        }
-    }
-}
-
-impl From<ReadinessResultView> for PublicReadinessResult {
-    fn from(value: ReadinessResultView) -> Self {
-        match value {
-            ReadinessResultView::Ready => Self::Ready,
-            ReadinessResultView::ConfigInvalid => Self::ConfigInvalid,
-            ReadinessResultView::ZcodeStartFailed => Self::ZcodeStartFailed,
-            ReadinessResultView::RuntimeProtocolFailed => Self::RuntimeProtocolFailed,
-            ReadinessResultView::ModelAuthFailed => Self::ModelAuthFailed,
-            ReadinessResultView::RuntimeFailed => Self::RuntimeFailed,
-            ReadinessResultView::NotObservedWithinTimeout => Self::NotObservedWithinTimeout,
-            ReadinessResultView::CleanupFailed => Self::CleanupFailed,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicCapabilityMaturity {
     BetaReady,
@@ -269,7 +202,6 @@ pub struct PublicAgentCapabilities {
     pub access_mode_defaults: BTreeMap<String, PublicBudget>,
     pub hard_budget_caps: PublicBudget,
     pub max_rpc_frame_bytes: usize,
-    pub max_events: usize,
     pub max_wait_ms: u64,
     pub max_artifact_chunk_bytes: usize,
     pub named_checks: bool,
@@ -307,7 +239,6 @@ impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
             access_mode_defaults,
             hard_budget_caps: value.hard_budget_caps.into(),
             max_rpc_frame_bytes: value.max_rpc_frame_bytes,
-            max_events: value.max_events,
             max_wait_ms: value.max_wait_ms,
             max_artifact_chunk_bytes: MAX_ARTIFACT_CHUNK_BYTES,
             named_checks: value.named_checks,
@@ -462,16 +393,12 @@ impl From<TaskOutcome> for PublicOutcome {
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicArtifactKind {
-    ReportMarkdown,
     ChangesPatch,
-    CheckReport,
 }
 
 fn artifact_kind(value: &str) -> Result<PublicArtifactKind, String> {
     match value {
-        "report_markdown" => Ok(PublicArtifactKind::ReportMarkdown),
         "changes_patch" => Ok(PublicArtifactKind::ChangesPatch),
-        "check_report" => Ok(PublicArtifactKind::CheckReport),
         _ => Err(protocol_error()),
     }
 }
@@ -886,25 +813,6 @@ impl SubagentMcp {
         }
     }
 
-    fn status(&self, agent_id: &str) -> Result<PublicTask, String> {
-        validate_text(agent_id, "agent_id", MAX_ID_BYTES)?;
-        match self.rpc(RpcMethod::TaskStatus {
-            agent_id: agent_id.into(),
-        })? {
-            RpcSuccess::TaskStatus { task } => Ok(task.into()),
-            _ => Err(protocol_error()),
-        }
-    }
-
-    fn pending(&self, agent_id: &str) -> Result<Vec<PublicPendingRequest>, String> {
-        match self.rpc(RpcMethod::TaskPending {
-            agent_id: agent_id.into(),
-        })? {
-            RpcSuccess::Pending { requests } => Ok(requests.into_iter().map(Into::into).collect()),
-            _ => Err(protocol_error()),
-        }
-    }
-
     fn result(
         &self,
         agent_id: String,
@@ -1237,7 +1145,7 @@ impl SubagentMcp {
             mode: "queue".into(),
             content: input.content,
         }))? {
-            RpcSuccess::Message { disposition } => Ok(Json(AgentSendOutput {
+            RpcSuccess::Message { disposition, task } => Ok(Json(AgentSendOutput {
                 disposition: match disposition {
                     zcode_reviewd::rpc::MessageDispositionView::Queued => {
                         PublicMessageDisposition::Queued
@@ -1252,7 +1160,7 @@ impl SubagentMcp {
                         PublicMessageDisposition::Failed
                     }
                 },
-                attempt_sequence: self.status(&input.agent_id)?.attempt_sequence,
+                attempt_sequence: task.attempt_sequence,
             })),
             _ => Err(protocol_error()),
         }
@@ -1287,10 +1195,9 @@ impl SubagentMcp {
             decision,
             content: input.reason,
         }))? {
-            RpcSuccess::Respond { outcome } => Ok(Json(project_response(
-                outcome,
-                self.status(&input.agent_id)?.attempt_sequence,
-            ))),
+            RpcSuccess::Respond { outcome, task } => {
+                Ok(Json(project_response(outcome, task.attempt_sequence)))
+            }
             _ => Err(protocol_error()),
         }
     }
@@ -1312,9 +1219,7 @@ impl SubagentMcp {
         match self.rpc(RpcMethod::TaskCancel {
             agent_id: input.agent_id.clone(),
         })? {
-            RpcSuccess::Stopped { .. } => Ok(Json(AgentStateOutput {
-                task: self.status(&input.agent_id)?,
-            })),
+            RpcSuccess::Stopped { task } => Ok(Json(AgentStateOutput { task: task.into() })),
             _ => Err(protocol_error()),
         }
     }
@@ -1429,15 +1334,7 @@ impl SubagentMcp {
         match self.rpc(RpcMethod::TaskClose {
             agent_id: input.agent_id.clone(),
         })? {
-            RpcSuccess::Closed { .. } => {}
-            _ => return Err(protocol_error()),
-        }
-        match self.rpc(RpcMethod::TaskReap {
-            agent_id: input.agent_id.clone(),
-        })? {
-            RpcSuccess::Reaped { .. } => Ok(Json(AgentStateOutput {
-                task: self.status(&input.agent_id)?,
-            })),
+            RpcSuccess::Closed { task } => Ok(Json(AgentStateOutput { task: task.into() })),
             _ => Err(protocol_error()),
         }
     }
@@ -1470,14 +1367,17 @@ mod generic_tests {
         assert_eq!(names, V2_PUBLIC_TOOLS);
         let encoded = serde_json::to_string(&tools).unwrap();
         for forbidden in [
-            "zcode_review_spawn",
-            "zcode_review_continue",
+            concat!("zcode_", "review_spawn"),
+            concat!("zcode_", "review_continue"),
             "zcode_system_ensure_ready",
             "zcode_agent_get",
             "zcode_agent_events",
             "zcode_agent_wait",
-            "review_id",
-            "review_evidence",
+            concat!("review", "_id"),
+            concat!("review", "_evidence"),
+            "report_markdown",
+            "check_report",
+            concat!("artifact", "_intents"),
             "semantic_soft_timeout_ms",
             "semantic_hard_timeout_ms",
             "interrupt_and_continue",

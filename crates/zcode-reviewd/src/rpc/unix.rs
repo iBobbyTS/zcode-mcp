@@ -500,7 +500,7 @@ mod tests {
             .call(&RpcRequest {
                 version: RPC_VERSION,
                 request_id: "deadline".into(),
-                method: super::super::RpcMethod::Start,
+                method: super::super::RpcMethod::SystemStatus,
             })
             .unwrap_err();
         assert!(matches!(

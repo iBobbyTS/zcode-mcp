@@ -1,16 +1,15 @@
 use crate::{
     MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
-    ResponseDisposition, RuntimePreflightResult, Scheduler, SchedulerError,
+    ResponseDisposition, Scheduler, SchedulerError,
 };
 use review_preparation::{
     canonical_general_repository, BudgetLimits, GeneralProfile, GeneralTaskManifest,
     PreparedGeneralTask,
 };
 use review_store::{
-    DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
-    StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
-    TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
-    TurnState, WaitSnapshot,
+    EffectiveBudget, Job, PendingRequestState, Store, StoreError, StoredArtifact,
+    StoredPendingRequest, StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase,
+    TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,20 +21,15 @@ use std::{
     path::Path,
     sync::Arc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 10;
+pub const RPC_VERSION: u16 = 11;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_ID_BYTES: usize = 128;
-pub const MAX_PAGE_EVENTS: usize = 100;
 pub const MAX_LIST_JOBS: usize = 100;
-pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
-pub const MAX_PAGE_PAYLOAD_BYTES: usize = 64 * 1024;
-pub const MAX_PREVIEW_BYTES: usize = 8 * 1024;
 pub const MAX_PENDING_REQUESTS: usize = 100;
 pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
-const MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION: usize = 64 * 1024;
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
 pub const RPC_TRANSPORT_SUPPORTED: bool = cfg!(unix);
 
@@ -61,21 +55,10 @@ pub struct RpcRequest {
 )]
 pub enum RpcMethod {
     SystemStatus,
-    SystemEnsureReady {
-        timeout_ms: u64,
-    },
     SubmitGeneral {
         input: GeneralSubmitInput,
     },
-    TaskStatus {
-        agent_id: String,
-    },
     TaskList(TaskListQuery),
-    TaskPending {
-        agent_id: String,
-    },
-    TaskEvents(TaskEventQuery),
-    TaskWait(TaskWaitQuery),
     TaskPoll(TaskPollQuery),
     TaskMessage(MessageInput),
     TaskRespond(RespondInput),
@@ -91,37 +74,6 @@ pub enum RpcMethod {
     TaskClose {
         agent_id: String,
     },
-    TaskReap {
-        agent_id: String,
-    },
-    Enqueue {
-        job: NewJobInput,
-    },
-    Start,
-    Status {
-        agent_id: String,
-    },
-    Pending {
-        agent_id: String,
-    },
-    Events(EventQuery),
-    Wait(WaitQuery),
-    Message(MessageInput),
-    Respond(RespondInput),
-    Stop {
-        agent_id: String,
-    },
-    Result(ResultQuery),
-    List {
-        scope: JobListScopeView,
-        limit: usize,
-    },
-    Close {
-        agent_id: String,
-    },
-    Reap {
-        agent_id: String,
-    },
 }
 
 impl RpcMethod {
@@ -129,13 +81,8 @@ impl RpcMethod {
         matches!(
             name,
             "system_status"
-                | "system_ensure_ready"
                 | "submit_general"
-                | "task_status"
                 | "task_list"
-                | "task_pending"
-                | "task_events"
-                | "task_wait"
                 | "task_poll"
                 | "task_message"
                 | "task_respond"
@@ -143,20 +90,6 @@ impl RpcMethod {
                 | "task_result"
                 | "task_artifact"
                 | "task_close"
-                | "task_reap"
-                | "enqueue"
-                | "start"
-                | "status"
-                | "pending"
-                | "events"
-                | "wait"
-                | "message"
-                | "respond"
-                | "stop"
-                | "result"
-                | "list"
-                | "close"
-                | "reap"
         )
     }
 }
@@ -230,84 +163,10 @@ pub struct GeneralSubmitInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskEventQuery {
-    pub agent_id: String,
-    #[serde(default)]
-    pub after: u64,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskWaitQuery {
-    pub agent_id: String,
-    #[serde(default)]
-    pub after: u64,
-    pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskPollQuery {
     pub agent_id: String,
     #[serde(default)]
     pub after_revision: u64,
-    pub timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NewJobInput {
-    pub agent_id: String,
-    pub workspace_path: String,
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    #[serde(default)]
-    pub feature_id: Option<String>,
-    #[serde(default)]
-    pub runtime_hash: Option<String>,
-    #[serde(default = "default_initial_prompt")]
-    pub initial_prompt: String,
-}
-
-fn default_initial_prompt() -> String {
-    "Begin task.".into()
-}
-
-impl From<NewJobInput> for NewJob {
-    fn from(value: NewJobInput) -> Self {
-        Self {
-            agent_id: value.agent_id,
-            idempotency_key: value.idempotency_key,
-            feature_id: value.feature_id,
-            workspace_path: value.workspace_path,
-            runtime_hash: value.runtime_hash,
-            prepared_launch_json: None,
-            prepared_launch_sha256: None,
-            initial_prompt: value.initial_prompt,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EventQuery {
-    pub agent_id: String,
-    #[serde(default)]
-    pub runtime_agent_id: Option<String>,
-    #[serde(default)]
-    pub after: u64,
-    pub limit: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WaitQuery {
-    pub agent_id: String,
-    #[serde(default)]
-    pub runtime_agent_id: Option<String>,
-    #[serde(default)]
-    pub after: u64,
     pub timeout_ms: u64,
 }
 
@@ -332,24 +191,6 @@ pub struct RespondInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JobListScopeView {
-    Active,
-    Recent,
-    All,
-}
-
-impl From<JobListScopeView> for JobListScope {
-    fn from(value: JobListScopeView) -> Self {
-        match value {
-            JobListScopeView::Active => Self::Active,
-            JobListScopeView::Recent => Self::Recent,
-            JobListScopeView::All => Self::All,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ResponseDecision {
     Allow,
     Deny,
@@ -364,14 +205,6 @@ impl ResponseDecision {
             Self::Answer => "answer",
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResultQuery {
-    pub agent_id: String,
-    #[serde(default)]
-    pub preview_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,30 +248,13 @@ pub enum RpcSuccess {
     SystemStatus {
         status: SystemStatusView,
     },
-    SystemReadiness {
-        ready: bool,
-        status: SystemStatusView,
-        probe_result: ReadinessResultView,
-        reason_code: Option<String>,
-    },
     GeneralSubmitted {
         task: TaskView,
         disposition: SubmissionDispositionView,
     },
-    TaskStatus {
-        task: TaskView,
-    },
     TaskListed {
         tasks: Vec<TaskView>,
         next_cursor: Option<String>,
-    },
-    TaskEvents {
-        page: TaskEventPage,
-    },
-    TaskWait {
-        task: TaskView,
-        page: TaskEventPage,
-        timed_out: bool,
     },
     TaskPoll {
         task: TaskView,
@@ -457,48 +273,19 @@ pub enum RpcSuccess {
     TaskArtifact {
         chunk: TaskArtifactChunkView,
     },
-    Enqueued {
-        job: JobView,
-    },
-    Started {
-        agent_ids: Vec<String>,
-    },
-    Status {
-        job: JobView,
-    },
-    Pending {
-        requests: Vec<PendingRequestView>,
-    },
-    Events {
-        page: EventPage,
-    },
-    Wait {
-        job: JobView,
-        page: EventPage,
-        timed_out: bool,
-    },
     Message {
         disposition: MessageDispositionView,
+        task: TaskView,
     },
     Respond {
         outcome: ResponseOutcomeView,
+        task: TaskView,
     },
     Stopped {
-        state: JobStateView,
-    },
-    Result {
-        job: JobView,
-        artifact: Option<ArtifactView>,
-    },
-    Listed {
-        jobs: Vec<JobView>,
+        task: TaskView,
     },
     Closed {
-        state: JobStateView,
-    },
-    Reaped {
-        state: JobStateView,
-        resources_reaped: bool,
+        task: TaskView,
     },
 }
 
@@ -509,52 +296,6 @@ pub enum ComponentStateView {
     Degraded,
     Unavailable,
     Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ReadinessResultView {
-    Ready,
-    ConfigInvalid,
-    ZcodeStartFailed,
-    RuntimeProtocolFailed,
-    ModelAuthFailed,
-    RuntimeFailed,
-    NotObservedWithinTimeout,
-    CleanupFailed,
-}
-
-impl ReadinessResultView {
-    fn reason_code(self) -> Option<String> {
-        (!matches!(self, Self::Ready)).then(|| {
-            match self {
-                Self::Ready => unreachable!(),
-                Self::ConfigInvalid => "CONFIG_INVALID",
-                Self::ZcodeStartFailed => "ZCODE_START_FAILED",
-                Self::RuntimeProtocolFailed => "RUNTIME_PROTOCOL_FAILED",
-                Self::ModelAuthFailed => "MODEL_AUTH_FAILED",
-                Self::RuntimeFailed => "RUNTIME_FAILED",
-                Self::NotObservedWithinTimeout => "NOT_OBSERVED_WITHIN_TIMEOUT",
-                Self::CleanupFailed => "CLEANUP_FAILED",
-            }
-            .into()
-        })
-    }
-}
-
-impl From<RuntimePreflightResult> for ReadinessResultView {
-    fn from(value: RuntimePreflightResult) -> Self {
-        match value {
-            RuntimePreflightResult::Ready => Self::Ready,
-            RuntimePreflightResult::ConfigInvalid => Self::ConfigInvalid,
-            RuntimePreflightResult::ZcodeStartFailed => Self::ZcodeStartFailed,
-            RuntimePreflightResult::RuntimeProtocolFailed => Self::RuntimeProtocolFailed,
-            RuntimePreflightResult::ModelAuthFailed => Self::ModelAuthFailed,
-            RuntimePreflightResult::RuntimeFailed => Self::RuntimeFailed,
-            RuntimePreflightResult::NotObservedWithinTimeout => Self::NotObservedWithinTimeout,
-            RuntimePreflightResult::CleanupFailed => Self::CleanupFailed,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,7 +337,6 @@ pub struct AgentCapabilitiesView {
     pub profile_defaults: BTreeMap<String, BudgetLimits>,
     pub hard_budget_caps: BudgetLimits,
     pub max_rpc_frame_bytes: usize,
-    pub max_events: usize,
     pub max_wait_ms: u64,
     pub named_checks: bool,
     pub maturity: BTreeMap<String, CapabilityMaturityView>,
@@ -713,23 +453,6 @@ pub struct TaskArtifactChunkView {
     pub eof: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskEventView {
-    pub sequence: u64,
-    pub source_sequence: u64,
-    pub attempt_sequence: u64,
-    pub event_type: String,
-    pub payload_json: String,
-    pub redaction_level: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskEventPage {
-    pub events: Vec<TaskEventView>,
-    pub next_sequence: u64,
-    pub has_more: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
@@ -759,38 +482,6 @@ impl RpcError {
         let mut message = message.into();
         message.truncate(512);
         Self { code, message }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum JobStateView {
-    Queued,
-    Starting,
-    Running,
-    Stopping,
-    Completed,
-    Cancelled,
-    Failed,
-    FailedRuntimeLost,
-    Orphaned,
-    Closed,
-}
-
-impl From<JobState> for JobStateView {
-    fn from(value: JobState) -> Self {
-        match value {
-            JobState::Queued => Self::Queued,
-            JobState::Starting => Self::Starting,
-            JobState::Running => Self::Running,
-            JobState::Stopping => Self::Stopping,
-            JobState::Completed => Self::Completed,
-            JobState::Cancelled => Self::Cancelled,
-            JobState::Failed => Self::Failed,
-            JobState::FailedRuntimeLost => Self::FailedRuntimeLost,
-            JobState::Orphaned => Self::Orphaned,
-            JobState::Closed => Self::Closed,
-        }
     }
 }
 
@@ -872,138 +563,6 @@ pub struct PendingRequestView {
     pub operation: String,
     pub summary: String,
     pub policy_preview: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TurnStateView {
-    Idle,
-    Active,
-    Failed,
-}
-
-impl From<TurnState> for TurnStateView {
-    fn from(value: TurnState) -> Self {
-        match value {
-            TurnState::Idle => Self::Idle,
-            TurnState::Active => Self::Active,
-            TurnState::Failed => Self::Failed,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobView {
-    pub agent_id: String,
-    pub idempotency_key: Option<String>,
-    pub state: JobStateView,
-    pub workspace_path: String,
-    pub owner_epoch: u64,
-    pub close_requested: bool,
-    pub stop_requested: bool,
-    pub last_event_seq: u64,
-    pub failure_code: Option<String>,
-    pub failure_message: Option<String>,
-    pub runtime_agent_id: Option<String>,
-    pub zcode_session_id: Option<String>,
-    pub turn_state: TurnStateView,
-    pub closed: bool,
-    pub reaped: bool,
-    pub live_steer: bool,
-    pub prompt_sha256: String,
-    pub created_at: i64,
-}
-
-impl From<Job> for JobView {
-    fn from(value: Job) -> Self {
-        let prompt_sha256 = format!("{:x}", Sha256::digest(value.initial_prompt.as_bytes()));
-        Self {
-            agent_id: value.agent_id,
-            idempotency_key: value.idempotency_key,
-            state: value.state.into(),
-            workspace_path: value.workspace_path,
-            owner_epoch: value.owner_epoch,
-            close_requested: value.close_requested,
-            stop_requested: value.stop_requested,
-            last_event_seq: value.last_event_seq,
-            failure_code: value.failure_code,
-            failure_message: value.failure_message.map(|_| "[REDACTED]".into()),
-            runtime_agent_id: value.runtime_agent_id,
-            zcode_session_id: value.zcode_session_id,
-            turn_state: value.turn_state.into(),
-            closed: value.closed_at.is_some(),
-            reaped: value.reaped_at.is_some(),
-            live_steer: false,
-            prompt_sha256,
-            created_at: value.created_at,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventView {
-    pub runtime_agent_id: String,
-    pub sequence: u64,
-    pub source_sequence: u64,
-    pub event_type: String,
-    pub payload_json: String,
-    pub redaction_level: String,
-}
-
-impl From<StoredEvent> for EventView {
-    fn from(value: StoredEvent) -> Self {
-        Self {
-            runtime_agent_id: value.runtime_agent_id,
-            sequence: value.sequence,
-            source_sequence: value.source_sequence,
-            event_type: value.event_type,
-            payload_json: value.payload_json,
-            redaction_level: value.redaction_level,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventPage {
-    pub runtime_agent_id: Option<String>,
-    pub events: Vec<EventView>,
-    pub next_sequence: u64,
-    pub has_more: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PreviewState {
-    Available,
-    NotRequested,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactIntegrityView {
-    Valid,
-    Missing,
-    Replaced,
-    Binary,
-    Invalid,
-    LegacyUnverified,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactView {
-    pub artifact_id: String,
-    pub artifact_type: String,
-    pub locator: String,
-    pub expected_sha256: Option<String>,
-    pub expected_bytes: Option<u64>,
-    pub observed_sha256: Option<String>,
-    pub observed_bytes: Option<u64>,
-    pub checkpoint_number: Option<u64>,
-    pub finalized: bool,
-    pub integrity: ArtifactIntegrityView,
-    pub preview_state: PreviewState,
-    pub preview: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1112,31 +671,6 @@ impl RpcService {
             RpcMethod::SystemStatus => Ok(RpcSuccess::SystemStatus {
                 status: self.system_status(),
             }),
-            RpcMethod::SystemEnsureReady { timeout_ms } => {
-                if timeout_ms == 0 || timeout_ms > MAX_WAIT.as_millis() as u64 {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        "readiness timeout is outside the allowed range",
-                    ));
-                }
-                let preflight = self
-                    .scheduler
-                    .preflight_runtime(Duration::from_millis(timeout_ms));
-                let probe_result = ReadinessResultView::from(preflight.result);
-                let mut status = self.system_status();
-                let (driver, runtime, model_auth) = readiness_components(probe_result);
-                status.components.insert("driver".into(), driver);
-                status.components.insert("runtime".into(), runtime);
-                status.components.insert("model_auth".into(), model_auth);
-                let ready = matches!(probe_result, ReadinessResultView::Ready)
-                    && readiness_from_status(&status);
-                Ok(RpcSuccess::SystemReadiness {
-                    ready,
-                    status,
-                    probe_result,
-                    reason_code: probe_result.reason_code(),
-                })
-            }
             RpcMethod::SubmitGeneral { input } => {
                 validate_text(&input.feature_id, "feature_id", 256)?;
                 validate_text(&input.ownership_token, "ownership_token", 512)?;
@@ -1155,12 +689,6 @@ impl RpcService {
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted.job, submitted.task),
                     disposition: submitted.disposition.into(),
-                })
-            }
-            RpcMethod::TaskStatus { agent_id } => {
-                let (job, task) = self.require_task(&agent_id)?;
-                Ok(RpcSuccess::TaskStatus {
-                    task: task_view(job, task),
                 })
             }
             RpcMethod::TaskList(query) => {
@@ -1239,22 +767,6 @@ impl RpcService {
                     next_cursor: page.next_cursor.map(format_task_cursor),
                 })
             }
-            RpcMethod::TaskPending { agent_id } => {
-                let (_, task) = self.require_task(&agent_id)?;
-                let policy = self.scheduler.active_policy(&task.execution_agent_id);
-                let requests = self
-                    .store
-                    .pending_requests_bounded(&task.execution_agent_id, MAX_PENDING_REQUESTS)
-                    .map_err(map_store)?
-                    .into_iter()
-                    .map(|request| pending_request_view(policy.as_deref(), request))
-                    .collect();
-                Ok(RpcSuccess::Pending { requests })
-            }
-            RpcMethod::TaskEvents(query) => Ok(RpcSuccess::TaskEvents {
-                page: self.task_event_page(query)?,
-            }),
-            RpcMethod::TaskWait(query) => self.task_wait(query),
             RpcMethod::TaskPoll(query) => self.task_poll(query),
             RpcMethod::TaskMessage(input) => {
                 let (_, task) = self.require_task(&input.agent_id)?;
@@ -1279,8 +791,10 @@ impl RpcService {
                         &input.content,
                     )
                     .map_err(map_scheduler)?;
+                let (job, task) = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Message {
                     disposition: disposition.into(),
+                    task: task_view(job, task),
                 })
             }
             RpcMethod::TaskRespond(input) => {
@@ -1298,18 +812,23 @@ impl RpcService {
                         input.content.as_deref(),
                     )
                     .map_err(map_scheduler)?;
+                let (job, task) = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Respond {
                     outcome: outcome.into(),
+                    task: task_view(job, task),
                 })
             }
             RpcMethod::TaskCancel { agent_id } => {
                 let (_, task) = self.require_task(&agent_id)?;
-                let state = self
-                    .scheduler
+                self.scheduler
                     .stop_job(&task.execution_agent_id)
                     .map_err(map_scheduler)?;
+                self.scheduler
+                    .reap_job(&task.execution_agent_id)
+                    .map_err(map_scheduler)?;
+                let (job, task) = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Stopped {
-                    state: state.into(),
+                    task: task_view(job, task),
                 })
             }
             RpcMethod::TaskResult {
@@ -1339,138 +858,15 @@ impl RpcService {
             }
             RpcMethod::TaskClose { agent_id } => {
                 let (_, task) = self.require_task(&agent_id)?;
-                let state = self
-                    .scheduler
+                self.scheduler
                     .close_job(&task.execution_agent_id)
                     .map_err(map_scheduler)?;
-                Ok(RpcSuccess::Closed {
-                    state: state.into(),
-                })
-            }
-            RpcMethod::TaskReap { agent_id } => {
-                let (_, task) = self.require_task(&agent_id)?;
-                let state = self
-                    .scheduler
+                self.scheduler
                     .reap_job(&task.execution_agent_id)
                     .map_err(map_scheduler)?;
-                let resources_reaped = self.require_task(&agent_id)?.0.reaped_at.is_some();
-                Ok(RpcSuccess::Reaped {
-                    state: state.into(),
-                    resources_reaped,
-                })
-            }
-            RpcMethod::Enqueue { job } => {
-                validate_id(&job.agent_id, "agent_id")?;
-                validate_text(&job.workspace_path, "workspace_path", 4096)?;
-                validate_text(&job.initial_prompt, "initial_prompt", 64 * 1024)?;
-                if let Some(key) = &job.idempotency_key {
-                    validate_text(key, "idempotency_key", 512)?;
-                }
-                let job = self.scheduler.enqueue(&job.into()).map_err(map_scheduler)?;
-                Ok(RpcSuccess::Enqueued { job: job.into() })
-            }
-            RpcMethod::Start => Ok(RpcSuccess::Started {
-                agent_ids: self.scheduler.start_ready().map_err(map_scheduler)?,
-            }),
-            RpcMethod::Status { agent_id } => Ok(RpcSuccess::Status {
-                job: self.require_legacy_job(&agent_id)?.into(),
-            }),
-            RpcMethod::Pending { agent_id } => {
-                self.require_legacy_job(&agent_id)?;
-                let policy = self.scheduler.active_policy(&agent_id);
-                let requests = self
-                    .store
-                    .pending_requests_bounded(&agent_id, MAX_PENDING_REQUESTS)
-                    .map_err(map_store)?
-                    .into_iter()
-                    .map(|request| pending_request_view(policy.as_deref(), request))
-                    .collect();
-                Ok(RpcSuccess::Pending { requests })
-            }
-            RpcMethod::Events(query) => Ok(RpcSuccess::Events {
-                page: self.event_page(query)?,
-            }),
-            RpcMethod::Wait(query) => self.wait(query),
-            RpcMethod::Message(input) => {
-                self.require_legacy_job(&input.agent_id)?;
-                validate_id(&input.message_id, "message_id")?;
-                if input.mode != "queue" {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        "generic agent messages must use queue mode",
-                    ));
-                }
-                validate_text(&input.content, "content", 16 * 1024)?;
-                let disposition = self
-                    .scheduler
-                    .message_job(
-                        &input.agent_id,
-                        &input.message_id,
-                        &input.mode,
-                        &input.content,
-                    )
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::Message {
-                    disposition: disposition.into(),
-                })
-            }
-            RpcMethod::Respond(input) => {
-                self.require_legacy_job(&input.agent_id)?;
-                validate_id(&input.request_id, "request_id")?;
-                if let Some(content) = input.content.as_deref() {
-                    validate_text(content, "response content", 16 * 1024)?;
-                }
-                let outcome = self
-                    .scheduler
-                    .respond_job(
-                        &input.agent_id,
-                        &input.request_id,
-                        input.decision.as_str(),
-                        input.content.as_deref(),
-                    )
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::Respond {
-                    outcome: outcome.into(),
-                })
-            }
-            RpcMethod::Stop { agent_id } => {
-                self.require_legacy_job(&agent_id)?;
-                let state = self.scheduler.stop_job(&agent_id).map_err(map_scheduler)?;
-                Ok(RpcSuccess::Stopped {
-                    state: state.into(),
-                })
-            }
-            RpcMethod::Result(query) => self.result(query),
-            RpcMethod::List { scope, limit } => {
-                if limit == 0 || limit > MAX_LIST_JOBS {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        "list limit is outside the allowed range",
-                    ));
-                }
-                let jobs = self
-                    .store
-                    .list_legacy_jobs_scoped(scope.into(), limit)
-                    .map_err(map_store)?
-                    .into_iter()
-                    .map(JobView::from)
-                    .collect();
-                Ok(RpcSuccess::Listed { jobs })
-            }
-            RpcMethod::Close { agent_id } => {
-                self.require_legacy_job(&agent_id)?;
-                let state = self.scheduler.close_job(&agent_id).map_err(map_scheduler)?;
+                let (job, task) = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Closed {
-                    state: state.into(),
-                })
-            }
-            RpcMethod::Reap { agent_id } => {
-                self.require_legacy_job(&agent_id)?;
-                let state = self.scheduler.reap_job(&agent_id).map_err(map_scheduler)?;
-                let resources_reaped = self.require_legacy_job(&agent_id)?.reaped_at.is_some();
-                Ok(RpcSuccess::Reaped {
-                    state: state.into(),
-                    resources_reaped,
+                    task: task_view(job, task),
                 })
             }
         }
@@ -1493,7 +889,7 @@ impl RpcService {
         components.insert("runtime".into(), ComponentStateView::Unknown);
         components.insert("model_auth".into(), ComponentStateView::Unknown);
         SystemStatusView {
-            api_surface: "subagent_v2".into(),
+            api_surface: "generic_agent".into(),
             protocol_version: RPC_VERSION,
             service_generation: self.service_generation.clone(),
             components,
@@ -1587,7 +983,7 @@ impl RpcService {
             if permitted {
                 projected.push(TaskArtifactMetadataView {
                     artifact_id: artifact.artifact_id,
-                    kind: public_artifact_kind(&artifact.artifact_type).into(),
+                    kind: public_artifact_kind(&artifact.artifact_type)?.into(),
                     sha256: artifact.sha256,
                     size_bytes: artifact.bytes,
                 });
@@ -1638,116 +1034,6 @@ impl RpcService {
             .find(|artifact| artifact.artifact_id == query.artifact_id)
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "artifact was not found"))?;
         verified_artifact_chunk(stored, expected, query.offset_bytes, query.limit_bytes)
-    }
-
-    fn task_event_page(&self, query: TaskEventQuery) -> Result<TaskEventPage, RpcError> {
-        if query.limit == 0 || query.limit > MAX_PAGE_EVENTS {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "event limit is outside the allowed range",
-            ));
-        }
-        let (job, task) = self.require_task(&query.agent_id)?;
-        let stored = self
-            .store
-            .task_events_after(
-                &query.agent_id,
-                0,
-                MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION + 1,
-            )
-            .map_err(map_store)?;
-        if stored.len() > MAX_PRIVATE_EVENTS_FOR_PUBLIC_PROJECTION {
-            return Err(RpcError::new(
-                RpcErrorCode::Oversized,
-                "private task event history exceeds the bounded public projection",
-            ));
-        }
-        let events = self.task_high_level_events(&task, stored)?;
-        let frame_budget_task = task_frame_budget_view(job, task);
-        task_page_from_events(query.after, query.limit, events, &frame_budget_task)
-    }
-
-    fn task_high_level_events(
-        &self,
-        task: &TaskRecord,
-        stored: Vec<StoredEvent>,
-    ) -> Result<Vec<TaskEventView>, RpcError> {
-        let mut events = Vec::new();
-        if task.phase != TaskPhase::Queued {
-            events.push(TaskEventView {
-                sequence: 0,
-                source_sequence: 0,
-                attempt_sequence: task.attempt_sequence,
-                event_type: "attempt_started".into(),
-                payload_json: "{}".into(),
-                redaction_level: "allowlisted".into(),
-            });
-        }
-        for event in stored
-            .into_iter()
-            .filter(|event| event.attempt_sequence == task.attempt_sequence)
-        {
-            if let Some(request_id) = public_pending_request_id(&event) {
-                events.push(TaskEventView {
-                    sequence: 0,
-                    source_sequence: event.source_sequence,
-                    attempt_sequence: task.attempt_sequence,
-                    event_type: "pending_request".into(),
-                    payload_json: serde_json::json!({"request_id": request_id}).to_string(),
-                    redaction_level: "bounded".into(),
-                });
-            }
-        }
-        if task.phase == TaskPhase::Terminal {
-            events.push(TaskEventView {
-                sequence: 0,
-                source_sequence: 0,
-                attempt_sequence: task.attempt_sequence,
-                event_type: "terminal".into(),
-                payload_json: "{}".into(),
-                redaction_level: "allowlisted".into(),
-            });
-        }
-        for (index, event) in events.iter_mut().enumerate() {
-            event.sequence = u64::try_from(index + 1).map_err(|_| {
-                RpcError::new(RpcErrorCode::Oversized, "public event sequence overflowed")
-            })?;
-        }
-        Ok(events)
-    }
-
-    fn task_wait(&self, query: TaskWaitQuery) -> Result<RpcSuccess, RpcError> {
-        if query.timeout_ms == 0 || Duration::from_millis(query.timeout_ms) > MAX_WAIT {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "wait timeout is outside the allowed range",
-            ));
-        }
-        let deadline = Instant::now() + Duration::from_millis(query.timeout_ms);
-        loop {
-            let (job, task) = self.require_task(&query.agent_id)?;
-            let page = self.task_event_page(TaskEventQuery {
-                agent_id: query.agent_id.clone(),
-                after: query.after,
-                limit: MAX_PAGE_EVENTS,
-            })?;
-            if !page.events.is_empty() || task.phase == TaskPhase::Terminal {
-                return Ok(RpcSuccess::TaskWait {
-                    task: task_view(job, task),
-                    page,
-                    timed_out: false,
-                });
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(RpcSuccess::TaskWait {
-                    task: task_view(job, task),
-                    page,
-                    timed_out: true,
-                });
-            }
-            thread::sleep((deadline - now).min(Duration::from_millis(10)));
-        }
     }
 
     fn task_poll(&self, query: TaskPollQuery) -> Result<RpcSuccess, RpcError> {
@@ -1805,165 +1091,6 @@ impl RpcService {
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
     }
-
-    fn require_legacy_job(&self, agent_id: &str) -> Result<Job, RpcError> {
-        validate_id(agent_id, "agent_id")?;
-        self.store
-            .get_legacy_job(agent_id)
-            .map_err(map_store)?
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "job was not found"))
-    }
-
-    fn event_page(&self, query: EventQuery) -> Result<EventPage, RpcError> {
-        if query.limit == 0 || query.limit > MAX_PAGE_EVENTS {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "event limit is outside the allowed range",
-            ));
-        }
-        let job = self.require_legacy_job(&query.agent_id)?;
-        let runtime_agent_id = query.runtime_agent_id.or(job.runtime_agent_id);
-        let Some(runtime_agent_id) = runtime_agent_id else {
-            return Ok(EventPage {
-                runtime_agent_id: None,
-                events: Vec::new(),
-                next_sequence: query.after,
-                has_more: false,
-            });
-        };
-        validate_id(&runtime_agent_id, "runtime_agent_id")?;
-        let stored = self
-            .store
-            .events_after(
-                &query.agent_id,
-                &runtime_agent_id,
-                query.after,
-                query.limit + 1,
-            )
-            .map_err(map_store)?;
-        page_from_events(Some(runtime_agent_id), query.after, query.limit, stored)
-    }
-
-    fn wait(&self, query: WaitQuery) -> Result<RpcSuccess, RpcError> {
-        if query.timeout_ms == 0 || Duration::from_millis(query.timeout_ms) > MAX_WAIT {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "wait timeout is outside the allowed range",
-            ));
-        }
-        let deadline = Instant::now() + Duration::from_millis(query.timeout_ms);
-        validate_id(&query.agent_id, "agent_id")?;
-        self.require_legacy_job(&query.agent_id)?;
-        if let Some(runtime_agent_id) = query.runtime_agent_id.as_deref() {
-            validate_id(runtime_agent_id, "runtime_agent_id")?;
-        }
-        let fallback = match self
-            .store
-            .get_job_snapshot_until(&query.agent_id, deadline)
-            .map_err(map_store)?
-        {
-            DeadlineRead::Ready(Some(job)) => job,
-            DeadlineRead::Ready(None) => {
-                return Err(RpcError::new(RpcErrorCode::NotFound, "job was not found"))
-            }
-            DeadlineRead::TimedOut => return Err(wait_timeout()),
-        };
-        let (initial, initial_page) = match self.wait_snapshot(&query, deadline) {
-            Ok(snapshot) => snapshot,
-            Err(error) if error.code == RpcErrorCode::Timeout => {
-                return Ok(wait_timed_out(fallback, query.after))
-            }
-            Err(error) => return Err(error),
-        };
-        if !initial_page.events.is_empty() || initial.state.is_terminal() {
-            return Ok(RpcSuccess::Wait {
-                job: initial.into(),
-                page: initial_page,
-                timed_out: false,
-            });
-        }
-        let initial_state = initial.state;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(RpcSuccess::Wait {
-                    job: initial.into(),
-                    page: EventPage {
-                        runtime_agent_id: None,
-                        events: Vec::new(),
-                        next_sequence: query.after,
-                        has_more: false,
-                    },
-                    timed_out: true,
-                });
-            }
-            thread::sleep((deadline - now).min(Duration::from_millis(10)));
-            let (job, page) = match self.wait_snapshot(&query, deadline) {
-                Ok(snapshot) => snapshot,
-                Err(error) if error.code == RpcErrorCode::Timeout => {
-                    return Ok(wait_timed_out(initial, query.after));
-                }
-                Err(error) => return Err(error),
-            };
-            if !page.events.is_empty() || job.state.is_terminal() || job.state != initial_state {
-                return Ok(RpcSuccess::Wait {
-                    job: job.into(),
-                    page,
-                    timed_out: false,
-                });
-            }
-        }
-    }
-
-    fn wait_snapshot(
-        &self,
-        query: &WaitQuery,
-        deadline: Instant,
-    ) -> Result<(Job, EventPage), RpcError> {
-        let snapshot = match self
-            .store
-            .wait_snapshot_until(
-                &query.agent_id,
-                query.runtime_agent_id.as_deref(),
-                query.after,
-                MAX_PAGE_EVENTS + 1,
-                deadline,
-            )
-            .map_err(map_store)?
-        {
-            DeadlineRead::Ready(snapshot) => snapshot,
-            DeadlineRead::TimedOut => return Err(wait_timeout()),
-        };
-        let WaitSnapshot {
-            job,
-            runtime_agent_id,
-            events,
-        } = snapshot;
-        let job = job.ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "job was not found"))?;
-        let page = page_from_events(runtime_agent_id, query.after, MAX_PAGE_EVENTS, events)?;
-        Ok((job, page))
-    }
-
-    fn result(&self, query: ResultQuery) -> Result<RpcSuccess, RpcError> {
-        if query.preview_bytes > MAX_PREVIEW_BYTES {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "preview size exceeds the transport cap",
-            ));
-        }
-        let job = self.require_legacy_job(&query.agent_id)?;
-        let artifact = self
-            .store
-            .artifacts(&query.agent_id, 1)
-            .map_err(map_store)?
-            .into_iter()
-            .next()
-            .map(|artifact| artifact_view(artifact, query.preview_bytes));
-        Ok(RpcSuccess::Result {
-            job: job.into(),
-            artifact,
-        })
-    }
 }
 
 fn opaque_generation() -> Result<String, RpcServiceConfigError> {
@@ -2019,42 +1146,10 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
             max_artifact_bytes: 268_435_456,
         },
         max_rpc_frame_bytes: MAX_FRAME_BYTES,
-        max_events: MAX_PAGE_EVENTS,
         max_wait_ms: MAX_WAIT.as_millis() as u64,
         named_checks,
         maturity,
     }
-}
-
-fn readiness_components(
-    result: ReadinessResultView,
-) -> (ComponentStateView, ComponentStateView, ComponentStateView) {
-    use ComponentStateView::{Ready, Unavailable, Unknown};
-    match result {
-        ReadinessResultView::Ready => (Ready, Ready, Ready),
-        ReadinessResultView::ConfigInvalid | ReadinessResultView::ZcodeStartFailed => {
-            (Unavailable, Unknown, Unknown)
-        }
-        ReadinessResultView::RuntimeProtocolFailed | ReadinessResultView::CleanupFailed => {
-            (Ready, Unavailable, Unknown)
-        }
-        ReadinessResultView::ModelAuthFailed => (Ready, Ready, Unavailable),
-        ReadinessResultView::RuntimeFailed => (Ready, Ready, Unknown),
-        ReadinessResultView::NotObservedWithinTimeout => (Ready, Ready, Unknown),
-    }
-}
-
-fn readiness_from_status(status: &SystemStatusView) -> bool {
-    [
-        "daemon",
-        "store",
-        "scheduler",
-        "driver",
-        "runtime",
-        "model_auth",
-    ]
-    .iter()
-    .all(|component| status.components.get(*component) == Some(&ComponentStateView::Ready))
 }
 
 fn general_profile_name(profile: GeneralProfile) -> &'static str {
@@ -2078,12 +1173,13 @@ fn format_task_cursor(cursor: u64) -> String {
     format!("task:{cursor}")
 }
 
-fn public_artifact_kind(stored: &str) -> &'static str {
+fn public_artifact_kind(stored: &str) -> Result<&'static str, RpcError> {
     match stored {
-        "report_markdown" | "report" => "report_markdown",
-        "changes_patch" => "changes_patch",
-        "check_report" => "check_report",
-        _ => "unknown",
+        "changes_patch" => Ok("changes_patch"),
+        _ => Err(RpcError::new(
+            RpcErrorCode::ResultInvalid,
+            "stored artifact kind is not supported",
+        )),
     }
 }
 
@@ -2251,21 +1347,6 @@ fn activity_window_view(value: PassiveActivityWindow) -> ActivityWindowView {
     }
 }
 
-fn task_frame_budget_view(job: Job, task: TaskRecord) -> TaskView {
-    let mut view = task_view(job, task);
-    // Budget against the longest variants and JSON booleans that can be
-    // observed if task state changes between page construction and the wait
-    // response. Stable identifiers and effective budgets retain their exact
-    // serialized representation.
-    view.access_mode = "workspace_write".into();
-    view.phase = "WAITING_INPUT".into();
-    view.stop_requested = false;
-    view.close_requested = false;
-    view.closed = false;
-    view.reaped = false;
-    view
-}
-
 impl From<StoredTaskResult> for TaskResultView {
     fn from(stored: StoredTaskResult) -> Self {
         Self {
@@ -2282,128 +1363,6 @@ impl From<StoredTaskResult> for TaskResultView {
             artifacts: stored.result.artifacts,
             result_sha256: stored.result_sha256,
         }
-    }
-}
-
-fn public_pending_request_id(event: &StoredEvent) -> Option<String> {
-    if event.event_type != "driver.message" {
-        return None;
-    }
-    serde_json::from_str::<Value>(&event.payload_json)
-        .ok()?
-        .get("request_id")?
-        .as_str()
-        .filter(|request_id| !request_id.is_empty() && request_id.len() <= 256)
-        .map(str::to_owned)
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn task_page_from_events(
-    after: u64,
-    limit: usize,
-    projected: Vec<TaskEventView>,
-    frame_budget_task: &TaskView,
-) -> Result<TaskEventPage, RpcError> {
-    let start = usize::try_from(after).unwrap_or(usize::MAX);
-    if start >= projected.len() {
-        return Ok(TaskEventPage {
-            events: Vec::new(),
-            next_sequence: after,
-            has_more: false,
-        });
-    }
-    let mut events = Vec::new();
-    let mut payload_bytes = 0usize;
-    let remaining = projected.len() - start;
-    let mut has_more = remaining > limit;
-    for event in projected.into_iter().skip(start).take(limit) {
-        if event.payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
-            return Err(RpcError::new(
-                RpcErrorCode::Oversized,
-                "stored event payload exceeds the transport cap",
-            ));
-        }
-        let next_bytes = payload_bytes.saturating_add(event.payload_json.len());
-        if next_bytes > MAX_PAGE_PAYLOAD_BYTES {
-            has_more = true;
-            break;
-        }
-        let mut candidate_events = events.clone();
-        candidate_events.push(event.clone());
-        let candidate = TaskEventPage {
-            next_sequence: event.sequence,
-            events: candidate_events,
-            // `false` is one byte longer than `true`, so it is the
-            // conservative value for the transport-frame calculation.
-            has_more: false,
-        };
-        if !task_page_fits_frame(frame_budget_task, &candidate)? {
-            if events.is_empty() {
-                return Err(RpcError::new(
-                    RpcErrorCode::Oversized,
-                    "projected public event exceeds the RPC frame cap",
-                ));
-            }
-            has_more = true;
-            break;
-        }
-        payload_bytes = next_bytes;
-        events.push(event);
-    }
-    Ok(TaskEventPage {
-        next_sequence: events.last().map(|event| event.sequence).unwrap_or(after),
-        events,
-        has_more,
-    })
-}
-
-fn task_page_fits_frame(
-    frame_budget_task: &TaskView,
-    page: &TaskEventPage,
-) -> Result<bool, RpcError> {
-    let request_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
-    let response = RpcResponse::success(
-        request_id,
-        RpcSuccess::TaskWait {
-            task: frame_budget_task.clone(),
-            page: page.clone(),
-            // `false` is the longer JSON boolean and therefore the
-            // conservative representation.
-            timed_out: false,
-        },
-    );
-    serde_json::to_vec(&response)
-        .map(|frame| frame.len() <= MAX_FRAME_BYTES)
-        .map_err(|_| {
-            RpcError::new(
-                RpcErrorCode::Internal,
-                "public event page could not be serialized",
-            )
-        })
-}
-
-fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
-    let preview_state = if requested == 0 {
-        PreviewState::NotRequested
-    } else {
-        PreviewState::Unavailable
-    };
-    ArtifactView {
-        artifact_id: artifact.artifact_id,
-        artifact_type: artifact.artifact_type,
-        locator: artifact.path,
-        expected_sha256: Some(artifact.sha256),
-        expected_bytes: Some(artifact.bytes),
-        observed_sha256: None,
-        observed_bytes: None,
-        checkpoint_number: artifact.checkpoint_number,
-        finalized: false,
-        integrity: ArtifactIntegrityView::LegacyUnverified,
-        preview_state,
-        preview: None,
     }
 }
 
@@ -2518,59 +1477,6 @@ fn validate_id(value: &str, field: &str) -> Result<(), RpcError> {
 
 fn valid_request_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_REQUEST_ID_BYTES && !value.contains('\0')
-}
-
-fn wait_timeout() -> RpcError {
-    RpcError::new(RpcErrorCode::Timeout, "wait deadline elapsed")
-}
-
-fn wait_timed_out(job: Job, after: u64) -> RpcSuccess {
-    RpcSuccess::Wait {
-        job: job.into(),
-        page: EventPage {
-            runtime_agent_id: None,
-            events: Vec::new(),
-            next_sequence: after,
-            has_more: false,
-        },
-        timed_out: true,
-    }
-}
-
-fn page_from_events(
-    runtime_agent_id: Option<String>,
-    after: u64,
-    limit: usize,
-    stored: Vec<StoredEvent>,
-) -> Result<EventPage, RpcError> {
-    let mut events = Vec::new();
-    let mut payload_bytes = 0usize;
-    let mut has_more = stored.len() > limit;
-    for event in stored.into_iter().take(limit) {
-        if event.payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
-            return Err(RpcError::new(
-                RpcErrorCode::Oversized,
-                "stored event payload exceeds the transport cap",
-            ));
-        }
-        let next_bytes = payload_bytes.saturating_add(event.payload_json.len());
-        if next_bytes > MAX_PAGE_PAYLOAD_BYTES {
-            has_more = true;
-            break;
-        }
-        payload_bytes = next_bytes;
-        events.push(event.into());
-    }
-    let next_sequence = events
-        .last()
-        .map(|event: &EventView| event.sequence)
-        .unwrap_or(after);
-    Ok(EventPage {
-        runtime_agent_id,
-        events,
-        next_sequence,
-        has_more,
-    })
 }
 
 fn validate_text(value: &str, field: &str, max: usize) -> Result<(), RpcError> {

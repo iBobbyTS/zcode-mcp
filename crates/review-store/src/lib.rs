@@ -1,13 +1,10 @@
-use rusqlite::{
-    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::Digest;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::{Mutex, TryLockError},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::Mutex,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -109,18 +106,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     bytes INTEGER NOT NULL,
-    checkpoint_number INTEGER,
     created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS compatibility_runs (
-    runtime_hash TEXT NOT NULL,
-    runtime_version TEXT NOT NULL,
-    node_version TEXT,
-    tested_at INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    details_json TEXT NOT NULL,
-    PRIMARY KEY (runtime_hash, tested_at)
 );
 
 CREATE TABLE IF NOT EXISTS lifecycle_ledger (
@@ -216,13 +202,6 @@ pub enum JobState {
     FailedRuntimeLost,
     Orphaned,
     Closed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobListScope {
-    Active,
-    Recent,
-    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,9 +329,7 @@ pub struct ResultArtifact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
-    ReportMarkdown,
     ChangesPatch,
-    CheckReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -633,30 +610,6 @@ pub struct TerminalUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredEvent {
-    pub runtime_agent_id: String,
-    pub sequence: u64,
-    pub source_sequence: u64,
-    pub event_type: String,
-    pub payload_json: String,
-    pub redaction_level: String,
-    pub attempt_sequence: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WaitSnapshot {
-    pub job: Option<Job>,
-    pub runtime_agent_id: Option<String>,
-    pub events: Vec<StoredEvent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeadlineRead<T> {
-    Ready(T),
-    TimedOut,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewArtifact {
     pub artifact_id: String,
     pub agent_id: String,
@@ -664,7 +617,6 @@ pub struct NewArtifact {
     pub path: String,
     pub sha256: String,
     pub bytes: u64,
-    pub checkpoint_number: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -674,7 +626,6 @@ pub struct StoredArtifact {
     pub path: String,
     pub sha256: String,
     pub bytes: u64,
-    pub checkpoint_number: Option<u64>,
     pub created_at: i64,
 }
 
@@ -991,12 +942,8 @@ impl Store {
         &self,
         scope: TaskQueryScope<'_>,
         kind: Option<TaskKind>,
-        legacy_compatible_review_only: bool,
         limit: usize,
     ) -> StoreResult<Vec<TaskRecord>> {
-        if legacy_compatible_review_only {
-            return Ok(Vec::new());
-        }
         Ok(self
             .list_task_page(
                 scope,
@@ -1256,192 +1203,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn task_events_after(
-        &self,
-        public_agent_id: &str,
-        after_sequence: u64,
-        limit: usize,
-    ) -> StoreResult<Vec<StoredEvent>> {
-        let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare("SELECT e.runtime_agent_id,e.seq,e.source_seq,e.event_type,e.payload_json,e.redaction_level,e.attempt_sequence FROM events e JOIN task_attempts t ON t.execution_agent_id=e.agent_id WHERE t.public_agent_id=?1 AND e.seq>?2 ORDER BY e.seq LIMIT ?3")?;
-        let rows = statement
-            .query_map(
-                params![
-                    public_agent_id,
-                    u64_to_i64(after_sequence)?,
-                    usize_to_i64(limit)?
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(StoredEvent {
-                    runtime_agent_id: r.0,
-                    sequence: i64_to_u64(r.1)?,
-                    source_sequence: i64_to_u64(r.2)?,
-                    event_type: r.3,
-                    payload_json: r.4,
-                    redaction_level: r.5,
-                    attempt_sequence: i64_to_u64(r.6)?,
-                })
-            })
-            .collect()
-    }
-
     pub fn get_job(&self, agent_id: &str) -> StoreResult<Option<Job>> {
         let connection = self.connection.lock().unwrap();
         query_job(&connection, agent_id)
-    }
-
-    pub fn get_job_snapshot_until(
-        &self,
-        agent_id: &str,
-        deadline: Instant,
-    ) -> StoreResult<DeadlineRead<Option<Job>>> {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(DeadlineRead::TimedOut);
-        };
-        let connection = Connection::open_with_flags(
-            &self.database_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(remaining)?;
-        if Instant::now() >= deadline {
-            return Ok(DeadlineRead::TimedOut);
-        }
-        query_job(&connection, agent_id).map(DeadlineRead::Ready)
-    }
-
-    pub fn wait_snapshot_until(
-        &self,
-        agent_id: &str,
-        requested_runtime_agent_id: Option<&str>,
-        after: u64,
-        limit: usize,
-        deadline: Instant,
-    ) -> StoreResult<DeadlineRead<WaitSnapshot>> {
-        let after = u64_to_i64(after)?;
-        let limit = usize_to_i64(limit)?;
-        let connection = loop {
-            match self.connection.try_lock() {
-                Ok(connection) => break connection,
-                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
-                Err(TryLockError::WouldBlock) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(DeadlineRead::TimedOut);
-                    }
-                    thread::sleep((deadline - now).min(Duration::from_millis(1)));
-                }
-            }
-        };
-        let now = Instant::now();
-        if now >= deadline {
-            return Ok(DeadlineRead::TimedOut);
-        }
-        connection.busy_timeout(deadline - now)?;
-        let snapshot = (|| {
-            let job = query_job(&connection, agent_id)?;
-            let runtime_agent_id = requested_runtime_agent_id
-                .map(str::to_owned)
-                .or_else(|| job.as_ref().and_then(|job| job.runtime_agent_id.clone()));
-            let events = match runtime_agent_id.as_deref() {
-                Some(runtime_agent_id) => {
-                    query_events_after(&connection, agent_id, runtime_agent_id, after, limit)?
-                }
-                None => Vec::new(),
-            };
-            Ok(WaitSnapshot {
-                job,
-                runtime_agent_id,
-                events,
-            })
-        })();
-        let restore = connection.busy_timeout(STORE_BUSY_TIMEOUT);
-        restore?;
-        if Instant::now() >= deadline {
-            return Ok(DeadlineRead::TimedOut);
-        }
-        snapshot.map(DeadlineRead::Ready)
-    }
-
-    pub fn list_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
-        self.list_jobs_scoped(JobListScope::Recent, limit)
-    }
-
-    pub fn get_legacy_job(&self, agent_id: &str) -> StoreResult<Option<Job>> {
-        let connection = self.connection.lock().unwrap();
-        let compatible:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM agents a WHERE a.agent_id=?1 AND NOT EXISTS(SELECT 1 FROM task_attempts t WHERE t.execution_agent_id=a.agent_id))",[agent_id],|row|row.get(0))?;
-        if compatible {
-            query_job(&connection, agent_id)
-        } else {
-            Ok(None)
-        }
-    }
-    pub fn validate_legacy_job_id(&self, agent_id: &str) -> StoreResult<()> {
-        if self.get_legacy_job(agent_id)?.is_some() {
-            Ok(())
-        } else {
-            Err(StoreError::InvalidState(format!(
-                "job {agent_id} is not legacy-compatible"
-            )))
-        }
-    }
-    pub fn list_legacy_jobs(&self, limit: usize) -> StoreResult<Vec<Job>> {
-        self.list_legacy_jobs_scoped(JobListScope::All, limit)
-    }
-
-    pub fn list_legacy_jobs_scoped(
-        &self,
-        scope: JobListScope,
-        limit: usize,
-    ) -> StoreResult<Vec<Job>> {
-        let connection = self.connection.lock().unwrap();
-        let active_predicate = match scope {
-            JobListScope::Active => " AND a.state IN ('QUEUED', 'STARTING', 'RUNNING', 'STOPPING')",
-            JobListScope::Recent | JobListScope::All => "",
-        };
-        let sql = format!(
-            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id, owner_epoch, close_requested, stop_requested, last_event_seq, failure_code, failure_message, runtime_agent_id, zcode_session_id, turn_state, pid, process_group_id, process_uid, process_start_token, closed_at, reaped_at, created_at, prepared_launch_json, prepared_launch_sha256 FROM agents a WHERE NOT EXISTS(SELECT 1 FROM task_attempts t WHERE t.execution_agent_id=a.agent_id){active_predicate} ORDER BY created_at DESC,rowid DESC LIMIT ?1"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement
-            .query_map([usize_to_i64(limit)?], map_job_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(convert_job_row).collect()
-    }
-
-    pub fn list_jobs_scoped(&self, scope: JobListScope, limit: usize) -> StoreResult<Vec<Job>> {
-        let connection = self.connection.lock().unwrap();
-        let where_clause = match scope {
-            JobListScope::Active => "WHERE state IN ('QUEUED', 'STARTING', 'RUNNING', 'STOPPING')",
-            JobListScope::Recent | JobListScope::All => "",
-        };
-        let sql = format!(
-            "SELECT agent_id, idempotency_key, state, workspace_path, initial_prompt, owner_id,
-                    owner_epoch, close_requested, stop_requested, last_event_seq,
-                    failure_code, failure_message, runtime_agent_id,
-                    zcode_session_id, turn_state, pid, process_group_id,
-                    process_uid, process_start_token, closed_at, reaped_at, created_at,
-                    prepared_launch_json, prepared_launch_sha256
-             FROM agents {where_clause} ORDER BY created_at DESC, rowid DESC LIMIT ?1"
-        );
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement
-            .query_map([usize_to_i64(limit)?], map_job_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(convert_job_row).collect()
     }
 
     pub fn claim_next(
@@ -2304,9 +2068,8 @@ impl Store {
         let connection = self.connection.lock().unwrap();
         let changed = connection.execute(
             "INSERT OR IGNORE INTO artifacts
-             (artifact_id, agent_id, artifact_type, path, sha256, bytes,
-              checkpoint_number, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (artifact_id, agent_id, artifact_type, path, sha256, bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 artifact.artifact_id,
                 artifact.agent_id,
@@ -2314,54 +2077,10 @@ impl Store {
                 artifact.path,
                 artifact.sha256,
                 u64_to_i64(artifact.bytes)?,
-                artifact.checkpoint_number.map(u64_to_i64).transpose()?,
                 now_millis(),
             ],
         )?;
         Ok(changed == 1)
-    }
-
-    pub fn record_compatibility_run(
-        &self,
-        runtime_hash: &str,
-        runtime_version: &str,
-        node_version: Option<&str>,
-        tested_at: i64,
-        status: &str,
-        details_json: &str,
-    ) -> StoreResult<bool> {
-        let connection = self.connection.lock().unwrap();
-        let changed = connection.execute(
-            "INSERT OR IGNORE INTO compatibility_runs
-             (runtime_hash, runtime_version, node_version, tested_at, status, details_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                runtime_hash,
-                runtime_version,
-                node_version,
-                tested_at,
-                status,
-                details_json
-            ],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn events_after(
-        &self,
-        agent_id: &str,
-        runtime_agent_id: &str,
-        after: u64,
-        limit: usize,
-    ) -> StoreResult<Vec<StoredEvent>> {
-        let connection = self.connection.lock().unwrap();
-        query_events_after(
-            &connection,
-            agent_id,
-            runtime_agent_id,
-            u64_to_i64(after)?,
-            usize_to_i64(limit)?,
-        )
     }
 
     pub fn cursor(&self, agent_id: &str, runtime_agent_id: &str) -> StoreResult<u64> {
@@ -2388,10 +2107,9 @@ impl Store {
     pub fn artifacts(&self, agent_id: &str, limit: usize) -> StoreResult<Vec<StoredArtifact>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
-            "SELECT artifact_id, artifact_type, path, sha256, bytes,
-                    checkpoint_number, created_at
+            "SELECT artifact_id, artifact_type, path, sha256, bytes, created_at
              FROM artifacts WHERE agent_id = ?1
-             ORDER BY checkpoint_number DESC, created_at DESC, artifact_id DESC
+             ORDER BY created_at DESC, artifact_id DESC
              LIMIT ?2",
         )?;
         let rows = statement
@@ -2402,42 +2120,24 @@ impl Store {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(
-                |(
-                    artifact_id,
-                    artifact_type,
-                    path,
-                    sha256,
-                    bytes,
-                    checkpoint_number,
-                    created_at,
-                )| {
+                |(artifact_id, artifact_type, path, sha256, bytes, created_at)| {
                     Ok(StoredArtifact {
                         artifact_id,
                         artifact_type,
                         path,
                         sha256,
                         bytes: i64_to_u64(bytes)?,
-                        checkpoint_number: checkpoint_number.map(i64_to_u64).transpose()?,
                         created_at,
                     })
                 },
             )
             .collect()
-    }
-
-    pub fn compatibility_count(&self) -> StoreResult<u64> {
-        let connection = self.connection.lock().unwrap();
-        let count = connection.query_row("SELECT COUNT(*) FROM compatibility_runs", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        i64_to_u64(count)
     }
 
     pub fn active_count(&self) -> StoreResult<u64> {
@@ -2759,57 +2459,6 @@ fn query_pending_request(
         },
     )
     .transpose()
-}
-
-fn query_events_after(
-    connection: &Connection,
-    agent_id: &str,
-    runtime_agent_id: &str,
-    after: i64,
-    limit: i64,
-) -> StoreResult<Vec<StoredEvent>> {
-    let mut statement = connection.prepare(
-        "SELECT runtime_agent_id, seq, source_seq, event_type, payload_json, redaction_level, attempt_sequence
-         FROM events WHERE agent_id = ?1 AND runtime_agent_id = ?2 AND seq > ?3
-         ORDER BY seq LIMIT ?4",
-    )?;
-    let events = statement
-        .query_map(params![agent_id, runtime_agent_id, after, limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    events
-        .into_iter()
-        .map(
-            |(
-                runtime_agent_id,
-                sequence,
-                source_sequence,
-                event_type,
-                payload_json,
-                redaction_level,
-                attempt_sequence,
-            )| {
-                Ok(StoredEvent {
-                    runtime_agent_id,
-                    sequence: i64_to_u64(sequence)?,
-                    source_sequence: i64_to_u64(source_sequence)?,
-                    event_type,
-                    payload_json,
-                    redaction_level,
-                    attempt_sequence: i64_to_u64(attempt_sequence)?,
-                })
-            },
-        )
-        .collect()
 }
 
 fn query_job(connection: &Connection, agent_id: &str) -> StoreResult<Option<Job>> {
@@ -3138,22 +2787,6 @@ mod tests {
         store.enqueue_job(&job).unwrap()
     }
 
-    #[test]
-    fn active_list_filters_in_sql_before_limit() {
-        let (_directory, _path, store) = file_store();
-        enqueue(&store, "old-active", "/workspace/active");
-        let claim = store.claim_next("daemon", 200, 200).unwrap().unwrap();
-        assert_eq!(claim.job.agent_id, "old-active");
-        for index in 0..101 {
-            let id = format!("terminal-{index:03}");
-            enqueue(&store, &id, &format!("/workspace/{index}"));
-            assert_eq!(store.request_stop(&id).unwrap().state, JobState::Cancelled);
-        }
-        let active = store.list_jobs_scoped(JobListScope::Active, 100).unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].agent_id, "old-active");
-    }
-
     fn claim(store: &Store, id: &str) -> JobClaim {
         let claim = store.claim_next("daemon-1", 8, 8).unwrap().unwrap();
         assert_eq!(claim.job.agent_id, id);
@@ -3222,15 +2855,11 @@ mod tests {
             .insert_artifact(&NewArtifact {
                 artifact_id: "artifact-1".into(),
                 agent_id: "job-1".into(),
-                artifact_type: "report".into(),
-                path: "/report".into(),
+                artifact_type: "changes_patch".into(),
+                path: "/changes.patch".into(),
                 sha256: "abc".into(),
                 bytes: 12,
-                checkpoint_number: Some(1),
             })
-            .unwrap());
-        assert!(store
-            .record_compatibility_run("hash", "version", Some("node"), 7, "OK", "{}")
             .unwrap());
         let claimed = claim(&store, "job-1");
         assert!(store
@@ -3252,8 +2881,6 @@ mod tests {
         assert_eq!(reopened.cursor("job-1", "runtime-1").unwrap(), 1);
         assert_eq!(reopened.artifact_count("job-1").unwrap(), 1);
         assert_eq!(reopened.artifacts("job-1", 1).unwrap()[0].sha256, "abc");
-        assert_eq!(reopened.list_jobs(10).unwrap()[0].agent_id, "job-1");
-        assert_eq!(reopened.compatibility_count().unwrap(), 1);
     }
 
     #[test]
@@ -3443,42 +3070,6 @@ mod tests {
     }
 
     #[test]
-    fn wait_snapshot_deadline_includes_store_mutex_contention() {
-        let (_directory, _path, store) = file_store();
-        enqueue(&store, "job-1", "a");
-        let connection = store.connection.lock().unwrap();
-        let started = Instant::now();
-        let result = store
-            .wait_snapshot_until(
-                "job-1",
-                None,
-                0,
-                10,
-                Instant::now() + Duration::from_millis(20),
-            )
-            .unwrap();
-        assert_eq!(result, DeadlineRead::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(200));
-        drop(connection);
-    }
-
-    #[test]
-    fn readonly_job_snapshot_remains_bounded_during_store_mutex_contention() {
-        let (_directory, _path, store) = file_store();
-        enqueue(&store, "job-readonly", "a");
-        let connection = store.connection.lock().unwrap();
-        let started = Instant::now();
-        let snapshot = store
-            .get_job_snapshot_until("job-readonly", Instant::now() + Duration::from_millis(50))
-            .unwrap();
-        assert!(
-            matches!(snapshot, DeadlineRead::Ready(Some(ref job)) if job.agent_id == "job-readonly")
-        );
-        assert!(started.elapsed() < Duration::from_millis(200));
-        drop(connection);
-    }
-
-    #[test]
     fn bounded_pending_requests_prioritize_actionable_rows() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path().join("pending.sqlite3")).unwrap();
@@ -3543,17 +3134,11 @@ mod tests {
             store.append_lifecycle(&event("job-1", "runtime-1", claimed.owner_epoch, 42)),
             Err(StoreError::Conflict(_))
         ));
-        assert_eq!(
-            store
-                .events_after("job-1", "runtime-1", 0, 10)
-                .unwrap()
-                .len(),
-            2
-        );
+        assert_eq!(store.get_job("job-1").unwrap().unwrap().last_event_seq, 2);
     }
 
     #[test]
-    fn restart_and_close_retain_partial_events_artifacts_and_compatibility() {
+    fn restart_and_close_retain_partial_events_and_artifacts() {
         let (_directory, path, store) = file_store();
         enqueue(&store, "queued", "a");
         enqueue(&store, "running", "b");
@@ -3569,15 +3154,11 @@ mod tests {
             .insert_artifact(&NewArtifact {
                 artifact_id: "artifact".into(),
                 agent_id: "queued".into(),
-                artifact_type: "report".into(),
-                path: "/report".into(),
+                artifact_type: "changes_patch".into(),
+                path: "/changes.patch".into(),
                 sha256: "sha".into(),
                 bytes: 5,
-                checkpoint_number: None,
             })
-            .unwrap();
-        store
-            .record_compatibility_run("hash", "version", None, 1, "OK", "{}")
             .unwrap();
         drop(store);
 
@@ -3592,15 +3173,8 @@ mod tests {
             reopened.get_job("running").unwrap().unwrap().state,
             JobState::Queued
         );
-        assert_eq!(
-            reopened
-                .events_after("queued", "runtime", 0, 10)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(reopened.cursor("queued", "runtime").unwrap(), 1);
         assert_eq!(reopened.artifact_count("queued").unwrap(), 1);
-        assert_eq!(reopened.compatibility_count().unwrap(), 1);
         assert_eq!(
             reopened.request_close("queued").unwrap().state,
             JobState::FailedRuntimeLost
@@ -4072,43 +3646,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_active_scope_is_composed_before_limit_and_excludes_v2_rows() {
-        let (_directory, _path, store) = file_store();
-        enqueue(&store, "old-active", "/legacy-active");
-        let active_claim = claim(&store, "old-active");
-        store
-            .mark_running(
-                "old-active",
-                active_claim.owner_epoch,
-                "runtime-active",
-                None,
-            )
-            .unwrap();
-
-        for index in 0..101 {
-            let id = format!("new-terminal-{index:03}");
-            enqueue(&store, &id, "/legacy-terminal");
-            assert_eq!(store.request_stop(&id).unwrap().state, JobState::Cancelled);
-        }
-        store
-            .enqueue_task(&general_task("new-v2", "public-new-v2", "new-v2-key"))
-            .unwrap();
-        assert_eq!(
-            store.request_stop("new-v2").unwrap().state,
-            JobState::Stopping
-        );
-        store
-            .store_task_result("new-v2", &cancelled_task_result("v2 cancelled"))
-            .unwrap();
-
-        let active = store
-            .list_legacy_jobs_scoped(JobListScope::Active, 1)
-            .unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].agent_id, "old-active");
-    }
-
-    #[test]
     fn task_identity_idempotency_scope_and_budget_are_durable() {
         let (_directory, path, store) = file_store();
         let task = general_task("execution-1", "public-1", "key-1");
@@ -4246,7 +3783,7 @@ mod tests {
             checks: vec!["cargo test".into()],
             residual_gaps: vec!["auth unavailable".into()],
             artifacts: vec![ResultArtifact {
-                kind: ArtifactKind::ReportMarkdown,
+                kind: ArtifactKind::ChangesPatch,
                 artifact_id: "artifact-1".into(),
                 sha256: "def".into(),
             }],
@@ -4400,22 +3937,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_predicate_excludes_v2_before_limit_and_by_id() {
-        let (_directory, _path, store) = file_store();
-        store
-            .enqueue_job(&NewJob::new("legacy-only", "/workspace"))
-            .unwrap();
-        store
-            .enqueue_task(&general_task("v2-general", "v2-public", "v2-key"))
-            .unwrap();
-        let rows = store.list_legacy_jobs(1).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent_id, "legacy-only");
-        assert!(store.get_legacy_job("v2-general").unwrap().is_none());
-        assert!(store.validate_legacy_job_id("v2-general").is_err());
-    }
-
-    #[test]
     fn optional_store_scopes_filter_before_limit_and_reject_unscoped() {
         let (_directory, _path, store) = file_store();
         for (index, repo, feature, owner) in [
@@ -4442,7 +3963,6 @@ mod tests {
                         ownership_token: None
                     },
                     None,
-                    false,
                     1
                 )
                 .unwrap()
@@ -4458,7 +3978,6 @@ mod tests {
                         ownership_token: None
                     },
                     None,
-                    false,
                     10
                 )
                 .unwrap()
@@ -4474,7 +3993,6 @@ mod tests {
                         ownership_token: Some("o2")
                     },
                     None,
-                    false,
                     10
                 )
                 .unwrap()
@@ -4489,7 +4007,6 @@ mod tests {
                     ownership_token: None
                 },
                 None,
-                false,
                 10
             ),
             Err(StoreError::InvalidState(_))
