@@ -11,6 +11,17 @@
             "timeoutMs": 5000
           }
         ]
+      },
+      {
+        "matcher": "^(Read|Grep|Glob|Write|Edit|Delete|Move)$",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${ZCODE_PLUGIN_ROOT}/hooks/check-agent-files.mjs"],
+            "timeoutMs": 5000
+          }
+        ]
       }
     ],
     "PostToolUse": [

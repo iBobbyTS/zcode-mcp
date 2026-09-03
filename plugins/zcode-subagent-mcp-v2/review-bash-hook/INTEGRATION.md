@@ -11,6 +11,28 @@ hook identity. The daemon itself creates a fresh opaque restart-scoped
 `ZCODE_REVIEW_SERVICE_GENERATION` from the provenance record: hook
 `activation_generation` and daemon service identity are intentionally separate.
 
+## Generic agent file guard
+
+The parent plugin also registers `hooks/check-agent-files.mjs` for the
+`Read|Grep|Glob|Write|Edit|Delete|Move` tools.  The daemon's existing runtime
+command owner injects these environment values into each child:
+
+```text
+ZCODE_AGENT_POLICY=1
+ZCODE_AGENT_WORKTREE_ROOT=/absolute/prepared/worktree
+ZCODE_AGENT_WRITE_MANIFEST=["src"]
+ZCODE_AGENT_BOOTSTRAP_ROOTS=/Applications/ZCode.app
+```
+
+The guard canonicalizes the worktree and rejects traversal, outside-root,
+symlink escapes, credentials/secrets, and protected Git/agent metadata.  File
+mutations must be within the serialized write manifest; an empty manifest is
+read-only.  The optional bootstrap roots permit startup reads from explicitly
+listed runtime resources and never grant write access. Missing marker, root, or malformed manifest is denied without
+echoing paths or tool input.  This is intentionally fail-closed for global
+user hooks: non-daemon sessions that do not carry the marker cannot use these
+file tools until their environment is explicitly prepared.
+
 ## Option A — Install as a local ZCode plugin
 
 The repository root is already a valid plugin:

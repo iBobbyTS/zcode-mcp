@@ -2009,6 +2009,54 @@ impl<F> CommandRuntimeFactory<F> {
     }
 }
 
+/// Bind the daemon-owned policy envelope to every ZCode child.  The hook is
+/// intentionally activated only for daemon-launched runtimes; readiness jobs
+/// receive an empty manifest and therefore remain read-only.
+fn apply_agent_policy_environment(command: &mut Command, job: &Job) -> io::Result<()> {
+    const MAX_AGENT_WRITE_MANIFEST_ENTRIES: usize = 256;
+    const MAX_AGENT_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
+    let root = Path::new(&job.workspace_path);
+    if !root.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime workspace path must be absolute",
+        ));
+    }
+    let manifest = if job.prepared_launch_json.is_some() {
+        match task_route(job)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
+        {
+            TaskRoute::General(prepared, _) => prepared
+                .write_manifest
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        }
+    } else {
+        Vec::new()
+    };
+    let serialized = serde_json::to_string(&manifest).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("write manifest could not be serialized: {error}"),
+        )
+    })?;
+    if manifest.len() > MAX_AGENT_WRITE_MANIFEST_ENTRIES
+        || serialized.len() > MAX_AGENT_WRITE_MANIFEST_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write manifest exceeds runtime policy bounds",
+        ));
+    }
+    command
+        .env("ZCODE_AGENT_POLICY", "1")
+        .env("ZCODE_AGENT_WORKTREE_ROOT", root)
+        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
+        .env("ZCODE_AGENT_WRITE_MANIFEST", serialized);
+    Ok(())
+}
+
 impl<F> RuntimeFactory for CommandRuntimeFactory<F>
 where
     F: Fn(&Job) -> io::Result<Command> + Send + Sync + 'static,
@@ -2029,7 +2077,8 @@ where
                 }
             }
         }
-        let command = (self.command)(job)?;
+        let mut command = (self.command)(job)?;
+        apply_agent_policy_environment(&mut command, job)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
 
@@ -2040,7 +2089,8 @@ where
         deadline: Instant,
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
         ensure_readiness_deadline(deadline)?;
-        let command = (self.command)(job)?;
+        let mut command = (self.command)(job)?;
+        apply_agent_policy_environment(&mut command, job)?;
         ensure_readiness_deadline(deadline)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
@@ -5898,6 +5948,68 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Barrier;
     use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
+
+    #[test]
+    fn command_runtime_binds_agent_policy_environment_for_readiness() {
+        let workspace = tempfile::tempdir().unwrap();
+        let job = readiness_job(workspace.path());
+        let mut command = Command::new("true");
+        apply_agent_policy_environment(&mut command, &job).unwrap();
+        let values = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(values.get("ZCODE_AGENT_POLICY"), Some(&"1".to_owned()));
+        assert_eq!(
+            values.get("ZCODE_AGENT_BOOTSTRAP_ROOTS"),
+            Some(&"/Applications/ZCode.app".to_owned())
+        );
+        assert_eq!(
+            values.get("ZCODE_AGENT_WORKTREE_ROOT"),
+            Some(&workspace.path().to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            values.get("ZCODE_AGENT_WRITE_MANIFEST"),
+            Some(&"[]".to_owned())
+        );
+    }
+
+    #[test]
+    fn command_runtime_binds_manifest_from_a_prepared_general_job() {
+        let (directory, _store, _factory, scheduler) = scheduler_fixture(1, 1);
+        let mut manifest = general_manifest(directory.path(), "policy-env", None);
+        manifest.profile = GeneralProfile::ImplementationWorktree;
+        manifest.write_manifest = vec!["src".into()];
+        let submitted = scheduler
+            .enqueue_general(&manifest, "feature", "owner")
+            .unwrap();
+        let job = submitted.job;
+        let mut command = Command::new("true");
+        apply_agent_policy_environment(&mut command, &job).unwrap();
+        let values = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            values.get("ZCODE_AGENT_WORKTREE_ROOT"),
+            Some(&job.workspace_path)
+        );
+        assert_eq!(
+            values.get("ZCODE_AGENT_WRITE_MANIFEST"),
+            Some(&r#"["src"]"#.to_owned())
+        );
+        scheduler.close_job(&job.agent_id).unwrap();
+    }
 
     #[test]
     fn passive_activity_full_case3_fixture_dedupes_windows_classifies_and_redacts() {

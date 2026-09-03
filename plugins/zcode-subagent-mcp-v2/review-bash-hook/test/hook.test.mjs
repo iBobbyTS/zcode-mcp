@@ -73,7 +73,13 @@ test('shipped plugin discovers the default guard and both audit hooks', () => {
   const outerHooks = JSON.parse(fs.readFileSync(path.join(outerRoot, 'hooks', 'hooks.json'), 'utf8'));
   assert.equal(outer.hooks, './hooks/hooks.json');
   assert.deepEqual(Object.keys(outerHooks.hooks).sort(), ['PostToolUse', 'PostToolUseFailure', 'PreToolUse']);
-  for (const event of Object.values(outerHooks.hooks)) {
+  assert.equal(outerHooks.hooks.PreToolUse.some((entry) => entry.matcher === 'Bash'), true);
+  const filePolicy = outerHooks.hooks.PreToolUse.find((entry) => entry.matcher === '^(Read|Grep|Glob|Write|Edit|Delete|Move)$');
+  assert.equal(filePolicy.matcher, '^(Read|Grep|Glob|Write|Edit|Delete|Move)$');
+  const fileScript = filePolicy.hooks[0].args[0].replace('${ZCODE_PLUGIN_ROOT}/', '');
+  assert.equal(fs.existsSync(path.join(outerRoot, fileScript)), true, fileScript);
+  for (const eventName of ['PostToolUse', 'PostToolUseFailure']) {
+    const event = outerHooks.hooks[eventName];
     assert.equal(event[0].matcher, 'Bash');
     const script = event[0].hooks[0].args[0].replace('${ZCODE_PLUGIN_ROOT}/', '');
     assert.equal(fs.existsSync(path.join(outerRoot, script)), true, script);
