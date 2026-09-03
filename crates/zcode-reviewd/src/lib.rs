@@ -211,6 +211,9 @@ struct PassiveActivityState {
     latest_text_tail: String,
     latest_text_updated_at: Option<u64>,
     latest_text_truncated: bool,
+    terminal_text: String,
+    terminal_text_limit: u64,
+    terminal_text_oversized: bool,
     active_tools: HashMap<String, (PassiveToolKind, Instant)>,
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
@@ -223,9 +226,13 @@ struct PassiveActivityTracker {
 }
 
 impl PassiveActivityTracker {
-    fn new() -> Self {
+    fn new(terminal_text_limit: u64) -> Self {
+        let state = PassiveActivityState {
+            terminal_text_limit,
+            ..PassiveActivityState::default()
+        };
         Self {
-            state: Mutex::new(PassiveActivityState::default()),
+            state: Mutex::new(state),
             changed: Condvar::new(),
         }
     }
@@ -416,6 +423,24 @@ impl PassiveActivityTracker {
             telemetry_degraded: state.telemetry_degraded,
         }
     }
+
+    fn take_terminal_text(&self) -> TerminalText {
+        let mut state = self.state.lock().unwrap();
+        if state.terminal_text_oversized {
+            TerminalText::Oversized
+        } else if state.terminal_text.trim().is_empty() {
+            state.terminal_text.clear();
+            TerminalText::Missing
+        } else {
+            TerminalText::Visible(std::mem::take(&mut state.terminal_text))
+        }
+    }
+}
+
+enum TerminalText {
+    Visible(String),
+    Missing,
+    Oversized,
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -432,6 +457,15 @@ fn activity_wall_now_millis() -> u64 {
 }
 
 fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms: u64) {
+    if !state.terminal_text_oversized {
+        let next_len = (state.terminal_text.len() as u64).saturating_add(delta.len() as u64);
+        if next_len <= state.terminal_text_limit {
+            state.terminal_text.push_str(delta);
+        } else {
+            state.terminal_text.clear();
+            state.terminal_text_oversized = true;
+        }
+    }
     state.latest_text_tail.push_str(delta);
     if state.latest_text_tail.len() > MAX_LATEST_TEXT_BYTES {
         let mut split = state.latest_text_tail.len() - MAX_LATEST_TEXT_BYTES;
@@ -3590,7 +3624,10 @@ impl Scheduler {
             task.as_ref().map(|task| task.attempt_sequence).unwrap_or(1),
             claim.owner_epoch,
         ));
-        let activity = Arc::new(PassiveActivityTracker::new());
+        let terminal_text_limit = match &route {
+            TaskRoute::General(prepared, _) => prepared.effective_budget.max_result_bytes,
+        };
+        let activity = Arc::new(PassiveActivityTracker::new(terminal_text_limit));
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
             claim.job.agent_id.clone(),
@@ -4118,12 +4155,28 @@ impl Scheduler {
                     completion.reason_code = Some((*reason_code).into());
                     completion
                 } else if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
-                    let mut completion =
-                        GeneralFinalizer::finalize(prepared, CompletionOutcome::Succeeded);
+                    let terminal_text = sink.activity.take_terminal_text();
+                    let requested_outcome = match terminal_text {
+                        TerminalText::Visible(_) => CompletionOutcome::Succeeded,
+                        TerminalText::Missing | TerminalText::Oversized => {
+                            CompletionOutcome::ResultInvalid
+                        }
+                    };
+                    let mut completion = GeneralFinalizer::finalize(prepared, requested_outcome);
                     completion.checks = required_checks.unwrap_or_default();
-                    let tail = sink.activity.snapshot().latest_text_tail;
-                    if !tail.trim().is_empty() {
-                        completion.summary = tail;
+                    match terminal_text {
+                        TerminalText::Visible(text) => completion.summary = text,
+                        TerminalText::Missing if completion.reason_code.is_none() => {
+                            completion.summary =
+                                "runtime completed without visible final text".into();
+                            completion.reason_code = Some("FINAL_TEXT_MISSING".into());
+                        }
+                        TerminalText::Oversized if completion.reason_code.is_none() => {
+                            completion.summary =
+                                "terminal final text exceeds effective max_result_bytes".into();
+                            completion.reason_code = Some("FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into());
+                        }
+                        TerminalText::Missing | TerminalText::Oversized => {}
                     }
                     completion
                 } else {
@@ -5118,7 +5171,14 @@ impl Scheduler {
 
     pub fn reap_job(&self, agent_id: &str) -> Result<JobState, SchedulerError> {
         let deadline = self.control_deadline();
-        let state = self.request_stop_or_close(agent_id, true, deadline)?;
+        let state = self
+            .inner
+            .store
+            .get_job(agent_id)?
+            .ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(format!("unknown job {agent_id}")))
+            })?
+            .state;
         if !state.is_terminal() {
             return Ok(state);
         }
@@ -5414,7 +5474,7 @@ mod tests {
 
     #[test]
     fn passive_activity_full_case3_fixture_dedupes_windows_classifies_and_redacts() {
-        let tracker = PassiveActivityTracker::new();
+        let tracker = PassiveActivityTracker::new(u64::MAX);
         let base = Instant::now();
         for line in include_str!("../tests/fixtures/case3_activity_events.jsonl").lines() {
             let fixture: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -5543,7 +5603,7 @@ mod tests {
 
     #[test]
     fn model_stream_idle_baseline_resets_once_for_each_request() {
-        let tracker = PassiveActivityTracker::new();
+        let tracker = PassiveActivityTracker::new(u64::MAX);
         let base = Instant::now();
         let model_event = |request_id: &str, event_type: &str| {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(EventEnvelope {
@@ -6616,6 +6676,22 @@ exec tail -f /dev/null
             self.sink.emit(LifecycleRecord { sequence, event });
         }
 
+        fn emit_text_delta(&self, event_id: &str, delta: &str) {
+            self.emit_event(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                EventEnvelope {
+                    method: "session/event".into(),
+                    params: serde_json::json!({
+                        "type": "model.streaming",
+                        "eventId": event_id,
+                        "payload": {
+                            "kind": "text_delta",
+                            "delta": delta,
+                        },
+                    }),
+                },
+            ))));
+        }
+
         fn finish(&self, requested: RuntimeTerminal) -> RuntimeTerminal {
             let mut terminal = self.terminal.lock().unwrap();
             if let Some(existing) = &*terminal {
@@ -7206,11 +7282,11 @@ exec tail -f /dev/null
             factory.initial_prompt(&submitted.job.agent_id),
             submitted.job.initial_prompt
         );
-        factory
-            .runtime(&submitted.job.agent_id)
-            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
-                ChildExit::Exited(Some(0)),
-            )));
+        let runtime = factory.runtime(&submitted.job.agent_id);
+        runtime.emit_text_delta("control-final", "control completed");
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
         assert_eq!(
             wait_for_task_result(&store, &submitted.job.agent_id)
                 .result
@@ -7218,6 +7294,103 @@ exec tail -f /dev/null
             TaskOutcome::Succeeded
         );
         assert_general_workspace_cleaned(&prepared);
+    }
+
+    #[test]
+    fn terminal_result_keeps_full_multi_delta_text_beyond_the_poll_tail() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "full-terminal-text", None),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let agent_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        let first = "a".repeat(6 * 1024);
+        let second = "b".repeat(6 * 1024);
+        runtime.emit_text_delta("full-terminal-text-1", &first);
+        runtime.emit_text_delta("full-terminal-text-2", &second);
+
+        let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+        assert!(activity.latest_text_truncated);
+        assert_eq!(activity.latest_text_tail.len(), MAX_LATEST_TEXT_BYTES);
+        assert_eq!(
+            activity.latest_text_tail,
+            format!("{}{}", first, second)[4 * 1024..]
+        );
+
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Succeeded);
+        assert_eq!(result.result.summary, format!("{first}{second}"));
+    }
+
+    #[test]
+    fn terminal_result_fails_truthfully_when_visible_text_exceeds_result_limit() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+        budget.max_result_bytes = 1024;
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "oversized-terminal-text", Some(budget)),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let agent_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta("oversized-terminal-text", &"x".repeat(1025));
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::ResultInvalid);
+        assert_eq!(
+            result.result.summary,
+            "terminal final text exceeds effective max_result_bytes"
+        );
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into()));
+    }
+
+    #[test]
+    fn terminal_result_fails_truthfully_when_visible_text_is_missing() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "missing-terminal-text", None),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let agent_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        factory
+            .runtime(&agent_id)
+            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::ResultInvalid);
+        assert_eq!(
+            result.result.summary,
+            "runtime completed without visible final text"
+        );
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"FINAL_TEXT_MISSING".into()));
+        assert_ne!(result.result.summary, "RUNTIME_TERMINAL");
     }
 
     #[test]
@@ -7246,6 +7419,7 @@ exec tail -f /dev/null
             )
             .unwrap();
         let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta("pending-terminal-text", "pending task completed");
         runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));
@@ -7272,6 +7446,7 @@ exec tail -f /dev/null
             .message_job(&queued_id, "queued-before-terminal", "queue", "continue")
             .unwrap();
         let queued_runtime = factory.runtime(&queued_id);
+        queued_runtime.emit_text_delta("queued-terminal-text", "queued task completed");
         queued_runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));
@@ -7354,6 +7529,7 @@ exec tail -f /dev/null
                 .find(|request| request.state == PendingRequestState::Pending)
         });
         let wait_calls = runtime.wait_terminal_calls.load(Ordering::Acquire);
+        runtime.emit_text_delta("permission-terminal-text", "permission task completed");
         runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
             ChildExit::Exited(Some(0)),
         )));
@@ -7493,11 +7669,11 @@ exec tail -f /dev/null
              BEGIN SELECT RAISE(FAIL, 'scripted exact result write failure'); END;"
         ))
         .unwrap();
-        factory
-            .runtime(&execution_id)
-            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
-                ChildExit::Exited(Some(0)),
-            )));
+        let runtime = factory.runtime(&execution_id);
+        runtime.emit_text_delta("result-fault-terminal-text", "task completed");
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
 
         let result = wait_for_task_result(&store, &execution_id);
         assert_eq!(result.result.outcome, TaskOutcome::ResultInvalid);
@@ -7760,11 +7936,11 @@ exec tail -f /dev/null
             .unwrap();
         let late_id = late.job.agent_id;
         scheduler.start_ready().unwrap();
-        factory
-            .runtime(&late_id)
-            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
-                ChildExit::Exited(Some(0)),
-            )));
+        let late_runtime = factory.runtime(&late_id);
+        late_runtime.emit_text_delta("natural-wins-terminal-text", "task completed");
+        late_runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
         let succeeded = wait_for_task_result(&store, &late_id);
         assert_eq!(succeeded.result.outcome, TaskOutcome::Succeeded);
         assert_eq!(scheduler.close_job(&late_id).unwrap(), JobState::Completed);

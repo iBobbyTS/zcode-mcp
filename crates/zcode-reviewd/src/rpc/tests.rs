@@ -434,7 +434,56 @@ fn cancel_and_close_return_the_reaped_generic_task_without_followup_rpc() {
     assert_eq!(cancelled_task.agent_id, cancelled);
     assert_eq!(cancelled_task.phase, "TERMINAL");
     assert!(cancelled_task.stop_requested);
+    assert!(!cancelled_task.close_requested);
+    assert!(!cancelled_task.closed);
     assert!(cancelled_task.reaped);
+    let cancelled_execution_id = fixture
+        .store
+        .get_task(&cancelled)
+        .unwrap()
+        .unwrap()
+        .execution_agent_id;
+    let cancelled_result = fixture
+        .store
+        .task_result(&cancelled_execution_id)
+        .unwrap()
+        .unwrap();
+    let cancelled_artifacts = fixture
+        .store
+        .artifacts(&cancelled_execution_id, 16)
+        .unwrap();
+
+    for _ in 0..2 {
+        let explicitly_closed = match fixture
+            .service
+            .dispatch(RpcMethod::TaskClose {
+                agent_id: cancelled.clone(),
+            })
+            .unwrap()
+        {
+            RpcSuccess::Closed { task } => task,
+            other => panic!("unexpected close-after-cancel result: {other:?}"),
+        };
+        assert!(explicitly_closed.stop_requested);
+        assert!(explicitly_closed.close_requested);
+        assert!(explicitly_closed.closed);
+        assert!(explicitly_closed.reaped);
+        assert_eq!(
+            fixture
+                .store
+                .task_result(&cancelled_execution_id)
+                .unwrap()
+                .unwrap(),
+            cancelled_result
+        );
+        assert_eq!(
+            fixture
+                .store
+                .artifacts(&cancelled_execution_id, 16)
+                .unwrap(),
+            cancelled_artifacts
+        );
+    }
 
     let (_, closed) =
         submit_general_fixture(&fixture, "close-rpc", "feature-control", "owner-control");
