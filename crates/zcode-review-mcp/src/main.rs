@@ -8,5 +8,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !socket.is_absolute() {
         return Err("ZCODE_REVIEWD_SOCKET must be absolute".into());
     }
-    zcode_review_mcp::serve_stdio_mode(socket, Duration::from_secs(6)).await
+    zcode_review_mcp::serve_stdio_v2(socket, Duration::from_secs(6)).await
 }

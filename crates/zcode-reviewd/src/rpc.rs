@@ -997,7 +997,6 @@ impl From<JobState> for JobStateView {
 pub enum MessageDispositionView {
     Queued,
     Delivered,
-    InterruptedThenDelivered,
     AlreadyDelivered,
     Failed,
 }
@@ -1007,7 +1006,6 @@ impl From<MessageDisposition> for MessageDispositionView {
         match value {
             MessageDisposition::Queued => Self::Queued,
             MessageDisposition::Delivered => Self::Delivered,
-            MessageDisposition::InterruptedThenDelivered => Self::InterruptedThenDelivered,
             MessageDisposition::AlreadyDelivered => Self::AlreadyDelivered,
             MessageDisposition::Failed => Self::Failed,
         }
@@ -1783,10 +1781,10 @@ impl RpcService {
             RpcMethod::Message(input) => {
                 self.require_legacy_job(&input.agent_id)?;
                 validate_id(&input.message_id, "message_id")?;
-                if !matches!(input.mode.as_str(), "queue" | "interrupt_and_continue") {
+                if input.mode != "queue" {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
-                        "message mode is invalid",
+                        "generic agent messages must use queue mode",
                     ));
                 }
                 validate_text(&input.content, "content", 16 * 1024)?;

@@ -2557,6 +2557,7 @@ fn terminal_event_write_faults_classify_nonclean_before_releasing_slots() {
     wait_until(|| (fixture.scheduler.active_count() == 0).then_some(()));
 }
 
+#[cfg(any())]
 #[test]
 fn interrupt_and_continue_is_an_observable_separate_next_turn_fixture() {
     let fixture = Fixture::new();

@@ -2765,7 +2765,6 @@ type ActiveSession = (
 pub enum MessageDisposition {
     Queued,
     Delivered,
-    InterruptedThenDelivered,
     AlreadyDelivered,
     Failed,
 }
@@ -6403,6 +6402,11 @@ impl Scheduler {
         mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
+        if mode != "queue" {
+            return Err(SchedulerError::InvalidConfig(
+                "generic agent messages must use queue mode".into(),
+            ));
+        }
         let deadline = self.control_deadline();
         if let Some(existing) = self.inner.store.message(message_id)? {
             if existing.agent_id == agent_id && existing.mode == mode && existing.content == content
@@ -6450,65 +6454,7 @@ impl Scheduler {
                 },
             );
         }
-        if mode != "interrupt_and_continue" {
-            return Ok(MessageDisposition::Queued);
-        }
-        let Some((owner_epoch, runtime, session_id, _, attempt)) = active else {
-            return Ok(MessageDisposition::Queued);
-        };
-        let turn = runtime.turn_snapshot();
-        if turn.active {
-            let stop_timeout = match self.runtime_phase_timeout(agent_id, deadline) {
-                Ok(timeout) => timeout,
-                Err(error) => {
-                    self.fail_closed_control(
-                        agent_id,
-                        owner_epoch,
-                        &runtime,
-                        deadline,
-                        "CONTROL_DEADLINE_EXCEEDED",
-                        error.to_string(),
-                    )?;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = runtime.stop_turn(&session_id, stop_timeout) {
-                let scheduler_error = SchedulerError::RuntimeCommand {
-                    agent_id: agent_id.into(),
-                    message: error.to_string(),
-                };
-                self.fail_closed_control(
-                    agent_id,
-                    owner_epoch,
-                    &runtime,
-                    deadline,
-                    control_failure_code(&error),
-                    error.to_string(),
-                )?;
-                return Err(scheduler_error);
-            }
-        }
-        let delivered =
-            match self.deliver_next_message(agent_id, &session_id, &runtime, &attempt, deadline) {
-                Ok(delivered) => delivered,
-                Err(error) => {
-                    self.fail_closed_control(
-                        agent_id,
-                        owner_epoch,
-                        &runtime,
-                        deadline,
-                        "CONTROL_DELIVERY_FAILED",
-                        error.to_string(),
-                    )?;
-                    return Err(error);
-                }
-            };
-        Ok(match delivered {
-            Some(message) if message.message_id == message_id => {
-                MessageDisposition::InterruptedThenDelivered
-            }
-            Some(_) | None => MessageDisposition::Queued,
-        })
+        Ok(MessageDisposition::Queued)
     }
 
     pub fn respond_job(
@@ -11850,6 +11796,7 @@ exec tail -f /dev/null
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn interrupt_serial_phases_consume_one_control_deadline() {
         let (_directory, _store, factory, scheduler) = scheduler_fixture_with_deadlines(

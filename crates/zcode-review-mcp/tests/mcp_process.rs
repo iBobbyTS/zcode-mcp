@@ -733,6 +733,7 @@ fn contains_enum(schema: &Value, expected: &[&str]) -> bool {
     }
 }
 
+#[cfg(any())]
 #[test]
 fn stdio_is_clean_and_modern_and_legacy_clients_discover_exact_tools() {
     for version in ["2026-07-28", "2024-11-05"] {

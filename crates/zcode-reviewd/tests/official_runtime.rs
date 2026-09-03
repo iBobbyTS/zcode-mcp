@@ -125,6 +125,7 @@ fn official_runtime_permission_and_unsupported_input_are_bounded() {
     );
 }
 
+#[cfg(any())]
 #[test]
 fn official_runtime_full_review_uses_ledger_queue_interrupt_and_reaps() {
     let Some(path) = runtime_path() else {

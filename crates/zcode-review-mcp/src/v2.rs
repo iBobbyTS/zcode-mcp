@@ -21,11 +21,11 @@ use std::{
 };
 use zcode_reviewd::rpc::{
     AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
-    MessageDispositionView, MessageInput, ReadinessResultView, RespondInput, ResponseDecision,
-    ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
-    SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
-    TaskArtifactMetadataView, TaskArtifactQuery, TaskListQuery, TaskPhaseFilter, TaskPollQuery,
-    TaskResultView, TaskView, TelemetryStatusView, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+    MessageInput, ReadinessResultView, RespondInput, ResponseDecision, ResponseOutcomeView,
+    RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess, SubmissionDispositionView,
+    SystemStatusView, TaskActivityStateView, TaskActivityView, TaskArtifactMetadataView,
+    TaskArtifactQuery, TaskListQuery, TaskPhaseFilter, TaskPollQuery, TaskResultView, TaskView,
+    TelemetryStatusView, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
 };
 
 use crate::{
@@ -96,10 +96,6 @@ impl From<PublicAccessMode> for GeneralProfile {
 #[schemars(deny_unknown_fields)]
 pub struct PublicBudget {
     pub wall_time_ms: u64,
-    #[serde(default = "review_preparation::default_semantic_soft_timeout_ms")]
-    pub semantic_soft_timeout_ms: u64,
-    #[serde(default = "review_preparation::default_semantic_hard_timeout_ms")]
-    pub semantic_hard_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
@@ -111,8 +107,8 @@ impl From<PublicBudget> for BudgetLimits {
     fn from(value: PublicBudget) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
-            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
-            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
+            semantic_soft_timeout_ms: review_preparation::default_semantic_soft_timeout_ms(),
+            semantic_hard_timeout_ms: review_preparation::default_semantic_hard_timeout_ms(),
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -126,8 +122,6 @@ impl From<BudgetLimits> for PublicBudget {
     fn from(value: BudgetLimits) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
-            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
-            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -141,8 +135,6 @@ impl From<EffectiveBudget> for PublicBudget {
     fn from(value: EffectiveBudget) -> Self {
         Self {
             wall_time_ms: value.wall_time_ms,
-            semantic_soft_timeout_ms: value.semantic_soft_timeout_ms,
-            semantic_hard_timeout_ms: value.semantic_hard_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -769,21 +761,8 @@ pub struct AgentSendInput {
 pub enum PublicMessageDisposition {
     Queued,
     Delivered,
-    InterruptedThenDelivered,
     AlreadyDelivered,
     Failed,
-}
-
-impl From<MessageDispositionView> for PublicMessageDisposition {
-    fn from(value: MessageDispositionView) -> Self {
-        match value {
-            MessageDispositionView::Queued => Self::Queued,
-            MessageDispositionView::Delivered => Self::Delivered,
-            MessageDispositionView::InterruptedThenDelivered => Self::InterruptedThenDelivered,
-            MessageDispositionView::AlreadyDelivered => Self::AlreadyDelivered,
-            MessageDispositionView::Failed => Self::Failed,
-        }
-    }
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1410,7 +1389,20 @@ impl SubagentMcp {
             content: input.content,
         }))? {
             RpcSuccess::Message { disposition } => Ok(Json(AgentSendOutput {
-                disposition: disposition.into(),
+                disposition: match disposition {
+                    zcode_reviewd::rpc::MessageDispositionView::Queued => {
+                        PublicMessageDisposition::Queued
+                    }
+                    zcode_reviewd::rpc::MessageDispositionView::Delivered => {
+                        PublicMessageDisposition::Delivered
+                    }
+                    zcode_reviewd::rpc::MessageDispositionView::AlreadyDelivered => {
+                        PublicMessageDisposition::AlreadyDelivered
+                    }
+                    zcode_reviewd::rpc::MessageDispositionView::Failed => {
+                        PublicMessageDisposition::Failed
+                    }
+                },
                 attempt_sequence: self.status(&input.agent_id)?.attempt_sequence,
             })),
             _ => Err(protocol_error()),
@@ -1668,6 +1660,75 @@ pub async fn serve_stdio_v2(
         .waiting()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+
+    #[test]
+    fn exact_generic_catalog_and_no_legacy_symbols() {
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/unused"), Duration::from_secs(1));
+        let tools = facade.tool_router.list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(names, V2_PUBLIC_TOOLS);
+        let encoded = serde_json::to_string(&tools).unwrap();
+        for forbidden in [
+            "zcode_review_spawn",
+            "zcode_review_continue",
+            "zcode_system_ensure_ready",
+            "zcode_agent_get",
+            "zcode_agent_events",
+            "zcode_agent_wait",
+            "review_id",
+            "review_evidence",
+            "semantic_soft_timeout_ms",
+            "semantic_hard_timeout_ms",
+            "interrupt_and_continue",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public schema leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_budget_contains_only_runtime_and_absolute_limits() {
+        let budget = PublicBudget {
+            wall_time_ms: 1,
+            max_turns: 2,
+            max_tool_calls: 3,
+            max_context_bytes: 4,
+            max_result_bytes: 5,
+            max_artifact_bytes: 6,
+        };
+        let value = serde_json::to_value(budget).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert!(!value.to_string().contains("semantic"));
+    }
+
+    #[test]
+    fn generic_spawn_rejects_duplicate_command_ids() {
+        let mut input = serde_json::from_value::<AgentSpawnInput>(serde_json::json!({
+            "repository": "/tmp/repository",
+            "base_ref": "a".repeat(40),
+            "access_mode": "workspace_write",
+            "prompt": "run checks",
+            "feature_id": "feature",
+            "ownership_token": "owner",
+            "idempotency_key": "key",
+            "write_manifest": ["src/lib.rs"],
+            "allowed_command_ids": ["unit"],
+            "required_command_ids": ["lint"]
+        }))
+        .unwrap();
+        input.allowed_command_ids.push("unit".into());
+        assert!(general_manifest(&input).is_err());
+    }
 }
 
 // Legacy review-specific projections are intentionally retired with the
