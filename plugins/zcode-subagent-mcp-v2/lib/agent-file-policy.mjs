@@ -149,8 +149,16 @@ function protectedPath(root, value) {
     .some((part) => PROTECTED_PART.test(part) || SECRET_NAME.test(part));
 }
 
-function confinedToAnyRoot(roots, value) {
-  return roots.some((root) => confinedPath(root, value));
+function pathAllowedForRead(state, value) {
+  // Relative paths are daemon-worktree paths.  Never reinterpret a relative
+  // payload against a bootstrap root (that would turn a worktree symlink into
+  // an apparently safe bootstrap path).  Bootstrap roots are absolute-only.
+  if (!path.isAbsolute(value)) {
+    return confinedPath(state.root, value) && !protectedPath(state.root, value);
+  }
+  return [state.root, ...state.bootstrapRoots].some(
+    (root) => confinedPath(root, value) && !protectedPath(root, value),
+  );
 }
 
 function withinManifest(root, value, manifest) {
@@ -174,9 +182,8 @@ export function evaluateAgentFileInput(input, env = process.env) {
   if (WRITE_TOOLS.has(tool) && paths.length === 0) return deny('path_missing');
   const cwd = input?.cwd ?? input?.working_directory ?? input?.workingDirectory ?? state.root;
   if (!confinedPath(state.root, cwd) || protectedPath(state.root, cwd)) return deny('cwd_outside_root');
-  const readableRoots = [state.root, ...state.bootstrapRoots];
   for (const value of paths.length ? paths : [cwd]) {
-    if (!confinedToAnyRoot(readableRoots, value) || readableRoots.some((root) => protectedPath(root, value))) return deny('path_outside_root');
+    if (!pathAllowedForRead(state, value)) return deny('path_outside_root');
     if (WRITE_TOOLS.has(tool) && !withinManifest(state.root, value, state.manifest)) return deny('write_not_allowlisted');
   }
   return allow();

@@ -38,7 +38,7 @@ test('requires marker and canonical root, and rejects traversal/symlink escape',
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-agent-outside-'));
   fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
   fs.symlinkSync(outside, path.join(root, 'link'));
-  const e = env(root);
+  const e = { ...env(root), ZCODE_AGENT_BOOTSTRAP_ROOTS: outside };
   assert.equal(evaluateAgentFileInput({ tool_name: 'Read', tool_input: { path: '../secret.txt' }, cwd: root }, e).decision, 'deny');
   assert.equal(evaluateAgentFileInput({ tool_name: 'Read', tool_input: { path: 'link/secret.txt' }, cwd: root }, e).decision, 'deny');
 });
