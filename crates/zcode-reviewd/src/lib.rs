@@ -2943,43 +2943,76 @@ fn task_outcome(outcome: CompletionOutcome) -> TaskOutcome {
     }
 }
 
+#[derive(Default)]
+struct RequiredGeneralChecks {
+    succeeded: Vec<String>,
+    failure: Option<&'static str>,
+}
+
 fn run_required_general_checks(
     prepared: &PreparedGeneralTask,
     required_command_ids: &[String],
-) -> Result<Vec<String>, &'static str> {
+) -> RequiredGeneralChecks {
     if required_command_ids.is_empty() {
-        return Ok(Vec::new());
+        return RequiredGeneralChecks::default();
     }
-    prepared
-        .validate_digest()
-        .map_err(|_| "REQUIRED_CHECK_PREPARED_TASK_INVALID")?;
-    let policy = prepared
-        .launcher()
-        .map_err(|_| "REQUIRED_CHECK_POLICY_INVALID")?;
+    if prepared.validate_digest().is_err() {
+        return RequiredGeneralChecks {
+            failure: Some("REQUIRED_CHECK_PREPARED_TASK_INVALID"),
+            ..RequiredGeneralChecks::default()
+        };
+    }
+    let policy = match prepared.launcher() {
+        Ok(policy) => policy,
+        Err(_) => {
+            return RequiredGeneralChecks {
+                failure: Some("REQUIRED_CHECK_POLICY_INVALID"),
+                ..RequiredGeneralChecks::default()
+            };
+        }
+    };
     let cancellation = AtomicBool::new(false);
     let mut verified = Vec::with_capacity(required_command_ids.len());
     for command_id in required_command_ids {
-        let command = prepared
-            .validation_commands
-            .get(command_id)
-            .ok_or("REQUIRED_CHECK_NOT_PREPARED")?;
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(command.timeout_ms))
-            .ok_or("REQUIRED_CHECK_DEADLINE_INVALID")?;
-        let output = policy
-            .run_cancellable(command_id, deadline, &cancellation)
-            .map_err(|_| "REQUIRED_CHECK_EXECUTION_FAILED")?;
+        let Some(command) = prepared.validation_commands.get(command_id) else {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_NOT_PREPARED"),
+            };
+        };
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(command.timeout_ms))
+        else {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_DEADLINE_INVALID"),
+            };
+        };
+        let output = match policy.run_cancellable(command_id, deadline, &cancellation) {
+            Ok(output) => output,
+            Err(_) => {
+                return RequiredGeneralChecks {
+                    succeeded: verified,
+                    failure: Some("REQUIRED_CHECK_EXECUTION_FAILED"),
+                };
+            }
+        };
         if output.status_code != Some(0)
             || output.timed_out
             || output.cancelled
             || output.stdout_truncated
             || output.stderr_truncated
         {
-            return Err("REQUIRED_CHECK_FAILED");
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_FAILED"),
+            };
         }
         verified.push(command_id.clone());
     }
-    Ok(verified)
+    RequiredGeneralChecks {
+        succeeded: verified,
+        failure: None,
+    }
 }
 
 fn minimal_task_result(outcome: CompletionOutcome, summary: &str, reason_code: &str) -> TaskResult {
@@ -4195,41 +4228,61 @@ impl Scheduler {
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
-                let required_checks =
-                    if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
-                        run_required_general_checks(prepared, required_command_ids)
-                    } else {
-                        Ok(Vec::new())
-                    };
-                let mut completion = if let Err(reason_code) = required_checks.as_ref() {
-                    let mut completion =
-                        GeneralFinalizer::finalize(prepared, CompletionOutcome::Failed);
-                    completion.summary = "daemon required named check failed".into();
-                    completion.reason_code = Some((*reason_code).into());
-                    completion
-                } else if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
+                let natural_completed =
+                    natural_completion && matches!(terminal, RuntimeTerminal::Completed(_));
+                let required_checks = if natural_completed {
+                    run_required_general_checks(prepared, required_command_ids)
+                } else {
+                    RequiredGeneralChecks::default()
+                };
+                let mut completion = if natural_completed {
                     let terminal_text = sink.activity.take_terminal_text();
-                    let requested_outcome = match terminal_text {
+                    let requested_outcome = match &terminal_text {
+                        TerminalText::Visible(_) if required_checks.failure.is_some() => {
+                            CompletionOutcome::Failed
+                        }
                         TerminalText::Visible(_) => CompletionOutcome::Succeeded,
                         TerminalText::Missing | TerminalText::Oversized => {
                             CompletionOutcome::ResultInvalid
                         }
                     };
                     let mut completion = GeneralFinalizer::finalize(prepared, requested_outcome);
-                    completion.checks = required_checks.unwrap_or_default();
+                    completion.checks = required_checks.succeeded;
                     match terminal_text {
                         TerminalText::Visible(text) => completion.summary = text,
-                        TerminalText::Missing if completion.reason_code.is_none() => {
+                        TerminalText::Missing => {
                             completion.summary =
                                 "runtime completed without visible final text".into();
-                            completion.reason_code = Some("FINAL_TEXT_MISSING".into());
+                            if completion.reason_code.is_none() {
+                                completion.reason_code = Some("FINAL_TEXT_MISSING".into());
+                            } else {
+                                completion.residual_gaps.push("FINAL_TEXT_MISSING".into());
+                            }
                         }
-                        TerminalText::Oversized if completion.reason_code.is_none() => {
+                        TerminalText::Oversized => {
                             completion.summary =
                                 "terminal final text exceeds effective max_result_bytes".into();
-                            completion.reason_code = Some("FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into());
+                            if completion.reason_code.is_none() {
+                                completion.reason_code =
+                                    Some("FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into());
+                            } else {
+                                completion
+                                    .residual_gaps
+                                    .push("FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into());
+                            }
                         }
-                        TerminalText::Missing | TerminalText::Oversized => {}
+                    }
+                    if let Some(check_failure) = required_checks.failure {
+                        if !completion
+                            .residual_gaps
+                            .iter()
+                            .any(|gap| gap == check_failure)
+                        {
+                            completion.residual_gaps.push(check_failure.into());
+                        }
+                        if completion.reason_code.is_none() {
+                            completion.reason_code = Some(check_failure.into());
+                        }
                     }
                     completion
                 } else {
@@ -4244,7 +4297,10 @@ impl Scheduler {
                 {
                     completion.reason_code = Some(reason);
                 }
-                if completion.outcome == CompletionOutcome::Succeeded {
+                let result = task_result(&completion);
+                if !general_result_response_fits(&self.inner.store, agent_id, &completion, &result)?
+                {
+                    invalidate_untransportable_completion(&mut completion);
                     let result = task_result(&completion);
                     if !general_result_response_fits(
                         &self.inner.store,
@@ -4252,16 +4308,7 @@ impl Scheduler {
                         &completion,
                         &result,
                     )? {
-                        invalidate_untransportable_completion(&mut completion);
-                        let result = task_result(&completion);
-                        if !general_result_response_fits(
-                            &self.inner.store,
-                            agent_id,
-                            &completion,
-                            &result,
-                        )? {
-                            compact_untransportable_artifact_projection(&mut completion);
-                        }
+                        compact_untransportable_artifact_projection(&mut completion);
                     }
                 }
                 match sink.finish_general(&terminal, prepared, &completion) {
@@ -7238,19 +7285,34 @@ exec tail -f /dev/null
         let repository = manifest.repository.clone();
         let catalog_path = write_general_command_catalog(
             directory.path(),
-            serde_json::json!([{
-                "repository":repository,
-                "command_id":"required",
-                "command":{
-                    "program":"/bin/test",
-                    "args":["-f","src/lib.rs"],
-                    "cwd":".",
-                    "timeout_ms":1000,
-                    "max_output_bytes":1024
+            serde_json::json!([
+                {
+                    "repository":repository,
+                    "command_id":"a-successful",
+                    "command":{
+                        "program":"/bin/test",
+                        "args":["-f","README.md"],
+                        "cwd":".",
+                        "timeout_ms":1000,
+                        "max_output_bytes":1024
+                    },
+                    "allowed_profiles":["implementation_worktree"],
+                    "readonly_safe":false
                 },
-                "allowed_profiles":["implementation_worktree"],
-                "readonly_safe":false
-            }]),
+                {
+                    "repository":repository,
+                    "command_id":"z-required",
+                    "command":{
+                        "program":"/bin/test",
+                        "args":["-f","src/lib.rs"],
+                        "cwd":".",
+                        "timeout_ms":1000,
+                        "max_output_bytes":1024
+                    },
+                    "allowed_profiles":["implementation_worktree"],
+                    "readonly_safe":false
+                }
+            ]),
         );
         let store = Arc::new(Store::open(directory.path().join("required.sqlite3")).unwrap());
         let factory = Arc::new(FakeFactory::default());
@@ -7264,28 +7326,35 @@ exec tail -f /dev/null
         .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
         .unwrap();
         let submitted = scheduler
-            .enqueue_general_with_commands(&manifest, "feature", "owner", &[], &["required".into()])
+            .enqueue_general_with_commands(
+                &manifest,
+                "feature",
+                "owner",
+                &[],
+                &["a-successful".into(), "z-required".into()],
+            )
             .unwrap();
         let agent_id = submitted.job.agent_id.clone();
         let prepared = prepared_general(&submitted.job);
         let route = task_route(&submitted.job).unwrap();
         let TaskRoute::General(_, required) = route;
-        assert_eq!(required, vec!["required"]);
+        assert_eq!(required, vec!["a-successful", "z-required"]);
 
         scheduler.start_ready().unwrap();
         std::fs::remove_file(prepared.worktree.path.join("src/lib.rs")).unwrap();
-        factory
-            .runtime(&agent_id)
-            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
-                ChildExit::Exited(Some(0)),
-            )));
+        let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta("required-check-final-text", "model terminal summary");
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
         let result = wait_for_task_result(&store, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(result.result.summary, "model terminal summary");
         assert!(result
             .result
             .residual_gaps
             .contains(&"REQUIRED_CHECK_FAILED".into()));
-        assert!(result.result.checks.is_empty());
+        assert_eq!(result.result.checks, ["a-successful"]);
         assert_general_workspace_cleaned(&prepared);
     }
 

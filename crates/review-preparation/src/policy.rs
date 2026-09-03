@@ -1876,11 +1876,6 @@ fn bash_denial_identity(command: &str) -> (String, String, String, String) {
         let operand_class = git_denial_operand_class(&argv[1..]);
         let reason = if matches!(operand_class.as_str(), "sensitive_path") {
             "git_sensitive_path_denied"
-        } else if matches!(
-            operand_class.as_str(),
-            "cwd_override" | "config_override" | "repository_override"
-        ) {
-            "git_option_or_mutation_denied"
         } else {
             "git_option_or_mutation_denied"
         };

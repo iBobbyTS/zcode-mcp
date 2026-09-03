@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeCommandError, RuntimeEvent,
-    RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady, TurnBoundary,
-    TurnSnapshot,
+    GeneralCommandCatalog, LifecycleRecord, LifecycleSink, ManagedRuntime, RuntimeCommandError,
+    RuntimeEvent, RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady,
+    TurnBoundary, TurnSnapshot, GENERAL_COMMAND_CATALOG_SCHEMA,
 };
 use review_store::{
     ArtifactKind, Job, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome, TaskResult,
@@ -583,6 +583,128 @@ fn oversized_terminal_text_persists_a_readable_result_invalid_response() {
         },
         RpcOutcome::Error { error } => panic!("large result was not readable: {error:?}"),
     }
+}
+
+#[test]
+fn failed_required_check_text_is_guarded_by_the_real_rpc_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = directory.path().join("required-check-frame-repository");
+    std::fs::create_dir_all(repository.join("src")).unwrap();
+    std::fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    git(&repository, &["init"]);
+    git(&repository, &["config", "user.name", "Result Frame Test"]);
+    git(
+        &repository,
+        &["config", "user.email", "result-frame@example.invalid"],
+    );
+    git(&repository, &["add", "src/lib.rs"]);
+    git(&repository, &["commit", "-m", "fixture"]);
+    let base_ref = git(&repository, &["rev-parse", "HEAD"]);
+    let repository = std::fs::canonicalize(repository).unwrap();
+    let catalog_path = directory.path().join("general-commands.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema":GENERAL_COMMAND_CATALOG_SCHEMA,
+            "commands":[{
+                "repository":repository,
+                "command_id":"required",
+                "command":{
+                    "program":"/bin/test",
+                    "args":["-f","missing"],
+                    "cwd":".",
+                    "timeout_ms":1000,
+                    "max_output_bytes":1024
+                },
+                "allowed_profiles":["analysis_readonly"],
+                "readonly_safe":true
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = Arc::new(Store::open(directory.path().join("review.sqlite3")).unwrap());
+    let factory = Arc::new(FakeFactory::default());
+    let scheduler = Scheduler::new(
+        "required-check-frame-owner",
+        Arc::clone(&store),
+        factory.clone(),
+        SchedulerConfig::default(),
+    )
+    .unwrap()
+    .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+    .unwrap();
+    let socket = directory.path().join("rpc").join("review.sock");
+    let service = Arc::new(RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap());
+    let server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_commands(
+            &GeneralTaskManifest {
+                schema: review_preparation::GENERAL_TASK_SCHEMA.into(),
+                task_id: "required-check-frame".into(),
+                repository,
+                base_ref,
+                profile: GeneralProfile::AnalysisReadonly,
+                prompt: "inspect the fixture".into(),
+                repo_context: vec!["src/lib.rs".into()],
+                attachments: Vec::new(),
+                write_manifest: Vec::new(),
+                scratch_root: ".agent-work/scratch/required-check-frame".into(),
+                artifact_root: ".agent-work/artifacts/required-check-frame".into(),
+                budget: None,
+                validation_commands: Default::default(),
+                retain_partial: false,
+                idempotency_key: "required-check-frame-key".into(),
+            },
+            "feature-required-check-frame",
+            "owner-required-check-frame",
+            &[],
+            &["required".into()],
+        )
+        .unwrap();
+    let public_agent_id = submitted.task.public_agent_id;
+    let execution_agent_id = submitted.job.agent_id;
+    scheduler.start_ready().unwrap();
+    let runtime = factory.runtime(&execution_agent_id);
+    runtime.emit_text_delta("required-check-frame-text", &"x".repeat(140 * 1024));
+    runtime.complete();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while store.get_task(&public_agent_id).unwrap().unwrap().phase != TaskPhase::Terminal {
+        assert!(Instant::now() < deadline, "task did not reach terminal");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let response = client(&socket)
+        .call(&request(
+            "failed-required-check-result",
+            RpcMethod::TaskResult {
+                agent_id: public_agent_id,
+                attempt_sequence: None,
+            },
+        ))
+        .unwrap();
+    match response.outcome {
+        RpcOutcome::Success { result } => match *result {
+            RpcSuccess::TaskResult {
+                result: Some(result),
+                artifacts,
+                ..
+            } => {
+                assert_eq!(result.outcome, TaskOutcome::ResultInvalid);
+                assert_eq!(
+                    result.summary,
+                    "terminal result exceeds private RPC response frame"
+                );
+                assert!(result
+                    .residual_gaps
+                    .contains(&"RESULT_RESPONSE_FRAME_EXCEEDED".into()));
+                assert!(artifacts.is_empty());
+            }
+            other => panic!("unexpected task result response: {other:?}"),
+        },
+        RpcOutcome::Error { error } => panic!("failed result was not readable: {error:?}"),
+    }
+    server.shutdown();
 }
 
 #[test]
