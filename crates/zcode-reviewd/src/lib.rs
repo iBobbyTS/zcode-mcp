@@ -4311,7 +4311,10 @@ impl Scheduler {
             .ledger_mcp
             .as_ref()
             .map(|config| match &route {
-                TaskRoute::General(_, _) => vec![config.general_server_for(&claim.job.agent_id)],
+                // Generic agents have no model-authored completion/check MCP;
+                // the daemon observes runtime events and executes required
+                // named checks during finalization.
+                TaskRoute::General(_, _) => Vec::new(),
                 TaskRoute::Review(_) if task.is_some() => {
                     vec![config.task_server_for(
                         &claim.job.agent_id,
@@ -5021,8 +5024,12 @@ impl Scheduler {
                         }
                         RuntimeTerminal::Completed(_)
                         | RuntimeTerminal::FailedTurn(_)
-                        | RuntimeTerminal::Exited(_)
                         | RuntimeTerminal::ReviewFailed(_) => CompletionOutcome::Failed,
+                        // A child exit without an observed turn boundary is
+                        // a runtime loss, not a model-reported task failure.
+                        // This keeps COMPLETED reserved for a matching
+                        // turn.completed plus successful daemon finalization.
+                        RuntimeTerminal::Exited(_) => CompletionOutcome::RuntimeLost,
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
@@ -5051,11 +5058,18 @@ impl Scheduler {
                             GeneralFinalizer::finalize_submission(prepared, &submission)
                         }
                         None => {
-                            let mut completion = GeneralFinalizer::finalize(
-                                prepared,
-                                CompletionOutcome::ResultInvalid,
-                            );
+                            // Runtime completion is authoritative.  The model
+                            // no longer needs to call a private completion MCP
+                            // tool: a matching turn.completed is finalized by
+                            // the daemon.  Keep the bounded passive text tail
+                            // as the user-visible final text when available.
+                            let mut completion =
+                                GeneralFinalizer::finalize(prepared, CompletionOutcome::Succeeded);
                             completion.checks = required_checks.unwrap_or_default();
+                            let tail = sink.activity.snapshot().latest_text_tail;
+                            if !tail.trim().is_empty() {
+                                completion.summary = tail;
+                            }
                             completion
                         }
                     }

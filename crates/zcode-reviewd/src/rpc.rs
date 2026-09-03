@@ -1573,10 +1573,14 @@ impl RpcService {
             RpcMethod::TaskMessage(input) => {
                 let (_, task) = self.require_task(&input.agent_id)?;
                 validate_id(&input.message_id, "message_id")?;
-                if !matches!(input.mode.as_str(), "queue" | "interrupt_and_continue") {
+                // The generic control plane only queues clarification.  A
+                // terminal task must be resumed by creating a new agent;
+                // interrupt-and-continue remains a legacy/private path and
+                // is intentionally not reachable through TaskMessage.
+                if input.mode != "queue" {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
-                        "message mode is invalid",
+                        "generic agent messages must use queue mode",
                     ));
                 }
                 validate_text(&input.content, "content", 16 * 1024)?;

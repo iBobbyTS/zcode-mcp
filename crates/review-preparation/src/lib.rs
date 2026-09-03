@@ -275,8 +275,7 @@ pub use general::{
     CompletionOutcome, GeneralArtifactIntent, GeneralArtifactKind, GeneralCompletion,
     GeneralCompletionSubmission, GeneralFinalizer, GeneralNamedCommand, GeneralProfile,
     GeneralTaskManifest, GeneralTaskPreparer, PreparedAttachment, PreparedContext,
-    PreparedGeneralTask, PublicAttachment, GENERAL_COMPLETE_TOOL_NAME, GENERAL_CONTROL_SCHEMA,
-    GENERAL_RUN_CHECK_TOOL_NAME, GENERAL_TASK_SCHEMA,
+    PreparedGeneralTask, PublicAttachment, GENERAL_CONTROL_SCHEMA, GENERAL_TASK_SCHEMA,
 };
 
 pub use manifest::{
