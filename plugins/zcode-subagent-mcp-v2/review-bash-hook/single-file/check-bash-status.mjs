@@ -143,7 +143,7 @@ function denialRecovery(code, programFamily, operandClass) {
     code.includes('credential') || code.includes('sensitive') || code.includes('secret') ||
     code.includes('network') || code.includes('write') || code.includes('mutation') ||
     code.includes('outside') || code.includes('escape') || code.includes('protected') ||
-    code.includes('prior_review') || code === 'external_policy_denied' ||
+    code === 'external_policy_denied' ||
     ['write_option', 'mutation', 'sensitive_path', 'outside_scope'].includes(operandClass)
   ) {
     return ['do_not_retry_equivalent', 'stop_evidence_path'];

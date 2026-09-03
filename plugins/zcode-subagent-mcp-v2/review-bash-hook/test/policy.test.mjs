@@ -13,6 +13,10 @@ function fixture() {
   fs.writeFileSync(path.join(root, 'README.md'), 'needle\n');
   fs.writeFileSync(path.join(root, 'src', 'a.js'), 'const needle = 1;\n');
   fs.writeFileSync(path.join(root, 'docs', 'note.txt'), 'note\n');
+  fs.writeFileSync(path.join(root, 'gpt-raw-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'gpt-admission-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'glm-raw-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'glm-admission-notes.txt'), 'ordinary\n');
   fs.writeFileSync(path.join(root, '.env'), 'SECRET=x\n');
   return root;
 }
@@ -44,6 +48,10 @@ const ALLOW = [
   'git ls-files -- src',
   'git branch --show-current',
   `git branch --list 'feature/*'`,
+  'cat gpt-raw-notes.txt',
+  'cat gpt-admission-notes.txt',
+  'cat glm-raw-notes.txt',
+  'cat glm-admission-notes.txt',
 ];
 
 const DENY = [
@@ -108,18 +116,18 @@ test('denies an existing symlink that escapes the review root', () => {
   assert.equal(result.code, 'symlink_escape');
 });
 
-test('rechecks canonical symlink targets for secret and prior-review paths', () => {
+test('rechecks canonical symlink targets for secrets and generic agent metadata', () => {
   const root = fixture();
   fs.mkdirSync(path.join(root, '.git'), { recursive: true });
   fs.writeFileSync(path.join(root, '.git', 'config'), '[core]\n');
-  fs.mkdirSync(path.join(root, '.agent-work', 'reviews'), { recursive: true });
-  fs.writeFileSync(path.join(root, '.agent-work', 'reviews', 'old.md'), 'old\n');
+  fs.mkdirSync(path.join(root, '.agent-work', 'runtime'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.agent-work', 'runtime', 'metadata.json'), '{}\n');
   fs.writeFileSync(path.join(root, 'private.pem'), 'key\n');
   fs.writeFileSync(path.join(root, 'id_ed25519'), 'key\n');
   for (const [alias, target] of [
     ['safe-env', '.env'],
     ['safe-git', '.git/config'],
-    ['safe-review', '.agent-work/reviews/old.md'],
+    ['safe-agent-metadata', '.agent-work/runtime/metadata.json'],
     ['safe-pem', 'private.pem'],
     ['safe-ed', 'id_ed25519'],
   ]) {

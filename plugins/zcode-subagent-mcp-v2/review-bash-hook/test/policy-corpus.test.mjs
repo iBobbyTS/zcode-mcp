@@ -21,11 +21,15 @@ function reasonClass(result, command) {
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-policy-corpus-'));
   fs.mkdirSync(path.join(root, 'src'));
-  fs.mkdirSync(path.join(root, '.agent-work', 'reviews'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.agent-work', 'runtime'), { recursive: true });
   fs.writeFileSync(path.join(root, 'README.md'), 'needle\n');
   fs.writeFileSync(path.join(root, 'src', 'lib.rs'), 'fn main() {}\n');
   fs.writeFileSync(path.join(root, '.env'), 'SECRET=x\n');
-  fs.writeFileSync(path.join(root, '.agent-work', 'reviews', 'old.md'), 'old\n');
+  fs.writeFileSync(path.join(root, '.agent-work', 'runtime', 'metadata.json'), '{}\n');
+  fs.writeFileSync(path.join(root, 'gpt-raw-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'gpt-admission-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'glm-raw-notes.txt'), 'ordinary\n');
+  fs.writeFileSync(path.join(root, 'glm-admission-notes.txt'), 'ordinary\n');
   return root;
 }
 

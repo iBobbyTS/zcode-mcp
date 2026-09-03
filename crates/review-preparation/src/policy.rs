@@ -497,7 +497,7 @@ impl PolicyLauncher {
         }
         if program == "git"
             && argv[2..].iter().any(|arg| {
-                is_credential_path(Path::new(arg)) || is_prior_review_artifact(Path::new(arg))
+                is_credential_path(Path::new(arg)) || is_agent_metadata_path(Path::new(arg))
             })
         {
             return PermissionDecision {
@@ -550,6 +550,13 @@ impl PolicyLauncher {
                 .any(|root| path.starts_with(root))
     }
 
+    fn enters_agent_metadata(&self, path: &Path) -> bool {
+        std::iter::once(&self.worktree)
+            .chain(self.readable_inputs.iter())
+            .filter_map(|root| path.strip_prefix(root).ok())
+            .any(is_agent_metadata_path)
+    }
+
     fn review_paths_confined(&self, args: &[String], cwd: &Path, require_file: bool) -> bool {
         args.iter().all(|arg| {
             let path = Path::new(arg);
@@ -559,7 +566,7 @@ impl PolicyLauncher {
                     .components()
                     .any(|component| component == Component::ParentDir)
                 || is_credential_path(path)
-                || is_prior_review_artifact(path)
+                || is_agent_metadata_path(path)
             {
                 return false;
             }
@@ -573,7 +580,7 @@ impl PolicyLauncher {
             };
             if !self.is_review_root(&real)
                 || is_credential_path(&real)
-                || is_prior_review_artifact(&real)
+                || self.enters_agent_metadata(&real)
             {
                 return false;
             }
@@ -638,8 +645,8 @@ impl PolicyLauncher {
                 let Ok(path) = fs::canonicalize(path) else {
                     return Some("read_path_unverifiable");
                 };
-                if is_prior_review_artifact(&path) {
-                    return Some("prior_review_artifact_denied");
+                if self.enters_agent_metadata(&path) {
+                    return Some("agent_metadata_read_denied");
                 }
                 if path.starts_with(&self.worktree)
                     || self
@@ -851,6 +858,7 @@ fn unsafe_review_git_object_path(arg: &str) -> bool {
             .components()
             .any(|component| component == Component::ParentDir)
         || is_credential_path(path)
+        || is_agent_metadata_path(path)
 }
 
 fn safe_review_git_operand(arg: &str) -> bool {
@@ -861,7 +869,7 @@ fn safe_review_git_operand(arg: &str) -> bool {
             .split('/')
             .any(|component| component.is_empty() || component == "..")
         && !is_credential_path(Path::new(arg))
-        && !is_prior_review_artifact(Path::new(arg))
+        && !is_agent_metadata_path(Path::new(arg))
         && !unsafe_review_git_object_path(arg)
 }
 
@@ -1810,7 +1818,7 @@ fn read_denial_identity(
     }
     if matches!(
         validated_reason,
-        "read_path_escape_denied" | "prior_review_artifact_denied"
+        "read_path_escape_denied" | "agent_metadata_read_denied"
     ) || path.is_some_and(|path| {
         path.components()
             .any(|component| component == Component::ParentDir)
@@ -1878,9 +1886,13 @@ fn bash_denial_identity(command: &str) -> (String, String, String, String) {
         };
         return (family, category, reason.into(), operand_class);
     }
-    let operand_class = if argv[1..].iter().any(|value| {
-        is_credential_path(Path::new(value)) || is_prior_review_artifact(Path::new(value))
-    }) {
+    let credential_path = argv[1..]
+        .iter()
+        .any(|value| is_credential_path(Path::new(value)));
+    let agent_metadata_path = argv[1..]
+        .iter()
+        .any(|value| is_agent_metadata_path(Path::new(value)));
+    let operand_class = if credential_path || agent_metadata_path {
         "sensitive_path"
     } else if argv[1..].iter().any(|value| value.starts_with('-')) {
         "option"
@@ -1890,6 +1902,7 @@ fn bash_denial_identity(command: &str) -> (String, String, String, String) {
         "path"
     };
     let inferred_reason = match operand_class {
+        "sensitive_path" if agent_metadata_path => "agent_metadata_read_denied",
         "sensitive_path" => "credential_read_denied",
         "missing_path" => "command_option_not_allowlisted",
         _ => "external_policy_denied",
@@ -1948,7 +1961,7 @@ fn git_denial_operand_class(args: &[String]) -> String {
         return "write_option".into();
     }
     if args.iter().any(|value| {
-        is_credential_path(Path::new(value)) || is_prior_review_artifact(Path::new(value))
+        is_credential_path(Path::new(value)) || is_agent_metadata_path(Path::new(value))
     }) {
         return "sensitive_path".into();
     }
@@ -2052,7 +2065,7 @@ fn denial_recovery(
         || reason_code.contains("outside")
         || reason_code.contains("escape")
         || reason_code.contains("protected")
-        || reason_code.contains("prior_review")
+        || reason_code.contains("agent_metadata")
         || reason_code == "external_policy_denied"
         || matches!(
             operand_class,
@@ -2666,14 +2679,12 @@ pub(crate) fn is_credential_path(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn is_prior_review_artifact(path: &Path) -> bool {
+pub(crate) fn is_agent_metadata_path(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    normalized.contains("/.agent-work/reviews/")
-        || normalized.contains("gpt-raw")
-        || normalized.contains("gpt-admission")
-        || normalized.contains("glm-raw")
-        || normalized.contains("glm-admission")
+    normalized
+        .split('/')
+        .any(|component| component == ".agent-work")
 }

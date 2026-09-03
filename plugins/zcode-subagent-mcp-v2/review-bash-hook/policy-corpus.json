@@ -21,7 +21,11 @@
     { "command": "git cat-file -t HEAD", "reason_class": "allow" },
     { "command": "git ls-files -- src", "reason_class": "allow" },
     { "command": "git branch --show-current", "reason_class": "allow" },
-    { "command": "git branch --list main", "reason_class": "allow" }
+    { "command": "git branch --list main", "reason_class": "allow" },
+    { "command": "cat gpt-raw-notes.txt", "reason_class": "allow" },
+    { "command": "cat gpt-admission-notes.txt", "reason_class": "allow" },
+    { "command": "cat glm-raw-notes.txt", "reason_class": "allow" },
+    { "command": "cat glm-admission-notes.txt", "reason_class": "allow" }
   ],
   "deny": [
     { "command": "cat", "reason_class": "stdin" },
@@ -49,7 +53,7 @@
     { "command": "git -c core.pager=cat status", "reason_class": "git" },
     { "command": "cat .env", "reason_class": "path" },
     { "command": "cat .git/config", "reason_class": "path" },
-    { "command": "cat .agent-work/reviews/old.md", "reason_class": "path" },
+    { "command": "cat .agent-work/runtime/metadata.json", "reason_class": "path" },
     { "command": "git status && pwd", "reason_class": "shell" }
   ],
   "recovery": [

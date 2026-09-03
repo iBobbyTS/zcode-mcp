@@ -2,8 +2,8 @@ use review_preparation::{
     general_control_header, general_launch_prompt, AttachmentInput, CompletionOutcome,
     ExternalDecision, GeneralArtifactKind, GeneralCompletion, GeneralFinalizer,
     GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
-    PermissionRequest, PreparationError, PreparedGeneralTask, ValidationCommand,
-    GENERAL_TASK_SCHEMA,
+    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, PreparedGeneralTask,
+    ValidationCommand, GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,6 +20,76 @@ struct Fixture {
     repository: PathBuf,
     attachments: PathBuf,
     head: String,
+}
+
+#[test]
+fn review_policy_protects_generic_agent_metadata_without_filename_heuristics() {
+    let f = Fixture::new();
+    let scratch = f.repository.join("policy-scratch");
+    let reports = f.repository.join("policy-reports");
+    fs::create_dir_all(&scratch).unwrap();
+    fs::create_dir_all(&reports).unwrap();
+    for name in [
+        "gpt-raw-notes.txt",
+        "gpt-admission-notes.txt",
+        "glm-raw-notes.txt",
+        "glm-admission-notes.txt",
+    ] {
+        fs::write(f.repository.join(name), "ordinary input\n").unwrap();
+    }
+    let metadata = f.repository.join(".agent-work/runtime/metadata.json");
+    fs::create_dir_all(metadata.parent().unwrap()).unwrap();
+    fs::write(&metadata, "{}\n").unwrap();
+    symlink(
+        ".agent-work/runtime/metadata.json",
+        f.repository.join("metadata-alias"),
+    )
+    .unwrap();
+
+    let policy = PolicyLauncher::new(
+        f.repository.clone(),
+        scratch,
+        reports.join("result.json"),
+        Vec::new(),
+        BTreeMap::new(),
+        false,
+        PolicyCapabilities::default(),
+    )
+    .unwrap();
+    let bash = |command: &str| {
+        policy.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName":"Bash",
+                "input":{"command":command,"cwd":f.repository}
+            }),
+            ExternalDecision::Allow,
+        )
+    };
+
+    for name in [
+        "gpt-raw-notes.txt",
+        "gpt-admission-notes.txt",
+        "glm-raw-notes.txt",
+        "glm-admission-notes.txt",
+    ] {
+        assert!(bash(&format!("cat {name}")).allowed, "{name}");
+        assert!(bash(&format!("git diff -- {name}")).allowed, "git {name}");
+    }
+
+    for path in [".agent-work/runtime/metadata.json", "metadata-alias"] {
+        assert!(!bash(&format!("cat {path}")).allowed, "{path}");
+    }
+    let metadata_request = serde_json::json!({
+        "toolName":"Read",
+        "input":{"file_path":metadata}
+    });
+    let (metadata_read, metadata_denial) =
+        policy.decide_zcode_permission_validated(&metadata_request, ExternalDecision::Allow);
+    assert!(!metadata_read.allowed);
+    assert_eq!(metadata_read.reason, "agent_metadata_read_denied");
+    let feedback = metadata_denial.unwrap().feedback(false);
+    assert!(feedback.contains("code=agent_metadata_read_denied"));
+    assert!(feedback.contains("retry=do_not_retry_equivalent"));
 }
 impl Fixture {
     fn new() -> Self {
