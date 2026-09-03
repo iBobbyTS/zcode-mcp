@@ -5,6 +5,7 @@ import unittest
 from conformance import ConformanceError
 from run_matrix import (
     EVIDENCE_SCHEMA,
+    minimal_evidence,
     source_integrity_unchanged,
     validate_evidence_identity,
 )
@@ -68,6 +69,31 @@ class EvidenceIdentityTests(unittest.TestCase):
                 {"schema": EVIDENCE_SCHEMA, "identity": dict(identity, repository_head="f" * 40)},
                 identity,
             )
+
+    def test_minimal_evidence_redacts_text_tools_paths_and_raw_diffs(self) -> None:
+        output = {
+            "schema": EVIDENCE_SCHEMA,
+            "identity": {"repository_head": "a" * 40},
+            "execution_root": "/absolute/private/path",
+            "result": {
+                "task": {"agent_id": "agent-secret", "phase": "TERMINAL"},
+                "result": {"outcome": "SUCCEEDED", "final_text": "secret output",
+                           "changed_files": [], "checks": [], "result_sha256": "b" * 64},
+            },
+            "closed": {"task": {"closed": True, "resources_reaped": True}},
+            "activity_samples": [{"activity": {
+                "latest_text_tail": "secret reasoning", "active_tools": [{"tool_call_id": "id"}],
+                "window_60s": {"read_calls": 1, "other_tool_calls": 0,
+                               "tool_calls_failed": 1},
+            }}],
+            "permission_responses": [], "artifact_verification": [],
+            "source_before": {"tracked_diff": "secret diff"},
+            "source_unchanged": True, "poll_start_intervals_seconds": [],
+        }
+
+        encoded = str(minimal_evidence(output))
+        for forbidden in ("/absolute", "secret output", "secret reasoning", "secret diff", "tool_call_id"):
+            self.assertNotIn(forbidden, encoded)
 
 
 if __name__ == "__main__":

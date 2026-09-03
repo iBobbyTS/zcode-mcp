@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval-seconds", type=float, default=15.0)
     parser.add_argument("--max-polls", type=int, default=360)
     parser.add_argument("--permission-decision", choices=["allow", "deny"], default="allow")
+    parser.add_argument("--minimal-evidence", action="store_true")
     return parser.parse_args()
 
 
@@ -91,6 +92,62 @@ def validate_evidence_identity(
         raise ConformanceError("evidence schema is missing or stale")
     if evidence.get("identity") != expected_identity:
         raise ConformanceError("evidence identity does not match the executing exact head")
+
+
+def minimal_evidence(output: dict[str, object]) -> dict[str, object]:
+    result_envelope = output.get("result", {})
+    result = result_envelope.get("result", {}) if isinstance(result_envelope, dict) else {}
+    task = result_envelope.get("task", {}) if isinstance(result_envelope, dict) else {}
+    closed_envelope = output.get("closed", {})
+    closed_task = closed_envelope.get("task", {}) if isinstance(closed_envelope, dict) else {}
+    samples = output.get("activity_samples", [])
+    activity_summary = {
+        "samples": len(samples) if isinstance(samples, list) else 0,
+        "max_read_calls_60s": 0,
+        "max_other_tool_calls_60s": 0,
+        "max_tool_calls_failed_60s": 0,
+    }
+    for sample in samples if isinstance(samples, list) else []:
+        activity = sample.get("activity", {}) if isinstance(sample, dict) else {}
+        window = activity.get("window_60s", {}) if isinstance(activity, dict) else {}
+        for target, source in (
+            ("max_read_calls_60s", "read_calls"),
+            ("max_other_tool_calls_60s", "other_tool_calls"),
+            ("max_tool_calls_failed_60s", "tool_calls_failed"),
+        ):
+            value = window.get(source, 0) if isinstance(window, dict) else 0
+            activity_summary[target] = max(activity_summary[target], int(value))
+    permissions = []
+    for item in output.get("permission_responses", []):
+        request = item.get("request", {})
+        response = item.get("response", {})
+        permissions.append({
+            "tool_name": request.get("tool_name"),
+            "operation": request.get("operation"),
+            "policy_preview": request.get("policy_preview"),
+            "request_id_sha256": sha256(str(request.get("request_id", "")).encode()),
+            "requested_decision": response.get("requested_decision"),
+            "effective_decision": response.get("effective_decision"),
+            "policy_overrode": response.get("policy_overrode"),
+            "decision_code": response.get("policy_reason_code"),
+        })
+    return {
+        "schema": output.get("schema"),
+        "identity": output.get("identity"),
+        "agent_id_sha256": sha256(str(task.get("agent_id", "")).encode()),
+        "outcome": result.get("outcome") if isinstance(result, dict) else None,
+        "phase": task.get("phase") if isinstance(task, dict) else None,
+        "result_sha256": result.get("result_sha256") if isinstance(result, dict) else None,
+        "changed_files": result.get("changed_files", []) if isinstance(result, dict) else [],
+        "checks": result.get("checks", []) if isinstance(result, dict) else [],
+        "artifacts": output.get("artifact_verification", []),
+        "permissions": permissions,
+        "activity": activity_summary,
+        "poll_start_intervals_seconds": output.get("poll_start_intervals_seconds", []),
+        "source_unchanged": output.get("source_unchanged"),
+        "closed": closed_task.get("closed") if isinstance(closed_task, dict) else None,
+        "resources_reaped": closed_task.get("resources_reaped") if isinstance(closed_task, dict) else None,
+    }
 
 
 def main() -> int:
@@ -203,6 +260,15 @@ def main() -> int:
                     "size_bytes": len(content),
                     "sha256": sha256(content),
                     "verified": sha256(content) == artifact["sha256"],
+                    "applicable": (
+                        subprocess.run(
+                            ["git", "-C", str(args.repository.resolve()), "apply", "--check", "-"],
+                            input=content,
+                            capture_output=True,
+                        ).returncode == 0
+                        if artifact["kind"] == "changes_patch"
+                        else None
+                    ),
                 })
             closed = transport.call("zcode_agent_close", {"agent_id": agent_id})
             source_after = git_snapshot(args.repository.resolve())
@@ -234,8 +300,9 @@ def main() -> int:
                     "read-only source integrity requires clean tracked and staged state before and after"
                 )
             validate_evidence_identity(output, identity)
+            evidence = minimal_evidence(output) if args.minimal_evidence else output
             evidence_path.write_text(
-                json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             print(json.dumps({
                 "agent_id": agent_id,
@@ -265,8 +332,11 @@ def main() -> int:
                 output["daemon_reaped"] = daemon.poll() is not None
                 output["daemon_returncode"] = daemon.returncode
                 validate_evidence_identity(output, identity)
+                evidence = minimal_evidence(output) if args.minimal_evidence else output
+                evidence["daemon_reaped"] = output["daemon_reaped"]
+                evidence["daemon_returncode"] = output["daemon_returncode"]
                 evidence_path.write_text(
-                    json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                    json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
                 )
 
 
