@@ -1497,14 +1497,9 @@ fn enqueue_request(agent_id: &str, key: &str) -> RpcMethod {
             agent_id: agent_id.into(),
             workspace_path: "/workspace".into(),
             idempotency_key: Some(key.into()),
-            parent_agent_id: None,
-            review_kind: Some("code".into()),
             feature_id: Some("feature".into()),
-            section_id: Some("S02".into()),
-            round_kind: Some("INITIAL_BOUNDED".into()),
-            report_path: None,
             runtime_hash: Some("runtime-hash".into()),
-            initial_prompt: "Begin review.".into(),
+            initial_prompt: "Begin task.".into(),
         },
     }
 }

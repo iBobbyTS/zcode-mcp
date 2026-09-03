@@ -1,18 +1,5 @@
 use serde_json::{json, Map, Value};
-use std::{
-    io::{self, BufRead, BufReader, Read, Write},
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
-
-const LEDGER_TOOLS: [&str; 5] = [
-    "review_checkpoint",
-    "review_finding_upsert",
-    "review_validation_record",
-    "review_finalize",
-    "review_progress",
-];
+use std::io::{self, BufRead, Write};
 
 fn write_value(out: &mut impl Write, value: Value) -> io::Result<()> {
     serde_json::to_writer(&mut *out, &value)?;
@@ -148,281 +135,6 @@ fn valid_permission_response(result: &Value) -> bool {
     )
 }
 
-fn is_review_flow(mode: &str) -> bool {
-    mode.starts_with("review-flow")
-}
-
-fn mcp_request(
-    input: &mut impl Write,
-    output: &mut impl BufRead,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> io::Result<Value> {
-    write_value(
-        input,
-        json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
-    )?;
-    let mut line = String::new();
-    if output.read_line(&mut line)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "ledger MCP closed without a response",
-        ));
-    }
-    let response: Value = serde_json::from_str(&line).map_err(io::Error::other)?;
-    if response.get("id") != Some(&json!(id)) || response.get("error").is_some() {
-        return Err(io::Error::other("ledger MCP returned an invalid response"));
-    }
-    Ok(response)
-}
-
-fn ledger_tool_call(
-    input: &mut impl Write,
-    output: &mut impl BufRead,
-    id: u64,
-    name: &str,
-    arguments: Value,
-) -> io::Result<()> {
-    let response = mcp_request(
-        input,
-        output,
-        id,
-        "tools/call",
-        json!({"name":name,"arguments":arguments}),
-    )?;
-    let result = response
-        .get("result")
-        .and_then(Value::as_object)
-        .ok_or_else(|| io::Error::other("ledger tool response has no result"))?;
-    if result.get("isError") != Some(&Value::Bool(false))
-        || result.get("structuredContent").is_none()
-    {
-        return Err(io::Error::other("ledger tool call was not successful"));
-    }
-    Ok(())
-}
-
-fn wait_ledger_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| io::Error::other(format!("stage=child-wait: {error}")))?
-        {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return child.wait().map_err(|error| {
-                io::Error::other(format!(
-                    "stage=child-wait: timeout; kill wait failed: {error}"
-                ))
-            });
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn run_ledger_flow(server: &Value, finalize: bool) -> io::Result<()> {
-    let mode = std::env::var("ZCODE_FAKE_MODE").unwrap_or_default();
-    let server = server
-        .as_object()
-        .ok_or_else(|| io::Error::other("ledger MCP descriptor is not an object"))?;
-    if server.get("name").and_then(Value::as_str) != Some("review-ledger") {
-        return Err(io::Error::other("ledger MCP descriptor has the wrong name"));
-    }
-    let command = server
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| io::Error::other("ledger MCP command is missing"))?;
-    let args = server
-        .get("args")
-        .and_then(Value::as_array)
-        .ok_or_else(|| io::Error::other("ledger MCP args are missing"))?;
-    let task_scoped = args
-        .iter()
-        .any(|value| value.as_str() == Some("--task-ledger-mcp"));
-    let env = server
-        .get("env")
-        .and_then(Value::as_array)
-        .ok_or_else(|| io::Error::other("ledger MCP env is missing"))?;
-    let mut process = Command::new(command);
-    for argument in args {
-        process.arg(
-            argument
-                .as_str()
-                .ok_or_else(|| io::Error::other("ledger MCP arg is not text"))?,
-        );
-    }
-    for variable in env {
-        let variable = variable
-            .as_object()
-            .ok_or_else(|| io::Error::other("ledger MCP env entry is not an object"))?;
-        let name = variable
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| io::Error::other("ledger MCP env name is missing"))?;
-        let value = variable
-            .get("value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| io::Error::other("ledger MCP env value is missing"))?;
-        process.env(name, value);
-    }
-    let mut child = process
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| io::Error::other(format!("stage=spawn: {error}")))?;
-    let mut input = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("ledger MCP stdin is missing"))?;
-    let mut output = BufReader::new(
-        child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("ledger MCP stdout is missing"))?,
-    );
-    let stderr = child.stderr.take().unwrap();
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.take(8193).read_to_end(&mut bytes);
-        let truncated = bytes.len() > 8192;
-        bytes.truncate(8192);
-        (String::from_utf8_lossy(&bytes).into_owned(), truncated)
-    });
-
-    let flow = (|| -> io::Result<()> {
-        let initialized = mcp_request(&mut input, &mut output, 1, "initialize", json!({}))
-            .map_err(|error| io::Error::other(format!("stage=initialize: {error}")))?;
-        if initialized["result"]["serverInfo"]["name"] != "zcode-review-ledger" {
-            return Err(io::Error::other(
-                "stage=initialize: ledger MCP response is invalid",
-            ));
-        }
-        let listed = mcp_request(&mut input, &mut output, 2, "tools/list", json!({}))
-            .map_err(|error| io::Error::other(format!("stage=tools-list: {error}")))?;
-        let names = listed["result"]["tools"]
-            .as_array()
-            .ok_or_else(|| io::Error::other("stage=tools-list: tool list is missing"))?
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        let expected_tools = if task_scoped {
-            LEDGER_TOOLS.as_slice()
-        } else {
-            &LEDGER_TOOLS[..4]
-        };
-        if names != expected_tools {
-            return Err(io::Error::other(
-                "stage=tools-list: ledger MCP tool list is not exact",
-            ));
-        }
-
-        let mut next_id = 3;
-        if task_scoped && mode != "review-flow-ledger-without-progress" {
-            ledger_tool_call(
-                &mut input,
-                &mut output,
-                next_id,
-                LEDGER_TOOLS[4],
-                json!({
-                    "stage":"inspection",
-                    "summary":"fake runtime started semantic review",
-                    "counters":{"files":0}
-                }),
-            )
-            .map_err(|error| io::Error::other(format!("stage=progress: {error}")))?;
-            next_id += 1;
-        }
-        if mode == "review-flow-progress-only" {
-            return Ok(());
-        }
-        ledger_tool_call(
-        &mut input,
-        &mut output,
-        next_id,
-        LEDGER_TOOLS[0],
-        json!({
-            "checkpoint_id":"scope-1","stage":"inspection","summary":"bounded evidence observed",
-            "inspected":[{"path":"src/approval.rs","line_ranges":["1"]}],
-            "commands":[],"open_questions":[],"remaining_scope":[]
-        }),
-    )
-        .map_err(|error| io::Error::other(format!("stage=checkpoint: {error}")))?;
-        ledger_tool_call(
-        &mut input,
-        &mut output,
-        next_id + 1,
-        LEDGER_TOOLS[1],
-        json!({
-            "finding_id":"S06-F1","severity":"P2","confidence":"medium",
-            "title":"candidate","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
-            "evidence":["observable fixture"],"impact":"bounded","suggested_remediation":"none",
-            "status":"open"
-        }),
-    )
-        .map_err(|error| io::Error::other(format!("stage=finding-open: {error}")))?;
-        ledger_tool_call(
-        &mut input,
-        &mut output,
-        next_id + 2,
-        LEDGER_TOOLS[1],
-        json!({
-            "finding_id":"S06-F1","severity":"P2","confidence":"high",
-            "title":"candidate disproved","locations":[{"path":"src/approval.rs","start_line":1,"end_line":1}],
-            "evidence":["later observable fixture"],"impact":"none","suggested_remediation":"none",
-            "status":"withdrawn"
-        }),
-    )
-        .map_err(|error| io::Error::other(format!("stage=finding-withdraw: {error}")))?;
-        ledger_tool_call(
-            &mut input,
-            &mut output,
-            next_id + 3,
-            LEDGER_TOOLS[2],
-            json!({
-                "validation_id":"validation-1","command":"cargo test -p fixture","cwd":".",
-                "exit_code":0,"duration_ms":1,"stdout_summary":"passed","stderr_summary":"",
-                "related_findings":[]
-            }),
-        )
-        .map_err(|error| io::Error::other(format!("stage=validation: {error}")))?;
-        if finalize {
-            ledger_tool_call(
-                &mut input,
-                &mut output,
-                next_id + 4,
-                LEDGER_TOOLS[3],
-                json!({
-                    "signal":"no_findings_observed","summary":"bounded review complete",
-                    "coverage":{"covered":["src"],"not_covered":[]},
-                    "uncertainties":[],"recommended_next_actions":[]
-                }),
-            )
-            .map_err(|error| io::Error::other(format!("stage=finalize: {error}")))?;
-        }
-        Ok(())
-    })();
-    drop(input);
-    let status = wait_ledger_child(&mut child);
-    let (stderr_text, stderr_truncated) = stderr_reader.join().unwrap_or_default();
-    let status = status?;
-    if let Err(error) = flow {
-        return Err(io::Error::other(format!(
-            "{error}; child_status={status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
-        )));
-    }
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "stage=child-wait: ledger MCP process exited with {status}; stderr={stderr_text:?}; stderr_truncated={stderr_truncated}"
-        )));
-    }
-    Ok(())
-}
-
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "session".into());
     let stdin = io::stdin();
@@ -430,19 +142,9 @@ fn main() {
     let mut active_turn = false;
     let mut next_turn = 1u64;
     let mut sequence = 0u64;
-    let mut ledger_server: Option<Value> = None;
-    let mut ledger_completed = false;
     let session_id =
         std::env::var("ZCODE_FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-7f3a".into());
     let mut pending_permission: Option<Value> = None;
-    let _descendant: Option<Child> = if is_review_flow(&mode) {
-        Command::new("sh")
-            .args(["-c", "trap '' TERM; sleep 30"])
-            .spawn()
-            .ok()
-    } else {
-        None
-    };
 
     let mut lines = stdin.lock().lines();
     while let Some(line) = lines.next() {
@@ -493,41 +195,11 @@ fn main() {
                 && object.get("error").is_none()
                 && object.get("result").is_some_and(valid_permission_response)
             {
-                let expected_response = if is_review_flow(&mode) {
-                    json!({"decision": "deny", "reason": "denied"})
-                } else {
-                    json!({"decision": "allow", "reason": "allowed once"})
-                };
+                let expected_response = json!({"decision": "allow", "reason": "allowed once"});
                 if object.get("result") != Some(&expected_response) {
                     continue;
                 }
-                if is_review_flow(&mode)
-                    && mode != "review-flow-no-ledger"
-                    && mode != "review-flow-no-progress"
-                    && !ledger_completed
-                {
-                    let Some(server) = ledger_server.as_ref() else {
-                        std::process::exit(23);
-                    };
-                    if let Err(error) = run_ledger_flow(server, mode != "review-flow-no-finalize") {
-                        eprintln!("fake-runtime ledger failure: {error}");
-                        std::process::exit(23);
-                    }
-                    ledger_completed = true;
-                }
                 pending_permission = None;
-                if is_review_flow(&mode) && active_turn {
-                    active_turn = false;
-                    let _ = write_value(
-                        &mut out,
-                        event(
-                            &mut sequence,
-                            &session_id,
-                            "turn.completed",
-                            json!({"response": "permission settled"}),
-                        ),
-                    );
-                }
             }
             continue;
         }
@@ -549,15 +221,6 @@ fn main() {
                 let _ = write_value(&mut out, response(id, json!({"ready": true})));
             }
             "session/create" => {
-                ledger_server = params
-                    .get("mcpServers")
-                    .and_then(Value::as_array)
-                    .and_then(|servers| {
-                        servers.iter().find(|server| {
-                            server.get("name").and_then(Value::as_str) == Some("review-ledger")
-                        })
-                    })
-                    .cloned();
                 let preference_id = Value::String("runtime-preferences-1".into());
                 let _ = write_value(
                     &mut out,
@@ -607,16 +270,6 @@ fn main() {
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if mode == "review-flow-nudge-send-failure"
-                    && content.starts_with("CONVERGENCE_NUDGE:")
-                {
-                    let _ = write_value(&mut out, error(id, -32012, "SCRIPTED_NUDGE_FAILURE"));
-                    continue;
-                }
-                if mode == "review-flow-send-failure" && next_turn > 1 {
-                    let _ = write_value(&mut out, error(id, -32011, "SCRIPTED_SEND_FAILURE"));
-                    continue;
-                }
                 if active_turn {
                     let _ = write_value(&mut out, error(id, -32010, "PROMPT_ALREADY_RUNNING"));
                     continue;
@@ -637,16 +290,9 @@ fn main() {
                         json!({"turnId": turn_id, "turnNumber": next_turn - 1}),
                     ),
                 );
-                let review_flow_initial = is_review_flow(&mode) && next_turn == 2;
-                let semantic_idle_fixture = matches!(
-                    mode.as_str(),
-                    "review-flow-semantic-idle" | "review-flow-nudge-send-failure"
-                );
-                if (content.contains("permission") || review_flow_initial) && !semantic_idle_fixture
-                {
+                if content.contains("permission") {
                     let request_id = Value::String("server-1".into());
                     pending_permission = Some(request_id.clone());
-                    let hard_deny = review_flow_initial;
                     let _ = write_value(
                         &mut out,
                         json!({
@@ -654,10 +300,10 @@ fn main() {
                             "method": "interaction/requestPermission",
                             "params": {
                                 "toolCallId": "tool-1",
-                                "toolName": if hard_deny { "git_ref_mutation" } else { "read" },
+                                "toolName": "read",
                                 "riskLevel": "low",
                                 "reason": "fixture permission",
-                                "input": if hard_deny { json!({}) } else { json!({"path": "fixture.txt"}) },
+                                "input": json!({"path": "fixture.txt"}),
                                 "options": [
                                     {"id": "allow_once", "kind": "allow_once", "label": "Allow once", "response": {"decision": "allow", "reason": "allowed once"}},
                                     {"id": "deny", "kind": "deny", "label": "Deny", "response": {"decision": "deny", "reason": "denied"}}
@@ -666,7 +312,7 @@ fn main() {
                         }),
                     );
                 }
-                if content.contains("input") || review_flow_initial {
+                if content.contains("input") {
                     let _ = write_value(
                         &mut out,
                         json!({
@@ -676,7 +322,7 @@ fn main() {
                         }),
                     );
                 }
-                if content.contains("unknown_event") || review_flow_initial {
+                if content.contains("unknown_event") {
                     let _ = write_value(
                         &mut out,
                         event(
@@ -688,22 +334,6 @@ fn main() {
                     );
                 }
                 if content.contains("auto_complete") {
-                    if is_review_flow(&mode)
-                        && mode != "review-flow-no-ledger"
-                        && mode != "review-flow-no-progress"
-                        && !ledger_completed
-                    {
-                        let Some(server) = ledger_server.as_ref() else {
-                            std::process::exit(23);
-                        };
-                        if let Err(error) =
-                            run_ledger_flow(server, mode != "review-flow-no-finalize")
-                        {
-                            eprintln!("fake-runtime ledger failure: {error}");
-                            std::process::exit(23);
-                        }
-                        ledger_completed = true;
-                    }
                     let _ = write_value(
                         &mut out,
                         event(
@@ -711,18 +341,6 @@ fn main() {
                             &session_id,
                             "turn.completed",
                             json!({"response": "fixture complete"}),
-                        ),
-                    );
-                    active_turn = false;
-                }
-                if semantic_idle_fixture {
-                    let _ = write_value(
-                        &mut out,
-                        event(
-                            &mut sequence,
-                            &session_id,
-                            "turn.completed",
-                            json!({"response": "semantic idle fixture"}),
                         ),
                     );
                     active_turn = false;

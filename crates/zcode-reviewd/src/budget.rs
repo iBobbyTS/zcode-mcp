@@ -50,11 +50,19 @@ pub(crate) struct AttemptBudget {
 impl AttemptBudget {
     #[cfg(test)]
     pub(crate) fn new(limits: &BudgetLimits) -> Self {
-        Self::with_limits(limits.absolute_wall_time_ms, limits.max_turns, limits.max_tool_calls)
+        Self::with_limits(
+            limits.absolute_wall_time_ms,
+            limits.max_turns,
+            limits.max_tool_calls,
+        )
     }
 
     pub(crate) fn from_effective(limits: &EffectiveBudget) -> Self {
-        Self::with_limits(limits.absolute_wall_time_ms, limits.max_turns, limits.max_tool_calls)
+        Self::with_limits(
+            limits.absolute_wall_time_ms,
+            limits.max_turns,
+            limits.max_tool_calls,
+        )
     }
 
     fn with_limits(wall_time_ms: u64, max_turns: u64, max_tool_calls: u64) -> Self {

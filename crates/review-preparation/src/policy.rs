@@ -375,70 +375,70 @@ impl PolicyLauncher {
             return self.decide_review_bash(input, external);
         }
         let request = match tool_name.to_ascii_lowercase().as_str() {
-                "read" | "grep" | "glob" => input
-                    .get("path")
+            "read" | "grep" | "glob" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Read(self.resolve_job_path(path))),
+            "write" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Write(self.resolve_job_path(path))),
+            "edit" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Edit(self.resolve_job_path(path))),
+            "delete" => input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| PermissionRequest::Delete(self.resolve_job_path(path))),
+            "move" => {
+                let source = input
+                    .get("source")
                     .and_then(serde_json::Value::as_str)
-                    .map(|path| PermissionRequest::Read(self.resolve_job_path(path))),
-                "write" => input
-                    .get("path")
+                    .map(|path| self.resolve_job_path(path));
+                let destination = input
+                    .get("destination")
                     .and_then(serde_json::Value::as_str)
-                    .map(|path| PermissionRequest::Write(self.resolve_job_path(path))),
-                "edit" => input
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|path| PermissionRequest::Edit(self.resolve_job_path(path))),
-                "delete" => input
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|path| PermissionRequest::Delete(self.resolve_job_path(path))),
-                "move" => {
-                    let source = input
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|path| self.resolve_job_path(path));
-                    let destination = input
-                        .get("destination")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|path| self.resolve_job_path(path));
-                    match (source, destination) {
-                        (Some(source), Some(destination)) => Some(PermissionRequest::Move {
-                            source,
-                            destination,
-                        }),
-                        _ => None,
-                    }
+                    .map(|path| self.resolve_job_path(path));
+                match (source, destination) {
+                    (Some(source), Some(destination)) => Some(PermissionRequest::Move {
+                        source,
+                        destination,
+                    }),
+                    _ => None,
                 }
-                "network" => input
-                    .get("target")
+            }
+            "network" => input
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .map(|target| PermissionRequest::Network(target.into())),
+            "git_ref_mutation" => Some(PermissionRequest::GitRefMutation),
+            "execute" | "terminal" => {
+                let program = input
+                    .get("program")
                     .and_then(serde_json::Value::as_str)
-                    .map(|target| PermissionRequest::Network(target.into())),
-                "git_ref_mutation" => Some(PermissionRequest::GitRefMutation),
-                "execute" | "terminal" => {
-                    let program = input
-                        .get("program")
-                        .and_then(serde_json::Value::as_str)
-                        .map(PathBuf::from);
-                    let args = input
-                        .get("args")
-                        .and_then(serde_json::Value::as_array)
-                        .and_then(|values| {
-                            values
-                                .iter()
-                                .map(|value| value.as_str().map(str::to_owned))
-                                .collect::<Option<Vec<_>>>()
-                        });
-                    let cwd = input
-                        .get("cwd")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|path| self.resolve_job_path(path));
-                    match (program, args, cwd) {
-                        (Some(program), Some(args), Some(cwd)) => {
-                            Some(PermissionRequest::Execute { program, args, cwd })
-                        }
-                        _ => None,
+                    .map(PathBuf::from);
+                let args = input
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|values| {
+                        values
+                            .iter()
+                            .map(|value| value.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                let cwd = input
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|path| self.resolve_job_path(path));
+                match (program, args, cwd) {
+                    (Some(program), Some(args), Some(cwd)) => {
+                        Some(PermissionRequest::Execute { program, args, cwd })
                     }
+                    _ => None,
                 }
-                _ => None,
+            }
+            _ => None,
         };
         match request {
             Some(request) => self.decide(&request, external),

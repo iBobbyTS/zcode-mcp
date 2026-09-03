@@ -1,8 +1,7 @@
 use review_store::Store;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
-    env, fs,
-    io,
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
     sync::{atomic::AtomicBool, Arc},
@@ -10,9 +9,14 @@ use std::{
     time::Duration,
 };
 #[cfg(debug_assertions)]
-use std::{io::{Read, Write}, os::unix::net::UnixStream};
-use zcode_reviewd::{rpc::ServerOptions, CommandRuntimeFactory, Daemon, GeneralCommandCatalog,
-    RuntimeFactory, Scheduler, SchedulerConfig};
+use std::{
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+};
+use zcode_reviewd::{
+    rpc::ServerOptions, CommandRuntimeFactory, Daemon, GeneralCommandCatalog, RuntimeFactory,
+    Scheduler, SchedulerConfig,
+};
 
 struct Config {
     database: PathBuf,

@@ -1024,8 +1024,6 @@ fn validate_public_command_ids(command_ids: &[String], field: &str) -> Result<()
     Ok(())
 }
 
-
-
 fn project_response(value: ResponseOutcomeView, attempt_sequence: u64) -> AgentRespondOutput {
     let requested_decision = if value.requested_decision == "allow" {
         PublicDecision::Allow
@@ -1443,7 +1441,6 @@ impl SubagentMcp {
             _ => Err(protocol_error()),
         }
     }
-
 }
 
 pub async fn serve_stdio_v2(

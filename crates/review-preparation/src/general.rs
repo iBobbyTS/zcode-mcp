@@ -1624,8 +1624,14 @@ fn validate_budget(v: &BudgetLimits) -> PreparationResult<()> {
     let cap = hard_budget_cap();
     let vals = [
         (v.absolute_wall_time_ms, cap.absolute_wall_time_ms),
-        (v.runtime_activity_idle_timeout_ms, cap.runtime_activity_idle_timeout_ms),
-        (v.model_stream_idle_timeout_ms, cap.model_stream_idle_timeout_ms),
+        (
+            v.runtime_activity_idle_timeout_ms,
+            cap.runtime_activity_idle_timeout_ms,
+        ),
+        (
+            v.model_stream_idle_timeout_ms,
+            cap.model_stream_idle_timeout_ms,
+        ),
         (v.tool_call_timeout_ms, cap.tool_call_timeout_ms),
         (v.input_wait_timeout_ms, cap.input_wait_timeout_ms),
         (v.max_turns, cap.max_turns),

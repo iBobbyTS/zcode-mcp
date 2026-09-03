@@ -15,8 +15,8 @@ use std::{
 };
 use zcode_driver::{observe_process, observe_process_group};
 use zcode_reviewd::rpc::{
-    ReadinessResultView, RespondInput, ResponseDecision, RpcClient, RpcMethod,
-    RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
+    ReadinessResultView, RespondInput, ResponseDecision, RpcClient, RpcMethod, RpcOutcome,
+    RpcRequest, RpcSuccess, RPC_VERSION,
 };
 
 fn fake_runtime() -> PathBuf {
@@ -128,22 +128,22 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     let repository = create_repository(directory.path());
     let head = git_text(&repository, &["rev-parse", "HEAD"]);
     let manifest = GeneralTaskManifest {
-            schema: GENERAL_TASK_SCHEMA.into(),
-            task_id: "daemon-job".into(),
-            repository,
-            base_ref: head,
-            profile: GeneralProfile::AnalysisReadonly,
-            prompt: "permission input".into(),
-            repo_context: vec!["src/lib.rs".into()],
-            attachments: Vec::new(),
-            write_manifest: Vec::new(),
-            scratch_root: ".agent-work/scratch/daemon-job".into(),
-            artifact_root: ".agent-work/artifacts/daemon-job".into(),
-            budget: None,
-            validation_commands: Default::default(),
-            retain_partial: false,
-            idempotency_key: "daemon-key".into(),
-        };
+        schema: GENERAL_TASK_SCHEMA.into(),
+        task_id: "daemon-job".into(),
+        repository,
+        base_ref: head,
+        profile: GeneralProfile::AnalysisReadonly,
+        prompt: "permission input".into(),
+        repo_context: vec!["src/lib.rs".into()],
+        attachments: Vec::new(),
+        write_manifest: Vec::new(),
+        scratch_root: ".agent-work/scratch/daemon-job".into(),
+        artifact_root: ".agent-work/artifacts/daemon-job".into(),
+        budget: None,
+        validation_commands: Default::default(),
+        retain_partial: false,
+        idempotency_key: "daemon-key".into(),
+    };
     let prepared = GeneralTaskPreparer::new(Vec::new())
         .unwrap()
         .prepare_submission(&manifest)
@@ -157,7 +157,9 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     queued.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
     let budget = EffectiveBudget {
         absolute_wall_time_ms: prepared.effective_budget.absolute_wall_time_ms,
-        runtime_activity_idle_timeout_ms: prepared.effective_budget.runtime_activity_idle_timeout_ms,
+        runtime_activity_idle_timeout_ms: prepared
+            .effective_budget
+            .runtime_activity_idle_timeout_ms,
         model_stream_idle_timeout_ms: prepared.effective_budget.model_stream_idle_timeout_ms,
         tool_call_timeout_ms: prepared.effective_budget.tool_call_timeout_ms,
         input_wait_timeout_ms: prepared.effective_budget.input_wait_timeout_ms,
@@ -173,8 +175,6 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
             job: queued,
             public_agent_id: agent_id.clone(),
             task_kind: TaskKind::General,
-            review_id: None,
-            continuation_of: None,
             repository: prepared.repository.to_string_lossy().into_owned(),
             feature_id: "feature".into(),
             ownership_token: "daemon-process-test".into(),

@@ -5,13 +5,12 @@ use sha2::Digest;
 use std::{
     fmt,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, TryLockError},
+    sync::{Mutex, TryLockError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_REVIEW_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -19,19 +18,14 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS agents (
     agent_id TEXT PRIMARY KEY,
     idempotency_key TEXT UNIQUE,
-    parent_agent_id TEXT,
-    review_kind TEXT,
     feature_id TEXT,
-    section_id TEXT,
-    round_kind TEXT,
     state TEXT NOT NULL,
     workspace_path TEXT NOT NULL,
-    report_path TEXT,
     runtime_hash TEXT,
     prepared_launch_json TEXT,
     prepared_launch_sha256 TEXT,
     zcode_session_id TEXT,
-    initial_prompt TEXT NOT NULL DEFAULT 'Begin review.',
+    initial_prompt TEXT NOT NULL DEFAULT 'Begin task.',
     turn_state TEXT NOT NULL DEFAULT 'IDLE',
     pid INTEGER,
     process_group_id INTEGER,
@@ -139,127 +133,22 @@ CREATE TABLE IF NOT EXISTS lifecycle_ledger (
     recorded_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS ledger_entries (
-    entry_id TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    entry_type TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    checkpoint_number INTEGER,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS review_reports (
-    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
-    expected_path TEXT NOT NULL,
-    report_root TEXT NOT NULL,
-    current_revision INTEGER NOT NULL DEFAULT 0,
-    published_revision INTEGER,
-    sha256 TEXT,
-    bytes INTEGER,
-    finalized INTEGER NOT NULL DEFAULT 0,
-    final_signal TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS review_provenance (
-    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
-    manifest_sha256 TEXT NOT NULL,
-    prepared_sha256 TEXT NOT NULL,
-    base_sha TEXT NOT NULL,
-    head_sha TEXT NOT NULL,
-    runtime_sha256 TEXT,
-    zcode_session_id TEXT,
-    requested_model TEXT,
-    observed_model TEXT
-);
-
-CREATE TABLE IF NOT EXISTS review_checkpoints (
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    checkpoint_id TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_sha256 TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, checkpoint_id),
-    UNIQUE (agent_id, revision)
-);
-
-CREATE TABLE IF NOT EXISTS review_findings (
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    finding_id TEXT NOT NULL,
-    status TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_sha256 TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, finding_id)
-);
-
-CREATE TABLE IF NOT EXISTS review_finding_history (
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    finding_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_sha256 TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, finding_id, version),
-    UNIQUE (agent_id, revision)
-);
-
-CREATE TABLE IF NOT EXISTS review_validations (
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    validation_id TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_sha256 TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, validation_id),
-    UNIQUE (agent_id, revision)
-);
-
-CREATE TABLE IF NOT EXISTS review_finalizations (
-    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
-    signal TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_sha256 TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS review_report_events (
-    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-    revision INTEGER NOT NULL,
-    event_type TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, revision)
-);
-
 CREATE TABLE IF NOT EXISTS task_attempts (
     execution_agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
     public_agent_id TEXT NOT NULL,
     task_kind TEXT NOT NULL,
     phase TEXT NOT NULL DEFAULT 'QUEUED',
-    review_id TEXT,
-    review_kind TEXT,
-    continuation_of TEXT REFERENCES task_attempts(execution_agent_id),
     attempt_sequence INTEGER NOT NULL,
     repository TEXT NOT NULL,
     feature_id TEXT NOT NULL,
     ownership_token TEXT NOT NULL,
     semantic_fingerprint TEXT NOT NULL,
     effective_budget_json TEXT NOT NULL,
-    independent_evidence INTEGER NOT NULL,
     retain_partial INTEGER NOT NULL DEFAULT 0,
     UNIQUE(public_agent_id, attempt_sequence)
 );
 CREATE TABLE IF NOT EXISTS task_identities (
     public_agent_id TEXT PRIMARY KEY,
-    review_id TEXT UNIQUE,
-    review_kind TEXT,
     repository TEXT NOT NULL,
     feature_id TEXT NOT NULL,
     ownership_token TEXT NOT NULL
@@ -284,20 +173,9 @@ CREATE TABLE IF NOT EXISTS task_results (
     completed_at INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS review_progress (
-    agent_id TEXT PRIMARY KEY REFERENCES agents(agent_id) ON DELETE CASCADE,
-    attempt_sequence INTEGER NOT NULL,
-    run_idempotency_key TEXT NOT NULL,
-    stage TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    counters_json TEXT,
-    updated_at INTEGER NOT NULL,
-    nudge_sent INTEGER NOT NULL DEFAULT 0
-);
-
 "#;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -441,8 +319,6 @@ pub struct NewTask {
     pub job: NewJob,
     pub public_agent_id: String,
     pub task_kind: TaskKind,
-    pub review_id: Option<String>,
-    pub continuation_of: Option<String>,
     pub repository: String,
     pub feature_id: String,
     pub ownership_token: String,
@@ -456,15 +332,11 @@ pub struct TaskRecord {
     pub public_agent_id: String,
     pub task_kind: TaskKind,
     pub phase: TaskPhase,
-    pub review_id: Option<String>,
-    pub review_kind: Option<String>,
-    pub continuation_of: Option<String>,
     pub attempt_sequence: u64,
     pub repository: String,
     pub feature_id: String,
     pub ownership_token: String,
     pub effective_budget: EffectiveBudget,
-    pub independent_evidence: bool,
     pub retain_partial: bool,
 }
 
@@ -649,13 +521,8 @@ impl JobState {
 pub struct NewJob {
     pub agent_id: String,
     pub idempotency_key: Option<String>,
-    pub parent_agent_id: Option<String>,
-    pub review_kind: Option<String>,
     pub feature_id: Option<String>,
-    pub section_id: Option<String>,
-    pub round_kind: Option<String>,
     pub workspace_path: String,
-    pub report_path: Option<String>,
     pub runtime_hash: Option<String>,
     pub prepared_launch_json: Option<String>,
     pub prepared_launch_sha256: Option<String>,
@@ -667,17 +534,12 @@ impl NewJob {
         Self {
             agent_id: agent_id.into(),
             idempotency_key: None,
-            parent_agent_id: None,
-            review_kind: None,
             feature_id: None,
-            section_id: None,
-            round_kind: None,
             workspace_path: workspace_path.into(),
-            report_path: None,
             runtime_hash: None,
             prepared_launch_json: None,
             prepared_launch_sha256: None,
-            initial_prompt: "Begin review.".into(),
+            initial_prompt: "Begin task.".into(),
         }
     }
 }
@@ -789,40 +651,6 @@ pub struct WaitSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewProgressWrite {
-    pub agent_id: String,
-    pub attempt_sequence: u64,
-    pub run_idempotency_key: String,
-    pub stage: String,
-    pub summary: String,
-    pub counters_json: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewProgressState {
-    pub agent_id: String,
-    pub attempt_sequence: u64,
-    pub run_idempotency_key: String,
-    pub stage: String,
-    pub summary: String,
-    pub counters_json: Option<String>,
-    pub updated_at: i64,
-    pub nudge_sent: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewProgressDisposition {
-    Applied,
-    Duplicate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewProgressMutation {
-    pub disposition: ReviewProgressDisposition,
-    pub state: ReviewProgressState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeadlineRead<T> {
     Ready(T),
     TimedOut,
@@ -847,87 +675,6 @@ pub struct StoredArtifact {
     pub sha256: String,
     pub bytes: u64,
     pub checkpoint_number: Option<u64>,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewInitialization {
-    pub agent_id: String,
-    pub expected_path: String,
-    pub report_root: String,
-    pub manifest_sha256: String,
-    pub prepared_sha256: String,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub runtime_sha256: Option<String>,
-    pub requested_model: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewMutationDisposition {
-    Applied,
-    Duplicate,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewMutationResult {
-    pub disposition: ReviewMutationDisposition,
-    pub revision: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewReportState {
-    pub agent_id: String,
-    pub expected_path: String,
-    pub report_root: String,
-    pub current_revision: u64,
-    pub published_revision: Option<u64>,
-    pub sha256: Option<String>,
-    pub bytes: Option<u64>,
-    pub finalized: bool,
-    pub final_signal: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewProvenanceRecord {
-    pub manifest_sha256: String,
-    pub prepared_sha256: String,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub runtime_sha256: Option<String>,
-    pub zcode_session_id: Option<String>,
-    pub requested_model: Option<String>,
-    pub observed_model: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewEntryRecord {
-    pub stable_id: String,
-    pub status: Option<String>,
-    pub payload_json: String,
-    pub revision: u64,
-    pub recorded_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewSnapshot {
-    pub report: ReviewReportState,
-    pub provenance: ReviewProvenanceRecord,
-    pub checkpoints: Vec<ReviewEntryRecord>,
-    pub findings: Vec<ReviewEntryRecord>,
-    pub validations: Vec<ReviewEntryRecord>,
-    pub finalization: Option<ReviewEntryRecord>,
-}
-
-pub type ReviewSnapshotProjector = fn(&ReviewSnapshot) -> Result<u64, String>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewReportEvent {
-    pub revision: u64,
-    pub event_type: String,
-    pub payload_json: String,
     pub created_at: i64,
 }
 
@@ -990,7 +737,6 @@ pub enum PendingResponseClaimDisposition {
 pub struct Store {
     connection: Mutex<Connection>,
     database_path: PathBuf,
-    review_snapshot_projector: OnceLock<ReviewSnapshotProjector>,
 }
 
 impl Store {
@@ -998,19 +744,14 @@ impl Store {
         let mut connection = Connection::open(path.as_ref())?;
         connection.busy_timeout(STORE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        migrate_to_v4(&mut connection)?;
+        initialize_schema(&mut connection)?;
         let database_path = std::fs::canonicalize(path.as_ref()).map_err(|error| {
             StoreError::InvalidState(format!("database path cannot be canonicalized: {error}"))
         })?;
         Ok(Self {
             connection: Mutex::new(connection),
             database_path,
-            review_snapshot_projector: OnceLock::new(),
         })
-    }
-
-    pub fn install_review_snapshot_projector(&self, projector: ReviewSnapshotProjector) {
-        let _ = self.review_snapshot_projector.set(projector);
     }
 
     pub fn database_path(&self) -> &Path {
@@ -1069,25 +810,18 @@ impl Store {
                 job.agent_id
             )));
         }
-        ensure_report_target_available(&transaction, job.report_path.as_deref(), &job.agent_id)?;
         let created_at = now_millis();
         transaction.execute(
             "INSERT INTO agents (
-                agent_id, idempotency_key, parent_agent_id, review_kind,
-                feature_id, section_id, round_kind, state, workspace_path,
-                report_path, runtime_hash, prepared_launch_json,
-                prepared_launch_sha256, initial_prompt, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'QUEUED', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                agent_id, idempotency_key, feature_id, state, workspace_path,
+                runtime_hash, prepared_launch_json, prepared_launch_sha256,
+                initial_prompt, created_at
+             ) VALUES (?1, ?2, ?3, 'QUEUED', ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 job.agent_id,
                 job.idempotency_key,
-                job.parent_agent_id,
-                job.review_kind,
                 job.feature_id,
-                job.section_id,
-                job.round_kind,
                 job.workspace_path,
-                job.report_path,
                 job.runtime_hash,
                 job.prepared_launch_json,
                 job.prepared_launch_sha256,
@@ -1160,17 +894,12 @@ impl Store {
                 task.job.agent_id
             )));
         }
-        ensure_report_target_available(
-            &transaction,
-            task.job.report_path.as_deref(),
-            &task.job.agent_id,
-        )?;
-        let (attempt_sequence, independent_evidence) = continuation_identity(&transaction, task)?;
+        let attempt_sequence = 1;
         bind_task_identity(&transaction, task)?;
         let created_at = now_millis();
         transaction.execute(
-            "INSERT INTO agents (agent_id,idempotency_key,parent_agent_id,review_kind,feature_id,section_id,round_kind,state,workspace_path,report_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,initial_prompt,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'QUEUED',?8,?9,?10,?11,?12,?13,?14)",
-            params![task.job.agent_id,task.job.idempotency_key,task.job.parent_agent_id,task.job.review_kind,task.job.feature_id,task.job.section_id,task.job.round_kind,task.job.workspace_path,task.job.report_path,task.job.runtime_hash,task.job.prepared_launch_json,task.job.prepared_launch_sha256,task.job.initial_prompt,created_at])?;
+            "INSERT INTO agents (agent_id,idempotency_key,feature_id,state,workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,initial_prompt,created_at) VALUES (?1,?2,?3,'QUEUED',?4,?5,?6,?7,?8,?9)",
+            params![task.job.agent_id,task.job.idempotency_key,task.job.feature_id,task.job.workspace_path,task.job.runtime_hash,task.job.prepared_launch_json,task.job.prepared_launch_sha256,task.job.initial_prompt,created_at])?;
         insert_ledger(
             &transaction,
             &task.job.agent_id,
@@ -1180,8 +909,8 @@ impl Store {
             None,
         )?;
         transaction.execute(
-            "INSERT INTO task_attempts (execution_agent_id,public_agent_id,task_kind,phase,review_id,review_kind,continuation_of,attempt_sequence,repository,feature_id,ownership_token,semantic_fingerprint,effective_budget_json,independent_evidence,retain_partial) VALUES (?1,?2,?3,'QUEUED',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            params![task.job.agent_id,task.public_agent_id,task.task_kind.as_str(),task.review_id,task.job.review_kind,task.continuation_of,u64_to_i64(attempt_sequence)?,task.repository,task.feature_id,task.ownership_token,fingerprint,serde_json::to_string(&effective).map_err(|e| StoreError::InvalidState(e.to_string()))?,independent_evidence,task.retain_partial])?;
+            "INSERT INTO task_attempts (execution_agent_id,public_agent_id,task_kind,phase,attempt_sequence,repository,feature_id,ownership_token,semantic_fingerprint,effective_budget_json,retain_partial) VALUES (?1,?2,?3,'QUEUED',?4,?5,?6,?7,?8,?9,?10)",
+            params![task.job.agent_id,task.public_agent_id,task.task_kind.as_str(),u64_to_i64(attempt_sequence)?,task.repository,task.feature_id,task.ownership_token,fingerprint,serde_json::to_string(&effective).map_err(|e| StoreError::InvalidState(e.to_string()))?,task.retain_partial])?;
         let job = query_job(&transaction, &task.job.agent_id)?.unwrap();
         let record = query_task_record(&transaction, &task.job.agent_id)?.unwrap();
         transaction.commit()?;
@@ -1256,26 +985,6 @@ impl Store {
     ) -> StoreResult<Option<TaskRecord>> {
         let connection = self.connection.lock().unwrap();
         query_task_record(&connection, execution_agent_id)
-    }
-
-    pub fn get_review_scoped(
-        &self,
-        review_id: &str,
-        scope: TaskQueryScope<'_>,
-    ) -> StoreResult<Option<TaskRecord>> {
-        validate_scope(&scope)?;
-        let connection = self.connection.lock().unwrap();
-        let public_id = connection
-            .query_row(
-                "SELECT public_agent_id FROM task_identities WHERE review_id=?1",
-                [review_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        public_id
-            .map(|id| query_latest_task_scoped(&connection, &id, scope))
-            .transpose()
-            .map(Option::flatten)
     }
 
     pub fn list_tasks_scoped(
@@ -1403,6 +1112,20 @@ impl Store {
             return Err(StoreError::Conflict(
                 "cancellation or close intent wins over late completion".into(),
             ));
+        }
+        if result.outcome == TaskOutcome::Succeeded {
+            let (pending, queued): (bool, bool) = transaction.query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM pending_requests WHERE agent_id=?1 AND state IN ('PENDING','SENDING')),
+                    EXISTS(SELECT 1 FROM messages WHERE agent_id=?1 AND state IN ('QUEUED','SENDING'))",
+                [execution_agent_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+            )?;
+            if pending || queued {
+                return Err(StoreError::Conflict(
+                    "natural completion is blocked by pending input or queued messages".into(),
+                ));
+            }
         }
         if canonical.len() as u64 > task.effective_budget.max_result_bytes {
             return Err(StoreError::InvalidState(
@@ -1850,291 +1573,6 @@ impl Store {
         }
         transaction.commit()?;
         Ok(changed == 1)
-    }
-
-    /// Starts the semantic-progress clock for a running review attempt. This
-    /// is intentionally separate from lifecycle heartbeats: transport churn
-    /// must not reset the semantic no-progress deadline.
-    pub fn initialize_review_progress(
-        &self,
-        agent_id: &str,
-        attempt_sequence: u64,
-        run_idempotency_key: &str,
-    ) -> StoreResult<ReviewProgressState> {
-        if attempt_sequence == 0 {
-            return Err(StoreError::InvalidState(
-                "review attempt sequence must be positive".into(),
-            ));
-        }
-        let connection = self.connection.lock().unwrap();
-        let now = now_millis();
-        connection.execute(
-            "INSERT INTO review_progress
-            (agent_id, attempt_sequence, run_idempotency_key, stage, summary, updated_at)
-             VALUES (?1, ?2, ?3, 'scope', 'review started', ?4)
-             ON CONFLICT(agent_id) DO UPDATE SET
-                 attempt_sequence = excluded.attempt_sequence,
-                 run_idempotency_key = excluded.run_idempotency_key,
-                 stage = excluded.stage,
-                 summary = excluded.summary,
-                 counters_json = NULL,
-                 updated_at = excluded.updated_at,
-                 nudge_sent = 0",
-            params![
-                agent_id,
-                u64_to_i64(attempt_sequence)?,
-                run_idempotency_key,
-                now
-            ],
-        )?;
-        query_review_progress(&connection, agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("review progress was not initialized".into()))
-    }
-
-    pub fn record_review_progress(
-        &self,
-        write: &ReviewProgressWrite,
-    ) -> StoreResult<ReviewProgressMutation> {
-        if write.agent_id.is_empty()
-            || write.run_idempotency_key.is_empty()
-            || write.stage.is_empty()
-            || write.summary.is_empty()
-            || write.attempt_sequence == 0
-        {
-            return Err(StoreError::InvalidState(
-                "review progress identity and bounded fields are required".into(),
-            ));
-        }
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (expected_attempt, task_kind): (i64, String) = transaction
-            .query_row(
-                "SELECT attempt_sequence, task_kind FROM task_attempts WHERE execution_agent_id=?1",
-                [&write.agent_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::InvalidState("unknown review task".into()))?;
-        if expected_attempt != u64_to_i64(write.attempt_sequence)? {
-            return Err(StoreError::Conflict(
-                "review progress attempt does not match the active execution".into(),
-            ));
-        }
-        if !matches!(task_kind.as_str(), "REVIEW" | "REVIEW_CONTINUATION") {
-            return Err(StoreError::Conflict(
-                "semantic progress is only available to review attempts".into(),
-            ));
-        }
-        let existing = query_review_progress(&transaction, &write.agent_id)?;
-        let now = now_millis();
-        if let Some(existing) = existing {
-            if existing.attempt_sequence != write.attempt_sequence {
-                return Err(StoreError::Conflict(
-                    "review progress belongs to a different attempt".into(),
-                ));
-            }
-            if existing.run_idempotency_key != write.run_idempotency_key {
-                return Err(StoreError::Conflict(
-                    "review progress run idempotency key changed".into(),
-                ));
-            }
-            let same_semantics = existing.stage == write.stage
-                && existing.summary == write.summary
-                && existing.counters_json == write.counters_json;
-            if same_semantics && existing.run_idempotency_key == write.run_idempotency_key {
-                transaction.commit()?;
-                return Ok(ReviewProgressMutation {
-                    disposition: ReviewProgressDisposition::Duplicate,
-                    state: existing,
-                });
-            }
-            let old_rank = progress_stage_rank(&existing.stage)?;
-            let new_rank = progress_stage_rank(&write.stage)?;
-            if new_rank < old_rank {
-                return Err(StoreError::Conflict(
-                    "review progress stage regressed".into(),
-                ));
-            }
-            if new_rank == old_rank {
-                transaction.commit()?;
-                return Ok(ReviewProgressMutation {
-                    disposition: ReviewProgressDisposition::Duplicate,
-                    state: existing,
-                });
-            }
-        }
-        transaction.execute(
-            "INSERT INTO review_progress
-             (agent_id, attempt_sequence, run_idempotency_key, stage, summary, counters_json, updated_at, nudge_sent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
-             ON CONFLICT(agent_id) DO UPDATE SET
-                 attempt_sequence = excluded.attempt_sequence,
-                 run_idempotency_key = excluded.run_idempotency_key,
-                 stage = excluded.stage,
-                 summary = excluded.summary,
-                 counters_json = excluded.counters_json,
-                 updated_at = excluded.updated_at",
-            params![
-                write.agent_id,
-                u64_to_i64(write.attempt_sequence)?,
-                write.run_idempotency_key,
-                write.stage,
-                write.summary,
-                write.counters_json,
-                now,
-            ],
-        )?;
-        let state = query_review_progress(&transaction, &write.agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("review progress disappeared".into()))?;
-        transaction.commit()?;
-        Ok(ReviewProgressMutation {
-            disposition: ReviewProgressDisposition::Applied,
-            state,
-        })
-    }
-
-    /// Applies a semantic advancement and its high-level event as one SQLite
-    /// transaction. Duplicate/cosmetic updates return without changing either
-    /// the semantic clock or event cursor.
-    pub fn record_review_progress_event(
-        &self,
-        write: &ReviewProgressWrite,
-        runtime_agent_id: &str,
-        owner_epoch: u64,
-        source_sequence: u64,
-    ) -> StoreResult<ReviewProgressMutation> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, epoch, _, _) = query_guard(&transaction, &write.agent_id)?;
-        if state.is_terminal() || state != JobState::Running || epoch != owner_epoch {
-            return Err(StoreError::Conflict(
-                "review progress arrived outside the active execution".into(),
-            ));
-        }
-        let (expected_attempt, task_kind): (i64, String) = transaction.query_row(
-            "SELECT attempt_sequence, task_kind FROM task_attempts WHERE execution_agent_id=?1",
-            [&write.agent_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if expected_attempt != u64_to_i64(write.attempt_sequence)?
-            || !matches!(task_kind.as_str(), "REVIEW" | "REVIEW_CONTINUATION")
-        {
-            return Err(StoreError::Conflict(
-                "review progress identity mismatch".into(),
-            ));
-        }
-        let existing = query_review_progress(&transaction, &write.agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("review progress is not initialized".into()))?;
-        if existing.run_idempotency_key != write.run_idempotency_key {
-            return Err(StoreError::Conflict(
-                "review progress run identity mismatch".into(),
-            ));
-        }
-        let old_rank = progress_stage_rank(&existing.stage)?;
-        let new_rank = progress_stage_rank(&write.stage)?;
-        if new_rank < old_rank {
-            return Err(StoreError::Conflict(
-                "review progress stage regressed".into(),
-            ));
-        }
-        if new_rank == old_rank {
-            transaction.commit()?;
-            return Ok(ReviewProgressMutation {
-                disposition: ReviewProgressDisposition::Duplicate,
-                state: existing,
-            });
-        }
-        let now = now_millis();
-        transaction.execute(
-            "UPDATE review_progress SET stage=?1, summary=?2, counters_json=?3,
-                    updated_at=?4 WHERE agent_id=?5",
-            params![
-                write.stage,
-                write.summary,
-                write.counters_json,
-                now,
-                write.agent_id
-            ],
-        )?;
-        let last_seq: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(e.seq),0) FROM events e JOIN task_attempts t
-             ON t.execution_agent_id=e.agent_id WHERE t.public_agent_id=(SELECT public_agent_id
-             FROM task_attempts WHERE execution_agent_id=?1)",
-            [&write.agent_id],
-            |row| row.get(0),
-        )?;
-        let sequence = last_seq
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidState("event sequence overflow".into()))?;
-        let payload_json = serde_json::json!({
-            "stage": write.stage,
-            "summary": write.summary,
-            "counters": write.counters_json.as_deref().and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()),
-            "attempt_sequence": write.attempt_sequence,
-            "updated_at": now,
-        })
-        .to_string();
-        transaction.execute(
-            "INSERT INTO events (agent_id,runtime_agent_id,seq,source_seq,timestamp,event_type,
-                 turn_id,payload_json,redaction_level,attempt_sequence)
-             VALUES (?1,?2,?3,?4,?5,'review.progress',NULL,?6,'allowlisted',?7)",
-            params![
-                write.agent_id,
-                runtime_agent_id,
-                sequence,
-                u64_to_i64(source_sequence)?,
-                now,
-                payload_json,
-                expected_attempt
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO agent_cursors (agent_id,runtime_agent_id,last_seq) VALUES (?1,?2,?3)
-             ON CONFLICT(agent_id,runtime_agent_id) DO UPDATE SET last_seq=excluded.last_seq",
-            params![write.agent_id, runtime_agent_id, sequence],
-        )?;
-        transaction.execute(
-            "UPDATE agents SET last_event_seq=MAX(last_event_seq,?1) WHERE agent_id=?2",
-            params![sequence, write.agent_id],
-        )?;
-        let updated = query_review_progress(&transaction, &write.agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("review progress disappeared".into()))?;
-        transaction.commit()?;
-        Ok(ReviewProgressMutation {
-            disposition: ReviewProgressDisposition::Applied,
-            state: updated,
-        })
-    }
-
-    pub fn review_progress(&self, agent_id: &str) -> StoreResult<Option<ReviewProgressState>> {
-        let connection = self.connection.lock().unwrap();
-        query_review_progress(&connection, agent_id)
-    }
-
-    #[cfg(test)]
-    pub fn set_review_progress_updated_at_for_test(
-        &self,
-        agent_id: &str,
-        updated_at: i64,
-    ) -> StoreResult<()> {
-        let connection = self.connection.lock().unwrap();
-        connection.execute(
-            "UPDATE review_progress SET updated_at=?1 WHERE agent_id=?2",
-            params![updated_at, agent_id],
-        )?;
-        Ok(())
-    }
-
-    /// Atomically claims the one allowed stale-progress nudge.
-    pub fn claim_review_progress_nudge(&self, agent_id: &str) -> StoreResult<bool> {
-        let connection = self.connection.lock().unwrap();
-        Ok(connection.execute(
-            "UPDATE review_progress SET nudge_sent=1
-             WHERE agent_id=?1 AND nudge_sent=0
-               AND EXISTS (SELECT 1 FROM agents WHERE agent_id=?1
-                           AND state IN ('STARTING','RUNNING','STOPPING'))",
-            [agent_id],
-        )? == 1)
     }
 
     pub fn append_lifecycle(&self, write: &LifecycleWrite) -> StoreResult<u64> {
@@ -2681,6 +2119,19 @@ impl Store {
         self.pending_requests_bounded(agent_id, i64::MAX as usize)
     }
 
+    pub fn completion_blockers(&self, agent_id: &str) -> StoreResult<(bool, bool)> {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM pending_requests WHERE agent_id=?1 AND state IN ('PENDING','SENDING')),
+                    EXISTS(SELECT 1 FROM messages WHERE agent_id=?1 AND state IN ('QUEUED','SENDING'))",
+                [agent_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+            )
+            .map_err(StoreError::from)
+    }
+
     pub fn pending_requests_bounded(
         &self,
         agent_id: &str,
@@ -2870,608 +2321,6 @@ impl Store {
         Ok(changed == 1)
     }
 
-    pub fn insert_ledger_entry(
-        &self,
-        entry_id: &str,
-        agent_id: &str,
-        entry_type: &str,
-        payload_json: &str,
-        checkpoint_number: Option<u64>,
-    ) -> StoreResult<bool> {
-        let connection = self.connection.lock().unwrap();
-        let changed = connection.execute(
-            "INSERT OR IGNORE INTO ledger_entries
-             (entry_id, agent_id, entry_type, payload_json, checkpoint_number, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                entry_id,
-                agent_id,
-                entry_type,
-                payload_json,
-                checkpoint_number.map(u64_to_i64).transpose()?,
-                now_millis(),
-            ],
-        )?;
-        Ok(changed == 1)
-    }
-
-    pub fn initialize_review(
-        &self,
-        initialization: &ReviewInitialization,
-    ) -> StoreResult<ReviewReportState> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = now_millis();
-        transaction.execute(
-            "INSERT OR IGNORE INTO review_reports (
-                agent_id, expected_path, report_root, current_revision,
-                finalized, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, 0, 0, ?4, ?4)",
-            params![
-                initialization.agent_id,
-                initialization.expected_path,
-                initialization.report_root,
-                now
-            ],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO review_provenance (
-                agent_id, manifest_sha256, prepared_sha256, base_sha, head_sha,
-                runtime_sha256, requested_model
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                initialization.agent_id,
-                initialization.manifest_sha256,
-                initialization.prepared_sha256,
-                initialization.base_sha,
-                initialization.head_sha,
-                initialization.runtime_sha256,
-                initialization.requested_model,
-            ],
-        )?;
-        let stored = query_review_initialization(&transaction, &initialization.agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("initialized review is missing".into()))?;
-        if stored.report.expected_path != initialization.expected_path
-            || stored.report.report_root != initialization.report_root
-            || stored.manifest_sha256 != initialization.manifest_sha256
-            || stored.prepared_sha256 != initialization.prepared_sha256
-            || stored.base_sha != initialization.base_sha
-            || stored.head_sha != initialization.head_sha
-            || stored.requested_model != initialization.requested_model
-        {
-            return Err(StoreError::Conflict(format!(
-                "job {} already owns different review provenance",
-                initialization.agent_id
-            )));
-        }
-        self.validate_projected_review(&transaction, &initialization.agent_id)?;
-        transaction.commit()?;
-        Ok(stored.report_state())
-    }
-
-    pub fn review_report_state(&self, agent_id: &str) -> StoreResult<Option<ReviewReportState>> {
-        let connection = self.connection.lock().unwrap();
-        query_review_report_state(&connection, agent_id)
-    }
-
-    pub fn review_report_agent_ids(&self) -> StoreResult<Vec<String>> {
-        let connection = self.connection.lock().unwrap();
-        let mut statement = connection
-            .prepare("SELECT agent_id FROM review_reports ORDER BY created_at, agent_id")?;
-        let agent_ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(agent_ids)
-    }
-
-    pub fn validate_review_report_ownership(&self) -> StoreResult<()> {
-        let connection = self.connection.lock().unwrap();
-        let mismatch = connection
-            .query_row(
-                "SELECT r.agent_id, a.report_path, r.expected_path
-                 FROM review_reports r
-                 LEFT JOIN agents a ON a.agent_id = r.agent_id
-                 WHERE a.agent_id IS NULL
-                    OR a.report_path IS NULL
-                    OR a.report_path <> r.expected_path
-                 ORDER BY r.created_at, r.agent_id
-                 LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((agent_id, report_path, expected_path)) = mismatch {
-            return Err(StoreError::Conflict(format!(
-                "persisted review {agent_id} has inconsistent report ownership: agent={report_path:?}, ledger={expected_path:?}"
-            )));
-        }
-
-        let duplicate_target = connection
-            .query_row(
-                "WITH report_owners(agent_id, target) AS (
-                    SELECT agent_id, report_path FROM agents WHERE report_path IS NOT NULL
-                    UNION
-                    SELECT agent_id, expected_path FROM review_reports
-                 )
-                 SELECT target
-                 FROM report_owners
-                 GROUP BY target
-                 HAVING COUNT(*) > 1
-                 ORDER BY target
-                 LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(target) = duplicate_target {
-            return Err(StoreError::Conflict(format!(
-                "persisted review report target has multiple owners: {target}"
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn record_review_runtime(
-        &self,
-        agent_id: &str,
-        runtime_sha256: Option<&str>,
-        zcode_session_id: &str,
-        observed_model: Option<&str>,
-    ) -> StoreResult<ReviewMutationResult> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_review_mutable(&transaction, agent_id)?;
-        let current = transaction
-            .query_row(
-                "SELECT runtime_sha256, zcode_session_id, observed_model
-                 FROM review_provenance WHERE agent_id = ?1",
-                [agent_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
-        let desired_runtime = runtime_sha256.map(str::to_owned).or(current.0.clone());
-        let desired_session = Some(zcode_session_id.to_owned());
-        let desired_model = observed_model.map(str::to_owned).or(current.2.clone());
-        if current
-            == (
-                desired_runtime.clone(),
-                desired_session.clone(),
-                desired_model.clone(),
-            )
-        {
-            let revision = review_current_revision(&transaction, agent_id)?;
-            transaction.commit()?;
-            return Ok(ReviewMutationResult {
-                disposition: ReviewMutationDisposition::Duplicate,
-                revision,
-            });
-        }
-        transaction.execute(
-            "UPDATE review_provenance SET runtime_sha256 = ?1,
-                 zcode_session_id = ?2, observed_model = ?3 WHERE agent_id = ?4",
-            params![desired_runtime, desired_session, desired_model, agent_id],
-        )?;
-        let revision = advance_review_revision(&transaction, agent_id)?;
-        self.validate_projected_review(&transaction, agent_id)?;
-        transaction.commit()?;
-        Ok(ReviewMutationResult {
-            disposition: ReviewMutationDisposition::Applied,
-            revision,
-        })
-    }
-
-    pub fn apply_review_checkpoint(
-        &self,
-        agent_id: &str,
-        checkpoint_id: &str,
-        payload_json: &str,
-        payload_sha256: &str,
-    ) -> StoreResult<ReviewMutationResult> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_review_mutable(&transaction, agent_id)?;
-        if let Some(existing) = query_review_entry_hash(
-            &transaction,
-            "review_checkpoints",
-            "checkpoint_id",
-            agent_id,
-            checkpoint_id,
-        )? {
-            if existing != payload_sha256 {
-                return Err(StoreError::Conflict(format!(
-                    "checkpoint {checkpoint_id} already has different content"
-                )));
-            }
-            let revision = review_current_revision(&transaction, agent_id)?;
-            transaction.commit()?;
-            return Ok(ReviewMutationResult {
-                disposition: ReviewMutationDisposition::Duplicate,
-                revision,
-            });
-        }
-        let revision = advance_review_revision(&transaction, agent_id)?;
-        transaction.execute(
-            "INSERT INTO review_checkpoints (
-                agent_id, checkpoint_id, payload_json, payload_sha256, revision, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                agent_id,
-                checkpoint_id,
-                payload_json,
-                payload_sha256,
-                u64_to_i64(revision)?,
-                now_millis()
-            ],
-        )?;
-        self.validate_projected_review(&transaction, agent_id)?;
-        transaction.commit()?;
-        Ok(ReviewMutationResult {
-            disposition: ReviewMutationDisposition::Applied,
-            revision,
-        })
-    }
-
-    pub fn upsert_review_finding(
-        &self,
-        agent_id: &str,
-        finding_id: &str,
-        status: &str,
-        payload_json: &str,
-        payload_sha256: &str,
-    ) -> StoreResult<ReviewMutationResult> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_review_mutable(&transaction, agent_id)?;
-        let existing = transaction
-            .query_row(
-                "SELECT payload_sha256 FROM review_findings
-                 WHERE agent_id = ?1 AND finding_id = ?2",
-                params![agent_id, finding_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if existing.as_deref() == Some(payload_sha256) {
-            let revision = review_current_revision(&transaction, agent_id)?;
-            transaction.commit()?;
-            return Ok(ReviewMutationResult {
-                disposition: ReviewMutationDisposition::Duplicate,
-                revision,
-            });
-        }
-        let version: i64 = transaction.query_row(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM review_finding_history
-             WHERE agent_id = ?1 AND finding_id = ?2",
-            params![agent_id, finding_id],
-            |row| row.get(0),
-        )?;
-        let revision = advance_review_revision(&transaction, agent_id)?;
-        let now = now_millis();
-        transaction.execute(
-            "INSERT INTO review_finding_history (
-                agent_id, finding_id, version, status, payload_json,
-                payload_sha256, revision, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                agent_id,
-                finding_id,
-                version,
-                status,
-                payload_json,
-                payload_sha256,
-                u64_to_i64(revision)?,
-                now
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO review_findings (
-                agent_id, finding_id, status, payload_json, payload_sha256,
-                revision, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(agent_id, finding_id) DO UPDATE SET
-                status = excluded.status,
-                payload_json = excluded.payload_json,
-                payload_sha256 = excluded.payload_sha256,
-                revision = excluded.revision,
-                updated_at = excluded.updated_at",
-            params![
-                agent_id,
-                finding_id,
-                status,
-                payload_json,
-                payload_sha256,
-                u64_to_i64(revision)?,
-                now
-            ],
-        )?;
-        self.validate_projected_review(&transaction, agent_id)?;
-        transaction.commit()?;
-        Ok(ReviewMutationResult {
-            disposition: ReviewMutationDisposition::Applied,
-            revision,
-        })
-    }
-
-    pub fn apply_review_validation(
-        &self,
-        agent_id: &str,
-        validation_id: &str,
-        payload_json: &str,
-        payload_sha256: &str,
-    ) -> StoreResult<ReviewMutationResult> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_review_mutable(&transaction, agent_id)?;
-        if let Some(existing) = query_review_entry_hash(
-            &transaction,
-            "review_validations",
-            "validation_id",
-            agent_id,
-            validation_id,
-        )? {
-            if existing != payload_sha256 {
-                return Err(StoreError::Conflict(format!(
-                    "validation {validation_id} already has different content"
-                )));
-            }
-            let revision = review_current_revision(&transaction, agent_id)?;
-            transaction.commit()?;
-            return Ok(ReviewMutationResult {
-                disposition: ReviewMutationDisposition::Duplicate,
-                revision,
-            });
-        }
-        let revision = advance_review_revision(&transaction, agent_id)?;
-        transaction.execute(
-            "INSERT INTO review_validations (
-                agent_id, validation_id, payload_json, payload_sha256, revision, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                agent_id,
-                validation_id,
-                payload_json,
-                payload_sha256,
-                u64_to_i64(revision)?,
-                now_millis()
-            ],
-        )?;
-        self.validate_projected_review(&transaction, agent_id)?;
-        transaction.commit()?;
-        Ok(ReviewMutationResult {
-            disposition: ReviewMutationDisposition::Applied,
-            revision,
-        })
-    }
-
-    pub fn finalize_review(
-        &self,
-        agent_id: &str,
-        signal: &str,
-        payload_json: &str,
-        payload_sha256: &str,
-    ) -> StoreResult<ReviewMutationResult> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = transaction
-            .query_row(
-                "SELECT signal, payload_sha256, revision FROM review_finalizations
-                 WHERE agent_id = ?1",
-                [agent_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-        {
-            if existing.0 == signal && existing.1 == payload_sha256 {
-                transaction.commit()?;
-                return Ok(ReviewMutationResult {
-                    disposition: ReviewMutationDisposition::Duplicate,
-                    revision: i64_to_u64(existing.2)?,
-                });
-            }
-            return Err(StoreError::Conflict(format!(
-                "review {agent_id} is already finalized"
-            )));
-        }
-        ensure_review_mutable(&transaction, agent_id)?;
-        let revision = advance_review_revision(&transaction, agent_id)?;
-        transaction.execute(
-            "INSERT INTO review_finalizations (
-                agent_id, signal, payload_json, payload_sha256, revision, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                agent_id,
-                signal,
-                payload_json,
-                payload_sha256,
-                u64_to_i64(revision)?,
-                now_millis()
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE review_reports SET finalized = 1, final_signal = ?1,
-                 updated_at = ?2 WHERE agent_id = ?3",
-            params![signal, now_millis(), agent_id],
-        )?;
-        self.validate_projected_review(&transaction, agent_id)?;
-        transaction.commit()?;
-        Ok(ReviewMutationResult {
-            disposition: ReviewMutationDisposition::Applied,
-            revision,
-        })
-    }
-
-    pub fn review_snapshot(&self, agent_id: &str) -> StoreResult<Option<ReviewSnapshot>> {
-        let connection = self.connection.lock().unwrap();
-        query_review_snapshot(&connection, agent_id)
-    }
-
-    fn validate_projected_review(
-        &self,
-        connection: &Connection,
-        agent_id: &str,
-    ) -> StoreResult<()> {
-        let projector = self
-            .review_snapshot_projector
-            .get()
-            .copied()
-            .ok_or_else(|| {
-                StoreError::InvalidState("review snapshot projector is not installed".into())
-            })?;
-        let snapshot = query_review_snapshot(connection, agent_id)?
-            .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
-        let bytes = projector(&snapshot).map_err(StoreError::InvalidState)?;
-        if bytes > MAX_REVIEW_REPORT_BYTES {
-            return Err(StoreError::InvalidState(format!(
-                "projected review report exceeds {MAX_REVIEW_REPORT_BYTES} bytes"
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn review_finding_history(
-        &self,
-        agent_id: &str,
-        finding_id: &str,
-    ) -> StoreResult<Vec<ReviewEntryRecord>> {
-        let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare(
-            "SELECT version, status, payload_json, revision, created_at
-             FROM review_finding_history
-             WHERE agent_id = ?1 AND finding_id = ?2 ORDER BY version",
-        )?;
-        let history = statement
-            .query_map(params![agent_id, finding_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?
-            .map(|row| {
-                let (version, status, payload_json, revision, recorded_at) = row?;
-                Ok(ReviewEntryRecord {
-                    stable_id: format!("{finding_id}:v{}", i64_to_u64(version)?),
-                    status: Some(status),
-                    payload_json,
-                    revision: i64_to_u64(revision)?,
-                    recorded_at,
-                })
-            })
-            .collect();
-        history
-    }
-
-    pub fn publish_review_report(
-        &self,
-        agent_id: &str,
-        revision: u64,
-        sha256: &str,
-        bytes: u64,
-        event_payload_json: Option<&str>,
-    ) -> StoreResult<ReviewReportState> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = review_current_revision(&transaction, agent_id)?;
-        if current != revision {
-            return Err(StoreError::Conflict(format!(
-                "review {agent_id} advanced while report revision {revision} rendered"
-            )));
-        }
-        let now = now_millis();
-        transaction.execute(
-            "UPDATE review_reports SET published_revision = ?1, sha256 = ?2,
-                 bytes = ?3, updated_at = ?4 WHERE agent_id = ?5",
-            params![
-                u64_to_i64(revision)?,
-                sha256,
-                u64_to_i64(bytes)?,
-                now,
-                agent_id
-            ],
-        )?;
-        if let Some(event_payload_json) = event_payload_json {
-            transaction.execute(
-                "INSERT OR IGNORE INTO review_report_events (
-                    agent_id, revision, event_type, payload_json, created_at
-                 ) VALUES (?1, ?2, 'report.checkpoint', ?3, ?4)",
-                params![agent_id, u64_to_i64(revision)?, event_payload_json, now],
-            )?;
-        }
-        let report = query_review_report_state(&transaction, agent_id)?
-            .ok_or_else(|| StoreError::InvalidState("published review is missing".into()))?;
-        transaction.execute(
-            "INSERT INTO artifacts (
-                artifact_id, agent_id, artifact_type, path, sha256, bytes,
-                checkpoint_number, created_at
-             ) VALUES (?1, ?2, 'review_report', ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(artifact_id) DO UPDATE SET
-                path = excluded.path,
-                sha256 = excluded.sha256,
-                bytes = excluded.bytes,
-                checkpoint_number = excluded.checkpoint_number,
-                created_at = excluded.created_at",
-            params![
-                format!("review-report:{agent_id}"),
-                agent_id,
-                report.expected_path,
-                sha256,
-                u64_to_i64(bytes)?,
-                u64_to_i64(revision)?,
-                now
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(report)
-    }
-
-    pub fn review_report_events(&self, agent_id: &str) -> StoreResult<Vec<ReviewReportEvent>> {
-        let connection = self.connection.lock().unwrap();
-        let mut statement = connection.prepare(
-            "SELECT revision, event_type, payload_json, created_at
-             FROM review_report_events WHERE agent_id = ?1 ORDER BY revision",
-        )?;
-        let events = statement
-            .query_map([agent_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?
-            .map(|row| {
-                let (revision, event_type, payload_json, created_at) = row?;
-                Ok(ReviewReportEvent {
-                    revision: i64_to_u64(revision)?,
-                    event_type,
-                    payload_json,
-                    created_at,
-                })
-            })
-            .collect();
-        events
-    }
-
     pub fn record_compatibility_run(
         &self,
         runtime_hash: &str,
@@ -3583,13 +2432,6 @@ impl Store {
             .collect()
     }
 
-    pub fn ledger_entry_count(&self, agent_id: &str) -> StoreResult<u64> {
-        self.count_for(
-            "SELECT COUNT(*) FROM ledger_entries WHERE agent_id = ?1",
-            agent_id,
-        )
-    }
-
     pub fn compatibility_count(&self) -> StoreResult<u64> {
         let connection = self.connection.lock().unwrap();
         let count = connection.query_row("SELECT COUNT(*) FROM compatibility_runs", [], |row| {
@@ -3622,360 +2464,6 @@ impl Store {
     }
 }
 
-fn progress_stage_rank(stage: &str) -> StoreResult<u8> {
-    match stage {
-        "scope" => Ok(0),
-        "inspection" => Ok(1),
-        "validation" => Ok(2),
-        "synthesis" => Ok(3),
-        _ => Err(StoreError::InvalidState("unknown progress stage".into())),
-    }
-}
-
-struct StoredReviewInitialization {
-    report: ReviewReportState,
-    manifest_sha256: String,
-    prepared_sha256: String,
-    base_sha: String,
-    head_sha: String,
-    requested_model: Option<String>,
-}
-
-impl StoredReviewInitialization {
-    fn report_state(self) -> ReviewReportState {
-        self.report
-    }
-}
-
-fn query_review_snapshot(
-    connection: &Connection,
-    agent_id: &str,
-) -> StoreResult<Option<ReviewSnapshot>> {
-    let Some(report) = query_review_report_state(connection, agent_id)? else {
-        return Ok(None);
-    };
-    let provenance = query_review_provenance(connection, agent_id)?
-        .ok_or_else(|| StoreError::InvalidState("review provenance is missing".into()))?;
-    let checkpoints = query_review_entries(
-        connection,
-        "review_checkpoints",
-        "checkpoint_id",
-        false,
-        agent_id,
-    )?;
-    let findings =
-        query_review_entries(connection, "review_findings", "finding_id", true, agent_id)?;
-    let validations = query_review_entries(
-        connection,
-        "review_validations",
-        "validation_id",
-        false,
-        agent_id,
-    )?;
-    let finalization = connection
-        .query_row(
-            "SELECT signal, payload_json, revision, created_at
-             FROM review_finalizations WHERE agent_id = ?1",
-            [agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|(signal, payload_json, revision, recorded_at)| {
-            Ok::<ReviewEntryRecord, StoreError>(ReviewEntryRecord {
-                stable_id: "final".into(),
-                status: Some(signal),
-                payload_json,
-                revision: i64_to_u64(revision)?,
-                recorded_at,
-            })
-        })
-        .transpose()?;
-    Ok(Some(ReviewSnapshot {
-        report,
-        provenance,
-        checkpoints,
-        findings,
-        validations,
-        finalization,
-    }))
-}
-
-fn query_review_initialization(
-    connection: &Connection,
-    agent_id: &str,
-) -> StoreResult<Option<StoredReviewInitialization>> {
-    let row = connection
-        .query_row(
-            "SELECT r.expected_path, r.report_root, r.current_revision,
-                    r.published_revision, r.sha256, r.bytes, r.finalized,
-                    r.final_signal, r.created_at, r.updated_at,
-                    p.manifest_sha256, p.prepared_sha256, p.base_sha, p.head_sha,
-                    p.requested_model
-             FROM review_reports r
-             JOIN review_provenance p ON p.agent_id = r.agent_id
-             WHERE r.agent_id = ?1",
-            [agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, String>(11)?,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                ))
-            },
-        )
-        .optional()?;
-    row.map(
-        |(
-            expected_path,
-            report_root,
-            current_revision,
-            published_revision,
-            sha256,
-            bytes,
-            finalized,
-            final_signal,
-            created_at,
-            updated_at,
-            manifest_sha256,
-            prepared_sha256,
-            base_sha,
-            head_sha,
-            requested_model,
-        )| {
-            Ok(StoredReviewInitialization {
-                report: ReviewReportState {
-                    agent_id: agent_id.to_owned(),
-                    expected_path,
-                    report_root,
-                    current_revision: i64_to_u64(current_revision)?,
-                    published_revision: published_revision.map(i64_to_u64).transpose()?,
-                    sha256,
-                    bytes: bytes.map(i64_to_u64).transpose()?,
-                    finalized: finalized != 0,
-                    final_signal,
-                    created_at,
-                    updated_at,
-                },
-                manifest_sha256,
-                prepared_sha256,
-                base_sha,
-                head_sha,
-                requested_model,
-            })
-        },
-    )
-    .transpose()
-}
-
-fn query_review_report_state(
-    connection: &Connection,
-    agent_id: &str,
-) -> StoreResult<Option<ReviewReportState>> {
-    let row = connection
-        .query_row(
-            "SELECT expected_path, report_root, current_revision, published_revision,
-                    sha256, bytes, finalized, final_signal, created_at, updated_at
-             FROM review_reports WHERE agent_id = ?1",
-            [agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                ))
-            },
-        )
-        .optional()?;
-    row.map(
-        |(
-            expected_path,
-            report_root,
-            current_revision,
-            published_revision,
-            sha256,
-            bytes,
-            finalized,
-            final_signal,
-            created_at,
-            updated_at,
-        )| {
-            Ok(ReviewReportState {
-                agent_id: agent_id.to_owned(),
-                expected_path,
-                report_root,
-                current_revision: i64_to_u64(current_revision)?,
-                published_revision: published_revision.map(i64_to_u64).transpose()?,
-                sha256,
-                bytes: bytes.map(i64_to_u64).transpose()?,
-                finalized: finalized != 0,
-                final_signal,
-                created_at,
-                updated_at,
-            })
-        },
-    )
-    .transpose()
-}
-
-fn query_review_provenance(
-    connection: &Connection,
-    agent_id: &str,
-) -> StoreResult<Option<ReviewProvenanceRecord>> {
-    connection
-        .query_row(
-            "SELECT manifest_sha256, prepared_sha256, base_sha, head_sha,
-                    runtime_sha256, zcode_session_id, requested_model, observed_model
-             FROM review_provenance WHERE agent_id = ?1",
-            [agent_id],
-            |row| {
-                Ok(ReviewProvenanceRecord {
-                    manifest_sha256: row.get(0)?,
-                    prepared_sha256: row.get(1)?,
-                    base_sha: row.get(2)?,
-                    head_sha: row.get(3)?,
-                    runtime_sha256: row.get(4)?,
-                    zcode_session_id: row.get(5)?,
-                    requested_model: row.get(6)?,
-                    observed_model: row.get(7)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(StoreError::from)
-}
-
-fn query_review_entries(
-    connection: &Connection,
-    table: &str,
-    id_column: &str,
-    has_status: bool,
-    agent_id: &str,
-) -> StoreResult<Vec<ReviewEntryRecord>> {
-    let status = if has_status { "status" } else { "NULL" };
-    let timestamp = if table == "review_findings" {
-        "updated_at"
-    } else {
-        "created_at"
-    };
-    let sql = format!(
-        "SELECT {id_column}, {status}, payload_json, revision, {timestamp}
-         FROM {table} WHERE agent_id = ?1 ORDER BY revision, {id_column}"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let entries = statement
-        .query_map([agent_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?
-        .map(|row| {
-            let (stable_id, status, payload_json, revision, recorded_at) = row?;
-            Ok(ReviewEntryRecord {
-                stable_id,
-                status,
-                payload_json,
-                revision: i64_to_u64(revision)?,
-                recorded_at,
-            })
-        })
-        .collect();
-    entries
-}
-
-fn query_review_entry_hash(
-    connection: &Connection,
-    table: &str,
-    id_column: &str,
-    agent_id: &str,
-    stable_id: &str,
-) -> StoreResult<Option<String>> {
-    connection
-        .query_row(
-            &format!(
-                "SELECT payload_sha256 FROM {table}
-                 WHERE agent_id = ?1 AND {id_column} = ?2"
-            ),
-            params![agent_id, stable_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(StoreError::from)
-}
-
-fn review_current_revision(connection: &Connection, agent_id: &str) -> StoreResult<u64> {
-    let revision = connection
-        .query_row(
-            "SELECT current_revision FROM review_reports WHERE agent_id = ?1",
-            [agent_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
-    i64_to_u64(revision)
-}
-
-fn ensure_review_mutable(connection: &Connection, agent_id: &str) -> StoreResult<()> {
-    let finalized = connection
-        .query_row(
-            "SELECT finalized FROM review_reports WHERE agent_id = ?1",
-            [agent_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::InvalidState(format!("unknown review {agent_id}")))?;
-    if finalized != 0 {
-        return Err(StoreError::Conflict(format!(
-            "review {agent_id} is finalized"
-        )));
-    }
-    Ok(())
-}
-
-fn advance_review_revision(connection: &Connection, agent_id: &str) -> StoreResult<u64> {
-    let changed = connection.execute(
-        "UPDATE review_reports SET current_revision = current_revision + 1,
-             published_revision = NULL, sha256 = NULL, bytes = NULL, updated_at = ?1
-         WHERE agent_id = ?2",
-        params![now_millis(), agent_id],
-    )?;
-    if changed != 1 {
-        return Err(StoreError::InvalidState(format!(
-            "unknown review {agent_id}"
-        )));
-    }
-    review_current_revision(connection, agent_id)
-}
-
 fn validate_task(task: &NewTask) -> StoreResult<()> {
     if task.public_agent_id.is_empty()
         || task.repository.is_empty()
@@ -3991,23 +2479,12 @@ fn validate_task(task: &NewTask) -> StoreResult<()> {
         .feature_id
         .as_deref()
         .is_some_and(|value| value != task.feature_id)
-        || task
-            .job
-            .parent_agent_id
-            .as_deref()
-            .is_some_and(|value| Some(value) != task.continuation_of.as_deref())
     {
         return Err(StoreError::Conflict(
             "duplicated legacy/new task identity fields disagree".into(),
         ));
     }
-    if task.review_id.is_some() || task.job.review_kind.is_some() || task.continuation_of.is_some() {
-        Err(StoreError::InvalidState(
-            "generic task cannot carry retired review identity".into(),
-        ))
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn validate_prepared_launch(job: &NewJob) -> StoreResult<()> {
@@ -4024,22 +2501,31 @@ fn validate_prepared_launch(job: &NewJob) -> StoreResult<()> {
 }
 
 fn bind_task_identity(connection: &Connection, task: &NewTask) -> StoreResult<()> {
-    if let Some(owner) = connection
+    if let Some(existing) = connection
         .query_row(
-            "SELECT public_agent_id FROM task_identities WHERE review_id=?1",
-            [task.review_id.as_deref()],
-            |row| row.get::<_, String>(0),
+            "SELECT repository,feature_id,ownership_token FROM task_identities WHERE public_agent_id=?1",
+            [&task.public_agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
         )
         .optional()?
     {
-        if owner != task.public_agent_id {
+        if existing
+            != (
+                task.repository.clone(),
+                task.feature_id.clone(),
+                task.ownership_token.clone(),
+            )
+        {
             return Err(StoreError::Conflict(
-                "review_id is already bound to another public agent".into(),
+                "public agent identity is already bound to different semantics".into(),
             ));
         }
+        return Ok(());
     }
-    if let Some(existing)=connection.query_row("SELECT review_id,review_kind,repository,feature_id,ownership_token FROM task_identities WHERE public_agent_id=?1",[&task.public_agent_id],|row| Ok((row.get::<_,Option<String>>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?))).optional()? { if existing != (task.review_id.clone(),task.job.review_kind.clone(),task.repository.clone(),task.feature_id.clone(),task.ownership_token.clone()) { return Err(StoreError::Conflict("public agent identity is already bound to different semantics".into())); } return Ok(()); }
-    connection.execute("INSERT INTO task_identities (public_agent_id,review_id,review_kind,repository,feature_id,ownership_token) VALUES (?1,?2,?3,?4,?5,?6)",params![task.public_agent_id,task.review_id,task.job.review_kind,task.repository,task.feature_id,task.ownership_token])?;
+    connection.execute(
+        "INSERT INTO task_identities (public_agent_id,repository,feature_id,ownership_token) VALUES (?1,?2,?3,?4)",
+        params![task.public_agent_id, task.repository, task.feature_id, task.ownership_token],
+    )?;
     Ok(())
 }
 
@@ -4067,11 +2553,23 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
         BudgetRequest::Limits(value) => value.clone(),
     };
     let pairs = [
-        (value.absolute_wall_time_ms, MAX_BUDGET.absolute_wall_time_ms),
-        (value.runtime_activity_idle_timeout_ms, MAX_BUDGET.runtime_activity_idle_timeout_ms),
-        (value.model_stream_idle_timeout_ms, MAX_BUDGET.model_stream_idle_timeout_ms),
+        (
+            value.absolute_wall_time_ms,
+            MAX_BUDGET.absolute_wall_time_ms,
+        ),
+        (
+            value.runtime_activity_idle_timeout_ms,
+            MAX_BUDGET.runtime_activity_idle_timeout_ms,
+        ),
+        (
+            value.model_stream_idle_timeout_ms,
+            MAX_BUDGET.model_stream_idle_timeout_ms,
+        ),
         (value.tool_call_timeout_ms, MAX_BUDGET.tool_call_timeout_ms),
-        (value.input_wait_timeout_ms, MAX_BUDGET.input_wait_timeout_ms),
+        (
+            value.input_wait_timeout_ms,
+            MAX_BUDGET.input_wait_timeout_ms,
+        ),
         (value.max_turns, MAX_BUDGET.max_turns),
         (value.max_tool_calls, MAX_BUDGET.max_tool_calls),
         (value.max_context_bytes, MAX_BUDGET.max_context_bytes),
@@ -4094,9 +2592,6 @@ fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
             task.task_kind,
             &task.public_agent_id,
             &task.job.workspace_path,
-            &task.review_id,
-            &task.job.review_kind,
-            &task.continuation_of,
             &task.repository,
             &task.feature_id,
             &task.ownership_token,
@@ -4106,22 +2601,13 @@ fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
         (
             &task.job.prepared_launch_json,
             &task.job.prepared_launch_sha256,
-            &task.job.report_path,
             &task.job.runtime_hash,
-            &task.job.section_id,
-            &task.job.round_kind,
-            &task.job.parent_agent_id,
             &task.job.feature_id,
             task.retain_partial,
             task.job.idempotency_key.as_deref()
         )
     );
     format!("{:x}", Sha256::digest(canonical.as_bytes()))
-}
-
-fn continuation_identity(connection: &Connection, task: &NewTask) -> StoreResult<(u64, bool)> {
-    let _ = (connection, task);
-    Ok((1, false))
 }
 
 fn validate_result(result: &TaskResult) -> StoreResult<()> {
@@ -4137,46 +2623,7 @@ fn validate_result(result: &TaskResult) -> StoreResult<()> {
 }
 
 fn query_task_record(connection: &Connection, id: &str) -> StoreResult<Option<TaskRecord>> {
-    connection.query_row("SELECT execution_agent_id,public_agent_id,task_kind,phase,review_id,review_kind,continuation_of,attempt_sequence,repository,feature_id,ownership_token,effective_budget_json,independent_evidence,retain_partial FROM task_attempts WHERE execution_agent_id=?1",[id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,i64>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?,row.get::<_,String>(10)?,row.get::<_,String>(11)?,row.get::<_,i64>(12)?,row.get::<_,i64>(13)?))).optional()?.map(|r| Ok(TaskRecord { execution_agent_id:r.0,public_agent_id:r.1,task_kind:TaskKind::parse(&r.2)?,phase:TaskPhase::parse(&r.3)?,review_id:r.4,review_kind:r.5,continuation_of:r.6,attempt_sequence:i64_to_u64(r.7)?,repository:r.8,feature_id:r.9,ownership_token:r.10,effective_budget:serde_json::from_str(&r.11).map_err(|e| StoreError::InvalidState(format!("invalid effective budget: {e}")))?,independent_evidence:r.12 != 0,retain_partial:r.13 != 0 })).transpose()
-}
-
-fn query_review_progress(
-    connection: &Connection,
-    agent_id: &str,
-) -> StoreResult<Option<ReviewProgressState>> {
-    connection
-        .query_row(
-            "SELECT agent_id, attempt_sequence, run_idempotency_key, stage,
-                    summary, counters_json, updated_at, nudge_sent
-             FROM review_progress WHERE agent_id=?1",
-            [agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|row| {
-            Ok(ReviewProgressState {
-                agent_id: row.0,
-                attempt_sequence: i64_to_u64(row.1)?,
-                run_idempotency_key: row.2,
-                stage: row.3,
-                summary: row.4,
-                counters_json: row.5,
-                updated_at: row.6,
-                nudge_sent: row.7 != 0,
-            })
-        })
-        .transpose()
+    connection.query_row("SELECT execution_agent_id,public_agent_id,task_kind,phase,attempt_sequence,repository,feature_id,ownership_token,effective_budget_json,retain_partial FROM task_attempts WHERE execution_agent_id=?1",[id],|row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?,row.get::<_,String>(7)?,row.get::<_,String>(8)?,row.get::<_,i64>(9)?))).optional()?.map(|r| Ok(TaskRecord { execution_agent_id:r.0,public_agent_id:r.1,task_kind:TaskKind::parse(&r.2)?,phase:TaskPhase::parse(&r.3)?,attempt_sequence:i64_to_u64(r.4)?,repository:r.5,feature_id:r.6,ownership_token:r.7,effective_budget:serde_json::from_str(&r.8).map_err(|e| StoreError::InvalidState(format!("invalid effective budget: {e}")))?,retain_partial:r.9 != 0 })).transpose()
 }
 
 fn query_latest_task_scoped(
@@ -4191,81 +2638,18 @@ fn query_latest_task_scoped(
         .map(Option::flatten)
 }
 
-fn migrate_to_v4(connection: &mut Connection) -> StoreResult<()> {
+fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
+    if version != 0 && version != SCHEMA_VERSION {
         return Err(StoreError::InvalidState(format!(
-            "store schema version {version} is newer than supported {SCHEMA_VERSION}"
+            "store schema version {version} predates the generic control plane"
         )));
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(SCHEMA)?;
-    for (table, column, definition) in [
-        (
-            "agents",
-            "initial_prompt",
-            "initial_prompt TEXT NOT NULL DEFAULT 'Begin review.'",
-        ),
-        (
-            "events",
-            "attempt_sequence",
-            "attempt_sequence INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "task_attempts",
-            "retain_partial",
-            "retain_partial INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "agents",
-            "turn_state",
-            "turn_state TEXT NOT NULL DEFAULT 'IDLE'",
-        ),
-        (
-            "agents",
-            "stop_requested",
-            "stop_requested INTEGER NOT NULL DEFAULT 0",
-        ),
-        ("agents", "closed_at", "closed_at INTEGER"),
-        ("messages", "failure_code", "failure_code TEXT"),
-        ("messages", "failure_message", "failure_message TEXT"),
-        (
-            "pending_requests",
-            "response_decision",
-            "response_decision TEXT",
-        ),
-        (
-            "pending_requests",
-            "response_content",
-            "response_content TEXT",
-        ),
-        (
-            "agents",
-            "prepared_launch_json",
-            "prepared_launch_json TEXT",
-        ),
-        (
-            "agents",
-            "prepared_launch_sha256",
-            "prepared_launch_sha256 TEXT",
-        ),
-    ] {
-        if !table_has_column(&transaction, table, column)? {
-            transaction.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition}"))?;
-        }
-    }
-    transaction.execute("INSERT INTO task_identities (public_agent_id,review_id,review_kind,repository,feature_id,ownership_token) SELECT DISTINCT public_agent_id,review_id,review_kind,repository,feature_id,ownership_token FROM task_attempts WHERE 1 ON CONFLICT(public_agent_id) DO NOTHING",[])?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
-}
-
-fn table_has_column(connection: &Connection, table: &str, expected: &str) -> StoreResult<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(columns.iter().any(|column| column == expected))
 }
 
 fn query_message(connection: &Connection, message_id: &str) -> StoreResult<Option<StoredMessage>> {
@@ -4475,29 +2859,6 @@ fn query_submission_ownership_by_idempotency(
         })
     })
     .transpose()
-}
-
-fn ensure_report_target_available(
-    connection: &Connection,
-    report_path: Option<&str>,
-    execution_agent_id: &str,
-) -> StoreResult<()> {
-    let Some(report_path) = report_path else {
-        return Ok(());
-    };
-    let owner = connection
-        .query_row(
-            "SELECT agent_id FROM agents WHERE report_path=?1 AND agent_id<>?2 LIMIT 1",
-            params![report_path, execution_agent_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if owner.is_some() {
-        return Err(StoreError::Conflict(
-            "report target is owned by another execution".into(),
-        ));
-    }
-    Ok(())
 }
 
 type JobRow = (
@@ -4823,17 +3184,12 @@ mod tests {
             .enqueue_job(&NewJob {
                 agent_id: "different-id".into(),
                 idempotency_key: original.idempotency_key.clone(),
-                parent_agent_id: None,
-                review_kind: None,
                 feature_id: None,
-                section_id: None,
-                round_kind: None,
                 workspace_path: "/different".into(),
-                report_path: None,
                 runtime_hash: None,
                 prepared_launch_json: None,
                 prepared_launch_sha256: None,
-                initial_prompt: "Begin review.".into(),
+                initial_prompt: "Begin task.".into(),
             })
             .unwrap();
         assert_eq!(duplicate.agent_id, "job-1");
@@ -4874,12 +3230,6 @@ mod tests {
             })
             .unwrap());
         assert!(store
-            .insert_ledger_entry("ledger-1", "job-1", "checkpoint", "{}", Some(1))
-            .unwrap());
-        assert!(!store
-            .insert_ledger_entry("ledger-1", "job-1", "checkpoint", "{}", Some(1))
-            .unwrap());
-        assert!(store
             .record_compatibility_run("hash", "version", Some("node"), 7, "OK", "{}")
             .unwrap());
         let claimed = claim(&store, "job-1");
@@ -4903,7 +3253,6 @@ mod tests {
         assert_eq!(reopened.artifact_count("job-1").unwrap(), 1);
         assert_eq!(reopened.artifacts("job-1", 1).unwrap()[0].sha256, "abc");
         assert_eq!(reopened.list_jobs(10).unwrap()[0].agent_id, "job-1");
-        assert_eq!(reopened.ledger_entry_count("job-1").unwrap(), 1);
         assert_eq!(reopened.compatibility_count().unwrap(), 1);
     }
 
@@ -5359,217 +3708,6 @@ mod tests {
     }
 
     #[test]
-    fn accepted_v1_rows_events_and_artifacts_migrate_in_place() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("v1.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                r#"
-                PRAGMA user_version = 1;
-                PRAGMA foreign_keys = ON;
-                CREATE TABLE agents (
-                    agent_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE,
-                    parent_agent_id TEXT, review_kind TEXT, feature_id TEXT,
-                    section_id TEXT, round_kind TEXT, state TEXT NOT NULL,
-                    workspace_path TEXT NOT NULL, report_path TEXT, runtime_hash TEXT,
-                    zcode_session_id TEXT, pid INTEGER, process_group_id INTEGER,
-                    process_uid INTEGER, process_start_token TEXT, runtime_agent_id TEXT,
-                    owner_id TEXT, owner_epoch INTEGER NOT NULL DEFAULT 0,
-                    lease_expires_at INTEGER, close_requested INTEGER NOT NULL DEFAULT 0,
-                    created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
-                    last_heartbeat_at INTEGER, last_event_seq INTEGER NOT NULL DEFAULT 0,
-                    failure_code TEXT, failure_message TEXT, reaped_at INTEGER
-                );
-                CREATE TABLE events (
-                    agent_id TEXT NOT NULL, runtime_agent_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL, source_seq INTEGER NOT NULL,
-                    timestamp INTEGER NOT NULL, event_type TEXT NOT NULL,
-                    turn_id TEXT, payload_json TEXT NOT NULL, redaction_level TEXT NOT NULL,
-                    PRIMARY KEY (agent_id, runtime_agent_id, seq),
-                    UNIQUE (agent_id, runtime_agent_id, source_seq)
-                );
-                CREATE TABLE artifacts (
-                    artifact_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
-                    artifact_type TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
-                    bytes INTEGER NOT NULL, checkpoint_number INTEGER, created_at INTEGER NOT NULL
-                );
-                CREATE TABLE messages (
-                    message_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, mode TEXT NOT NULL,
-                    content TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL,
-                    delivered_at INTEGER, target_turn_id TEXT
-                );
-                CREATE TABLE pending_requests (
-                    request_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
-                    correlation_id TEXT NOT NULL, request_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL, state TEXT NOT NULL,
-                    created_at INTEGER NOT NULL, responded_at INTEGER,
-                    UNIQUE (agent_id, correlation_id)
-                );
-                INSERT INTO agents (
-                    agent_id, idempotency_key, state, workspace_path, runtime_agent_id,
-                    owner_epoch, created_at, completed_at, last_event_seq
-                ) VALUES ('v1-job', 'v1-key', 'COMPLETED', '/v1', 'v1-runtime', 3, 1, 2, 1);
-                INSERT INTO events VALUES (
-                    'v1-job', 'v1-runtime', 1, 1, 1, 'driver.event', NULL,
-                    '{"preserved":true}', 'allowlisted'
-                );
-                INSERT INTO artifacts VALUES (
-                    'v1-artifact', 'v1-job', 'report', '/v1/report.md', 'abc', 7, 1, 2
-                );
-                INSERT INTO messages VALUES (
-                    'v1-message', 'v1-job', 'queue', 'preserved message',
-                    'DELIVERED', 1, 2, 'v1-turn'
-                );
-                INSERT INTO pending_requests VALUES (
-                    'v1-request', 'v1-job', '"wire-1"', 'permission', '{}',
-                    'RESPONDED', 1, 2
-                );
-                "#,
-            )
-            .unwrap();
-        drop(connection);
-
-        let store = Store::open(&path).unwrap();
-        let job = store.get_job("v1-job").unwrap().unwrap();
-        assert_eq!(job.state, JobState::Completed);
-        assert_eq!(job.initial_prompt, "Begin review.");
-        assert_eq!(job.turn_state, TurnState::Idle);
-        assert_eq!(job.zcode_session_id, None);
-        assert_eq!(
-            store.events_after("v1-job", "v1-runtime", 0, 10).unwrap()[0].payload_json,
-            "{\"preserved\":true}"
-        );
-        assert_eq!(store.artifacts("v1-job", 10).unwrap()[0].bytes, 7);
-        assert_eq!(
-            store.message("v1-message").unwrap().unwrap().state,
-            MessageState::Delivered
-        );
-        assert_eq!(
-            store
-                .pending_request("v1-job", "v1-request")
-                .unwrap()
-                .unwrap()
-                .state,
-            PendingRequestState::Responded
-        );
-        let version: i64 = store
-            .connection
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-    }
-
-    fn seed_historical_common(connection: &Connection, prefix: &str) {
-        let agent = format!("{prefix}-job");
-        let runtime = format!("{prefix}-runtime");
-        connection.execute("INSERT INTO agents (agent_id,state,workspace_path,initial_prompt,turn_state,runtime_agent_id,created_at,last_event_seq) VALUES (?1,'COMPLETED',?2,'preserved','IDLE',?3,1,1)",params![agent,format!("/{prefix}"),runtime]).unwrap();
-        connection.execute("INSERT INTO events (agent_id,runtime_agent_id,seq,source_seq,timestamp,event_type,turn_id,payload_json,redaction_level) VALUES (?1,?2,1,7,1,'historical.event',NULL,?3,'allowlisted')",params![agent,runtime,format!("{{\"version\":\"{prefix}\"}}")]).unwrap();
-        connection.execute("INSERT INTO messages (message_id,agent_id,mode,content,state,created_at,delivered_at,target_turn_id,failure_code,failure_message) VALUES (?1,?2,'queue',?3,'DELIVERED',1,2,NULL,NULL,NULL)",params![format!("{prefix}-message"),agent,format!("{prefix} message")]).unwrap();
-        connection.execute("INSERT INTO pending_requests (request_id,agent_id,correlation_id,request_type,payload_json,state,created_at,responded_at,response_decision,response_content) VALUES (?1,?2,?3,'permission','{}','RESPONDED',1,2,'allow',NULL)",params![format!("{prefix}-request"),agent,format!("{prefix}-correlation")]).unwrap();
-        connection.execute("INSERT INTO artifacts (artifact_id,agent_id,artifact_type,path,sha256,bytes,checkpoint_number,created_at) VALUES (?1,?2,'report',?3,?4,9,1,2)",params![format!("{prefix}-artifact"),agent,format!("/{prefix}/report.md"),format!("{prefix}-hash")]).unwrap();
-    }
-
-    fn assert_historical_common(store: &Store, prefix: &str) {
-        let agent = format!("{prefix}-job");
-        let runtime = format!("{prefix}-runtime");
-        assert_eq!(
-            store.events_after(&agent, &runtime, 0, 10).unwrap()[0].payload_json,
-            format!("{{\"version\":\"{prefix}\"}}")
-        );
-        assert_eq!(
-            store
-                .message(&format!("{prefix}-message"))
-                .unwrap()
-                .unwrap()
-                .content,
-            format!("{prefix} message")
-        );
-        assert_eq!(
-            store
-                .pending_request(&agent, &format!("{prefix}-request"))
-                .unwrap()
-                .unwrap()
-                .response_decision
-                .as_deref(),
-            Some("allow")
-        );
-        assert_eq!(
-            store.artifacts(&agent, 10).unwrap()[0].sha256,
-            format!("{prefix}-hash")
-        );
-    }
-
-    #[test]
-    fn accepted_v3_job_rows_migrate_to_current_review_and_task_tables() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("v3.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(include_str!("../tests/fixtures/schema-v3.sql"))
-            .unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
-        seed_historical_common(&connection, "v3");
-        drop(connection);
-
-        let store = Store::open(&path).unwrap();
-        assert_eq!(
-            store.get_job("v3-job").unwrap().unwrap().initial_prompt,
-            "preserved"
-        );
-        assert_historical_common(&store, "v3");
-        assert!(store.review_report_state("v3-job").unwrap().is_none());
-        assert!(store.review_report_agent_ids().unwrap().is_empty());
-        let version: i64 = store
-            .connection
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn accepted_v4_rows_migrate_without_losing_review_data() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("v4.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(include_str!("../tests/fixtures/schema-v4.sql"))
-            .unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
-        seed_historical_common(&connection, "v4");
-        connection.execute_batch(r#"INSERT INTO review_reports (agent_id,expected_path,report_root,current_revision,published_revision,sha256,bytes,finalized,final_signal,created_at,updated_at) VALUES ('v4-job','report.md','/v4',4,4,'report-hash',10,1,'findings_present',1,2);
-          INSERT INTO review_provenance (agent_id,manifest_sha256,prepared_sha256,base_sha,head_sha,runtime_sha256,zcode_session_id,requested_model,observed_model) VALUES ('v4-job','manifest','prepared','base','head','runtime','session','requested','observed');
-          INSERT INTO review_checkpoints VALUES ('v4-job','checkpoint','{"v":1}','checkpoint-hash',1,1);
-          INSERT INTO review_findings VALUES ('v4-job','finding','open','{"v":2}','finding-hash',2,2);
-          INSERT INTO review_finding_history VALUES ('v4-job','finding',1,'open','{"v":2}','finding-hash',2,2);
-          INSERT INTO review_validations VALUES ('v4-job','validation','{"v":3}','validation-hash',3,3);
-          INSERT INTO review_finalizations VALUES ('v4-job','findings_present','{"v":4}','final-hash',4,4);
-          INSERT INTO review_report_events VALUES ('v4-job',4,'finalized','{"v":4}',4);"#).unwrap();
-        drop(connection);
-        let store = Store::open(path).unwrap();
-        assert_eq!(
-            store.get_job("v4-job").unwrap().unwrap().state,
-            JobState::Completed
-        );
-        assert!(store.review_report_state("v4-job").unwrap().is_some());
-        assert_historical_common(&store, "v4");
-        let snapshot = store.review_snapshot("v4-job").unwrap().unwrap();
-        assert_eq!(snapshot.provenance.manifest_sha256, "manifest");
-        assert_eq!(snapshot.checkpoints[0].payload_json, "{\"v\":1}");
-        assert_eq!(snapshot.findings[0].stable_id, "finding");
-        assert_eq!(snapshot.validations[0].stable_id, "validation");
-        assert_eq!(snapshot.finalization.unwrap().payload_json, "{\"v\":4}");
-        assert_eq!(
-            store.review_report_events("v4-job").unwrap()[0].event_type,
-            "finalized"
-        );
-    }
-
-    #[test]
     fn forward_unknown_schema_fails_before_creating_current_tables() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("future.sqlite3");
@@ -5591,6 +3729,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(agents, 0);
+    }
+
+    #[test]
+    fn pre_generic_schema_is_rejected_without_compatibility_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pre-generic.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 7).unwrap();
+        drop(connection);
+        assert!(matches!(
+            Store::open(path),
+            Err(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]
@@ -5857,78 +4008,12 @@ mod tests {
             job,
             public_agent_id: public.into(),
             task_kind: TaskKind::General,
-            review_id: None,
-            continuation_of: None,
             repository: "repo".into(),
             feature_id: "feature".into(),
             ownership_token: "owner".into(),
             budget: BudgetRequest::Omitted,
             retain_partial: false,
         }
-    }
-
-    #[test]
-    fn report_target_is_globally_reserved_inside_enqueue_transaction() {
-        let (_directory, path, store) = file_store();
-        drop(store);
-        let first = Store::open(&path).unwrap();
-        let second = Store::open(&path).unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let results = thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for (store, agent_id, key) in [
-                (&first, "report-owner-a", "report-key-a"),
-                (&second, "report-owner-b", "report-key-b"),
-            ] {
-                let barrier = Arc::clone(&barrier);
-                workers.push(scope.spawn(move || {
-                    let mut job = NewJob::new(agent_id, "/workspace");
-                    job.idempotency_key = Some(key.into());
-                    job.report_path = Some("/canonical/review.md".into());
-                    barrier.wait();
-                    store.enqueue_job(&job)
-                }));
-            }
-            barrier.wait();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| matches!(result, Err(StoreError::Conflict(_))))
-                .count(),
-            1
-        );
-        let owner = results
-            .iter()
-            .find_map(|result| result.as_ref().ok())
-            .unwrap();
-        assert!(matches!(
-            owner.agent_id.as_str(),
-            "report-owner-a" | "report-owner-b"
-        ));
-        let compatible = first
-            .enqueue_job(&NewJob {
-                agent_id: "compatible-report-replay".into(),
-                idempotency_key: owner.idempotency_key.clone(),
-                parent_agent_id: None,
-                review_kind: None,
-                feature_id: None,
-                section_id: None,
-                round_kind: None,
-                workspace_path: "/workspace".into(),
-                report_path: Some("/canonical/review.md".into()),
-                runtime_hash: None,
-                prepared_launch_json: None,
-                prepared_launch_sha256: None,
-                initial_prompt: "Begin review.".into(),
-            })
-            .unwrap();
-        assert_eq!(compatible.agent_id, owner.agent_id);
     }
 
     fn cancelled_task_result(summary: &str) -> TaskResult {
@@ -6216,6 +4301,83 @@ mod tests {
     }
 
     #[test]
+    fn successful_completion_atomically_requires_empty_pending_and_message_queues() {
+        let (_directory, _path, store) = file_store();
+        let task = general_task("gate-exec", "gate-public", "gate-key");
+        store.enqueue_task(&task).unwrap();
+        let claim = store.claim_next("owner", 1, 1).unwrap().unwrap();
+        store
+            .mark_running("gate-exec", claim.owner_epoch, "runtime", None)
+            .unwrap();
+        let result = TaskResult {
+            outcome: TaskOutcome::Succeeded,
+            summary: "done".into(),
+            partial: false,
+            base_commit: None,
+            head_commit: None,
+            changed_files: Vec::new(),
+            diff_stat: None,
+            checks: Vec::new(),
+            residual_gaps: Vec::new(),
+            artifacts: Vec::new(),
+        };
+
+        store
+            .insert_message("gate-message", "gate-exec", "queue", "continue")
+            .unwrap();
+        assert_eq!(
+            store.completion_blockers("gate-exec").unwrap(),
+            (false, true)
+        );
+        assert!(matches!(
+            store.store_task_result("gate-exec", &result),
+            Err(StoreError::Conflict(_))
+        ));
+        store.claim_next_message("gate-exec").unwrap().unwrap();
+        store
+            .complete_message("gate-message", Some("turn-2"))
+            .unwrap();
+
+        store
+            .insert_pending_request(
+                "gate-request",
+                "gate-exec",
+                "correlation",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        assert_eq!(
+            store.completion_blockers("gate-exec").unwrap(),
+            (true, false)
+        );
+        assert!(matches!(
+            store.store_task_result("gate-exec", &result),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .claim_pending_response_if_attempt_accepting(
+                    "gate-exec",
+                    "gate-request",
+                    1,
+                    "deny",
+                    None,
+                )
+                .unwrap(),
+            PendingResponseClaimDisposition::Claimed
+        );
+        store
+            .complete_pending_response("gate-exec", "gate-request")
+            .unwrap();
+        assert_eq!(
+            store.completion_blockers("gate-exec").unwrap(),
+            (false, false)
+        );
+        store.store_task_result("gate-exec", &result).unwrap();
+    }
+
+    #[test]
     fn complete_fingerprint_covers_prepared_provenance_and_pair_validation() {
         let (_directory, _path, store) = file_store();
         let mut task = general_task("fingerprint", "fingerprint-public", "fingerprint-key");
@@ -6438,7 +4600,6 @@ mod tests {
         assert_eq!(second.tasks.len(), 1);
         assert_eq!(second.tasks[0].execution_agent_id, "page-match-1");
         assert_eq!(second.next_cursor, None);
-
     }
 
     #[test]

@@ -1,16 +1,16 @@
 use crate::{
-    MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow,
-    PassiveToolKind, ResponseDisposition, RuntimePreflightResult, Scheduler, SchedulerError,
+    MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
+    ResponseDisposition, RuntimePreflightResult, Scheduler, SchedulerError,
 };
 use review_preparation::{
     canonical_general_repository, BudgetLimits, GeneralProfile, GeneralTaskManifest,
     PreparedGeneralTask,
 };
 use review_store::{
-    DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState,
-    Store, StoreError, StoredArtifact, StoredEvent, StoredPendingRequest,
-    StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
-    TaskSubmissionDisposition, TurnState, WaitSnapshot,
+    DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState, Store,
+    StoreError, StoredArtifact, StoredEvent, StoredPendingRequest, StoredTaskResult, TaskKind,
+    TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
+    TurnState, WaitSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -263,17 +263,7 @@ pub struct NewJobInput {
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
-    pub parent_agent_id: Option<String>,
-    #[serde(default)]
-    pub review_kind: Option<String>,
-    #[serde(default)]
     pub feature_id: Option<String>,
-    #[serde(default)]
-    pub section_id: Option<String>,
-    #[serde(default)]
-    pub round_kind: Option<String>,
-    #[serde(default)]
-    pub report_path: Option<String>,
     #[serde(default)]
     pub runtime_hash: Option<String>,
     #[serde(default = "default_initial_prompt")]
@@ -281,7 +271,7 @@ pub struct NewJobInput {
 }
 
 fn default_initial_prompt() -> String {
-    "Begin review.".into()
+    "Begin task.".into()
 }
 
 impl From<NewJobInput> for NewJob {
@@ -289,13 +279,8 @@ impl From<NewJobInput> for NewJob {
         Self {
             agent_id: value.agent_id,
             idempotency_key: value.idempotency_key,
-            parent_agent_id: value.parent_agent_id,
-            review_kind: value.review_kind,
             feature_id: value.feature_id,
-            section_id: value.section_id,
-            round_kind: value.round_kind,
             workspace_path: value.workspace_path,
-            report_path: value.report_path,
             runtime_hash: value.runtime_hash,
             prepared_launch_json: None,
             prepared_launch_sha256: None,
@@ -617,7 +602,6 @@ pub struct AgentCapabilitiesView {
     pub maturity: BTreeMap<String, CapabilityMaturityView>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub agent_id: String,
@@ -926,83 +910,13 @@ pub struct JobView {
     pub closed: bool,
     pub reaped: bool,
     pub live_steer: bool,
-    pub review_kind: Option<String>,
-    pub feature_id: Option<String>,
-    pub section_id: Option<String>,
-    pub round_kind: Option<String>,
     pub prompt_sha256: String,
-    pub provenance: Option<ReviewProvenanceView>,
-    pub capabilities: ReviewCapabilitiesView,
     pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewCapabilitiesView {
-    pub private_review_orchestration: bool,
-    pub public_mcp: bool,
-    pub fresh_session: bool,
-    pub independent_session_observed: bool,
-    pub resume_counts_as_independent: bool,
-    pub live_steer: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewProvenanceView {
-    pub manifest_sha256: String,
-    pub prepared_sha256: String,
-    pub base_sha: String,
-    pub head_sha: String,
-    pub requested_model: Option<String>,
-    pub policy_version: String,
-    pub policy_sha256: String,
-    pub hook_provenance: review_preparation::ReviewHookProvenance,
 }
 
 impl From<Job> for JobView {
     fn from(value: Job) -> Self {
-        let prepared = value.prepared_launch_json.as_deref().and_then(|json| {
-            serde_json::from_str::<review_preparation::PreparedLaunchSpec>(json).ok()
-        });
-        let fresh_session = prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.fresh_session);
-        let review_kind = prepared
-            .as_ref()
-            .map(|prepared| prepared.review_kind.as_str().to_owned());
-        let feature_id = prepared
-            .as_ref()
-            .map(|prepared| prepared.feature_id.clone());
-        let section_id = prepared
-            .as_ref()
-            .map(|prepared| prepared.section_id.clone());
-        let round_kind = prepared
-            .as_ref()
-            .map(|prepared| prepared.round_kind.as_str().to_owned());
-        let provenance = prepared.as_ref().map(|prepared| {
-            let hook_provenance = review_preparation::review_bash_hook_provenance();
-            ReviewProvenanceView {
-                manifest_sha256: prepared.manifest_sha256.clone(),
-                prepared_sha256: prepared.prepared_sha256.clone(),
-                base_sha: prepared.base_sha.clone(),
-                head_sha: prepared.head_sha.clone(),
-                requested_model: prepared.model.clone(),
-                policy_version: review_preparation::REVIEW_BASH_POLICY_VERSION.into(),
-                policy_sha256: hook_provenance
-                    .effective_hook_sha256
-                    .clone()
-                    .unwrap_or_default(),
-                hook_provenance,
-            }
-        });
         let prompt_sha256 = format!("{:x}", Sha256::digest(value.initial_prompt.as_bytes()));
-        let capabilities = ReviewCapabilitiesView {
-            private_review_orchestration: fresh_session,
-            public_mcp: false,
-            fresh_session,
-            independent_session_observed: fresh_session && value.zcode_session_id.is_some(),
-            resume_counts_as_independent: false,
-            live_steer: false,
-        };
         Self {
             agent_id: value.agent_id,
             idempotency_key: value.idempotency_key,
@@ -1020,13 +934,7 @@ impl From<Job> for JobView {
             closed: value.closed_at.is_some(),
             reaped: value.reaped_at.is_some(),
             live_steer: false,
-            review_kind,
-            feature_id,
-            section_id,
-            round_kind,
             prompt_sha256,
-            provenance,
-            capabilities,
             created_at: value.created_at,
         }
     }
@@ -1081,7 +989,6 @@ pub enum ArtifactIntegrityView {
     Invalid,
     LegacyUnverified,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactView {

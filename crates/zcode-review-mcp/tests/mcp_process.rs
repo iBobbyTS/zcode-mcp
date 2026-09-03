@@ -6,7 +6,10 @@ use std::{
 
 fn discover() -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-review-mcp"))
-        .env("ZCODE_REVIEWD_SOCKET", "/tmp/zcode-review-mcp-test-unused.sock")
+        .env(
+            "ZCODE_REVIEWD_SOCKET",
+            "/tmp/zcode-review-mcp-test-unused.sock",
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

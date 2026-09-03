@@ -32,7 +32,6 @@ use zcode_protocol::{
 };
 
 mod budget;
-pub mod prompts;
 pub mod rpc;
 
 use budget::AttemptBudget;
@@ -40,9 +39,8 @@ use review_preparation::{
     canonical_general_repository, general_launch_prompt, validate_general_named_command,
     CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
     GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask,
-    ValidatedPermissionDenial, ValidationCommand, ValidationOutput,
-    MAX_VALIDATION_COMMAND_TIMEOUT_MS,
+    GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
+    ValidationCommand, ValidationOutput, MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,10 +296,11 @@ impl PassiveActivityTracker {
 
         match parsed.transition {
             Some(ActivityTransition::ModelStarted) => {
-                state
-                    .active_model_requests
-                    .entry(parsed.request_id.unwrap_or_else(|| "model-request".into()))
-                    .or_insert(now);
+                let request_id = parsed.request_id.unwrap_or_else(|| "model-request".into());
+                if !state.active_model_requests.contains_key(&request_id) {
+                    state.active_model_requests.insert(request_id, now);
+                    state.last_model_delta_at = Some(now);
+                }
             }
             Some(ActivityTransition::ModelCompleted) => {
                 if let Some(request_id) = parsed.request_id.as_deref() {
@@ -3163,21 +3162,20 @@ fn runtime_timeout_reason(
     activity: &PassiveActivitySnapshot,
     input_wait_age_ms: Option<u64>,
 ) -> Option<&'static str> {
-    if input_wait_age_ms.is_some_and(|age| age >= limits.input_wait_timeout_ms) {
-        Some("INPUT_WAIT_TIMEOUT")
-    } else if activity
-        .oldest_active_tool_age_ms
-        .is_some_and(|age| age >= limits.tool_call_timeout_ms)
-    {
-        Some("TOOL_CALL_TIMEOUT")
-    } else if activity.model_request_active
-        && activity
+    if let Some(age) = input_wait_age_ms {
+        return (age >= limits.input_wait_timeout_ms).then_some("INPUT_WAIT_TIMEOUT");
+    }
+    if let Some(age) = activity.oldest_active_tool_age_ms {
+        return (age >= limits.tool_call_timeout_ms).then_some("TOOL_CALL_TIMEOUT");
+    }
+    if activity.model_request_active {
+        return activity
             .model_last_delta_age_ms
             .or(activity.model_request_age_ms)
             .is_some_and(|age| age >= limits.model_stream_idle_timeout_ms)
-    {
-        Some("MODEL_STREAM_IDLE_TIMEOUT")
-    } else if activity
+            .then_some("MODEL_STREAM_IDLE_TIMEOUT");
+    }
+    if activity
         .last_activity_age_ms
         .is_some_and(|age| age >= limits.runtime_activity_idle_timeout_ms)
     {
@@ -3185,15 +3183,6 @@ fn runtime_timeout_reason(
     } else {
         None
     }
-}
-
-fn has_unresolved_request(requests: &[review_store::StoredPendingRequest]) -> bool {
-    requests.iter().any(|request| {
-        matches!(
-            request.state,
-            PendingRequestState::Pending | PendingRequestState::Sending
-        )
-    })
 }
 
 impl LifecycleSink for StoreLifecycleSink {
@@ -3785,8 +3774,6 @@ impl Scheduler {
             job,
             public_agent_id: prepared.task_id.clone(),
             task_kind: TaskKind::General,
-            review_id: None,
-            continuation_of: None,
             repository: prepared.repository.to_string_lossy().into_owned(),
             feature_id: feature_id.into(),
             ownership_token: ownership_token.into(),
@@ -4838,7 +4825,9 @@ impl Scheduler {
                                         PendingRequestState::Pending | PendingRequestState::Sending
                                     )
                                 })
-                                .map(|request| now_ms.saturating_sub(request.created_at.max(0) as u64))
+                                .map(|request| {
+                                    now_ms.saturating_sub(request.created_at.max(0) as u64)
+                                })
                                 .max()
                         });
                     let limits = &task.effective_budget;
@@ -4863,12 +4852,42 @@ impl Scheduler {
                     }
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
-                    check.cancel();
                     let _guard = operation.lock().unwrap();
                     if attempt.ingress_reason() == Some("LATE_AFTER_STOP") {
                         return;
                     }
                     let natural = matches!(terminal, RuntimeTerminal::Completed(_));
+                    if natural {
+                        match scheduler.inner.store.completion_blockers(&agent_id) {
+                            Ok((true, _)) | Err(_) => {
+                                drop(_guard);
+                                thread::sleep(Duration::from_millis(10));
+                                continue;
+                            }
+                            Ok((false, true)) => {
+                                match scheduler.deliver_next_message(
+                                    &agent_id,
+                                    &session_id,
+                                    &runtime,
+                                    &attempt,
+                                    scheduler.control_deadline(),
+                                ) {
+                                    Ok(Some(_)) => {
+                                        drop(_guard);
+                                        continue;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        scheduler.record_failure(&agent_id, error.to_string());
+                                        drop(_guard);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok((false, false)) => {}
+                        }
+                    }
+                    check.cancel();
                     let submission = general_submission.lock().unwrap().take();
                     if let Err(error) = scheduler.finish_locked_monitor_terminal(
                         &agent_id,
@@ -4947,15 +4966,13 @@ impl Scheduler {
                     ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            let pending = scheduler
+                            let completion_blocked = scheduler
                                 .inner
                                 .store
-                                .pending_requests(&agent_id)
-                                .map(|requests| has_unresolved_request(&requests))
+                                .completion_blockers(&agent_id)
+                                .map(|(pending, queued)| pending || queued)
                                 .unwrap_or(true);
-                            if boundary == TurnBoundary::Completed && pending {
-                                // A completed boundary cannot race past an unresolved typed
-                                // request. Resolution must drive a new matching turn boundary.
+                            if boundary == TurnBoundary::Completed && completion_blocked {
                                 handled_generation = handled_generation.saturating_sub(1);
                                 continue;
                             }
@@ -5819,9 +5836,7 @@ impl Drop for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use review_preparation::{
-        BudgetLimits, GeneralProfile, GENERAL_TASK_SCHEMA,
-    };
+    use review_preparation::{BudgetLimits, GeneralProfile, GENERAL_TASK_SCHEMA};
     use review_store::NewArtifact;
     use std::collections::BTreeMap;
     use std::sync::Barrier;
@@ -5941,34 +5956,73 @@ mod tests {
             runtime_timeout_reason(&limits, &timeout_test_activity(), None),
             None
         );
-    }
 
-    fn pending_request(state: PendingRequestState) -> review_store::StoredPendingRequest {
-        review_store::StoredPendingRequest {
-            request_id: "request".into(),
-            agent_id: "agent".into(),
-            correlation_id: "correlation".into(),
-            request_type: "permission".into(),
-            payload_json: "{}".into(),
-            state,
-            response_decision: None,
-            response_content: None,
-            created_at: 1,
-        }
+        let mut state_aware = timeout_test_activity();
+        state_aware.last_activity_age_ms = Some(1_000);
+        assert_eq!(
+            runtime_timeout_reason(&limits, &state_aware, Some(399)),
+            None
+        );
+        state_aware.oldest_active_tool_age_ms = Some(299);
+        assert_eq!(runtime_timeout_reason(&limits, &state_aware, None), None);
+        state_aware.oldest_active_tool_age_ms = None;
+        state_aware.model_request_active = true;
+        state_aware.model_request_age_ms = Some(199);
+        assert_eq!(runtime_timeout_reason(&limits, &state_aware, None), None);
     }
 
     #[test]
-    fn completed_boundary_waits_for_typed_request_resolution() {
-        assert!(has_unresolved_request(&[pending_request(
-            PendingRequestState::Pending
-        )]));
-        assert!(has_unresolved_request(&[pending_request(
-            PendingRequestState::Sending
-        )]));
-        assert!(!has_unresolved_request(&[pending_request(
-            PendingRequestState::Responded
-        )]));
-        assert!(!has_unresolved_request(&[]));
+    fn model_stream_idle_baseline_resets_once_for_each_request() {
+        let tracker = PassiveActivityTracker::new();
+        let base = Instant::now();
+        let model_event = |request_id: &str, event_type: &str| {
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type":"session.updated",
+                    "eventId":format!("{request_id}-{event_type}"),
+                    "payload":{"type":event_type,"requestId":request_id}
+                }),
+            })))
+        };
+        tracker.observe_at(
+            &model_event("request-1", "model_request_started"),
+            base,
+            1_000,
+        );
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_millis(50))
+                .model_last_delta_age_ms,
+            Some(50)
+        );
+        tracker.observe_at(
+            &model_event("request-1", "model_request_completed"),
+            base + Duration::from_millis(100),
+            1_100,
+        );
+        tracker.observe_at(
+            &model_event("request-2", "model_request_started"),
+            base + Duration::from_millis(200),
+            1_200,
+        );
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_millis(210))
+                .model_last_delta_age_ms,
+            Some(10)
+        );
+        tracker.observe_at(
+            &model_event("request-2", "model_request_started"),
+            base + Duration::from_millis(250),
+            1_250,
+        );
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_millis(260))
+                .model_last_delta_age_ms,
+            Some(60)
+        );
     }
 
     #[test]
@@ -7637,6 +7691,75 @@ exec tail -f /dev/null
         assert_general_workspace_cleaned(&prepared);
     }
 
+    #[test]
+    fn natural_runtime_terminal_waits_for_pending_and_queued_work() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "terminal-completion-gate", None),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let agent_id = submitted.job.agent_id;
+        scheduler.start_ready().unwrap();
+        store
+            .insert_pending_request(
+                "pending-before-terminal",
+                &agent_id,
+                "runtime-pending",
+                "permission",
+                &serde_json::json!({
+                    "toolName":"read",
+                    "input":{"path":"src/lib.rs"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let runtime = factory.runtime(&agent_id);
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        thread::sleep(Duration::from_millis(100));
+        assert!(store.task_result(&agent_id).unwrap().is_none());
+        assert_eq!(scheduler.active_count(), 1);
+
+        scheduler
+            .respond_job(&agent_id, "pending-before-terminal", "deny", None)
+            .unwrap();
+        let completed = wait_for_task_result(&store, &agent_id);
+        assert_eq!(completed.result.outcome, TaskOutcome::Succeeded);
+
+        let queued = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "queued-completion-gate", None),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let queued_id = queued.job.agent_id;
+        scheduler.start_ready().unwrap();
+        scheduler
+            .message_job(&queued_id, "queued-before-terminal", "queue", "continue")
+            .unwrap();
+        let queued_runtime = factory.runtime(&queued_id);
+        queued_runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        wait_until_condition(|| {
+            queued_runtime
+                .sent_turn_contents
+                .lock()
+                .unwrap()
+                .contains(&"continue".to_owned())
+                .then_some(())
+        });
+        assert!(store.task_result(&queued_id).unwrap().is_none());
+        queued_runtime.complete_turn(TurnBoundary::Completed);
+        let completed = wait_for_task_result(&store, &queued_id);
+        assert_eq!(completed.result.outcome, TaskOutcome::Succeeded);
+    }
+
     fn wait_for_task_result(store: &Store, execution_id: &str) -> review_store::StoredTaskResult {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -8419,5 +8542,4 @@ exec tail -f /dev/null
         assert_eq!(captured_lifecycle_level, durable_lifecycle.redaction_level);
         assert_eq!(captured_lifecycle["kind"], "lifecycle");
     }
-
 }

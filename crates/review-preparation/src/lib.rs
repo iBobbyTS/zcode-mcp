@@ -277,11 +277,7 @@ pub use general::{
     PreparedGeneralTask, PublicAttachment, GENERAL_CONTROL_SCHEMA, GENERAL_TASK_SCHEMA,
 };
 
-pub use manifest::{
-    InputArtifact, NetworkPolicy, PreparedLaunchSpec, PreparedReviewInputs, PreparedScopePath,
-    ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy, ValidationCommand,
-    MAX_REVIEW_DIFF_BYTES, MAX_VALIDATION_COMMAND_TIMEOUT_MS,
-};
+pub use manifest::{ValidationCommand, MAX_VALIDATION_COMMAND_TIMEOUT_MS};
 pub use policy::{
     ExternalDecision, PermissionDecision, PermissionRequest, PolicyCapabilities, PolicyLauncher,
     PolicyMode, PreparedCommand, SandboxEnforcement, ValidatedPermissionDenial, ValidationOutput,
