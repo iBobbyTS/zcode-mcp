@@ -10,7 +10,10 @@ import time
 from pathlib import Path
 
 from conformance import ConformanceError, StdioMCPTransport, collect_artifact, validate_catalog
-from fixture_workspace import create_execution_root
+from fixture_workspace import REPOSITORY_ROOT, create_execution_root
+
+
+EVIDENCE_SCHEMA = "zcode-official-generic-agent-evidence/v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,8 +57,40 @@ def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def source_integrity_unchanged(before: dict[str, str], after: dict[str, str]) -> bool:
-    return all(before[field] == after[field] for field in ("head", "tracked_diff", "staged_diff"))
+def source_integrity_unchanged(
+    before: dict[str, str], after: dict[str, str], access_mode: str
+) -> bool:
+    identity_unchanged = all(
+        before[field] == after[field] for field in ("head", "tracked_diff", "staged_diff")
+    )
+    if access_mode == "workspace_write":
+        return identity_unchanged
+    return identity_unchanged and all(
+        not snapshot[field]
+        for snapshot in (before, after)
+        for field in ("tracked_diff", "staged_diff")
+    )
+
+
+def evidence_identity(
+    runner: Path, daemon: Path, facade: Path, runtime: Path
+) -> dict[str, str]:
+    return {
+        "repository_head": git_snapshot(REPOSITORY_ROOT)["head"],
+        "runner_sha256": sha256(runner.read_bytes()),
+        "daemon_sha256": sha256(daemon.read_bytes()),
+        "facade_sha256": sha256(facade.read_bytes()),
+        "runtime_sha256": sha256(runtime.read_bytes()),
+    }
+
+
+def validate_evidence_identity(
+    evidence: dict[str, object], expected_identity: dict[str, str]
+) -> None:
+    if evidence.get("schema") != EVIDENCE_SCHEMA:
+        raise ConformanceError("evidence schema is missing or stale")
+    if evidence.get("identity") != expected_identity:
+        raise ConformanceError("evidence identity does not match the executing exact head")
 
 
 def main() -> int:
@@ -67,6 +102,11 @@ def main() -> int:
     root = create_execution_root("official-generic-agent-")
     evidence_path = root / "evidence.json"
     daemon_log_path = root / "daemon.log"
+    runner = Path(__file__).resolve()
+    daemon_binary = args.daemon.resolve()
+    facade_binary = args.facade.resolve()
+    runtime_binary = args.runtime.resolve()
+    identity = evidence_identity(runner, daemon_binary, facade_binary, runtime_binary)
     source_before = git_snapshot(args.repository.resolve())
     with daemon_log_path.open("wb") as daemon_log:
         socket = root / "daemon.sock"
@@ -75,12 +115,12 @@ def main() -> int:
         env.update({
             "ZCODE_REVIEWD_SOCKET": str(socket),
             "ZCODE_REVIEWD_DATABASE": str(database),
-            "ZCODE_RUNTIME_PATH": str(args.runtime.resolve()),
+            "ZCODE_RUNTIME_PATH": str(runtime_binary),
         })
         if args.command_catalog is not None:
             env["ZCODE_REVIEWD_COMMAND_CATALOG"] = str(args.command_catalog.resolve())
         daemon = subprocess.Popen(
-            [str(args.daemon.resolve())], env=env, stdout=daemon_log,
+            [str(daemon_binary)], env=env, stdout=daemon_log,
             stderr=subprocess.STDOUT,
         )
         transport = None
@@ -92,7 +132,7 @@ def main() -> int:
                 time.sleep(0.02)
             if not socket.exists():
                 raise ConformanceError("daemon socket did not become ready")
-            transport = StdioMCPTransport(args.facade.resolve(), socket)
+            transport = StdioMCPTransport(facade_binary, socket)
             validate_catalog(transport)
             status = transport.call("zcode_system_status", {})
             spawn = transport.call("zcode_agent_spawn", {
@@ -166,8 +206,12 @@ def main() -> int:
                 })
             closed = transport.call("zcode_agent_close", {"agent_id": agent_id})
             source_after = git_snapshot(args.repository.resolve())
-            source_unchanged = source_integrity_unchanged(source_before, source_after)
+            source_unchanged = source_integrity_unchanged(
+                source_before, source_after, args.access_mode
+            )
             output = {
+                "schema": EVIDENCE_SCHEMA,
+                "identity": identity,
                 "execution_root": str(root),
                 "status": status,
                 "spawn": spawn,
@@ -185,6 +229,11 @@ def main() -> int:
                 "source_unchanged": source_unchanged,
                 "source_status_unchanged": source_before["status"] == source_after["status"],
             }
+            if args.access_mode == "read_only" and not source_unchanged:
+                raise ConformanceError(
+                    "read-only source integrity requires clean tracked and staged state before and after"
+                )
+            validate_evidence_identity(output, identity)
             evidence_path.write_text(
                 json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
@@ -215,6 +264,7 @@ def main() -> int:
             if output is not None:
                 output["daemon_reaped"] = daemon.poll() is not None
                 output["daemon_returncode"] = daemon.returncode
+                validate_evidence_identity(output, identity)
                 evidence_path.write_text(
                     json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8"
                 )
