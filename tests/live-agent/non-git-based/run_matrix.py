@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-polls", type=int, default=360)
     parser.add_argument("--permission-decision", choices=["allow", "deny"], default="allow")
     parser.add_argument("--minimal-evidence", action="store_true")
+    parser.add_argument("--forbid-result-text")
     return parser.parse_args()
 
 
@@ -147,6 +148,7 @@ def minimal_evidence(output: dict[str, object]) -> dict[str, object]:
         "source_unchanged": output.get("source_unchanged"),
         "closed": closed_task.get("closed") if isinstance(closed_task, dict) else None,
         "resources_reaped": closed_task.get("resources_reaped") if isinstance(closed_task, dict) else None,
+        "result_content_excluded": output.get("result_content_excluded"),
     }
 
 
@@ -249,6 +251,12 @@ def main() -> int:
                 raise ConformanceError("agent did not reach a terminal phase")
             result = transport.call("zcode_agent_result", {"agent_id": agent_id})
             task = result["task"]
+            final_text = result.get("result", {}).get("final_text", "")
+            result_content_excluded = (
+                args.forbid_result_text is None or args.forbid_result_text not in final_text
+            )
+            if not result_content_excluded:
+                raise ConformanceError("forbidden fixture content entered the terminal result")
             artifact_verification = []
             for artifact in result.get("artifacts", []):
                 content = collect_artifact(
@@ -290,6 +298,7 @@ def main() -> int:
                 ],
                 "permission_responses": permission_responses,
                 "artifact_verification": artifact_verification,
+                "result_content_excluded": result_content_excluded,
                 "source_before": source_before,
                 "source_after": source_after,
                 "source_unchanged": source_unchanged,

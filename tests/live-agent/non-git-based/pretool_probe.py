@@ -17,6 +17,7 @@ WRITE_CONTENT = "official workspace write passed."
 WRITE_FILE = "output.txt"
 WRITE_CHECK_ID = "output-content"
 READ_LINK = "outside-link.txt"
+READ_CONTENT = "benign symlink escape fixture"
 ZCODE_LOG_ROOT = Path.home() / ".zcode" / "cli" / "log"
 
 
@@ -80,7 +81,7 @@ def make_write_fixture(root: Path) -> tuple[Path, Path, str]:
 
 def make_read_fixture(root: Path) -> tuple[Path, str]:
     outside = root / "benign-outside.txt"
-    outside.write_text("benign symlink escape fixture\n", encoding="utf-8")
+    outside.write_text(f"{READ_CONTENT}\n", encoding="utf-8")
     repository = root / "repository"
     repository.mkdir()
     head = initialize_repository(repository)
@@ -110,12 +111,8 @@ def validate_write_evidence(evidence: dict[str, object]) -> None:
 
 def validate_read_evidence(evidence: dict[str, object]) -> None:
     activity = evidence.get("activity", {})
-    if int(activity.get("max_read_calls_60s", 0)) < 1:
-        raise RuntimeError("official ZCode did not schedule the requested Read")
-    permissions = [item for item in evidence.get("permissions", []) if item.get("tool_name") == "Read"]
-    typed_denied = bool(permissions) and all(
-        item.get("effective_decision") == "deny" for item in permissions
-    )
+    if int(activity.get("max_read_calls_60s", 0)) != 0:
+        raise RuntimeError("PreToolUse denial did not precede tool.call.started")
     diagnostic = evidence.get("pretool_diagnostic", {})
     hook_denied = (
         isinstance(diagnostic, dict)
@@ -125,8 +122,10 @@ def validate_read_evidence(evidence: dict[str, object]) -> None:
         and isinstance(diagnostic.get("raw_line_sha256"), str)
         and len(diagnostic["raw_line_sha256"]) == 64
     )
-    if not typed_denied and not hook_denied:
+    if not hook_denied:
         raise RuntimeError("scheduled Read did not produce a verifiable PreToolUse denial")
+    if evidence.get("result_content_excluded") is not True:
+        raise RuntimeError("external benign fixture content was not proven absent from result")
     if not evidence.get("resources_reaped") or not evidence.get("daemon_reaped"):
         raise RuntimeError("official read resources were not cleanly reaped")
 
@@ -170,7 +169,7 @@ def main() -> int:
     else:
         repository, head = make_read_fixture(root)
         extra = ["--access-mode", "read_only", "--permission-decision", "deny",
-                 "--prompt", read_prompt()]
+                 "--forbid-result-text", READ_CONTENT, "--prompt", read_prompt()]
     command = [
         sys.executable, str(Path(__file__).with_name("run_matrix.py")),
         "--daemon", str(args.daemon.resolve()), "--facade", str(args.facade.resolve()),

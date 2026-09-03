@@ -52,22 +52,27 @@ class PreToolProbeContractTests(unittest.TestCase):
 
     def test_read_oracle_requires_scheduled_read_typed_deny_and_reap(self) -> None:
         valid = {
-            "activity": {"max_read_calls_60s": 1},
-            "permissions": [{"tool_name": "Read", "effective_decision": "deny"}],
+            "activity": {"max_read_calls_60s": 0}, "permissions": [],
+            "pretool_diagnostic": {
+                "tool_name": "Read", "event_count": 1, "decision": "deny",
+                "decision_code": "symlink_escape", "raw_line_sha256": "a" * 64,
+            },
+            "result_content_excluded": True,
             "resources_reaped": True, "daemon_reaped": True,
         }
         validate_read_evidence(valid)
-        with self.assertRaisesRegex(RuntimeError, "did not schedule"):
-            validate_read_evidence(dict(valid, activity={"max_read_calls_60s": 0}))
+        with self.assertRaisesRegex(RuntimeError, "precede"):
+            validate_read_evidence(dict(valid, activity={"max_read_calls_60s": 1}))
 
     def test_read_oracle_accepts_redacted_hook_diagnostic(self) -> None:
         evidence = {
-            "activity": {"max_read_calls_60s": 1}, "permissions": [],
+            "activity": {"max_read_calls_60s": 0}, "permissions": [],
             "pretool_diagnostic": {
                 "tool_name": "Read", "event_count": 1, "decision": "deny",
                 "decision_code": "symlink_escape", "raw_line_sha256": "a" * 64,
             },
             "resources_reaped": True, "daemon_reaped": True,
+            "result_content_excluded": True,
         }
 
         validate_read_evidence(evidence)
