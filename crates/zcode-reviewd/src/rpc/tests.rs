@@ -585,6 +585,105 @@ fn oversized_terminal_text_persists_a_readable_result_invalid_response() {
     }
 }
 
+#[test]
+fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
+    let fixture = fixture();
+    let (_, agent_id) = submit_general_fixture(
+        &fixture,
+        "escaped-result-frame",
+        "feature-escaped-frame",
+        "owner-escaped-frame",
+    );
+    fixture.scheduler.start_ready().unwrap();
+    let task = fixture.store.get_task(&agent_id).unwrap().unwrap();
+    let job = fixture
+        .store
+        .get_job(&task.execution_agent_id)
+        .unwrap()
+        .unwrap();
+    let result = |summary: String| TaskResult {
+        outcome: TaskOutcome::Succeeded,
+        summary,
+        partial: false,
+        base_commit: None,
+        head_commit: None,
+        changed_files: Vec::new(),
+        diff_stat: None,
+        checks: Vec::new(),
+        residual_gaps: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    let empty = result(String::new());
+    let ascii_id = "r".repeat(MAX_REQUEST_ID_BYTES);
+    let escaped_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
+    assert!(valid_request_id(&escaped_id));
+    let ascii_overhead =
+        terminal_result_response_size(&job, &task, &empty, &[], &ascii_id).unwrap();
+    let escaped_overhead =
+        terminal_result_response_size(&job, &task, &empty, &[], &escaped_id).unwrap();
+    assert_eq!(escaped_overhead - ascii_overhead, 5 * MAX_REQUEST_ID_BYTES);
+
+    let ascii_only = result("x".repeat(MAX_FRAME_BYTES - ascii_overhead));
+    assert_eq!(
+        terminal_result_response_size(&job, &task, &ascii_only, &[], &ascii_id),
+        Some(MAX_FRAME_BYTES)
+    );
+    assert!(
+        terminal_result_response_size(&job, &task, &ascii_only, &[], &escaped_id).unwrap()
+            > MAX_FRAME_BYTES
+    );
+    assert!(!terminal_result_response_fits(
+        &job,
+        &task,
+        &ascii_only,
+        &[]
+    ));
+
+    let visible_text = "x".repeat(MAX_FRAME_BYTES - escaped_overhead);
+    let safe = result(visible_text.clone());
+    assert_eq!(
+        terminal_result_response_size(&job, &task, &safe, &[], &escaped_id),
+        Some(MAX_FRAME_BYTES)
+    );
+    assert!(terminal_result_response_fits(&job, &task, &safe, &[]));
+
+    let runtime = fixture.factory.runtime(&task.execution_agent_id);
+    runtime.emit_text_delta("escaped-result-frame-text", &visible_text);
+    runtime.complete();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.store.get_task(&agent_id).unwrap().unwrap().phase != TaskPhase::Terminal {
+        assert!(Instant::now() < deadline, "task did not reach terminal");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let response = client(&fixture.socket)
+        .call(&request(
+            &escaped_id,
+            RpcMethod::TaskResult {
+                agent_id,
+                attempt_sequence: None,
+            },
+        ))
+        .unwrap();
+    assert_eq!(response.request_id.as_deref(), Some(escaped_id.as_str()));
+    let response_size = serde_json::to_vec(&response).unwrap().len();
+    assert!(response_size <= MAX_FRAME_BYTES);
+    assert!(response_size >= MAX_FRAME_BYTES - 1);
+    match response.outcome {
+        RpcOutcome::Success { result } => match *result {
+            RpcSuccess::TaskResult {
+                result: Some(result),
+                ..
+            } => {
+                assert_eq!(result.outcome, TaskOutcome::Succeeded);
+                assert_eq!(result.summary, visible_text);
+            }
+            other => panic!("unexpected task result response: {other:?}"),
+        },
+        RpcOutcome::Error { error } => panic!("near-cap result was not readable: {error:?}"),
+    }
+}
+
 fn request(request_id: &str, method: RpcMethod) -> RpcRequest {
     RpcRequest {
         version: RPC_VERSION,

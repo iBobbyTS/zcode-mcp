@@ -1372,10 +1372,22 @@ pub(crate) fn terminal_result_response_fits(
     result: &TaskResult,
     artifacts: &[TaskArtifactMetadataView],
 ) -> bool {
+    let worst_case_request_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
+    terminal_result_response_size(job, task, result, artifacts, &worst_case_request_id)
+        .is_some_and(|size| size <= MAX_FRAME_BYTES)
+}
+
+fn terminal_result_response_size(
+    job: &Job,
+    task: &TaskRecord,
+    result: &TaskResult,
+    artifacts: &[TaskArtifactMetadataView],
+    request_id: &str,
+) -> Option<usize> {
     let mut task = task_view(job.clone(), task.clone());
     task.phase = "TERMINAL".into();
     let response = RpcResponse::success(
-        "r".repeat(MAX_REQUEST_ID_BYTES),
+        request_id.into(),
         RpcSuccess::TaskResult {
             task,
             result: Some(TaskResultView::from(StoredTaskResult {
@@ -1388,7 +1400,7 @@ pub(crate) fn terminal_result_response_fits(
             artifacts: artifacts.to_vec(),
         },
     );
-    serde_json::to_vec(&response).is_ok_and(|frame| frame.len() <= MAX_FRAME_BYTES)
+    serde_json::to_vec(&response).ok().map(|frame| frame.len())
 }
 
 fn pending_request_view(

@@ -2854,25 +2854,23 @@ fn general_result_response_fits(
     ))
 }
 
-fn invalidate_untransportable_completion(
-    prepared: &PreparedGeneralTask,
-    completion: &mut GeneralCompletion,
-) {
-    for artifact in &completion.artifacts {
-        let path = general_artifact_path(prepared, artifact.kind);
-        if let Err(error) = std::fs::remove_file(path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                completion.cleaned = false;
-            }
-        }
-    }
+fn invalidate_untransportable_completion(completion: &mut GeneralCompletion) {
     completion.outcome = CompletionOutcome::ResultInvalid;
     completion.reason_code = Some("RESULT_RESPONSE_FRAME_EXCEEDED".into());
     completion.summary = "terminal result exceeds private RPC response frame".into();
     completion.checks.clear();
     completion.residual_gaps.clear();
-    completion.artifacts.clear();
-    completion.artifact = None;
+}
+
+fn compact_untransportable_artifact_projection(completion: &mut GeneralCompletion) {
+    for artifact in &mut completion.artifacts {
+        artifact.changed_paths.clear();
+        artifact.diff_stat = None;
+    }
+    if let Some(artifact) = completion.artifact.as_mut() {
+        artifact.changed_paths.clear();
+        artifact.diff_stat = None;
+    }
 }
 
 fn general_artifact_type(kind: GeneralArtifactKind) -> &'static str {
@@ -4254,7 +4252,16 @@ impl Scheduler {
                         &completion,
                         &result,
                     )? {
-                        invalidate_untransportable_completion(prepared, &mut completion);
+                        invalidate_untransportable_completion(&mut completion);
+                        let result = task_result(&completion);
+                        if !general_result_response_fits(
+                            &self.inner.store,
+                            agent_id,
+                            &completion,
+                            &result,
+                        )? {
+                            compact_untransportable_artifact_projection(&mut completion);
+                        }
                     }
                 }
                 match sink.finish_general(&terminal, prepared, &completion) {
@@ -7426,6 +7433,101 @@ exec tail -f /dev/null
             .result
             .residual_gaps
             .contains(&"FINAL_TEXT_EXCEEDS_RESULT_LIMIT".into()));
+    }
+
+    #[test]
+    fn workspace_write_response_overflow_preserves_consistent_artifacts() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let mut manifest = general_manifest(directory.path(), "write-result-frame", None);
+        manifest.profile = GeneralProfile::ImplementationWorktree;
+        manifest.write_manifest = vec!["src".into()];
+        let submitted = scheduler
+            .enqueue_general(&manifest, "feature", "owner")
+            .unwrap();
+        let public_agent_id = submitted.task.public_agent_id.clone();
+        let execution_id = submitted.job.agent_id.clone();
+        let prepared = prepared_general(&submitted.job);
+        scheduler.start_ready().unwrap();
+        std::fs::write(
+            prepared.worktree.path.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .unwrap();
+        let runtime = factory.runtime(&execution_id);
+        runtime.emit_text_delta("write-result-frame-text", &"x".repeat(140 * 1024));
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+
+        let stored = wait_for_task_result(&store, &execution_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::ResultInvalid);
+        assert!(stored
+            .result
+            .residual_gaps
+            .contains(&"RESULT_RESPONSE_FRAME_EXCEEDED".into()));
+        assert_eq!(stored.result.artifacts.len(), 1);
+        assert_eq!(stored.result.changed_files, ["src/lib.rs"]);
+
+        let artifact_rows = store.artifacts(&execution_id, 2).unwrap();
+        assert_eq!(artifact_rows.len(), 1);
+        let artifact_row = &artifact_rows[0];
+        let result_artifact = &stored.result.artifacts[0];
+        let patch_path = prepared.artifact_root.join("changes.patch");
+        let manifest_path = prepared.artifact_root.join("changes.manifest.json");
+        let patch = std::fs::read(&patch_path).unwrap();
+        let manifest: review_preparation::ArtifactMetadata =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let patch_sha256 = format!("{:x}", Sha256::digest(&patch));
+        assert_eq!(result_artifact.artifact_id, manifest.artifact_id);
+        assert_eq!(result_artifact.sha256, patch_sha256);
+        assert_eq!(artifact_row.artifact_id, manifest.artifact_id);
+        assert_eq!(artifact_row.artifact_type, "changes_patch");
+        assert_eq!(artifact_row.sha256, patch_sha256);
+        assert_eq!(artifact_row.bytes, patch.len() as u64);
+        assert_eq!(artifact_row.path, patch_path.to_string_lossy());
+        assert_eq!(manifest.sha256, patch_sha256);
+        assert_eq!(manifest.size_bytes, patch.len() as u64);
+        assert_eq!(manifest.changed_paths, ["src/lib.rs"]);
+        assert_eq!(manifest.kind, GeneralArtifactKind::ChangesPatch);
+        assert!(!manifest.partial);
+        assert_eq!(
+            stored.result.base_commit.as_deref(),
+            Some(manifest.base_sha.as_str())
+        );
+        assert_eq!(stored.result.head_commit, manifest.head_commit);
+        assert!(String::from_utf8_lossy(&patch).contains("value() -> u8 { 2 }"));
+        let mut artifact_files = std::fs::read_dir(&prepared.artifact_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        artifact_files.sort();
+        assert_eq!(artifact_files, ["changes.manifest.json", "changes.patch"]);
+
+        let service = rpc::RpcService::new(scheduler, Arc::clone(&store)).unwrap();
+        match service
+            .dispatch(rpc::RpcMethod::TaskResult {
+                agent_id: public_agent_id,
+                attempt_sequence: None,
+            })
+            .unwrap()
+        {
+            rpc::RpcSuccess::TaskResult {
+                result: Some(result),
+                artifacts,
+                ..
+            } => {
+                assert_eq!(result.outcome, TaskOutcome::ResultInvalid);
+                assert_eq!(result.result_sha256, stored.result_sha256);
+                assert_eq!(result.artifacts, stored.result.artifacts);
+                assert_eq!(artifacts.len(), 1);
+                assert_eq!(artifacts[0].kind, "changes_patch");
+                assert_eq!(artifacts[0].artifact_id, manifest.artifact_id);
+                assert_eq!(artifacts[0].sha256, patch_sha256);
+                assert_eq!(artifacts[0].size_bytes, patch.len() as u64);
+            }
+            other => panic!("unexpected public result: {other:?}"),
+        }
+        assert_general_workspace_cleaned(&prepared);
     }
 
     #[test]
