@@ -3,8 +3,8 @@ use crate::{
         MinimalStructuredReviewContinuation, OrchestrationError, ReviewJobOrchestrator,
         StructuredReviewContinuation, StructuredReviewProjection, StructuredReviewSubmission,
     },
-    GeneralCheckResult, MessageDisposition, ResponseDisposition, RuntimePreflightResult, Scheduler,
-    SchedulerError,
+    GeneralCheckResult, MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow,
+    PassiveToolKind, ResponseDisposition, RuntimePreflightResult, Scheduler, SchedulerError,
 };
 use review_ledger::{
     ArtifactIntegrity, ToolResult, VerifiedArtifact, MAX_TOOL_ID_BYTES, MAX_TOOL_TEXT_CHARS,
@@ -86,6 +86,7 @@ pub enum RpcMethod {
     },
     TaskEvents(TaskEventQuery),
     TaskWait(TaskWaitQuery),
+    TaskPoll(TaskPollQuery),
     TaskMessage(MessageInput),
     TaskRespond(RespondInput),
     TaskCancel {
@@ -164,6 +165,7 @@ impl RpcMethod {
                 | "task_pending"
                 | "task_events"
                 | "task_wait"
+                | "task_poll"
                 | "task_message"
                 | "task_respond"
                 | "task_cancel"
@@ -257,7 +259,9 @@ pub struct GeneralSubmitInput {
     pub feature_id: String,
     pub ownership_token: String,
     #[serde(default)]
-    pub command_ids: Vec<String>,
+    pub allowed_command_ids: Vec<String>,
+    #[serde(default)]
+    pub required_command_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +293,15 @@ pub struct TaskWaitQuery {
     pub agent_id: String,
     #[serde(default)]
     pub after: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskPollQuery {
+    pub agent_id: String,
+    #[serde(default)]
+    pub after_revision: u64,
     pub timeout_ms: u64,
 }
 
@@ -506,6 +519,15 @@ pub enum RpcSuccess {
         page: TaskEventPage,
         timed_out: bool,
     },
+    TaskPoll {
+        task: TaskView,
+        revision: u64,
+        next_revision: u64,
+        pending_requests: Vec<PendingRequestView>,
+        result_available: bool,
+        activity: TaskActivityView,
+        timed_out: bool,
+    },
     TaskResult {
         task: TaskView,
         result: Option<TaskResultView>,
@@ -710,6 +732,7 @@ pub struct TaskView {
     pub agent_id: String,
     pub review_id: Option<String>,
     pub task_kind: String,
+    pub access_mode: String,
     pub phase: String,
     pub attempt_sequence: u64,
     pub effective_budget: EffectiveBudget,
@@ -719,6 +742,70 @@ pub struct TaskView {
     pub close_requested: bool,
     pub closed: bool,
     pub reaped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskActivityStateView {
+    Queued,
+    Preparing,
+    Active,
+    WaitingInput,
+    Cancelling,
+    Idle,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryStatusView {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityToolKindView {
+    Read,
+    Bash,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveToolView {
+    pub tool_call_id: String,
+    pub kind: ActivityToolKindView,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityWindowView {
+    pub reasoning_delta_events: u64,
+    pub reasoning_delta_bytes: u64,
+    pub text_delta_events: u64,
+    pub text_delta_bytes: u64,
+    pub tool_calls_started: u64,
+    pub tool_calls_completed: u64,
+    pub tool_calls_failed: u64,
+    pub read_calls: u64,
+    pub bash_calls: u64,
+    pub other_tool_calls: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskActivityView {
+    pub state: TaskActivityStateView,
+    pub last_runtime_event_at: Option<u64>,
+    pub last_activity_age_ms: Option<u64>,
+    pub model_request_active: bool,
+    pub model_request_age_ms: Option<u64>,
+    pub model_last_delta_age_ms: Option<u64>,
+    pub latest_text_tail: String,
+    pub latest_text_updated_at: Option<u64>,
+    pub latest_text_truncated: bool,
+    pub active_tools: Vec<ActiveToolView>,
+    pub window_60s: ActivityWindowView,
+    pub telemetry_status: TelemetryStatusView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1348,13 +1435,21 @@ impl RpcService {
             RpcMethod::SubmitGeneral { input } => {
                 validate_text(&input.feature_id, "feature_id", 256)?;
                 validate_text(&input.ownership_token, "ownership_token", 512)?;
+                validate_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
+                validate_command_ids(&input.required_command_ids, "required_command_ids")?;
+                let mut command_ids = input.allowed_command_ids;
+                for command_id in input.required_command_ids {
+                    if !command_ids.contains(&command_id) {
+                        command_ids.push(command_id);
+                    }
+                }
                 let submitted = self
                     .scheduler
                     .enqueue_general_with_commands(
                         &input.manifest,
                         &input.feature_id,
                         &input.ownership_token,
-                        &input.command_ids,
+                        &command_ids,
                     )
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
@@ -1437,7 +1532,7 @@ impl RpcService {
                             feature_id: query.feature_id.as_deref(),
                             ownership_token: query.ownership_token.as_deref(),
                         },
-                        None,
+                        Some(TaskKind::General),
                         TaskPageFilter {
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
@@ -1479,6 +1574,7 @@ impl RpcService {
                 page: self.task_event_page(query)?,
             }),
             RpcMethod::TaskWait(query) => self.task_wait(query),
+            RpcMethod::TaskPoll(query) => self.task_poll(query),
             RpcMethod::TaskMessage(input) => {
                 let (_, task) = self.require_task(&input.agent_id)?;
                 validate_id(&input.message_id, "message_id")?;
@@ -2305,6 +2401,62 @@ impl RpcService {
         }
     }
 
+    fn task_poll(&self, query: TaskPollQuery) -> Result<RpcSuccess, RpcError> {
+        if Duration::from_millis(query.timeout_ms) > MAX_WAIT {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "poll timeout is outside the allowed range",
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_millis(query.timeout_ms);
+        loop {
+            let (job, task) = self.require_task(&query.agent_id)?;
+            let policy = self.scheduler.active_policy(&task.execution_agent_id);
+            let pending_requests = self
+                .store
+                .pending_requests_bounded(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+                .map_err(map_store)?
+                .into_iter()
+                .map(|request| pending_request_view(policy.as_deref(), request))
+                .collect::<Vec<_>>();
+            let result_available = self
+                .store
+                .task_result(&task.execution_agent_id)
+                .map_err(map_store)?
+                .is_some();
+            let activity = self
+                .scheduler
+                .passive_activity_snapshot(&task.execution_agent_id);
+            let revision = activity
+                .as_ref()
+                .map(|activity| activity.revision)
+                .unwrap_or(0)
+                .max(job.last_event_seq);
+            let terminal = task.phase == TaskPhase::Terminal;
+            let now = Instant::now();
+            if revision > query.after_revision
+                || !pending_requests.is_empty()
+                || terminal
+                || now >= deadline
+            {
+                let timed_out = revision <= query.after_revision
+                    && pending_requests.is_empty()
+                    && !terminal
+                    && now >= deadline;
+                return Ok(RpcSuccess::TaskPoll {
+                    activity: task_activity_view(task.phase, activity),
+                    task: task_view(job, task),
+                    revision,
+                    next_revision: revision,
+                    pending_requests,
+                    result_available,
+                    timed_out,
+                });
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+        }
+    }
+
     fn require_legacy_job(&self, agent_id: &str) -> Result<Job, RpcError> {
         validate_id(agent_id, "agent_id")?;
         self.store
@@ -2663,6 +2815,18 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
         .zcode_session_id
         .as_deref()
         .is_some_and(|session| !session.trim().is_empty());
+    let access_mode = job
+        .prepared_launch_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<PreparedGeneralTask>(json).ok())
+        .map(|prepared| match prepared.profile {
+            GeneralProfile::AnalysisReadonly => "read_only",
+            GeneralProfile::ImplementationWorktree | GeneralProfile::TestRunner => {
+                "workspace_write"
+            }
+        })
+        .unwrap_or("read_only")
+        .to_owned();
     TaskView {
         agent_id: task.public_agent_id,
         review_id: task.review_id,
@@ -2672,6 +2836,7 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
             TaskKind::ReviewContinuation => "review_continuation",
         }
         .into(),
+        access_mode,
         phase: match task.phase {
             TaskPhase::Queued => "QUEUED",
             TaskPhase::Preparing => "PREPARING",
@@ -2692,6 +2857,80 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
     }
 }
 
+fn task_activity_view(
+    phase: TaskPhase,
+    snapshot: Option<PassiveActivitySnapshot>,
+) -> TaskActivityView {
+    let state = match phase {
+        TaskPhase::Queued => TaskActivityStateView::Queued,
+        TaskPhase::Preparing => TaskActivityStateView::Preparing,
+        TaskPhase::Running => TaskActivityStateView::Active,
+        TaskPhase::WaitingInput => TaskActivityStateView::WaitingInput,
+        TaskPhase::Cancelling => TaskActivityStateView::Cancelling,
+        TaskPhase::Terminal => TaskActivityStateView::Terminal,
+    };
+    let Some(snapshot) = snapshot else {
+        return TaskActivityView {
+            state,
+            last_runtime_event_at: None,
+            last_activity_age_ms: None,
+            model_request_active: false,
+            model_request_age_ms: None,
+            model_last_delta_age_ms: None,
+            latest_text_tail: String::new(),
+            latest_text_updated_at: None,
+            latest_text_truncated: false,
+            active_tools: Vec::new(),
+            window_60s: ActivityWindowView::default(),
+            telemetry_status: TelemetryStatusView::Unavailable,
+        };
+    };
+    TaskActivityView {
+        state,
+        last_runtime_event_at: snapshot.last_runtime_event_at,
+        last_activity_age_ms: snapshot.last_activity_age_ms,
+        model_request_active: snapshot.model_request_active,
+        model_request_age_ms: snapshot.model_request_age_ms,
+        model_last_delta_age_ms: snapshot.model_last_delta_age_ms,
+        latest_text_tail: snapshot.latest_text_tail,
+        latest_text_updated_at: snapshot.latest_text_updated_at,
+        latest_text_truncated: snapshot.latest_text_truncated,
+        active_tools: snapshot
+            .active_tools
+            .into_iter()
+            .map(|tool| ActiveToolView {
+                tool_call_id: tool.tool_call_id,
+                kind: match tool.kind {
+                    PassiveToolKind::Read => ActivityToolKindView::Read,
+                    PassiveToolKind::Bash => ActivityToolKindView::Bash,
+                    PassiveToolKind::Other => ActivityToolKindView::Other,
+                },
+            })
+            .collect(),
+        window_60s: activity_window_view(snapshot.window_60s),
+        telemetry_status: if snapshot.telemetry_degraded {
+            TelemetryStatusView::Degraded
+        } else {
+            TelemetryStatusView::Healthy
+        },
+    }
+}
+
+fn activity_window_view(value: PassiveActivityWindow) -> ActivityWindowView {
+    ActivityWindowView {
+        reasoning_delta_events: value.reasoning_delta_events,
+        reasoning_delta_bytes: value.reasoning_delta_bytes,
+        text_delta_events: value.text_delta_events,
+        text_delta_bytes: value.text_delta_bytes,
+        tool_calls_started: value.tool_calls_started,
+        tool_calls_completed: value.tool_calls_completed,
+        tool_calls_failed: value.tool_calls_failed,
+        read_calls: value.read_calls,
+        bash_calls: value.bash_calls,
+        other_tool_calls: value.other_tool_calls,
+    }
+}
+
 fn task_frame_budget_view(job: Job, task: TaskRecord) -> TaskView {
     let mut view = task_view(job, task);
     // Budget against the longest variants and JSON booleans that can be
@@ -2699,6 +2938,7 @@ fn task_frame_budget_view(job: Job, task: TaskRecord) -> TaskView {
     // response. Stable identifiers and effective budgets retain their exact
     // serialized representation.
     view.task_kind = "review_continuation".into();
+    view.access_mode = "workspace_write".into();
     view.phase = "WAITING_INPUT".into();
     view.independent_evidence = false;
     view.fresh_session_observed = false;
@@ -3118,6 +3358,31 @@ fn validate_text(value: &str, field: &str, max: usize) -> Result<(), RpcError> {
             RpcErrorCode::Validation,
             format!("{field} is invalid"),
         ));
+    }
+    Ok(())
+}
+
+fn validate_command_ids(values: &[String], field: &str) -> Result<(), RpcError> {
+    if values.len() > 128 {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            format!("{field} exceeds the selection cap"),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        if value.is_empty()
+            || value.len() > 256
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+            || !seen.insert(value)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                format!("{field} must contain exact unique command ids"),
+            ));
+        }
     }
     Ok(())
 }

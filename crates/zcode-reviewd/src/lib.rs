@@ -8,9 +8,8 @@ use review_store::{
 };
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt, fs, io,
-    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -18,7 +17,7 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard, TryLockError,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zcode_driver::{
     observe_process, observe_process_group, ChildExit, Driver, Inbound, ProcessIdentity,
@@ -136,6 +135,670 @@ pub struct RuntimeActivitySnapshot {
     pub turn: TurnSnapshot,
     pub model_request_elapsed: Option<Duration>,
     pub transport_idle_elapsed: Option<Duration>,
+}
+
+const PASSIVE_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_ACTIVITY_IDENTITIES: usize = 65_536;
+const MAX_LATEST_TEXT_BYTES: usize = 8 * 1024;
+const MAX_ACTIVITY_ID_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveToolKind {
+    Read,
+    Bash,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassiveActiveTool {
+    pub tool_call_id: String,
+    pub kind: PassiveToolKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassiveActivityWindow {
+    pub reasoning_delta_events: u64,
+    pub reasoning_delta_bytes: u64,
+    pub text_delta_events: u64,
+    pub text_delta_bytes: u64,
+    pub tool_calls_started: u64,
+    pub tool_calls_completed: u64,
+    pub tool_calls_failed: u64,
+    pub read_calls: u64,
+    pub bash_calls: u64,
+    pub other_tool_calls: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassiveActivitySnapshot {
+    pub revision: u64,
+    pub last_runtime_event_at: Option<u64>,
+    pub last_activity_age_ms: Option<u64>,
+    pub model_request_active: bool,
+    pub model_request_age_ms: Option<u64>,
+    pub model_last_delta_age_ms: Option<u64>,
+    pub latest_text_tail: String,
+    pub latest_text_updated_at: Option<u64>,
+    pub latest_text_truncated: bool,
+    pub active_tools: Vec<PassiveActiveTool>,
+    pub window_60s: PassiveActivityWindow,
+    pub telemetry_degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivitySource {
+    Session,
+    Telemetry,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivitySampleKind {
+    ReasoningDelta { bytes: u64 },
+    TextDelta { bytes: u64 },
+    ToolStarted { kind: PassiveToolKind },
+    ToolCompleted,
+    ToolFailed,
+}
+
+#[derive(Debug, Clone)]
+struct ActivitySample {
+    source: ActivitySource,
+    observed_at: Instant,
+    stream_key: Option<String>,
+    kind: ActivitySampleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivityTransition {
+    ModelStarted,
+    ModelCompleted,
+    ToolScheduled,
+    ToolStarted,
+    ToolCompleted,
+    ToolFailed,
+    PermissionRequested,
+    PermissionResolved,
+    TurnStarted,
+    TurnCompleted,
+    TurnFailed,
+}
+
+struct ParsedActivity {
+    source: ActivitySource,
+    identity: Option<String>,
+    stream_key: Option<String>,
+    sample: Option<ActivitySampleKind>,
+    text_delta: Option<String>,
+    transition: Option<ActivityTransition>,
+    request_id: Option<String>,
+    tool_call_id: Option<String>,
+    tool_kind: PassiveToolKind,
+    telemetry_known: bool,
+}
+
+impl ParsedActivity {
+    fn runtime() -> Self {
+        Self {
+            source: ActivitySource::Runtime,
+            identity: None,
+            stream_key: None,
+            sample: None,
+            text_delta: None,
+            transition: None,
+            request_id: None,
+            tool_call_id: None,
+            tool_kind: PassiveToolKind::Other,
+            telemetry_known: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PassiveActivityState {
+    revision: u64,
+    last_runtime_event_at: Option<(Instant, u64)>,
+    active_model_requests: HashMap<String, Instant>,
+    last_model_delta_at: Option<Instant>,
+    latest_text_tail: String,
+    latest_text_updated_at: Option<u64>,
+    latest_text_truncated: bool,
+    active_tools: HashMap<String, PassiveToolKind>,
+    samples: HashMap<String, ActivitySample>,
+    sample_order: VecDeque<String>,
+    session_streams: HashSet<String>,
+    telemetry_degraded: bool,
+}
+
+struct PassiveActivityTracker {
+    state: Mutex<PassiveActivityState>,
+    changed: Condvar,
+}
+
+impl PassiveActivityTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PassiveActivityState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn observe(&self, event: &RuntimeEvent) {
+        self.observe_at(event, Instant::now(), activity_wall_now_millis());
+    }
+
+    fn observe_at(&self, event: &RuntimeEvent, now: Instant, wall_now_ms: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.revision = state.revision.saturating_add(1);
+        state.last_runtime_event_at = Some((now, wall_now_ms));
+        let parsed = parse_passive_activity(event);
+        if parsed.source == ActivitySource::Telemetry && !parsed.telemetry_known {
+            state.telemetry_degraded = true;
+        }
+
+        let mut admitted = true;
+        if let Some(stream_key) = parsed.stream_key.as_ref() {
+            if parsed.source == ActivitySource::Session {
+                state.session_streams.insert(stream_key.clone());
+                state.samples.retain(|_, sample| {
+                    sample.source != ActivitySource::Telemetry
+                        || sample.stream_key.as_ref() != Some(stream_key)
+                });
+            } else if parsed.source == ActivitySource::Telemetry
+                && state.session_streams.contains(stream_key)
+            {
+                admitted = false;
+            }
+        }
+
+        if admitted {
+            if let (Some(identity), Some(sample)) = (parsed.identity.as_ref(), parsed.sample) {
+                let replace = match state.samples.get(identity) {
+                    Some(existing) => {
+                        existing.source == ActivitySource::Telemetry
+                            && parsed.source == ActivitySource::Session
+                    }
+                    None => true,
+                };
+                if replace {
+                    if !state.samples.contains_key(identity) {
+                        state.sample_order.push_back(identity.clone());
+                    }
+                    state.samples.insert(
+                        identity.clone(),
+                        ActivitySample {
+                            source: parsed.source,
+                            observed_at: now,
+                            stream_key: parsed.stream_key.clone(),
+                            kind: sample,
+                        },
+                    );
+                } else {
+                    admitted = false;
+                }
+            }
+        }
+
+        while state.sample_order.len() > MAX_ACTIVITY_IDENTITIES {
+            if let Some(identity) = state.sample_order.pop_front() {
+                state.samples.remove(&identity);
+            }
+        }
+
+        if admitted
+            && matches!(
+                parsed.sample,
+                Some(
+                    ActivitySampleKind::ReasoningDelta { .. }
+                        | ActivitySampleKind::TextDelta { .. }
+                )
+            )
+        {
+            state.last_model_delta_at = Some(now);
+        }
+        if admitted {
+            if let Some(delta) = parsed.text_delta.as_deref() {
+                append_latest_text(&mut state, delta, wall_now_ms);
+            }
+        }
+
+        match parsed.transition {
+            Some(ActivityTransition::ModelStarted) => {
+                state
+                    .active_model_requests
+                    .entry(parsed.request_id.unwrap_or_else(|| "model-request".into()))
+                    .or_insert(now);
+            }
+            Some(ActivityTransition::ModelCompleted) => {
+                if let Some(request_id) = parsed.request_id.as_deref() {
+                    state.active_model_requests.remove(request_id);
+                } else {
+                    state.active_model_requests.clear();
+                }
+            }
+            Some(ActivityTransition::ToolScheduled | ActivityTransition::ToolStarted) => {
+                if let Some(tool_call_id) = parsed.tool_call_id {
+                    state.active_tools.insert(tool_call_id, parsed.tool_kind);
+                }
+            }
+            Some(
+                ActivityTransition::ToolCompleted
+                | ActivityTransition::ToolFailed
+                | ActivityTransition::PermissionResolved,
+            ) => {
+                if let Some(tool_call_id) = parsed.tool_call_id {
+                    state.active_tools.remove(&tool_call_id);
+                }
+            }
+            Some(ActivityTransition::TurnCompleted | ActivityTransition::TurnFailed) => {
+                state.active_model_requests.clear();
+                state.active_tools.clear();
+            }
+            Some(ActivityTransition::PermissionRequested | ActivityTransition::TurnStarted)
+            | None => {}
+        }
+        self.changed.notify_all();
+    }
+
+    fn snapshot(&self) -> PassiveActivitySnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> PassiveActivitySnapshot {
+        let state = self.state.lock().unwrap();
+        let mut window = PassiveActivityWindow::default();
+        for sample in state.samples.values() {
+            if now.saturating_duration_since(sample.observed_at) > PASSIVE_ACTIVITY_WINDOW {
+                continue;
+            }
+            match sample.kind {
+                ActivitySampleKind::ReasoningDelta { bytes } => {
+                    window.reasoning_delta_events = window.reasoning_delta_events.saturating_add(1);
+                    window.reasoning_delta_bytes =
+                        window.reasoning_delta_bytes.saturating_add(bytes);
+                }
+                ActivitySampleKind::TextDelta { bytes } => {
+                    window.text_delta_events = window.text_delta_events.saturating_add(1);
+                    window.text_delta_bytes = window.text_delta_bytes.saturating_add(bytes);
+                }
+                ActivitySampleKind::ToolStarted { kind } => {
+                    window.tool_calls_started = window.tool_calls_started.saturating_add(1);
+                    match kind {
+                        PassiveToolKind::Read => {
+                            window.read_calls = window.read_calls.saturating_add(1)
+                        }
+                        PassiveToolKind::Bash => {
+                            window.bash_calls = window.bash_calls.saturating_add(1)
+                        }
+                        PassiveToolKind::Other => {
+                            window.other_tool_calls = window.other_tool_calls.saturating_add(1)
+                        }
+                    }
+                }
+                ActivitySampleKind::ToolCompleted => {
+                    window.tool_calls_completed = window.tool_calls_completed.saturating_add(1)
+                }
+                ActivitySampleKind::ToolFailed => {
+                    window.tool_calls_failed = window.tool_calls_failed.saturating_add(1)
+                }
+            }
+        }
+        let mut active_tools = state
+            .active_tools
+            .iter()
+            .map(|(tool_call_id, kind)| PassiveActiveTool {
+                tool_call_id: tool_call_id.clone(),
+                kind: *kind,
+            })
+            .collect::<Vec<_>>();
+        active_tools.sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
+        PassiveActivitySnapshot {
+            revision: state.revision,
+            last_runtime_event_at: state.last_runtime_event_at.map(|(_, wall)| wall),
+            last_activity_age_ms: state
+                .last_runtime_event_at
+                .map(|(at, _)| duration_millis(now.saturating_duration_since(at))),
+            model_request_active: !state.active_model_requests.is_empty(),
+            model_request_age_ms: state
+                .active_model_requests
+                .values()
+                .min()
+                .map(|at| duration_millis(now.saturating_duration_since(*at))),
+            model_last_delta_age_ms: state
+                .last_model_delta_at
+                .map(|at| duration_millis(now.saturating_duration_since(at))),
+            latest_text_tail: state.latest_text_tail.clone(),
+            latest_text_updated_at: state.latest_text_updated_at,
+            latest_text_truncated: state.latest_text_truncated,
+            active_tools,
+            window_60s: window,
+            telemetry_degraded: state.telemetry_degraded,
+        }
+    }
+}
+
+fn duration_millis(value: Duration) -> u64 {
+    value.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn activity_wall_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms: u64) {
+    state.latest_text_tail.push_str(delta);
+    if state.latest_text_tail.len() > MAX_LATEST_TEXT_BYTES {
+        let mut split = state.latest_text_tail.len() - MAX_LATEST_TEXT_BYTES;
+        while !state.latest_text_tail.is_char_boundary(split) {
+            split += 1;
+        }
+        state.latest_text_tail.drain(..split);
+        state.latest_text_truncated = true;
+    }
+    state.latest_text_updated_at = Some(wall_now_ms);
+}
+
+fn parse_passive_activity(event: &RuntimeEvent) -> ParsedActivity {
+    match event {
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(event))) => {
+            parse_activity_message(&event.method, &event.params, ActivitySource::Session)
+        }
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => {
+            let params = raw.get("params").unwrap_or(&serde_json::Value::Null);
+            let source = if method == "v4/telemetry/event" {
+                ActivitySource::Telemetry
+            } else if method == "session/event" {
+                ActivitySource::Session
+            } else {
+                ActivitySource::Runtime
+            };
+            parse_activity_message(method, params, source)
+        }
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
+            if request.method == INTERACTION_REQUEST_PERMISSION
+                || request.method == INTERACTION_REQUEST_USER_INPUT =>
+        {
+            let mut parsed = ParsedActivity::runtime();
+            parsed.transition = Some(ActivityTransition::PermissionRequested);
+            parsed.request_id = activity_id(request.params.get("requestId"));
+            parsed.tool_call_id = activity_id(request.params.get("toolCallId"));
+            parsed.tool_kind = classify_passive_tool(request.params.get("toolName"));
+            parsed.identity = parsed
+                .request_id
+                .as_ref()
+                .map(|id| format!("permission:{id}:requested"));
+            parsed
+        }
+        _ => ParsedActivity::runtime(),
+    }
+}
+
+fn parse_activity_message(
+    method: &str,
+    params: &serde_json::Value,
+    source: ActivitySource,
+) -> ParsedActivity {
+    let mut parsed = ParsedActivity::runtime();
+    parsed.source = source;
+    parsed.telemetry_known = source != ActivitySource::Telemetry;
+    if method == "session/event" {
+        let kind = params.get("type").and_then(serde_json::Value::as_str);
+        let payload = params.get("payload").unwrap_or(&serde_json::Value::Null);
+        let payload_kind = payload.get("kind").and_then(serde_json::Value::as_str);
+        let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
+        let event_id = activity_id(params.get("eventId"));
+        let turn_id = activity_id(params.get("turnId"));
+        match (kind, payload_kind, payload_type) {
+            (Some("model.streaming"), Some("reasoning_delta"), _) => {
+                let delta = payload.get("delta").and_then(serde_json::Value::as_str);
+                let bytes = delta.map(|value| value.len() as u64).unwrap_or(0);
+                parsed.stream_key = stream_key(params, payload, "reasoning");
+                parsed.identity = event_id.map(|id| format!("stream:{id}"));
+                parsed.sample = Some(ActivitySampleKind::ReasoningDelta { bytes });
+            }
+            (Some("model.streaming"), Some("text_delta"), _) => {
+                let delta = payload.get("delta").and_then(serde_json::Value::as_str);
+                let bytes = delta.map(|value| value.len() as u64).unwrap_or(0);
+                parsed.stream_key = stream_key(params, payload, "text");
+                parsed.identity = event_id.map(|id| format!("stream:{id}"));
+                parsed.sample = Some(ActivitySampleKind::TextDelta { bytes });
+                parsed.text_delta = delta.map(str::to_owned);
+            }
+            (Some("tool.updated" | "streamRecovery.updated"), _, _) => {
+                parse_tool_activity(&mut parsed, payload, source);
+            }
+            (Some("session.updated"), _, Some("model_request_started")) => {
+                parse_model_activity(&mut parsed, payload, true);
+            }
+            (Some("session.updated"), _, Some("model_request_completed")) => {
+                parse_model_activity(&mut parsed, payload, false);
+            }
+            (Some("permission.requested"), _, _) => {
+                parse_permission_activity(&mut parsed, payload, true);
+            }
+            (Some("permission.resolved"), _, _) => {
+                parse_permission_activity(&mut parsed, payload, false);
+            }
+            (Some("turn.started"), _, _) => {
+                parsed.transition = Some(ActivityTransition::TurnStarted);
+                parsed.identity = event_id.or(turn_id).map(|id| format!("turn:{id}:started"));
+            }
+            (Some("turn.completed"), _, _) => {
+                parsed.transition = Some(ActivityTransition::TurnCompleted);
+                parsed.identity = event_id
+                    .or(turn_id)
+                    .map(|id| format!("turn:{id}:completed"));
+            }
+            (Some("turn.failed"), _, _) => {
+                parsed.transition = Some(ActivityTransition::TurnFailed);
+                parsed.identity = event_id.or(turn_id).map(|id| format!("turn:{id}:failed"));
+            }
+            _ => {}
+        }
+    } else if method == "v4/telemetry/event" {
+        parsed.telemetry_known = true;
+        match params.get("kind").and_then(serde_json::Value::as_str) {
+            Some("stream.chunk") => {
+                let channel = match params.get("channel").and_then(serde_json::Value::as_str) {
+                    Some("thought") => "reasoning",
+                    Some("text") => "text",
+                    _ => {
+                        parsed.telemetry_known = false;
+                        return parsed;
+                    }
+                };
+                let Some(bytes) = params
+                    .get("chunkLength")
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    parsed.telemetry_known = false;
+                    return parsed;
+                };
+                parsed.stream_key = stream_key(params, params, channel);
+                parsed.identity =
+                    activity_id(params.get("eventId")).map(|id| format!("stream:{id}"));
+                parsed.sample = Some(if channel == "reasoning" {
+                    ActivitySampleKind::ReasoningDelta { bytes }
+                } else {
+                    ActivitySampleKind::TextDelta { bytes }
+                });
+            }
+            Some("tool.lifecycle") => parse_tool_activity(&mut parsed, params, source),
+            Some("model.request.status") => {
+                let started = params.get("status").and_then(serde_json::Value::as_str)
+                    == Some("model_request_started");
+                let completed = params.get("status").and_then(serde_json::Value::as_str)
+                    == Some("model_request_completed");
+                if started || completed {
+                    parse_model_activity(&mut parsed, params, started);
+                } else {
+                    parsed.telemetry_known = false;
+                }
+            }
+            Some("permission.lifecycle") => {
+                match params.get("phase").and_then(serde_json::Value::as_str) {
+                    Some("requested") => parse_permission_activity(&mut parsed, params, true),
+                    Some("resolved") => parse_permission_activity(&mut parsed, params, false),
+                    _ => parsed.telemetry_known = false,
+                }
+            }
+            Some("turn.started") => parsed.transition = Some(ActivityTransition::TurnStarted),
+            Some("turn.completed") => parsed.transition = Some(ActivityTransition::TurnCompleted),
+            Some("turn.failed") => parsed.transition = Some(ActivityTransition::TurnFailed),
+            Some("usage.delta") => {}
+            _ => parsed.telemetry_known = false,
+        }
+    }
+    parsed
+}
+
+fn parse_model_activity(parsed: &mut ParsedActivity, payload: &serde_json::Value, started: bool) {
+    parsed.request_id = activity_id(payload.get("requestId"));
+    let phase = if started { "started" } else { "completed" };
+    parsed.identity = parsed
+        .request_id
+        .as_ref()
+        .map(|id| format!("model:{id}:{phase}"));
+    parsed.transition = Some(if started {
+        ActivityTransition::ModelStarted
+    } else {
+        ActivityTransition::ModelCompleted
+    });
+}
+
+fn parse_permission_activity(
+    parsed: &mut ParsedActivity,
+    payload: &serde_json::Value,
+    requested: bool,
+) {
+    parsed.request_id = activity_id(payload.get("requestId"));
+    parsed.tool_call_id = activity_id(payload.get("toolCallId"));
+    parsed.tool_kind = classify_passive_tool(payload.get("toolName"));
+    let phase = if requested { "requested" } else { "resolved" };
+    parsed.identity = parsed
+        .request_id
+        .as_ref()
+        .map(|id| format!("permission:{id}:{phase}"));
+    parsed.transition = Some(if requested {
+        ActivityTransition::PermissionRequested
+    } else {
+        ActivityTransition::PermissionResolved
+    });
+}
+
+fn parse_tool_activity(
+    parsed: &mut ParsedActivity,
+    payload: &serde_json::Value,
+    source: ActivitySource,
+) {
+    let phase = payload
+        .get(if source == ActivitySource::Telemetry {
+            "phase"
+        } else {
+            "kind"
+        })
+        .and_then(serde_json::Value::as_str)
+        .and_then(|phase| match phase {
+            "scheduled" => Some(ActivityTransition::ToolScheduled),
+            "started" => Some(ActivityTransition::ToolStarted),
+            "result" | "tool_result" | "completed" => Some(ActivityTransition::ToolCompleted),
+            "error" | "tool_error" | "failed" => Some(ActivityTransition::ToolFailed),
+            "batch" => None,
+            _ => {
+                if source == ActivitySource::Telemetry {
+                    parsed.telemetry_known = false;
+                }
+                None
+            }
+        });
+    parsed.tool_call_id = activity_id(payload.get("toolCallId"));
+    parsed.tool_kind = classify_passive_tool(payload.get("toolName"));
+    parsed.transition = phase;
+    if let (Some(tool_call_id), Some(phase)) = (parsed.tool_call_id.as_ref(), phase) {
+        let phase_name = match phase {
+            ActivityTransition::ToolScheduled => "scheduled",
+            ActivityTransition::ToolStarted => "started",
+            ActivityTransition::ToolCompleted => "completed",
+            ActivityTransition::ToolFailed => "failed",
+            _ => return,
+        };
+        parsed.identity = Some(format!("tool:{tool_call_id}:{phase_name}"));
+        parsed.sample = match phase {
+            ActivityTransition::ToolStarted => Some(ActivitySampleKind::ToolStarted {
+                kind: parsed.tool_kind,
+            }),
+            ActivityTransition::ToolCompleted => Some(ActivitySampleKind::ToolCompleted),
+            ActivityTransition::ToolFailed => Some(ActivitySampleKind::ToolFailed),
+            _ => None,
+        };
+    }
+}
+
+fn stream_key(
+    params: &serde_json::Value,
+    payload: &serde_json::Value,
+    channel: &str,
+) -> Option<String> {
+    let turn_id = activity_id(params.get("turnId"));
+    let message_id = activity_id(payload.get("assistantMessageId"));
+    match (turn_id, message_id) {
+        (Some(turn_id), Some(message_id)) => Some(format!("{turn_id}:{message_id}:{channel}")),
+        (None, Some(message_id)) => Some(format!("{message_id}:{channel}")),
+        _ => None,
+    }
+}
+
+fn activity_id(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= MAX_ACTIVITY_ID_BYTES && !value.contains('\0')
+        })
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+fn capture_payload(
+    event: &RuntimeEvent,
+    pending_request_id: Option<&str>,
+    durable: &LifecycleProjection,
+) -> (serde_json::Value, &'static str) {
+    match event {
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => (
+            serde_json::json!({"kind":"unknown_event","method":method,"raw":raw}),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(message))) => (
+            serde_json::json!({"kind":"event","method":message.method,"type":event_type(message),"params":message.params}),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))) => (
+            serde_json::json!({"kind":"request","method":request.method,"request_id":pending_request_id,"params":request.params}),
+            "analysis_full",
+        ),
+        RuntimeEvent::Driver(Inbound::Message(WireMessage::Response(response))) => (
+            serde_json::json!({"kind":"response","outcome":if response.error.is_some(){"error"}else{"result"},"result":response.result,"error":response.error}),
+            "analysis_full",
+        ),
+        _ => (
+            serde_json::from_str::<serde_json::Value>(&durable.payload_json)
+                .unwrap_or_else(|_| serde_json::json!({"detail":"[REDACTED]"})),
+            durable.redaction_level,
+        ),
+    }
+}
+
+fn classify_passive_tool(value: Option<&serde_json::Value>) -> PassiveToolKind {
+    match value.and_then(serde_json::Value::as_str) {
+        Some("Read" | "read") => PassiveToolKind::Read,
+        Some("Bash" | "bash") => PassiveToolKind::Bash,
+        _ => PassiveToolKind::Other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1796,6 +2459,7 @@ enum ResponseClaimHookStage {
 #[derive(Default)]
 struct SchedulerState {
     active: HashMap<String, ActiveRuntime>,
+    activities: HashMap<String, Arc<PassiveActivityTracker>>,
     failures: HashMap<String, String>,
 }
 
@@ -2185,7 +2849,7 @@ struct StoreLifecycleSink {
     owner_epoch: u64,
     budget: Option<Arc<AttemptBudget>>,
     attempt: Arc<AttemptRuntimeLifecycle>,
-    event_capture_path: Option<PathBuf>,
+    activity: Arc<PassiveActivityTracker>,
     write_state: Mutex<SinkWriteState>,
     #[cfg(test)]
     after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -2214,6 +2878,7 @@ impl StoreLifecycleSink {
         owner_epoch: u64,
         budget: Option<Arc<AttemptBudget>>,
         attempt: Arc<AttemptRuntimeLifecycle>,
+        activity: Arc<PassiveActivityTracker>,
     ) -> Self {
         Self {
             store,
@@ -2222,51 +2887,11 @@ impl StoreLifecycleSink {
             owner_epoch,
             budget,
             attempt,
-            event_capture_path: std::env::var_os("ZCODE_RUNTIME_EVENT_CAPTURE_PATH")
-                .map(PathBuf::from),
+            activity,
             write_state: Mutex::new(SinkWriteState::default()),
             #[cfg(test)]
             after_admission_hook: Mutex::new(None),
         }
-    }
-
-    /// Optional analysis-only mirror, disabled unless explicitly configured.
-    /// The durable event path keeps its redacted projection; this local mirror
-    /// preserves the complete inbound wire payload (including model reasoning)
-    /// for post-run analysis of exactly what the runtime emitted.
-    fn capture_event(
-        &self,
-        record: &LifecycleRecord,
-        projection: &LifecycleProjection,
-        pending_request_id: Option<&str>,
-    ) {
-        let Some(path) = self.event_capture_path.as_ref() else {
-            return;
-        };
-        let (payload, redaction_level) =
-            capture_payload(&record.event, pending_request_id, projection);
-        let value = serde_json::json!({
-            "agent_id": self.agent_id,
-            "runtime_agent_id": self.runtime_agent_id,
-            "source_sequence": record.sequence,
-            "event_type": projection.event_type,
-            "payload": payload,
-            "redaction_level": redaction_level,
-        });
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{}", value);
-        }
-    }
-
-    fn capture_synthesized_terminal(&self, source_sequence: u64, terminal: &RuntimeTerminal) {
-        self.capture_event(
-            &LifecycleRecord {
-                sequence: source_sequence,
-                event: RuntimeEvent::Terminal(terminal.clone()),
-            },
-            &lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None),
-            None,
-        );
     }
 
     #[cfg(test)]
@@ -2294,9 +2919,6 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        if state.pending_terminal_sequence.is_none() {
-            self.capture_synthesized_terminal(source_sequence, terminal);
-        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2338,9 +2960,6 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        if state.pending_terminal_sequence.is_none() {
-            self.capture_synthesized_terminal(source_sequence, terminal);
-        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2381,9 +3000,6 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        if state.pending_terminal_sequence.is_none() {
-            self.capture_synthesized_terminal(source_sequence, terminal);
-        }
         let projection = lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         let terminal_write = self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
@@ -2603,6 +3219,7 @@ impl LifecycleSink for StoreLifecycleSink {
                 budget.observe(inbound);
             }
         }
+        self.activity.observe(&record.event);
         let mut state = self.write_state.lock().unwrap();
         if state.first_error.is_some() {
             return;
@@ -2647,7 +3264,6 @@ impl LifecycleSink for StoreLifecycleSink {
             _ => None,
         };
         let projection = lifecycle_projection(&record.event, pending_request_id.as_deref());
-        self.capture_event(&record, &projection, pending_request_id.as_deref());
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -2671,55 +3287,6 @@ impl LifecycleSink for StoreLifecycleSink {
         if let Err(error) = self.store.append_lifecycle(&write) {
             state.first_error = Some(error.to_string());
         }
-    }
-}
-
-fn capture_payload(
-    event: &RuntimeEvent,
-    pending_request_id: Option<&str>,
-    durable: &LifecycleProjection,
-) -> (serde_json::Value, &'static str) {
-    match event {
-        RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => (
-            serde_json::json!({
-                "kind": "unknown_event",
-                "method": method,
-                "raw": raw,
-            }),
-            "analysis_full",
-        ),
-        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(message))) => (
-            serde_json::json!({
-                "kind": "event",
-                "method": message.method,
-                "type": event_type(message),
-                "params": message.params,
-            }),
-            "analysis_full",
-        ),
-        RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))) => (
-            serde_json::json!({
-                "kind": "request",
-                "method": request.method,
-                "request_id": pending_request_id,
-                "params": request.params,
-            }),
-            "analysis_full",
-        ),
-        RuntimeEvent::Driver(Inbound::Message(WireMessage::Response(response))) => (
-            serde_json::json!({
-                "kind": "response",
-                "outcome": if response.error.is_some() { "error" } else { "result" },
-                "result": response.result,
-                "error": response.error,
-            }),
-            "analysis_full",
-        ),
-        _ => (
-            serde_json::from_str::<serde_json::Value>(&durable.payload_json)
-                .unwrap_or_else(|_| serde_json::json!({"detail": "[REDACTED]"})),
-            durable.redaction_level,
-        ),
     }
 }
 
@@ -3562,6 +4129,7 @@ impl Scheduler {
             task.as_ref().map(|task| task.attempt_sequence).unwrap_or(1),
             claim.owner_epoch,
         ));
+        let activity = Arc::new(PassiveActivityTracker::new());
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
             claim.job.agent_id.clone(),
@@ -3569,6 +4137,7 @@ impl Scheduler {
             claim.owner_epoch,
             budget.as_ref().map(Arc::clone),
             Arc::clone(&attempt),
+            Arc::clone(&activity),
         ));
         let lifecycle_sink: Arc<dyn LifecycleSink> = sink.clone();
         if budget
@@ -3747,6 +4316,9 @@ impl Scheduler {
         };
         {
             let mut state = self.inner.state.lock().unwrap();
+            state
+                .activities
+                .insert(claim.job.agent_id.clone(), Arc::clone(&activity));
             state.active.insert(
                 claim.job.agent_id.clone(),
                 ActiveRuntime {
@@ -6228,6 +6800,19 @@ impl Scheduler {
             .map(|(_, runtime, _, _, _)| (runtime.turn_snapshot(), runtime.stop_boundary_count()))
     }
 
+    pub(crate) fn passive_activity_snapshot(
+        &self,
+        agent_id: &str,
+    ) -> Option<PassiveActivitySnapshot> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .get(agent_id)
+            .map(|activity| activity.snapshot())
+    }
+
     pub fn last_error(&self, agent_id: &str) -> Option<String> {
         self.inner
             .state
@@ -6463,6 +7048,60 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Barrier;
     use zcode_protocol::{EventEnvelope, RequestEnvelope, ResponseEnvelope, WireId};
+
+    #[test]
+    fn passive_activity_full_case3_fixture_dedupes_windows_classifies_and_redacts() {
+        let tracker = PassiveActivityTracker::new();
+        let base = Instant::now();
+        for line in include_str!("../tests/fixtures/case3_activity_events.jsonl").lines() {
+            let fixture: serde_json::Value = serde_json::from_str(line).unwrap();
+            let at_ms = fixture["at_ms"].as_u64().unwrap();
+            let wire = fixture["wire"].clone();
+            let method = wire["method"].as_str().unwrap();
+            let params = wire["params"].clone();
+            let message = if method == "session/event" {
+                WireMessage::Event(EventEnvelope {
+                    method: method.into(),
+                    params,
+                })
+            } else {
+                WireMessage::UnknownEvent {
+                    method: method.into(),
+                    raw: wire,
+                }
+            };
+            tracker.observe_at(
+                &RuntimeEvent::Driver(Inbound::Message(message)),
+                base + Duration::from_millis(at_ms),
+                1_000_000 + at_ms,
+            );
+        }
+        let snapshot = tracker.snapshot_at(base + Duration::from_secs(65));
+        assert_eq!(snapshot.window_60s.reasoning_delta_events, 1);
+        assert_eq!(snapshot.window_60s.reasoning_delta_bytes, 26);
+        assert_eq!(snapshot.window_60s.text_delta_events, 2);
+        assert_eq!(snapshot.window_60s.text_delta_bytes, 7);
+        assert_eq!(snapshot.latest_text_tail, "visible");
+        assert_eq!(snapshot.window_60s.tool_calls_started, 3);
+        assert_eq!(snapshot.window_60s.tool_calls_completed, 2);
+        assert_eq!(snapshot.window_60s.tool_calls_failed, 1);
+        assert_eq!(snapshot.window_60s.read_calls, 1);
+        assert_eq!(snapshot.window_60s.bash_calls, 1);
+        assert_eq!(snapshot.window_60s.other_tool_calls, 1);
+        assert!(snapshot.active_tools.is_empty());
+        assert!(!snapshot.model_request_active);
+        assert!(snapshot.telemetry_degraded);
+        let public_shape = format!("{snapshot:?}");
+        for forbidden in [
+            "PRIVATE_REASONING_SENTINEL",
+            "PRIVATE_RAW_COMMAND",
+            "PRIVATE_TOOL_OUTPUT",
+            "/PRIVATE/PATH",
+            "PRIVATE_SECRET",
+        ] {
+            assert!(!public_shape.contains(forbidden));
+        }
+    }
 
     #[test]
     fn requested_model_normalization_is_narrow_and_fail_closed() {

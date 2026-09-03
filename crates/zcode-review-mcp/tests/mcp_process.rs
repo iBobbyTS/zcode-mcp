@@ -860,7 +860,7 @@ fn v2_stdio_discovers_only_the_exact_static_catalog() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(names, zcode_review_mcp::V2_PUBLIC_TOOLS);
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 9);
     assert!(tools.iter().all(|tool| {
         tool["inputSchema"]["additionalProperties"] == false
             && tool["outputSchema"]["additionalProperties"] == false
@@ -868,51 +868,16 @@ fn v2_stdio_discovers_only_the_exact_static_catalog() {
     }));
     assert!(!names.contains(&"zcode_review_status"));
     assert!(!names.contains(&"zcode_review_list"));
-    let ensure_ready = tools
-        .iter()
-        .find(|tool| tool["name"] == "zcode_system_ensure_ready")
-        .unwrap();
-    let readiness_output = &ensure_ready["outputSchema"];
-    assert!(contains_enum(
-        readiness_output,
-        &[
-            "READY",
-            "CONFIG_INVALID",
-            "ZCODE_START_FAILED",
-            "RUNTIME_PROTOCOL_FAILED",
-            "MODEL_AUTH_FAILED",
-            "RUNTIME_FAILED",
-            "NOT_OBSERVED_WITHIN_TIMEOUT",
-            "CLEANUP_FAILED"
-        ]
-    ));
-    let reason_property = &readiness_output["properties"]["reason_code"];
-    let reason_variants = reason_property["anyOf"].as_array().unwrap();
-    assert_eq!(reason_variants.len(), 2);
-    let reason_enum = reason_variants
-        .iter()
-        .find_map(|variant| {
-            variant["$ref"]
-                .as_str()
-                .and_then(|reference| readiness_output.pointer(reference.strip_prefix('#')?))
-                .filter(|schema| schema.get("enum").is_some())
-        })
-        .unwrap();
-    assert_eq!(
-        reason_enum["enum"],
-        json!([
-            "CONFIG_INVALID",
-            "ZCODE_START_FAILED",
-            "RUNTIME_PROTOCOL_FAILED",
-            "MODEL_AUTH_FAILED",
-            "RUNTIME_FAILED",
-            "NOT_OBSERVED_WITHIN_TIMEOUT",
-            "CLEANUP_FAILED"
-        ])
-    );
-    assert!(reason_variants
-        .iter()
-        .any(|variant| variant["type"] == "null"));
+    for removed in [
+        "zcode_system_ensure_ready",
+        "zcode_agent_get",
+        "zcode_agent_events",
+        "zcode_agent_wait",
+        "zcode_review_spawn",
+        "zcode_review_continue",
+    ] {
+        assert!(!names.contains(&removed));
+    }
     let status = tools
         .iter()
         .find(|tool| tool["name"] == "zcode_system_status")

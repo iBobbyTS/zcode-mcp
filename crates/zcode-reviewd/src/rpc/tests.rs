@@ -23,6 +23,7 @@ use std::{
     },
 };
 use zcode_driver::{observe_process_group, ChildExit, Inbound, ProcessIdentity, StopOutcome};
+use zcode_protocol::{RequestEnvelope, WireMessage};
 
 #[test]
 fn unverified_review_bash_policy_preserves_the_fail_closed_rpc_code() {
@@ -351,7 +352,8 @@ fn submit_general_fixture(
                 },
                 feature_id: feature_id.into(),
                 ownership_token: ownership_token.into(),
-                command_ids: Vec::new(),
+                allowed_command_ids: Vec::new(),
+                required_command_ids: Vec::new(),
             },
         })
         .unwrap();
@@ -363,6 +365,109 @@ fn submit_general_fixture(
         other => panic!("unexpected general submission: {other:?}"),
     };
     (repository, agent_id)
+}
+
+#[test]
+fn task_poll_uses_revision_and_wakes_for_pending_and_terminal() {
+    let fixture = fixture();
+    let (_, agent_id) = submit_general_fixture(&fixture, "poll", "feature-poll", "owner-poll");
+    fixture.scheduler.start_ready().unwrap();
+    let task = fixture.store.get_task(&agent_id).unwrap().unwrap();
+    let runtime = fixture.factory.runtime(&task.execution_agent_id);
+
+    let initial = fixture
+        .service
+        .dispatch(RpcMethod::TaskPoll(TaskPollQuery {
+            agent_id: agent_id.clone(),
+            after_revision: 0,
+            timeout_ms: 0,
+        }))
+        .unwrap();
+    let revision = match initial {
+        RpcSuccess::TaskPoll {
+            revision,
+            next_revision,
+            timed_out,
+            ..
+        } => {
+            assert_eq!(revision, next_revision);
+            assert!(!timed_out);
+            revision
+        }
+        other => panic!("unexpected poll result: {other:?}"),
+    };
+
+    let service = Arc::clone(&fixture.service);
+    let waiting_agent = agent_id.clone();
+    let waiter = thread::spawn(move || {
+        service
+            .dispatch(RpcMethod::TaskPoll(TaskPollQuery {
+                agent_id: waiting_agent,
+                after_revision: revision,
+                timeout_ms: 1000,
+            }))
+            .unwrap()
+    });
+    thread::sleep(Duration::from_millis(20));
+    runtime.emit(RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(
+        RequestEnvelope {
+            id: zcode_protocol::WireId::String("permission-wire".into()),
+            method: zcode_protocol::INTERACTION_REQUEST_PERMISSION.into(),
+            params: serde_json::json!({
+                "requestId":"permission-1",
+                "toolCallId":"read-1",
+                "toolName":"Read",
+                "input":{"path":"src/lib.rs"},
+                "options":[{"id":"deny","kind":"deny","label":"Deny","response":{"decision":"deny"}}]
+            }),
+        },
+    ))));
+    let (pending_revision, request_id) = match waiter.join().unwrap() {
+        RpcSuccess::TaskPoll {
+            revision,
+            pending_requests,
+            timed_out,
+            ..
+        } => {
+            assert!(revision > 0);
+            assert_eq!(pending_requests.len(), 1);
+            assert!(!timed_out);
+            (revision, pending_requests[0].request_id.clone())
+        }
+        other => panic!("unexpected pending poll result: {other:?}"),
+    };
+
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskRespond(RespondInput {
+            agent_id: agent_id.clone(),
+            request_id,
+            decision: ResponseDecision::Deny,
+            content: None,
+        }))
+        .unwrap();
+    runtime.finish();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while fixture.store.get_task(&agent_id).unwrap().unwrap().phase != TaskPhase::Terminal {
+        assert!(Instant::now() < deadline, "task did not reach terminal");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let terminal = fixture
+        .service
+        .dispatch(RpcMethod::TaskPoll(TaskPollQuery {
+            agent_id,
+            after_revision: pending_revision,
+            timeout_ms: 1000,
+        }))
+        .unwrap();
+    assert!(matches!(
+        terminal,
+        RpcSuccess::TaskPoll {
+            task: TaskView { phase, .. },
+            timed_out: false,
+            ..
+        } if phase == "TERMINAL"
+    ));
 }
 
 fn running_review_progress_fixture(fixture: &Fixture, name: &str) -> (String, String, u64) {
@@ -2292,7 +2397,8 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
                 },
                 feature_id: "feature".into(),
                 ownership_token: "owner-group".into(),
-                command_ids: Vec::new(),
+                allowed_command_ids: Vec::new(),
+                required_command_ids: Vec::new(),
             },
         },
         RpcMethod::GeneralComplete(GeneralCompleteInput {
@@ -2333,6 +2439,11 @@ fn typed_protocol_round_trips_every_method_and_outer_error() {
         RpcMethod::TaskWait(TaskWaitQuery {
             agent_id: "general-1".into(),
             after: 0,
+            timeout_ms: 50,
+        }),
+        RpcMethod::TaskPoll(TaskPollQuery {
+            agent_id: "general-1".into(),
+            after_revision: 0,
             timeout_ms: 50,
         }),
         RpcMethod::TaskMessage(MessageInput {

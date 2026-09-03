@@ -29,10 +29,10 @@ use zcode_reviewd::{
         AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
         MessageDispositionView, MessageInput, ReadinessResultView, RespondInput, ResponseDecision,
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
-        SubmissionDispositionView, SystemStatusView, TaskArtifactMetadataView, TaskArtifactQuery,
-        TaskEventPage, TaskEventQuery, TaskListQuery, TaskPhaseFilter, TaskResultView,
-        TaskReviewEvidenceView, TaskReviewProgressStage, TaskView, TaskWaitQuery,
-        MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
+        SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
+        TaskArtifactMetadataView, TaskArtifactQuery, TaskEventPage, TaskListQuery, TaskPhaseFilter,
+        TaskPollQuery, TaskResultView, TaskReviewEvidenceView, TaskReviewProgressStage, TaskView,
+        TelemetryStatusView, MAX_ARTIFACT_CHUNK_BYTES, RPC_VERSION,
     },
 };
 
@@ -41,20 +41,15 @@ use crate::{
     PublicResponseDisposition,
 };
 
-pub const V2_PUBLIC_TOOLS: [&str; 14] = [
+pub const V2_PUBLIC_TOOLS: [&str; 9] = [
     "zcode_agent_cancel",
     "zcode_agent_close",
-    "zcode_agent_events",
-    "zcode_agent_get",
     "zcode_agent_list",
-    "zcode_agent_message",
+    "zcode_agent_poll",
     "zcode_agent_respond",
     "zcode_agent_result",
+    "zcode_agent_send",
     "zcode_agent_spawn",
-    "zcode_agent_wait",
-    "zcode_review_continue",
-    "zcode_review_spawn",
-    "zcode_system_ensure_ready",
     "zcode_system_status",
 ];
 
@@ -86,18 +81,16 @@ fn validate_path(value: &str, field: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PublicProfile {
-    AnalysisReadonly,
-    ImplementationWorktree,
-    TestRunner,
+pub enum PublicAccessMode {
+    ReadOnly,
+    WorkspaceWrite,
 }
 
-impl From<PublicProfile> for GeneralProfile {
-    fn from(value: PublicProfile) -> Self {
+impl From<PublicAccessMode> for GeneralProfile {
+    fn from(value: PublicAccessMode) -> Self {
         match value {
-            PublicProfile::AnalysisReadonly => Self::AnalysisReadonly,
-            PublicProfile::ImplementationWorktree => Self::ImplementationWorktree,
-            PublicProfile::TestRunner => Self::TestRunner,
+            PublicAccessMode::ReadOnly => Self::AnalysisReadonly,
+            PublicAccessMode::WorkspaceWrite => Self::ImplementationWorktree,
         }
     }
 }
@@ -271,8 +264,7 @@ impl From<ComponentStateView> for PublicComponentState {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicAgentCapabilities {
-    pub task_kinds: Vec<String>,
-    pub profiles: Vec<String>,
+    pub access_modes: Vec<String>,
     pub profile_defaults: BTreeMap<String, PublicBudget>,
     pub hard_budget_caps: PublicBudget,
     pub max_rpc_frame_bytes: usize,
@@ -286,8 +278,7 @@ pub struct PublicAgentCapabilities {
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
     fn from(value: AgentCapabilitiesView) -> Self {
         Self {
-            task_kinds: value.task_kinds,
-            profiles: value.profiles,
+            access_modes: vec!["read_only".into(), "workspace_write".into()],
             profile_defaults: value
                 .profile_defaults
                 .into_iter()
@@ -373,7 +364,7 @@ pub struct PublicAttachmentInput {
 pub struct AgentSpawnInput {
     pub repository: String,
     pub base_ref: String,
-    pub profile: PublicProfile,
+    pub access_mode: PublicAccessMode,
     pub prompt: String,
     pub feature_id: String,
     pub ownership_token: String,
@@ -389,7 +380,9 @@ pub struct AgentSpawnInput {
     #[serde(default)]
     pub retain_partial: bool,
     #[serde(default)]
-    pub command_ids: Vec<String>,
+    pub allowed_command_ids: Vec<String>,
+    #[serde(default)]
+    pub required_command_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -420,13 +413,10 @@ pub struct AgentInput {
 #[schemars(deny_unknown_fields)]
 pub struct PublicTask {
     pub agent_id: String,
-    pub review_id: Option<String>,
-    pub task_kind: String,
+    pub access_mode: String,
     pub phase: String,
     pub attempt_sequence: u64,
     pub effective_budget: PublicBudget,
-    pub counts_as_independent: bool,
-    pub fresh_session_observed: bool,
     pub cancel_requested: bool,
     pub close_requested: bool,
     pub closed: bool,
@@ -437,13 +427,10 @@ impl From<TaskView> for PublicTask {
     fn from(value: TaskView) -> Self {
         Self {
             agent_id: value.agent_id,
-            review_id: value.review_id,
-            task_kind: value.task_kind,
+            access_mode: value.access_mode,
             phase: value.phase,
             attempt_sequence: value.attempt_sequence,
             effective_budget: value.effective_budget.into(),
-            counts_as_independent: value.independent_evidence && value.fresh_session_observed,
-            fresh_session_observed: value.fresh_session_observed,
             cancel_requested: value.stop_requested,
             close_requested: value.close_requested,
             closed: value.closed,
@@ -523,7 +510,7 @@ impl TryFrom<TaskArtifactMetadataView> for PublicArtifact {
 #[schemars(deny_unknown_fields)]
 pub struct PublicResult {
     pub outcome: PublicOutcome,
-    pub summary: String,
+    pub final_text: String,
     pub partial: bool,
     pub retained: bool,
     pub base_commit: Option<String>,
@@ -533,7 +520,6 @@ pub struct PublicResult {
     pub checks: Vec<String>,
     pub residual_gaps: Vec<String>,
     pub result_sha256: String,
-    pub review_evidence: Option<PublicReviewEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -647,7 +633,7 @@ impl TryFrom<TaskResultView> for PublicResult {
     fn try_from(value: TaskResultView) -> Result<Self, Self::Error> {
         Ok(Self {
             outcome: value.outcome.into(),
-            summary: value.summary,
+            final_text: value.summary,
             partial: value.partial,
             retained: value.retained,
             base_commit: value.base_commit,
@@ -657,7 +643,6 @@ impl TryFrom<TaskResultView> for PublicResult {
             checks: value.checks,
             residual_gaps: value.residual_gaps,
             result_sha256: value.result_sha256,
-            review_evidence: value.review_evidence.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -685,7 +670,7 @@ pub struct AgentListInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     pub outcome: Option<PublicOutcomeFilter>,
     #[serde(default, deserialize_with = "optional_non_null")]
-    pub profile: Option<PublicProfile>,
+    pub access_mode: Option<PublicAccessMode>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 100))]
@@ -749,6 +734,153 @@ impl From<PublicOutcomeFilter> for TaskOutcome {
 pub struct AgentListOutput {
     pub tasks: Vec<PublicTask>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPollInput {
+    pub agent_id: String,
+    pub after_revision: u64,
+    #[schemars(range(min = 0, max = 5000))]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicActivityState {
+    Queued,
+    Preparing,
+    Active,
+    WaitingInput,
+    Cancelling,
+    Idle,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicTelemetryStatus {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicActivityToolKind {
+    Read,
+    Bash,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicActiveTool {
+    pub tool_call_id: String,
+    pub kind: PublicActivityToolKind,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicActivityWindow {
+    pub reasoning_delta_events: u64,
+    pub reasoning_delta_bytes: u64,
+    pub text_delta_events: u64,
+    pub text_delta_bytes: u64,
+    pub tool_calls_started: u64,
+    pub tool_calls_completed: u64,
+    pub tool_calls_failed: u64,
+    pub read_calls: u64,
+    pub bash_calls: u64,
+    pub other_tool_calls: u64,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicActivity {
+    pub state: PublicActivityState,
+    pub last_runtime_event_at: Option<u64>,
+    pub last_activity_age_ms: Option<u64>,
+    pub model_request_active: bool,
+    pub model_request_age_ms: Option<u64>,
+    pub model_last_delta_age_ms: Option<u64>,
+    pub latest_text_tail: String,
+    pub latest_text_updated_at: Option<u64>,
+    pub latest_text_truncated: bool,
+    pub active_tools: Vec<PublicActiveTool>,
+    pub window_60s: PublicActivityWindow,
+    pub telemetry_status: PublicTelemetryStatus,
+}
+
+impl From<TaskActivityView> for PublicActivity {
+    fn from(value: TaskActivityView) -> Self {
+        Self {
+            state: match value.state {
+                TaskActivityStateView::Queued => PublicActivityState::Queued,
+                TaskActivityStateView::Preparing => PublicActivityState::Preparing,
+                TaskActivityStateView::Active => PublicActivityState::Active,
+                TaskActivityStateView::WaitingInput => PublicActivityState::WaitingInput,
+                TaskActivityStateView::Cancelling => PublicActivityState::Cancelling,
+                TaskActivityStateView::Idle => PublicActivityState::Idle,
+                TaskActivityStateView::Terminal => PublicActivityState::Terminal,
+            },
+            last_runtime_event_at: value.last_runtime_event_at,
+            last_activity_age_ms: value.last_activity_age_ms,
+            model_request_active: value.model_request_active,
+            model_request_age_ms: value.model_request_age_ms,
+            model_last_delta_age_ms: value.model_last_delta_age_ms,
+            latest_text_tail: value.latest_text_tail,
+            latest_text_updated_at: value.latest_text_updated_at,
+            latest_text_truncated: value.latest_text_truncated,
+            active_tools: value
+                .active_tools
+                .into_iter()
+                .map(|tool| PublicActiveTool {
+                    tool_call_id: tool.tool_call_id,
+                    kind: match tool.kind {
+                        zcode_reviewd::rpc::ActivityToolKindView::Read => {
+                            PublicActivityToolKind::Read
+                        }
+                        zcode_reviewd::rpc::ActivityToolKindView::Bash => {
+                            PublicActivityToolKind::Bash
+                        }
+                        zcode_reviewd::rpc::ActivityToolKindView::Other => {
+                            PublicActivityToolKind::Other
+                        }
+                    },
+                })
+                .collect(),
+            window_60s: PublicActivityWindow {
+                reasoning_delta_events: value.window_60s.reasoning_delta_events,
+                reasoning_delta_bytes: value.window_60s.reasoning_delta_bytes,
+                text_delta_events: value.window_60s.text_delta_events,
+                text_delta_bytes: value.window_60s.text_delta_bytes,
+                tool_calls_started: value.window_60s.tool_calls_started,
+                tool_calls_completed: value.window_60s.tool_calls_completed,
+                tool_calls_failed: value.window_60s.tool_calls_failed,
+                read_calls: value.window_60s.read_calls,
+                bash_calls: value.window_60s.bash_calls,
+                other_tool_calls: value.window_60s.other_tool_calls,
+            },
+            telemetry_status: match value.telemetry_status {
+                TelemetryStatusView::Healthy => PublicTelemetryStatus::Healthy,
+                TelemetryStatusView::Degraded => PublicTelemetryStatus::Degraded,
+                TelemetryStatusView::Unavailable => PublicTelemetryStatus::Unavailable,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct AgentPollOutput {
+    pub task: PublicTask,
+    pub revision: u64,
+    pub next_revision: u64,
+    pub pending_requests: Vec<PublicPendingRequest>,
+    pub result_available: bool,
+    pub activity: PublicActivity,
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -837,10 +969,9 @@ pub enum PublicMessageMode {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AgentMessageInput {
+pub struct AgentSendInput {
     pub agent_id: String,
     pub message_id: String,
-    pub mode: PublicMessageMode,
     pub content: String,
 }
 
@@ -868,7 +999,7 @@ impl From<MessageDispositionView> for PublicMessageDisposition {
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-pub struct AgentMessageOutput {
+pub struct AgentSendOutput {
     pub disposition: PublicMessageDisposition,
     pub attempt_sequence: u64,
 }
@@ -1222,27 +1353,15 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
     if !repository.is_absolute() {
         return Err("validation: repository must be absolute".into());
     }
-    if input.command_ids.len() > 128 {
-        return Err("validation: command_ids exceeds the selection cap".into());
-    }
-    let mut seen_commands = std::collections::HashSet::new();
-    for command_id in &input.command_ids {
-        validate_text(command_id, "command_id", 256)?;
-        if !command_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-            || !seen_commands.insert(command_id)
-        {
-            return Err("validation: command_ids must be exact and unique".into());
-        }
-    }
+    validate_public_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
+    validate_public_command_ids(&input.required_command_ids, "required_command_ids")?;
     let task_id = "daemon-prepared".to_owned();
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
         task_id: task_id.clone(),
         repository,
         base_ref: input.base_ref.clone(),
-        profile: input.profile.into(),
+        profile: input.access_mode.into(),
         prompt: input.prompt.clone(),
         repo_context: input.repo_context.iter().map(PathBuf::from).collect(),
         attachments: input
@@ -1258,12 +1377,32 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
                 .budget
                 .clone()
                 .map(Into::into)
-                .unwrap_or_else(|| GeneralProfile::from(input.profile).default_budget()),
+                .unwrap_or_else(|| GeneralProfile::from(input.access_mode).default_budget()),
         ),
         validation_commands: BTreeMap::new(),
         retain_partial: input.retain_partial,
         idempotency_key: input.idempotency_key.clone(),
     })
+}
+
+fn validate_public_command_ids(command_ids: &[String], field: &str) -> Result<(), String> {
+    if command_ids.len() > 128 {
+        return Err(format!("validation: {field} exceeds the selection cap"));
+    }
+    let mut seen_commands = std::collections::HashSet::new();
+    for command_id in command_ids {
+        validate_text(command_id, "command_id", 256)?;
+        if !command_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+            || !seen_commands.insert(command_id)
+        {
+            return Err(format!(
+                "validation: {field} must contain exact unique command ids"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn review_manifest(input: &ReviewSpawnInput) -> Result<ReviewManifest, String> {
@@ -1490,48 +1629,6 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_system_ensure_ready",
-        description = "Wait boundedly for configured runtime readiness",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn system_ensure_ready(
-        &self,
-        Parameters(input): Parameters<EnsureReadyInput>,
-    ) -> Result<Json<EnsureReadyOutput>, String> {
-        if !(1..=5000).contains(&input.timeout_ms) {
-            return Err("validation: timeout_ms must be between 1 and 5000".into());
-        }
-        match self.rpc(RpcMethod::SystemEnsureReady {
-            timeout_ms: input.timeout_ms,
-        })? {
-            RpcSuccess::SystemReadiness {
-                ready,
-                status,
-                probe_result,
-                reason_code,
-            } => {
-                let public_reason = PublicReadinessReason::from_result(probe_result);
-                if reason_code.as_deref() != public_reason.map(PublicReadinessReason::as_wire_code)
-                {
-                    return Err(protocol_error());
-                }
-                Ok(Json(EnsureReadyOutput {
-                    ready,
-                    status: status.into(),
-                    probe_result: probe_result.into(),
-                    reason_code: public_reason,
-                }))
-            }
-            _ => Err(protocol_error()),
-        }
-    }
-
-    #[tool(
         name = "zcode_agent_spawn",
         description = "Submit a durable bounded general subagent task",
         annotations(
@@ -1551,7 +1648,8 @@ impl SubagentMcp {
                 manifest,
                 feature_id: input.feature_id,
                 ownership_token: input.ownership_token,
-                command_ids: input.command_ids,
+                allowed_command_ids: input.allowed_command_ids,
+                required_command_ids: input.required_command_ids,
             },
         })? {
             RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
@@ -1575,8 +1673,8 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_get",
-        description = "Read a task, verified result metadata, and typed pending requests",
+        name = "zcode_agent_poll",
+        description = "Long-poll a task revision with typed pending requests and passive runtime activity",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1584,18 +1682,38 @@ impl SubagentMcp {
             open_world_hint = false
         )
     )]
-    async fn agent_get(
+    async fn agent_poll(
         &self,
-        Parameters(input): Parameters<AgentInput>,
-    ) -> Result<Json<AgentGetOutput>, String> {
-        let (task, result, artifacts) = self.result(input.agent_id.clone(), None)?;
-        let pending_requests = self.pending(&input.agent_id)?;
-        Ok(Json(AgentGetOutput {
-            task,
-            result,
-            artifacts,
-            pending_requests,
-        }))
+        Parameters(input): Parameters<AgentPollInput>,
+    ) -> Result<Json<AgentPollOutput>, String> {
+        validate_text(&input.agent_id, "agent_id", MAX_ID_BYTES)?;
+        if input.timeout_ms > 5000 {
+            return Err("validation: timeout_ms must be between 0 and 5000".into());
+        }
+        match self.rpc(RpcMethod::TaskPoll(TaskPollQuery {
+            agent_id: input.agent_id,
+            after_revision: input.after_revision,
+            timeout_ms: input.timeout_ms,
+        }))? {
+            RpcSuccess::TaskPoll {
+                task,
+                revision,
+                next_revision,
+                pending_requests,
+                result_available,
+                activity,
+                timed_out,
+            } => Ok(Json(AgentPollOutput {
+                task: task.into(),
+                revision,
+                next_revision,
+                pending_requests: pending_requests.into_iter().map(Into::into).collect(),
+                result_available,
+                activity: activity.into(),
+                timed_out,
+            })),
+            _ => Err(protocol_error()),
+        }
     }
 
     #[tool(
@@ -1627,7 +1745,7 @@ impl SubagentMcp {
             ownership_token: input.ownership_token,
             phase: input.phase.map(Into::into),
             outcome: input.outcome.map(Into::into),
-            profile: input.profile.map(Into::into),
+            profile: input.access_mode.map(Into::into),
             cursor: input.cursor,
             limit: input.limit,
         }))? {
@@ -1640,74 +1758,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_events",
-        description = "Read a redacted monotonic task event page",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn agent_events(
-        &self,
-        Parameters(input): Parameters<AgentEventsInput>,
-    ) -> Result<Json<AgentEventsOutput>, String> {
-        if !(1..=100).contains(&input.limit) {
-            return Err("validation: limit must be between 1 and 100".into());
-        }
-        match self.rpc(RpcMethod::TaskEvents(TaskEventQuery {
-            agent_id: input.agent_id,
-            after: input.after_sequence,
-            limit: input.limit,
-        }))? {
-            RpcSuccess::TaskEvents { page } => Ok(Json(project_event_page(page)?)),
-            _ => Err(protocol_error()),
-        }
-    }
-
-    #[tool(
-        name = "zcode_agent_wait",
-        description = "Wait boundedly for a redacted task event or terminal state",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn agent_wait(
-        &self,
-        Parameters(input): Parameters<AgentWaitInput>,
-    ) -> Result<Json<AgentWaitOutput>, String> {
-        if !(1..=5000).contains(&input.timeout_ms) {
-            return Err("validation: timeout_ms must be between 1 and 5000".into());
-        }
-        match self.rpc(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: input.agent_id,
-            after: input.after_sequence,
-            timeout_ms: input.timeout_ms,
-        }))? {
-            RpcSuccess::TaskWait {
-                task,
-                page,
-                timed_out,
-            } => {
-                let projected = project_event_page(page)?;
-                Ok(Json(AgentWaitOutput {
-                    task: task.into(),
-                    events: projected.events,
-                    next_sequence: projected.next_sequence,
-                    has_more: projected.has_more,
-                    timed_out,
-                }))
-            }
-            _ => Err(protocol_error()),
-        }
-    }
-
-    #[tool(
-        name = "zcode_agent_message",
+        name = "zcode_agent_send",
         description = "Queue an idempotent bounded message for a running task",
         annotations(
             read_only_hint = false,
@@ -1716,22 +1767,18 @@ impl SubagentMcp {
             open_world_hint = false
         )
     )]
-    async fn agent_message(
+    async fn agent_send(
         &self,
-        Parameters(input): Parameters<AgentMessageInput>,
-    ) -> Result<Json<AgentMessageOutput>, String> {
+        Parameters(input): Parameters<AgentSendInput>,
+    ) -> Result<Json<AgentSendOutput>, String> {
         validate_text(&input.content, "content", MAX_MESSAGE_BYTES)?;
-        let mode = match input.mode {
-            PublicMessageMode::Queue => "queue",
-            PublicMessageMode::InterruptAndContinue => "interrupt_and_continue",
-        };
         match self.rpc(RpcMethod::TaskMessage(MessageInput {
             agent_id: input.agent_id.clone(),
             message_id: input.message_id,
-            mode: mode.into(),
+            mode: "queue".into(),
             content: input.content,
         }))? {
-            RpcSuccess::Message { disposition } => Ok(Json(AgentMessageOutput {
+            RpcSuccess::Message { disposition } => Ok(Json(AgentSendOutput {
                 disposition: disposition.into(),
                 attempt_sequence: self.status(&input.agent_id)?.attempt_sequence,
             })),
@@ -1923,16 +1970,7 @@ impl SubagentMcp {
         }
     }
 
-    #[tool(
-        name = "zcode_review_spawn",
-        description = "Submit a strict bounded structured review",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
+    #[allow(dead_code)]
     async fn review_spawn(
         &self,
         Parameters(input): Parameters<ReviewSpawnInput>,
@@ -1952,16 +1990,7 @@ impl SubagentMcp {
         }
     }
 
-    #[tool(
-        name = "zcode_review_continue",
-        description = "Continue an accepted structured review using daemon-owned immutable context",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
+    #[allow(dead_code)]
     async fn review_continue(
         &self,
         Parameters(input): Parameters<ReviewContinueInput>,
@@ -2108,11 +2137,8 @@ mod tests {
         }));
         for name in [
             "zcode_system_status",
-            "zcode_system_ensure_ready",
-            "zcode_agent_get",
             "zcode_agent_list",
-            "zcode_agent_events",
-            "zcode_agent_wait",
+            "zcode_agent_poll",
             "zcode_agent_result",
         ] {
             let annotations = tools
@@ -2139,21 +2165,32 @@ mod tests {
             );
         }
         let schemas = serde_json::to_string(&tools).unwrap();
-        assert!(schemas.contains("command_ids"));
-        for progress_field in [
-            "stage",
-            "summary",
-            "counters",
-            "last_progress_at",
-            "semantic_idle_ms",
-            "nudge_sent",
+        for required in [
+            "access_mode",
+            "allowed_command_ids",
+            "required_command_ids",
+            "after_revision",
+            "next_revision",
+            "latest_text_tail",
+            "reasoning_delta_events",
+            "tool_calls_started",
         ] {
             assert!(
-                schemas.contains(progress_field),
-                "public schema omitted {progress_field}"
+                schemas.contains(required),
+                "public schema omitted {required}"
             );
         }
         for forbidden in [
+            "zcode_system_ensure_ready",
+            "zcode_agent_get",
+            "zcode_agent_events",
+            "zcode_agent_wait",
+            "zcode_review_spawn",
+            "zcode_review_continue",
+            "review_id",
+            "review_evidence",
+            "semantic_idle_ms",
+            "nudge_sent",
             "workspace_path",
             "runtime_agent_id",
             "owner_epoch",
@@ -2164,7 +2201,7 @@ mod tests {
             "process_group_id",
             "environment",
             "credentials",
-            "reasoning",
+            "reasoning_content",
             "validation_commands",
             "program",
             "args",
@@ -2346,7 +2383,7 @@ mod tests {
         let input = AgentSpawnInput {
             repository: repository.to_string_lossy().into_owned(),
             base_ref: head.trim().into(),
-            profile: PublicProfile::AnalysisReadonly,
+            access_mode: PublicAccessMode::ReadOnly,
             prompt: "inspect".into(),
             feature_id: "feature".into(),
             ownership_token: "owner".into(),
@@ -2356,7 +2393,8 @@ mod tests {
             attachments: Vec::new(),
             budget: None,
             retain_partial: false,
-            command_ids: Vec::new(),
+            allowed_command_ids: Vec::new(),
+            required_command_ids: Vec::new(),
         };
         let manifest = general_manifest(&input).unwrap();
         assert_eq!(manifest.task_id, "daemon-prepared");
@@ -2374,15 +2412,18 @@ mod tests {
         let base = serde_json::json!({
             "repository":"/tmp/repository",
             "base_ref":"a".repeat(40),
-            "profile":"test_runner",
+            "access_mode":"workspace_write",
             "prompt":"run checks",
             "feature_id":"feature",
             "ownership_token":"owner",
             "idempotency_key":"key",
-            "command_ids":["unit"]
+            "write_manifest":["src/lib.rs"],
+            "allowed_command_ids":["unit"],
+            "required_command_ids":["lint"]
         });
         let parsed: AgentSpawnInput = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(parsed.command_ids, vec!["unit"]);
+        assert_eq!(parsed.allowed_command_ids, vec!["unit"]);
+        assert_eq!(parsed.required_command_ids, vec!["lint"]);
         for forbidden in [
             serde_json::json!({"validation_commands":{"unit":{"program":"cargo"}}}),
             serde_json::json!({"program":"cargo"}),
@@ -2399,7 +2440,7 @@ mod tests {
             assert!(serde_json::from_value::<AgentSpawnInput>(injected).is_err());
         }
         let mut duplicate: AgentSpawnInput = serde_json::from_value(base).unwrap();
-        duplicate.command_ids.push("unit".into());
+        duplicate.allowed_command_ids.push("unit".into());
         assert!(general_manifest(&duplicate).is_err());
     }
 }

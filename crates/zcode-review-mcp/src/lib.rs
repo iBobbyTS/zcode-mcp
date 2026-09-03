@@ -815,32 +815,11 @@ pub async fn serve_stdio(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublicApiMode {
-    LegacyReviewV1,
-    SubagentV2,
-}
-
-impl PublicApiMode {
-    pub fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, String> {
-        match value.and_then(std::ffi::OsStr::to_str) {
-            None => Ok(Self::LegacyReviewV1),
-            Some("legacy_review_v1") => Ok(Self::LegacyReviewV1),
-            Some("subagent_v2") => Ok(Self::SubagentV2),
-            Some(_) => Err("ZCODE_PUBLIC_API_MODE must be legacy_review_v1 or subagent_v2".into()),
-        }
-    }
-}
-
 pub async fn serve_stdio_mode(
     socket: PathBuf,
     timeout: Duration,
-    mode: PublicApiMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match mode {
-        PublicApiMode::LegacyReviewV1 => serve_stdio(socket, timeout).await,
-        PublicApiMode::SubagentV2 => v2::serve_stdio_v2(socket, timeout).await,
-    }
+    v2::serve_stdio_v2(socket, timeout).await
 }
 fn read_manifest(path: &Path) -> Result<review_preparation::ReviewManifest, String> {
     if !path.is_absolute() {
@@ -1123,23 +1102,8 @@ mod tests {
         }
     }
     #[test]
-    fn startup_selector_is_static_strict_and_legacy_by_default() {
-        use std::ffi::OsStr;
-
-        assert_eq!(
-            PublicApiMode::parse(None).unwrap(),
-            PublicApiMode::LegacyReviewV1
-        );
-        assert_eq!(
-            PublicApiMode::parse(Some(OsStr::new("legacy_review_v1"))).unwrap(),
-            PublicApiMode::LegacyReviewV1
-        );
-        assert_eq!(
-            PublicApiMode::parse(Some(OsStr::new("subagent_v2"))).unwrap(),
-            PublicApiMode::SubagentV2
-        );
-        assert!(PublicApiMode::parse(Some(OsStr::new(""))).is_err());
-        assert!(PublicApiMode::parse(Some(OsStr::new("both"))).is_err());
+    fn public_entrypoint_has_no_catalog_selector() {
+        assert_eq!(V2_PUBLIC_TOOLS.len(), 9);
     }
     #[tokio::test]
     async fn official_sdk_initialization_and_discovery_work_over_stream_transport() {
