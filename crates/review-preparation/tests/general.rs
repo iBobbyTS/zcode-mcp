@@ -572,6 +572,91 @@ fn profile_policy_allows_only_frozen_implementation_paths() {
 }
 
 #[test]
+fn official_file_path_permissions_reuse_the_bounded_file_policy() {
+    let f = Fixture::new();
+    let implementation = f
+        .preparer()
+        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .unwrap();
+    let policy = implementation.launcher().unwrap();
+    let worktree = &implementation.worktree.path;
+    let src = worktree.join("src/lib.rs");
+    let new_src = worktree.join("src/new.rs");
+    let read = |tool: &str, input: serde_json::Value| {
+        policy.decide_zcode_permission(
+            &serde_json::json!({"toolName":tool,"input":input}),
+            ExternalDecision::Allow,
+        )
+    };
+
+    for tool in ["Read", "Edit", "Delete"] {
+        assert!(
+            read(tool, serde_json::json!({"file_path":src.to_string_lossy()})).allowed,
+            "official {tool} file_path should use the existing bounded policy"
+        );
+    }
+    assert!(
+        read(
+            "Write",
+            serde_json::json!({"file_path":new_src.to_string_lossy()})
+        )
+        .allowed
+    );
+    assert!(
+        read(
+            "Write",
+            serde_json::json!({"path":new_src.to_string_lossy()})
+        )
+        .allowed,
+        "the existing path contract remains supported"
+    );
+
+    let conflict = read(
+        "Write",
+        serde_json::json!({
+            "file_path":new_src.to_string_lossy(),
+            "path":worktree.join("README.md").to_string_lossy(),
+        }),
+    );
+    assert!(!conflict.allowed);
+    assert_eq!(conflict.reason, "permission_request_unrecognized");
+    let missing = read("Write", serde_json::json!({}));
+    assert!(!missing.allowed);
+    assert_eq!(missing.reason, "permission_request_unrecognized");
+
+    let outside = read(
+        "Write",
+        serde_json::json!({"file_path":f.repository.join("src/lib.rs").to_string_lossy()}),
+    );
+    assert!(!outside.allowed);
+    assert_eq!(outside.reason, "write_outside_artifact_roots_denied");
+    let unlisted = read(
+        "Write",
+        serde_json::json!({"file_path":worktree.join("README.md").to_string_lossy()}),
+    );
+    assert!(!unlisted.allowed);
+    assert_eq!(unlisted.reason, "tracked_path_not_allowlisted");
+
+    fs::write(worktree.join("src/.env"), "SECRET=x\n").unwrap();
+    let secret = read(
+        "Read",
+        serde_json::json!({"file_path":worktree.join("src/.env").to_string_lossy()}),
+    );
+    assert!(!secret.allowed);
+    assert_eq!(secret.reason, "credential_read_denied");
+
+    let outside_file = f.repository.join("outside.rs");
+    fs::write(&outside_file, "outside\n").unwrap();
+    symlink(&outside_file, worktree.join("src/link.rs")).unwrap();
+    let symlink_escape = read(
+        "Edit",
+        serde_json::json!({"file_path":worktree.join("src/link.rs").to_string_lossy()}),
+    );
+    assert!(!symlink_escape.allowed);
+    assert_eq!(symlink_escape.reason, "write_outside_artifact_roots_denied");
+}
+
+#[test]
 fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
     let f = Fixture::new();
     let source_head = git(&f.repository, &["rev-parse", "HEAD"]);

@@ -375,21 +375,17 @@ impl PolicyLauncher {
             return self.decide_review_bash(input, external);
         }
         let request = match tool_name.to_ascii_lowercase().as_str() {
-            "read" | "grep" | "glob" => input
+            "read" => zcode_file_path(input)
+                .map(|path| PermissionRequest::Read(self.resolve_job_path(path))),
+            "grep" | "glob" => input
                 .get("path")
                 .and_then(serde_json::Value::as_str)
                 .map(|path| PermissionRequest::Read(self.resolve_job_path(path))),
-            "write" => input
-                .get("path")
-                .and_then(serde_json::Value::as_str)
+            "write" => zcode_file_path(input)
                 .map(|path| PermissionRequest::Write(self.resolve_job_path(path))),
-            "edit" => input
-                .get("path")
-                .and_then(serde_json::Value::as_str)
+            "edit" => zcode_file_path(input)
                 .map(|path| PermissionRequest::Edit(self.resolve_job_path(path))),
-            "delete" => input
-                .get("path")
-                .and_then(serde_json::Value::as_str)
+            "delete" => zcode_file_path(input)
                 .map(|path| PermissionRequest::Delete(self.resolve_job_path(path))),
             "move" => {
                 let source = input
@@ -812,6 +808,18 @@ impl PolicyLauncher {
         } else {
             None
         }
+    }
+}
+
+fn zcode_file_path(input: &serde_json::Value) -> Option<&str> {
+    match (input.get("file_path"), input.get("path")) {
+        (Some(file_path), None) => file_path.as_str(),
+        (None, Some(path)) => path.as_str(),
+        (Some(file_path), Some(path)) => file_path
+            .as_str()
+            .zip(path.as_str())
+            .and_then(|(file_path, path)| (file_path == path).then_some(file_path)),
+        (None, None) => None,
     }
 }
 
@@ -1784,10 +1792,14 @@ fn read_denial_identity(
     input: &serde_json::Value,
     validated_reason: &'static str,
 ) -> (String, String, String, String) {
-    let path = input
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(Path::new);
+    let path = if tool == "read" {
+        zcode_file_path(input).map(Path::new)
+    } else {
+        input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new)
+    };
     if validated_reason == "credential_read_denied" || path.is_some_and(is_credential_path) {
         return (
             tool.into(),
