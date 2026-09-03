@@ -1,5 +1,5 @@
 # Merge this table into ~/.codex/config.toml and replace the absolute paths.
-[mcp_servers.zcode_subagent_v2]
+[mcp_servers.zcode_subagent]
 command = "/absolute/path/to/zcode-mcp/target/release/zcode-review-mcp"
 enabled = true
 required = true
@@ -18,17 +18,17 @@ enabled_tools = [
 ]
 default_tools_approval_mode = "prompt"
 
-[mcp_servers.zcode_subagent_v2.env]
+[mcp_servers.zcode_subagent.env]
 ZCODE_REVIEWD_SOCKET = "/absolute/private/zcode-reviewd.sock"
 
-[mcp_servers.zcode_subagent_v2.tools.zcode_system_status]
+[mcp_servers.zcode_subagent.tools.zcode_system_status]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent_v2.tools.zcode_agent_list]
+[mcp_servers.zcode_subagent.tools.zcode_agent_list]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent_v2.tools.zcode_agent_poll]
+[mcp_servers.zcode_subagent.tools.zcode_agent_poll]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent_v2.tools.zcode_agent_result]
+[mcp_servers.zcode_subagent.tools.zcode_agent_result]
 approval_mode = "auto"

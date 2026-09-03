@@ -617,34 +617,6 @@ pub struct AgentCapabilitiesView {
     pub maturity: BTreeMap<String, CapabilityMaturityView>,
 }
 
-#[cfg(any())]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GeneralCheckResultView {
-    pub command_id: String,
-    pub succeeded: bool,
-    pub status_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
-    pub timed_out: bool,
-}
-
-#[cfg(any())]
-impl From<GeneralCheckResult> for GeneralCheckResultView {
-    fn from(value: GeneralCheckResult) -> Self {
-        Self {
-            command_id: value.command_id,
-            succeeded: value.succeeded,
-            status_code: value.output.status_code,
-            stdout: value.output.stdout,
-            stderr: value.output.stderr,
-            stdout_truncated: value.output.stdout_truncated,
-            stderr_truncated: value.output.stderr_truncated,
-            timed_out: value.output.timed_out,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
@@ -765,27 +737,6 @@ pub struct TaskEventView {
     pub event_type: String,
     pub payload_json: String,
     pub redaction_level: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stage: Option<TaskReviewProgressStage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub counters: Option<BTreeMap<String, u64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_progress_at: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_idle_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nudge_sent: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskReviewProgressStage {
-    Scope,
-    Inspection,
-    Validation,
-    Synthesis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1131,18 +1082,6 @@ pub enum ArtifactIntegrityView {
     LegacyUnverified,
 }
 
-#[cfg(any())]
-impl From<review_ledger::ArtifactIntegrity> for ArtifactIntegrityView {
-    fn from(value: ArtifactIntegrity) -> Self {
-        match value {
-            ArtifactIntegrity::Valid => Self::Valid,
-            ArtifactIntegrity::Missing => Self::Missing,
-            ArtifactIntegrity::Replaced => Self::Replaced,
-            ArtifactIntegrity::Binary => Self::Binary,
-            ArtifactIntegrity::Invalid => Self::Invalid,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactView {
@@ -1309,27 +1248,6 @@ impl RpcService {
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted.job, submitted.task),
                     disposition: submitted.disposition.into(),
-                })
-            }
-            #[cfg(any())]
-            RpcMethod::GeneralComplete(input) => {
-                validate_id(&input.agent_id, "agent_id")?;
-                let accepted = self
-                    .scheduler
-                    .submit_general_completion(&input.agent_id, input.submission)
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::GeneralCompletionAccepted { accepted })
-            }
-            #[cfg(any())]
-            RpcMethod::GeneralRunCheck(input) => {
-                validate_id(&input.agent_id, "agent_id")?;
-                validate_text(&input.command_id, "command_id", 256)?;
-                let result = self
-                    .scheduler
-                    .run_general_check(&input.agent_id, &input.command_id)
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::GeneralCheckCompleted {
-                    result: result.into(),
                 })
             }
             RpcMethod::TaskStatus { agent_id } => {
@@ -1534,86 +1452,6 @@ impl RpcService {
                     resources_reaped,
                 })
             }
-            #[cfg(any())]
-            RpcMethod::SpawnReview { manifest } => {
-                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
-                    RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "private review orchestration is unavailable",
-                    )
-                })?;
-                let spawned = orchestrator
-                    .spawn_review(&manifest)
-                    .map_err(map_orchestration)?;
-                let capabilities = JobView::from(spawned.job.clone()).capabilities;
-                let counts_as_independent =
-                    !spawned.resumed_existing && spawned.job.zcode_session_id.is_some();
-                Ok(RpcSuccess::ReviewSpawned {
-                    job: spawned.job.into(),
-                    prompt_sha256: spawned.prompt_sha256,
-                    resumed_existing: spawned.resumed_existing,
-                    counts_as_independent,
-                    capabilities,
-                })
-            }
-            #[cfg(any())]
-            RpcMethod::SubmitReview { manifest } => {
-                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
-                    RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "private review orchestration is unavailable",
-                    )
-                })?;
-                let submitted = orchestrator
-                    .submit_review(&manifest)
-                    .map_err(map_orchestration)?;
-                let capabilities = JobView::from(submitted.job.clone()).capabilities;
-                Ok(RpcSuccess::ReviewSubmitted {
-                    job: submitted.job.into(),
-                    prompt_sha256: submitted.prompt_sha256,
-                    resumed_existing: submitted.resumed_existing,
-                    capabilities,
-                })
-            }
-            #[cfg(any())]
-            RpcMethod::SubmitStructuredReview { input } => {
-                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
-                    RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "private review orchestration is unavailable",
-                    )
-                })?;
-                let review = orchestrator
-                    .submit_structured_review(&input)
-                    .map_err(map_orchestration)?;
-                Ok(RpcSuccess::StructuredReviewSubmitted { review })
-            }
-            #[cfg(any())]
-            RpcMethod::ContinueStructuredReview { input } => {
-                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
-                    RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "private review orchestration is unavailable",
-                    )
-                })?;
-                let review = orchestrator
-                    .submit_structured_continuation(&input)
-                    .map_err(map_orchestration)?;
-                Ok(RpcSuccess::StructuredReviewSubmitted { review })
-            }
-            #[cfg(any())]
-            RpcMethod::ContinueStructuredReviewMinimal { input } => {
-                let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
-                    RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "private review orchestration is unavailable",
-                    )
-                })?;
-                let review = orchestrator
-                    .submit_minimal_structured_continuation(&input)
-                    .map_err(map_orchestration)?;
-                Ok(RpcSuccess::StructuredReviewSubmitted { review })
-            }
             RpcMethod::Enqueue { job } => {
                 validate_id(&job.agent_id, "agent_id")?;
                 validate_text(&job.workspace_path, "workspace_path", 4096)?;
@@ -1727,42 +1565,6 @@ impl RpcService {
                     state: state.into(),
                     resources_reaped,
                 })
-            }
-            #[cfg(any())]
-            RpcMethod::TaskReviewTool(input) => {
-                validate_id(&input.agent_id, "agent_id")?;
-                let task = self
-                    .store
-                    .task_by_execution_agent_id(&input.agent_id)
-                    .map_err(map_store)?
-                    .ok_or_else(|| {
-                        RpcError::new(RpcErrorCode::NotFound, "review task was not found")
-                    })?;
-                if !matches!(
-                    task.task_kind,
-                    TaskKind::Review | TaskKind::ReviewContinuation
-                ) {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        "internal review ledger is unavailable for this task kind",
-                    ));
-                }
-                validate_text(&input.tool, "review tool", 128)?;
-                let result = self
-                    .scheduler
-                    .call_task_review_tool(&input.agent_id, &input.tool, input.arguments)
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::ReviewTool { result })
-            }
-            #[cfg(any())]
-            RpcMethod::ReviewTool(input) => {
-                self.require_legacy_job(&input.agent_id)?;
-                validate_text(&input.tool, "review tool", 128)?;
-                let result = self
-                    .scheduler
-                    .call_review_tool(&input.agent_id, &input.tool, input.arguments)
-                    .map_err(map_scheduler)?;
-                Ok(RpcSuccess::ReviewTool { result })
             }
         }
     }
@@ -1972,12 +1774,6 @@ impl RpcService {
                 event_type: "attempt_started".into(),
                 payload_json: "{}".into(),
                 redaction_level: "allowlisted".into(),
-                stage: None,
-                summary: None,
-                counters: None,
-                last_progress_at: None,
-                semantic_idle_ms: None,
-                nudge_sent: None,
             });
         }
         for event in stored
@@ -1992,12 +1788,6 @@ impl RpcService {
                     event_type: "pending_request".into(),
                     payload_json: serde_json::json!({"request_id": request_id}).to_string(),
                     redaction_level: "bounded".into(),
-                    stage: None,
-                    summary: None,
-                    counters: None,
-                    last_progress_at: None,
-                    semantic_idle_ms: None,
-                    nudge_sent: None,
                 });
             }
         }
@@ -2009,12 +1799,6 @@ impl RpcService {
                 event_type: "terminal".into(),
                 payload_json: "{}".into(),
                 redaction_level: "allowlisted".into(),
-                stage: None,
-                summary: None,
-                counters: None,
-                last_progress_at: None,
-                semantic_idle_ms: None,
-                nudge_sent: None,
             });
         }
         for (index, event) in events.iter_mut().enumerate() {
@@ -2594,78 +2378,6 @@ impl From<StoredTaskResult> for TaskResultView {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredReviewProgressPayload {
-    stage: TaskReviewProgressStage,
-    summary: String,
-    #[serde(default)]
-    counters: Option<BTreeMap<String, u64>>,
-    attempt_sequence: u64,
-    updated_at: i64,
-}
-
-struct ProjectedReviewProgress {
-    stage: TaskReviewProgressStage,
-    summary: String,
-    counters: Option<BTreeMap<String, u64>>,
-    last_progress_at: u64,
-    semantic_idle_ms: u64,
-    nudge_sent: bool,
-}
-
-#[cfg(any())]
-fn project_review_progress(
-    task: &TaskRecord,
-    event: &StoredEvent,
-    state: Option<&ReviewProgressState>,
-    wall_now_ms: u64,
-) -> Option<ProjectedReviewProgress> {
-    if event.redaction_level != "allowlisted" {
-        return None;
-    }
-    let state = state.filter(|state| {
-        state.agent_id == task.execution_agent_id && state.attempt_sequence == task.attempt_sequence
-    })?;
-    let payload = serde_json::from_str::<StoredReviewProgressPayload>(&event.payload_json).ok()?;
-    if payload.attempt_sequence != task.attempt_sequence
-        || payload.summary.is_empty()
-        || payload.summary.chars().count() > MAX_TOOL_TEXT_CHARS
-        || payload.summary.contains('\0')
-        || payload.counters.as_ref().is_some_and(|counters| {
-            counters.len() > 16
-                || counters.iter().any(|(key, value)| {
-                    key.is_empty()
-                        || key.len() > MAX_TOOL_ID_BYTES
-                        || !key
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
-                        || *value > 1_000_000_000
-                })
-        })
-    {
-        return None;
-    }
-    let last_progress_at = u64::try_from(payload.updated_at).ok()?;
-    Some(ProjectedReviewProgress {
-        stage: payload.stage,
-        summary: payload.summary,
-        counters: payload.counters,
-        last_progress_at,
-        semantic_idle_ms: wall_now_ms.saturating_sub(last_progress_at),
-        nudge_sent: state.nudge_sent,
-    })
-}
-
-fn wall_now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 fn public_pending_request_id(event: &StoredEvent) -> Option<String> {
     if event.event_type != "driver.message" {
         return None;
@@ -2785,34 +2497,6 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
         integrity: ArtifactIntegrityView::LegacyUnverified,
         preview_state,
         preview: None,
-    }
-}
-
-#[cfg(any())]
-fn verified_artifact_view(
-    artifact: review_ledger::VerifiedArtifact,
-    requested: usize,
-) -> ArtifactView {
-    let preview_state = if requested == 0 {
-        PreviewState::NotRequested
-    } else if artifact.preview.is_some() {
-        PreviewState::Available
-    } else {
-        PreviewState::Unavailable
-    };
-    ArtifactView {
-        artifact_id: "review-report".into(),
-        artifact_type: "review_report".into(),
-        locator: artifact.locator,
-        expected_sha256: artifact.expected_sha256,
-        expected_bytes: artifact.expected_bytes,
-        observed_sha256: artifact.actual_sha256,
-        observed_bytes: artifact.actual_bytes,
-        checkpoint_number: Some(artifact.checkpoint_number),
-        finalized: artifact.finalized,
-        integrity: artifact.integrity.into(),
-        preview_state,
-        preview: artifact.preview,
     }
 }
 
@@ -3028,38 +2712,6 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
         }
         SchedulerError::RuntimeCommand { .. } => {
             RpcError::new(RpcErrorCode::Unavailable, "runtime command failed")
-        }
-    }
-}
-
-#[cfg(any())]
-fn map_orchestration(error: OrchestrationError) -> RpcError {
-    match error {
-        OrchestrationError::Contract("REVIEW_BASH_POLICY_UNVERIFIED") => {
-            RpcError::new(RpcErrorCode::Validation, "REVIEW_BASH_POLICY_UNVERIFIED")
-        }
-        OrchestrationError::Contract(_) => RpcError::new(
-            RpcErrorCode::Validation,
-            "structured review fields are invalid",
-        ),
-        OrchestrationError::Conflict(_) => RpcError::new(
-            RpcErrorCode::Conflict,
-            "structured review conflicts with durable state",
-        ),
-        OrchestrationError::Preparation(message) if message.contains("idempotency conflict") => {
-            RpcError::new(
-                RpcErrorCode::Conflict,
-                "review submission conflicts with durable state",
-            )
-        }
-        OrchestrationError::Preparation(_) | OrchestrationError::Prompt(_) => RpcError::new(
-            RpcErrorCode::Validation,
-            "review preparation failed validation",
-        ),
-        OrchestrationError::Scheduler(error) => map_scheduler(error),
-        OrchestrationError::Store(error) => map_store(error),
-        OrchestrationError::Unavailable(message) => {
-            RpcError::new(RpcErrorCode::Unavailable, message)
         }
     }
 }

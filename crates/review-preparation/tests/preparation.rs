@@ -603,18 +603,12 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
         "mcp__review-ledger__review_finding_upsert",
         "mcp__review-ledger__review_validation_record",
         "mcp__review-ledger__review_finalize",
+        "mcp__general-completion__zcode_general_complete",
     ] {
         let request = serde_json::json!({"toolName":tool,"input":{}});
-        assert!(
-            launcher
-                .decide_zcode_permission(&request, ExternalDecision::Allow)
-                .allowed
-        );
-        assert!(
-            !launcher
-                .decide_zcode_permission(&request, ExternalDecision::Deny)
-                .allowed
-        );
+        let decision = launcher.decide_zcode_permission(&request, ExternalDecision::Allow);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, "permission_request_unrecognized");
     }
     let arbitrary_mcp = serde_json::json!({
         "toolName":"mcp__review-ledger__unapproved_tool","input":{}
@@ -633,27 +627,6 @@ fn hard_deny_precedes_external_allow_and_network_capability_is_truthful() {
         assert!(!decision.allowed);
         assert_eq!(decision.reason, "permission_request_unrecognized");
     }
-    let general_completion = serde_json::json!({
-        "toolName":"mcp__general-completion__zcode_general_complete",
-        "input":{}
-    });
-    for external in [ExternalDecision::Allow, ExternalDecision::Deny] {
-        let decision = launcher.decide_zcode_permission(&general_completion, external);
-        assert!(!decision.allowed);
-        assert_eq!(
-            decision.reason,
-            "general_completion_unavailable_for_review_task"
-        );
-    }
-    let direct_general_completion = launcher.decide(
-        &PermissionRequest::InternalGeneralCompletion,
-        ExternalDecision::Allow,
-    );
-    assert!(!direct_general_completion.allowed);
-    assert_eq!(
-        direct_general_completion.reason,
-        "general_completion_unavailable_for_review_task"
-    );
     let bash = launcher.decide_zcode_permission(
         &serde_json::json!({"toolName":"Bash","input":{}}),
         ExternalDecision::Allow,

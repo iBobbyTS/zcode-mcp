@@ -1,102 +1,27 @@
 # Operations
 
-## Normal lifecycle
+## Generic lifecycle
 
-1. Start `zcode-reviewd` with absolute database/socket/runtime paths.
-2. Start Codex or `zcode-review-mcp` with the same socket path.
-3. Submit one validated manifest and retain its `agent_id`.
-4. Poll with `status`, `wait`, or ordered `events` pages.
-5. Inspect sanitized pending requests. Respond only when `respondable=true`.
-6. Queue a next-turn message or use `interrupt_and_continue` to stop the current
-   turn before sending the next instruction.
-7. Read partial/final reports through `result`; verify `integrity=valid`.
-8. Use `stop` to cancel while preserving resources/history, then `close` when
-   runtime resources should be reaped.
+1. Call `zcode_agent_spawn` with `read_only` or `workspace_write`.
+2. Call `zcode_agent_poll` with the returned `agent_id`, `after_revision`, and bounded `timeout_ms`.
+3. Reuse `next_revision`; do not restart polling from zero.
+4. Answer only daemon-published typed requests through `zcode_agent_respond`.
+5. Queue clarification with `zcode_agent_send`. A terminal task cannot continue; create a new Agent.
+6. Read final text, verified checks, changed files, patch, and bounded artifact chunks through `zcode_agent_result`.
+7. Use `zcode_agent_cancel` for authoritative stop/kill/reap and `zcode_agent_close` for idempotent cleanup.
 
-For `subagent_v2`, use `zcode_agent_spawn`, then `zcode_agent_get/list/events/
-wait/message/respond/result/cancel/close`. `zcode_agent_list` requires at least
-one repository, feature, or ownership-token scope and the daemon applies that
-scope before the limit. Structured work starts with `zcode_review_spawn` and
-continues with `zcode_review_continue`; all later lifecycle operations use the
-common Agent tools. `attempt_sequence` distinguishes review attempts while the
-public `agent_id` and `review_id` remain stable.
+`zcode_agent_list` requires repository, feature, or ownership scope. Filtering occurs in the Store before the limit.
 
-V2 `zcode_agent_result` returns verified artifact metadata. Request full bytes
-in chunks no larger than 8192 bytes by supplying the artifact ID, attempt,
-offset, and limit together. Every chunk repeats authoritative SHA-256/size and
-the daemon rehashes the non-symlink regular file before returning bytes. Reject
-metadata drift, gaps, oversized artifacts, or a final digest mismatch.
+## Activity
 
-`wait` accepts 1-5000 ms and a no-change timeout succeeds with
-`timed_out=true`. Event/list limits are 1-100. Result previews are 0-8192
-bytes. For complete evidence use the confined report artifact and verify its
-returned expected/observed SHA-256 and byte count; the preview is not the full
-report.
+Poll exposes bounded visible text, active tool classes, model request clocks, and rolling 60-second counts. Reasoning content, tool arguments, cwd, command output, and absolute internal paths are never public. Runtime activity is liveness evidence, not semantic progress.
 
-Runtime bootstrap is asynchronous from public submission and may use its
-90-second production allowance. Each synchronous message, interrupt, stop, or
-close call instead has one five-second internal budget covering operation-lock
-wait and all runtime/event/stop/reap phases. A runtime command that times out
-after write is failed closed through terminal persistence and process stop/reap
-before the daemon returns; retry the same durable intent rather than changing
-its identifier.
+Pending requests and terminal transitions wake long polls immediately. Unknown telemetry shapes degrade telemetry status without failing the Agent.
 
-## Public states
+## Completion and timeouts
 
-Job states are `QUEUED`, `STARTING`, `RUNNING`, `STOPPING`, `COMPLETED`,
-`CANCELLED`, `FAILED`, `FAILED_RUNTIME_LOST`, `ORPHANED`, and `CLOSED`. Turn
-states are `IDLE`, `ACTIVE`, and `FAILED`. Process spawn alone does not make a
-job `RUNNING`; a real session and initial turn must be established.
+A matching `turn.completed` automatically finalizes only when no queued message or unresolved typed request exists. Read-only finalization verifies zero tracked/staged diff. Workspace-write finalization verifies the write manifest, executes required named checks against the final tree, and emits a detached commit and patch.
 
-Message dispositions are `queued`, `delivered`,
-`interrupted_then_delivered`, `already_delivered`, and `failed`. Reuse the same
-`message_id` only for the exact same intent; different content conflicts.
-Permission dispositions are `responded`, `already_responded`, and `in_flight`.
-Always inspect `effective_decision`, because local policy may override allow to
-deny.
+Timeout classes are `RUNTIME_ACTIVITY_IDLE_TIMEOUT`, `MODEL_STREAM_IDLE_TIMEOUT`, `TOOL_CALL_TIMEOUT`, `INPUT_WAIT_TIMEOUT`, and `WALL_TIME_DEADLINE_EXCEEDED`. Turn and tool-count exhaustion remain independent budget outcomes. Timeout and cancellation fence late events before result and artifact persistence.
 
-## Monitoring and errors
-
-Use `zcode_review_list` with `scope=active` for active work; the Store performs
-the active filter before applying the limit. `recent` and `all` are bounded
-views, not ownership scans. Ordered event cursors use `after_sequence` and must
-not be replaced with a private runtime identifier.
-
-Public error classes are redacted and stable: validation, daemon unavailable,
-protocol version mismatch, timeout, oversized frame, not found, conflict,
-runtime lost, result invalid, and protocol failure. `service_generation`
-changes across daemon replacement and is the only public daemon generation
-token; it is not a task resume token. Inspect daemon stderr and durable events for
-operator diagnostics; never expect raw private failure text on public MCP.
-
-The facade may be restarted freely. A replacement process with the same socket
-can access the existing job by `agent_id`. Do not run two daemons against the
-same database. If the daemon exits, follow `docs/recovery.md`.
-
-## Shadow operation
-
-Shadow is optional and non-authoritative. Start the daemon, set
-`ZCODE_REVIEW_MCP_PATH` and `ZCODE_REVIEWD_SOCKET`, then run
-`sectioned-shadow /absolute/path/shadow-config.json`. A counted full review
-explicitly starts the V2 facade. It retrieves the final report only through
-verified bounded artifact chunks; it does not trust a caller-provided artifact
-path. A counted full review requires a created Agent, fresh independent attempt,
-exact provenance, a valid final report, supported evidence, and successful reap. Duplicate runs
-cannot count as new independent evidence; DELTA is consultation only.
-
-Keep GPT and GLM RAW/admission/provenance artifacts separate. Main Codex alone
-admits findings and controls Clean counts, repair caps, recovery, sequencing,
-and acceptance.
-
-## Official ZCode 3.8.1 catalog
-
-The verified runtime entry SHA-256 is `9318f60f...e4274`. Its OAuth-generated
-CLI config may omit `zai/glm-5.3` even when the authenticated endpoint accepts
-it. The proven operator workaround adds only a `glm-5.3` model entry to the
-existing `zai` provider and selects `model.main = "zai/glm-5.3"`; it must not
-copy or replace provider credentials. Back up the exact config first and verify
-byte-for-byte restoration after a temporary compatibility run.
-
-The product reports the workspace model catalog it observes. A missing requested
-model is a configuration limitation, not permission to migrate desktop
-credentials or create a second config owner.
+`COMPLETED` means the runtime turn ended and daemon finalization succeeded. It does not mean a review is clean, a patch is correct, or the change is mergeable.

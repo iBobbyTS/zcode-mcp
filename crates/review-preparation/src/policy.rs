@@ -109,9 +109,6 @@ pub enum PermissionRequest {
     Network(String),
     GitRefMutation,
     CredentialRead(PathBuf),
-    InternalReviewLedger,
-    InternalGeneralCompletion,
-    InternalGeneralRunCheck(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,21 +374,7 @@ impl PolicyLauncher {
             }
             return self.decide_review_bash(input, external);
         }
-        let request = if tool_name == "mcp__general-completion__zcode_general_complete" {
-            Some(PermissionRequest::InternalGeneralCompletion)
-        } else if tool_name == "mcp__general-completion__zcode_general_run_check" {
-            exact_command_id_input(input).map(PermissionRequest::InternalGeneralRunCheck)
-        } else if matches!(
-            tool_name,
-            "mcp__review-ledger__review_checkpoint"
-                | "mcp__review-ledger__review_progress"
-                | "mcp__review-ledger__review_finding_upsert"
-                | "mcp__review-ledger__review_validation_record"
-                | "mcp__review-ledger__review_finalize"
-        ) {
-            Some(PermissionRequest::InternalReviewLedger)
-        } else {
-            match tool_name.to_ascii_lowercase().as_str() {
+        let request = match tool_name.to_ascii_lowercase().as_str() {
                 "read" | "grep" | "glob" => input
                     .get("path")
                     .and_then(serde_json::Value::as_str)
@@ -456,7 +439,6 @@ impl PolicyLauncher {
                     }
                 }
                 _ => None,
-            }
         };
         match request {
             Some(request) => self.decide(&request, external),
@@ -653,32 +635,6 @@ impl PolicyLauncher {
             PermissionRequest::Network(_) => None,
             PermissionRequest::GitRefMutation => Some("git_ref_mutation_denied"),
             PermissionRequest::CredentialRead(_) => Some("credential_read_denied"),
-            PermissionRequest::InternalReviewLedger => match self.mode {
-                PolicyMode::ReviewReadonly => None,
-                _ => Some("review_ledger_unavailable_for_general_task"),
-            },
-            PermissionRequest::InternalGeneralCompletion => match self.mode {
-                PolicyMode::ReviewReadonly => {
-                    Some("general_completion_unavailable_for_review_task")
-                }
-                PolicyMode::GeneralReadonly
-                | PolicyMode::GeneralTest
-                | PolicyMode::GeneralImplementation { .. } => None,
-            },
-            PermissionRequest::InternalGeneralRunCheck(command_id) => {
-                let Some(command) = self.commands.get(command_id) else {
-                    return Some("general_check_command_not_selected");
-                };
-                match self.mode {
-                    PolicyMode::ReviewReadonly => Some("general_check_unavailable_for_review_task"),
-                    PolicyMode::GeneralReadonly if !command.readonly_safe => {
-                        Some("general_check_not_readonly_safe")
-                    }
-                    PolicyMode::GeneralReadonly
-                    | PolicyMode::GeneralTest
-                    | PolicyMode::GeneralImplementation { .. } => None,
-                }
-            }
             PermissionRequest::Read(path) => {
                 if is_credential_path(path) {
                     return Some("credential_read_denied");
@@ -1734,23 +1690,6 @@ pub(crate) fn prepare_command(
         environment,
         readonly_safe: false,
     })
-}
-
-fn exact_command_id_input(input: &serde_json::Value) -> Option<String> {
-    let object = input.as_object()?;
-    if object.len() != 1 {
-        return None;
-    }
-    let command_id = object.get("command_id")?.as_str()?;
-    if command_id.is_empty()
-        || command_id.len() > 256
-        || !command_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
-        return None;
-    }
-    Some(command_id.to_owned())
 }
 
 fn permission_denial_semantics(

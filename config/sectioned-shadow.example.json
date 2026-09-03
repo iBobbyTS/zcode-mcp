@@ -1,9 +1,14 @@
 {
-  "schema": "sectioned-zcode-shadow/v1",
-  "manifest_path": "/absolute/path/.agent-work/manifests/S08-FINAL-GLM.json",
+  "schema": "sectioned-zcode-shadow/v2",
+  "repository": "/absolute/path/to/repository",
+  "base_ref": "0123456789abcdef0123456789abcdef01234567",
+  "prompt": "Review the bounded change and return findings with file and line evidence.",
+  "feature_id": "feature-id",
+  "ownership_token": "owner-token",
+  "idempotency_key": "fresh-review-key",
+  "repo_context": ["AGENTS.md", ".agent-work/PLAN-FULL.md"],
   "artifact_directory": "/absolute/path/.agent-work/reviews",
-  "artifact_stem": "S08-FINAL",
-  "mode": "full",
-  "wait_timeout_ms": 5000,
-  "max_waits": 120
+  "artifact_stem": "S03-ZCODE",
+  "poll_timeout_ms": 5000,
+  "max_polls": 120
 }

@@ -4952,51 +4952,6 @@ mod tests {
             ),
             Err(StoreError::InvalidState(_))
         ));
-        assert!(matches!(
-            store.get_review_scoped(
-                "missing-review",
-                TaskQueryScope {
-                    repository: None,
-                    feature_id: None,
-                    ownership_token: None
-                }
-            ),
-            Err(StoreError::InvalidState(_))
-        ));
-        let mut review = general_task(
-            "scope-review-exec",
-            "scope-review-public",
-            "scope-review-key",
-        );
-        review.task_kind = TaskKind::Review;
-        review.review_id = Some("scope-review".into());
-        review.job.review_kind = Some("initial".into());
-        review.repository = "r1".into();
-        review.feature_id = "f1".into();
-        review.ownership_token = "o1".into();
-        store.enqueue_task(&review).unwrap();
-        assert!(matches!(
-            store.get_review_scoped(
-                "scope-review",
-                TaskQueryScope {
-                    repository: None,
-                    feature_id: None,
-                    ownership_token: None
-                }
-            ),
-            Err(StoreError::InvalidState(_))
-        ));
-        assert!(store
-            .get_review_scoped(
-                "scope-review",
-                TaskQueryScope {
-                    repository: Some("r1"),
-                    feature_id: Some("f1"),
-                    ownership_token: None
-                }
-            )
-            .unwrap()
-            .is_some());
     }
 
     #[test]
@@ -5316,11 +5271,6 @@ mod tests {
         let (_directory, _path, store) = file_store();
         let general = general_task("restart-general", "public-general", "restart-general-key");
         store.enqueue_task(&general).unwrap();
-        let mut review = general_task("restart-review", "public-review", "restart-review-key");
-        review.task_kind = TaskKind::Review;
-        review.review_id = Some("review-restart".into());
-        review.job.review_kind = Some("initial".into());
-        store.enqueue_task(&review).unwrap();
         store
             .enqueue_job(&NewJob::new("restart-legacy", "/legacy-workspace"))
             .unwrap();
@@ -5335,14 +5285,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        let review_claim = store.claim_next("daemon-old", 8, 8).unwrap().unwrap();
-        assert_eq!(review_claim.job.agent_id, "restart-review");
         let legacy_claim = store.claim_next("daemon-old", 8, 8).unwrap().unwrap();
         assert_eq!(legacy_claim.job.agent_id, "restart-legacy");
 
         let reconciled = store.reconcile_startup().unwrap();
-        assert_eq!(reconciled.len(), 3);
-        for execution_id in ["restart-general", "restart-review"] {
+        assert_eq!(reconciled.len(), 2);
+        for execution_id in ["restart-general"] {
             let job = store.get_job(execution_id).unwrap().unwrap();
             assert_eq!(job.state, JobState::FailedRuntimeLost);
             assert_eq!(
@@ -5351,11 +5299,7 @@ mod tests {
             );
             let task = store
                 .get_task_scoped(
-                    if execution_id == "restart-general" {
-                        "public-general"
-                    } else {
-                        "public-review"
-                    },
+                    "public-general",
                     TaskQueryScope {
                         repository: Some("repo"),
                         feature_id: None,
@@ -5987,241 +5931,6 @@ mod tests {
         assert_eq!(compatible.agent_id, owner.agent_id);
     }
 
-    #[test]
-    fn report_target_and_idempotency_collisions_cross_legacy_and_v2_families() {
-        let (_directory, _path, store) = file_store();
-        let mut legacy = NewJob::new("legacy-owner", "/legacy-workspace");
-        legacy.idempotency_key = Some("shared-legacy-key".into());
-        legacy.report_path = Some("/canonical/legacy-report.md".into());
-        store.enqueue_job(&legacy).unwrap();
-
-        let mut structured = general_task(
-            "structured-collision",
-            "structured-public",
-            "shared-legacy-key",
-        );
-        structured.task_kind = TaskKind::Review;
-        structured.review_id = Some("structured-review".into());
-        structured.job.review_kind = Some("code".into());
-        assert!(matches!(
-            store.enqueue_task(&structured),
-            Err(StoreError::Conflict(_))
-        ));
-        assert!(store
-            .task_by_execution_agent_id("structured-collision")
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            store
-                .submission_by_idempotency("shared-legacy-key")
-                .unwrap()
-                .unwrap()
-                .task_kind,
-            None
-        );
-
-        let mut queued_v2 = general_task("queued-v2-owner", "queued-v2-public", "v2-key");
-        queued_v2.task_kind = TaskKind::Review;
-        queued_v2.review_id = Some("queued-v2-review".into());
-        queued_v2.job.review_kind = Some("code".into());
-        queued_v2.job.report_path = Some("/canonical/v2-report.md".into());
-        store.enqueue_task(&queued_v2).unwrap();
-
-        let mut legacy_idempotency_collision =
-            NewJob::new("legacy-idempotency-collision", "/legacy-workspace-2");
-        legacy_idempotency_collision.idempotency_key = Some("v2-key".into());
-        assert!(matches!(
-            store.enqueue_job(&legacy_idempotency_collision),
-            Err(StoreError::Conflict(_))
-        ));
-        let mut legacy_report_collision =
-            NewJob::new("legacy-report-collision", "/legacy-workspace-3");
-        legacy_report_collision.idempotency_key = Some("legacy-report-key".into());
-        legacy_report_collision.report_path = Some("/canonical/v2-report.md".into());
-        assert!(matches!(
-            store.enqueue_job(&legacy_report_collision),
-            Err(StoreError::Conflict(_))
-        ));
-        assert!(store
-            .get_job("legacy-idempotency-collision")
-            .unwrap()
-            .is_none());
-        assert!(store.get_job("legacy-report-collision").unwrap().is_none());
-        let owner = store.submission_by_idempotency("v2-key").unwrap().unwrap();
-        assert_eq!(owner.execution_agent_id, "queued-v2-owner");
-        assert_eq!(owner.task_kind, Some(TaskKind::Review));
-    }
-
-    #[test]
-    fn semantic_review_progress_is_bounded_idempotent_and_single_nudge() {
-        let (_directory, _path, store) = file_store();
-        let mut task = general_task("progress-exec", "progress-public", "progress-key");
-        task.task_kind = TaskKind::Review;
-        task.review_id = Some("progress-review".into());
-        task.job.review_kind = Some("code".into());
-        store.enqueue_task(&task).unwrap();
-        store
-            .initialize_review_progress("progress-exec", 1, "runtime")
-            .unwrap();
-
-        let write = ReviewProgressWrite {
-            agent_id: "progress-exec".into(),
-            attempt_sequence: 1,
-            run_idempotency_key: "runtime".into(),
-            stage: "inspection".into(),
-            summary: "inspected policy".into(),
-            counters_json: Some(r#"{"files":2}"#.into()),
-        };
-        assert_eq!(
-            store.record_review_progress(&write).unwrap().disposition,
-            ReviewProgressDisposition::Applied
-        );
-        assert_eq!(
-            store.record_review_progress(&write).unwrap().disposition,
-            ReviewProgressDisposition::Duplicate
-        );
-        let mut rapid = write.clone();
-        rapid.summary = "inspected another policy".into();
-        assert_eq!(
-            store.record_review_progress(&rapid).unwrap().disposition,
-            ReviewProgressDisposition::Duplicate
-        );
-        assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
-        // A queued attempt cannot claim a nudge; once running, exactly one
-        // claim is allowed.
-        let claim = claim(&store, "progress-exec");
-        store
-            .mark_running("progress-exec", claim.owner_epoch, "runtime", None)
-            .unwrap();
-        assert!(store.claim_review_progress_nudge("progress-exec").unwrap());
-        assert!(!store.claim_review_progress_nudge("progress-exec").unwrap());
-        let mut later = write;
-        later.stage = "validation".into();
-        later.summary = "semantic progress advanced".into();
-        store.record_review_progress(&later).unwrap();
-        assert!(
-            store
-                .review_progress("progress-exec")
-                .unwrap()
-                .unwrap()
-                .nudge_sent
-        );
-    }
-
-    #[test]
-    fn semantic_progress_event_write_is_failure_atomic() {
-        let (_directory, _path, store) = file_store();
-        let mut task = general_task("atomic-progress", "atomic-public", "atomic-key");
-        task.task_kind = TaskKind::Review;
-        task.review_id = Some("atomic-review".into());
-        task.job.review_kind = Some("code".into());
-        store.enqueue_task(&task).unwrap();
-        let claim = claim(&store, "atomic-progress");
-        store
-            .mark_running("atomic-progress", claim.owner_epoch, "runtime", None)
-            .unwrap();
-        store
-            .initialize_review_progress("atomic-progress", 1, "runtime")
-            .unwrap();
-        store
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER fail_progress_event BEFORE INSERT ON events
-                 WHEN NEW.event_type='review.progress'
-                 BEGIN SELECT RAISE(FAIL, 'scripted progress event failure'); END;",
-            )
-            .unwrap();
-        let result = store.record_review_progress_event(
-            &ReviewProgressWrite {
-                agent_id: "atomic-progress".into(),
-                attempt_sequence: 1,
-                run_idempotency_key: "runtime".into(),
-                stage: "inspection".into(),
-                summary: "must roll back".into(),
-                counters_json: None,
-            },
-            "runtime",
-            claim.owner_epoch,
-            1u64 << 62,
-        );
-        assert!(result.is_err());
-        let progress = store.review_progress("atomic-progress").unwrap().unwrap();
-        assert_eq!(progress.stage, "scope");
-        assert_eq!(progress.summary, "review started");
-        assert!(store
-            .task_events_after("atomic-public", 0, 10)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn persisted_review_report_ownership_rejects_legacy_duplicates_and_mismatches() {
-        let (_directory, path, store) = file_store();
-        for (agent_id, report_path) in [
-            ("legacy-review-a", "/canonical/a.md"),
-            ("legacy-review-b", "/canonical/b.md"),
-        ] {
-            let mut job = NewJob::new(agent_id, "/workspace");
-            job.report_path = Some(report_path.into());
-            store.enqueue_job(&job).unwrap();
-        }
-        let connection = Connection::open(&path).unwrap();
-        for (agent_id, report_path, created_at) in [
-            ("legacy-review-a", "/canonical/a.md", 1_i64),
-            ("legacy-review-b", "/canonical/b.md", 2_i64),
-        ] {
-            connection
-                .execute(
-                    "INSERT INTO review_reports (
-                        agent_id, expected_path, report_root, created_at, updated_at
-                     ) VALUES (?1, ?2, '/canonical', ?3, ?3)",
-                    params![agent_id, report_path, created_at],
-                )
-                .unwrap();
-        }
-        store.validate_review_report_ownership().unwrap();
-
-        connection
-            .execute(
-                "UPDATE agents SET report_path = '/canonical/a.md'
-                 WHERE agent_id = 'legacy-review-b'",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE review_reports SET expected_path = '/canonical/a.md'
-                 WHERE agent_id = 'legacy-review-b'",
-                [],
-            )
-            .unwrap();
-        assert!(matches!(
-            store.validate_review_report_ownership(),
-            Err(StoreError::Conflict(message)) if message.contains("multiple owners")
-        ));
-
-        connection
-            .execute(
-                "UPDATE agents SET report_path = '/canonical/other.md'
-                 WHERE agent_id = 'legacy-review-b'",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE review_reports SET expected_path = '/canonical/b.md'
-                 WHERE agent_id = 'legacy-review-b'",
-                [],
-            )
-            .unwrap();
-        assert!(matches!(
-            store.validate_review_report_ownership(),
-            Err(StoreError::Conflict(message)) if message.contains("inconsistent report ownership")
-        ));
-    }
-
     fn cancelled_task_result(summary: &str) -> TaskResult {
         TaskResult {
             outcome: TaskOutcome::Cancelled,
@@ -6411,7 +6120,7 @@ mod tests {
             Err(StoreError::InvalidState(_))
         ));
         task.budget = BudgetRequest::Limits(EffectiveBudget {
-            wall_time_ms: 0,
+            absolute_wall_time_ms: 0,
             ..DEFAULT_BUDGET
         });
         assert!(matches!(
@@ -6427,165 +6136,6 @@ mod tests {
             Err(StoreError::InvalidState(_))
         ));
         assert!(store.get_job("bad-budget").unwrap().is_none());
-    }
-
-    #[test]
-    fn review_continuation_preserves_public_identity_and_is_not_independent() {
-        let (_directory, _path, store) = file_store();
-        let mut fresh = general_task("review-attempt-1", "stable-agent", "review-key-1");
-        fresh.task_kind = TaskKind::Review;
-        fresh.job.review_kind = Some("initial".into());
-        fresh.review_id = Some("review-1".into());
-        let (_, first) = store.enqueue_task(&fresh).unwrap();
-        assert!(first.independent_evidence);
-        store
-            .connection
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "UPDATE agents SET state='COMPLETED' WHERE agent_id='review-attempt-1'; UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id='review-attempt-1'; INSERT INTO review_finalizations (agent_id,signal,payload_json,payload_sha256,revision,created_at) VALUES ('review-attempt-1','findings_present','{}','hash',1,1);",
-            )
-            .unwrap();
-        let mut continuation = general_task("review-attempt-2", "stable-agent", "review-key-2");
-        continuation.task_kind = TaskKind::ReviewContinuation;
-        continuation.job.review_kind = Some("initial".into());
-        continuation.review_id = Some("review-1".into());
-        continuation.continuation_of = Some("review-attempt-1".into());
-        let (_, second) = store.enqueue_task(&continuation).unwrap();
-        assert_eq!(second.attempt_sequence, 2);
-        assert!(!second.independent_evidence);
-        assert_eq!(second.public_agent_id, first.public_agent_id);
-        assert_eq!(store.get_task("stable-agent").unwrap().unwrap(), second);
-        assert!(store
-            .list_tasks_scoped(
-                TaskQueryScope {
-                    repository: Some("repo"),
-                    feature_id: Some("feature"),
-                    ownership_token: Some("owner")
-                },
-                None,
-                true,
-                10
-            )
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn result_invalid_review_cannot_continue() {
-        let (_directory, _path, store) = file_store();
-        let mut fresh = general_task("invalid-review", "invalid-public", "invalid-key");
-        fresh.task_kind = TaskKind::Review;
-        fresh.job.review_kind = Some("code".into());
-        fresh.review_id = Some("invalid-review-id".into());
-        store.enqueue_task(&fresh).unwrap();
-        store
-            .set_task_phase("invalid-review", TaskPhase::Preparing)
-            .unwrap();
-        store
-            .set_task_phase("invalid-review", TaskPhase::Running)
-            .unwrap();
-        store
-            .store_task_result(
-                "invalid-review",
-                &TaskResult {
-                    outcome: TaskOutcome::ResultInvalid,
-                    summary: "review provenance is invalid".into(),
-                    partial: true,
-                    base_commit: None,
-                    head_commit: None,
-                    changed_files: Vec::new(),
-                    diff_stat: None,
-                    checks: Vec::new(),
-                    residual_gaps: vec!["RESULT_INVALID".into()],
-                    artifacts: Vec::new(),
-                },
-            )
-            .unwrap();
-        let mut continuation = general_task(
-            "invalid-continuation",
-            "invalid-public",
-            "invalid-continuation-key",
-        );
-        continuation.task_kind = TaskKind::ReviewContinuation;
-        continuation.job.review_kind = Some("code".into());
-        continuation.review_id = Some("invalid-review-id".into());
-        continuation.continuation_of = Some("invalid-review".into());
-        assert!(matches!(
-            store.enqueue_task(&continuation),
-            Err(StoreError::Conflict(_))
-        ));
-    }
-
-    #[test]
-    fn public_event_sequence_does_not_reset_across_review_attempts() {
-        let (_directory, _path, store) = file_store();
-        let mut first = general_task("seq-attempt-1", "seq-agent", "seq-key-1");
-        first.task_kind = TaskKind::Review;
-        first.job.review_kind = Some("initial".into());
-        first.review_id = Some("seq-review".into());
-        store.enqueue_task(&first).unwrap();
-        let first_claim = claim(&store, "seq-attempt-1");
-        store
-            .mark_running("seq-attempt-1", first_claim.owner_epoch, "runtime-1", None)
-            .unwrap();
-        assert_eq!(
-            store
-                .append_lifecycle(&LifecycleWrite {
-                    agent_id: "seq-attempt-1".into(),
-                    runtime_agent_id: "runtime-1".into(),
-                    owner_epoch: first_claim.owner_epoch,
-                    source_sequence: 1,
-                    event_type: "complete".into(),
-                    turn_id: None,
-                    payload_json: "{}".into(),
-                    redaction_level: "public".into(),
-                    terminal: Some(TerminalUpdate {
-                        state: JobState::Completed,
-                        failure_code: None,
-                        failure_message: None
-                    }),
-                    turn_state: None
-                })
-                .unwrap(),
-            1
-        );
-        store.connection.lock().unwrap().execute_batch("UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id='seq-attempt-1'; INSERT INTO review_finalizations (agent_id,signal,payload_json,payload_sha256,revision,created_at) VALUES ('seq-attempt-1','no_findings_observed','{}','hash',1,1);").unwrap();
-        let mut second = general_task("seq-attempt-2", "seq-agent", "seq-key-2");
-        second.task_kind = TaskKind::ReviewContinuation;
-        second.job.review_kind = Some("initial".into());
-        second.review_id = Some("seq-review".into());
-        second.continuation_of = Some("seq-attempt-1".into());
-        store.enqueue_task(&second).unwrap();
-        let second_claim = claim(&store, "seq-attempt-2");
-        store
-            .mark_running("seq-attempt-2", second_claim.owner_epoch, "runtime-2", None)
-            .unwrap();
-        assert_eq!(
-            store
-                .append_lifecycle(&LifecycleWrite {
-                    agent_id: "seq-attempt-2".into(),
-                    runtime_agent_id: "runtime-2".into(),
-                    owner_epoch: second_claim.owner_epoch,
-                    source_sequence: 1,
-                    event_type: "started".into(),
-                    turn_id: None,
-                    payload_json: "{}".into(),
-                    redaction_level: "public".into(),
-                    terminal: None,
-                    turn_state: None
-                })
-                .unwrap(),
-            2
-        );
-        let events = store.task_events_after("seq-agent", 0, 10).unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .map(|e| (e.sequence, e.attempt_sequence))
-                .collect::<Vec<_>>(),
-            vec![(1, 1), (2, 2)]
-        );
     }
 
     #[test]
@@ -6631,61 +6181,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_identity_review_uniqueness_and_legacy_field_mismatch_fail_closed() {
-        let (_directory, _path, store) = file_store();
-        let mut first = general_task("identity-exec-1", "identity-public", "identity-key-1");
-        first.task_kind = TaskKind::Review;
-        first.review_id = Some("identity-review".into());
-        first.job.review_kind = Some("initial".into());
-        store.enqueue_task(&first).unwrap();
-        assert_eq!(
-            store
-                .get_task_scoped(
-                    "identity-public",
-                    TaskQueryScope {
-                        repository: Some("repo"),
-                        feature_id: None,
-                        ownership_token: None
-                    }
-                )
-                .unwrap()
-                .unwrap()
-                .execution_agent_id,
-            "identity-exec-1"
-        );
-        assert_eq!(
-            store
-                .get_review_scoped(
-                    "identity-review",
-                    TaskQueryScope {
-                        repository: None,
-                        feature_id: Some("feature"),
-                        ownership_token: None
-                    }
-                )
-                .unwrap()
-                .unwrap()
-                .public_agent_id,
-            "identity-public"
-        );
-        let mut duplicate = first.clone();
-        duplicate.job.agent_id = "identity-exec-2".into();
-        duplicate.job.idempotency_key = Some("identity-key-2".into());
-        duplicate.public_agent_id = "other-public".into();
-        assert!(matches!(
-            store.enqueue_task(&duplicate),
-            Err(StoreError::Conflict(_))
-        ));
-        let mut mismatch = general_task("mismatch", "mismatch-public", "mismatch-key");
-        mismatch.job.feature_id = Some("different".into());
-        assert!(matches!(
-            store.enqueue_task(&mismatch),
-            Err(StoreError::Conflict(_))
-        ));
-    }
-
-    #[test]
-    fn complete_is_atomic_with_scheduler_and_continuation_requires_eligible_truth() {
+    fn complete_is_atomic_with_scheduler_and_rejects_pre_running_result() {
         let (_directory, _path, store) = file_store();
         let task = general_task("atomic-exec", "atomic-public", "atomic-key");
         store.enqueue_task(&task).unwrap();
@@ -6717,25 +6213,6 @@ mod tests {
             JobState::Completed
         );
         assert!(store.claim_next("owner", 1, 1).unwrap().is_none());
-        let mut review = general_task("ineligible-review", "stable-ineligible", "ineligible-key");
-        review.task_kind = TaskKind::Review;
-        review.review_id = Some("ineligible-id".into());
-        review.job.review_kind = Some("initial".into());
-        store.enqueue_task(&review).unwrap();
-        store.connection.lock().unwrap().execute_batch("UPDATE agents SET state='COMPLETED' WHERE agent_id='ineligible-review'; UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id='ineligible-review';").unwrap();
-        let mut continuation = general_task(
-            "ineligible-next",
-            "stable-ineligible",
-            "ineligible-next-key",
-        );
-        continuation.task_kind = TaskKind::ReviewContinuation;
-        continuation.review_id = Some("ineligible-id".into());
-        continuation.job.review_kind = Some("initial".into());
-        continuation.continuation_of = Some("ineligible-review".into());
-        assert!(matches!(
-            store.enqueue_task(&continuation),
-            Err(StoreError::Conflict(_))
-        ));
     }
 
     #[test]
@@ -6962,60 +6439,6 @@ mod tests {
         assert_eq!(second.tasks[0].execution_agent_id, "page-match-1");
         assert_eq!(second.next_cursor, None);
 
-        let mut fresh = general_task("attempt-001", "attempt-public", "attempt-key-001");
-        fresh.task_kind = TaskKind::Review;
-        fresh.job.review_kind = Some("code".into());
-        fresh.review_id = Some("attempt-review".into());
-        store.enqueue_task(&fresh).unwrap();
-        let mut previous = fresh.job.agent_id;
-        for sequence in 2..=102 {
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .execute(
-                    "UPDATE agents SET state='COMPLETED' WHERE agent_id=?1",
-                    [&previous],
-                )
-                .unwrap();
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .execute(
-                    "UPDATE task_attempts SET phase='TERMINAL' WHERE execution_agent_id=?1",
-                    [&previous],
-                )
-                .unwrap();
-            store
-                .connection
-                .lock()
-                .unwrap()
-                .execute(
-                    "INSERT INTO review_finalizations (agent_id,signal,payload_json,payload_sha256,revision,created_at) VALUES (?1,'no_findings_observed','{}','hash',1,1)",
-                    [&previous],
-                )
-                .unwrap();
-            let execution_id = format!("attempt-{sequence:03}");
-            let mut continuation = general_task(
-                &execution_id,
-                "attempt-public",
-                &format!("attempt-key-{sequence:03}"),
-            );
-            continuation.task_kind = TaskKind::ReviewContinuation;
-            continuation.job.review_kind = Some("code".into());
-            continuation.review_id = Some("attempt-review".into());
-            continuation.continuation_of = Some(previous);
-            let (_, record) = store.enqueue_task(&continuation).unwrap();
-            assert_eq!(record.attempt_sequence, sequence);
-            previous = execution_id;
-        }
-        let oldest = store
-            .get_task_attempt("attempt-public", 1)
-            .unwrap()
-            .expect("oldest attempt must remain point-addressable");
-        assert_eq!(oldest.execution_agent_id, "attempt-001");
-        assert_eq!(oldest.attempt_sequence, 1);
     }
 
     #[test]

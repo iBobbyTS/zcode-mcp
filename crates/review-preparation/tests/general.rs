@@ -141,12 +141,10 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     assert!(header.starts_with("--- BEGIN DAEMON GENERAL CONTROL"));
     assert!(header.contains("\"profile\": \"test_runner\""));
     assert!(header.contains("\"command_id\": \"unit\""));
-    assert!(header.contains("mcp__general-completion__zcode_general_complete"));
-    assert!(header.contains("mcp__general-completion__zcode_general_run_check"));
-    assert!(header.contains("prose-only output is not successful completion"));
-    assert!(header.contains("exactly one accepted bounded terminal-result call"));
-    assert!(header.contains("Use SUCCEEDED only when the bounded task is complete"));
-    assert!(header.contains("Use BLOCKED only for a truthful bounded inability to finish"));
+    assert!(header.contains("Do not invoke private progress, checkpoint, finding, validation, completion, or finalize tools"));
+    assert!(header.contains("daemon finalizes a matching turn.completed boundary"));
+    assert!(header.contains("daemon owns outcome classification"));
+    assert!(!header.contains("general-completion"));
     assert!(header.contains("public result, status, or artifact content"));
     assert!(header
         .contains("hidden reasoning, credentials, absolute host paths, or low-level tool details"));
@@ -469,7 +467,7 @@ fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
     ));
     m = f.manifest(GeneralProfile::AnalysisReadonly);
     let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
-    budget.wall_time_ms = 86_400_001;
+    budget.absolute_wall_time_ms = 86_400_001;
     m.budget = Some(budget);
     assert!(matches!(
         f.preparer().prepare(&m),
@@ -571,194 +569,6 @@ fn profile_policy_allows_only_frozen_implementation_paths() {
             )
             .allowed
     );
-    assert!(
-        !policy
-            .decide(
-                &PermissionRequest::InternalReviewLedger,
-                ExternalDecision::Allow
-            )
-            .allowed
-    );
-}
-
-#[test]
-fn internal_general_completion_permission_is_exact_and_general_profile_scoped() {
-    const TOOL: &str = "mcp__general-completion__zcode_general_complete";
-    let f = Fixture::new();
-    for (profile, tracked_write_allowed) in [
-        (GeneralProfile::AnalysisReadonly, false),
-        (GeneralProfile::TestRunner, false),
-        (GeneralProfile::ImplementationWorktree, true),
-    ] {
-        let prepared = f.preparer().prepare(&f.manifest(profile)).unwrap();
-        let launcher = prepared.launcher().unwrap();
-        let request = serde_json::json!({"toolName":TOOL,"input":{}});
-
-        let allowed = launcher.decide_zcode_permission(&request, ExternalDecision::Allow);
-        assert!(allowed.allowed, "{profile:?}: {allowed:?}");
-        assert_eq!(allowed.reason, "allowed_by_bounded_policy");
-        assert!(
-            launcher
-                .decide(
-                    &PermissionRequest::InternalGeneralCompletion,
-                    ExternalDecision::Allow,
-                )
-                .allowed
-        );
-        let denied = launcher.decide_zcode_permission(&request, ExternalDecision::Deny);
-        assert!(!denied.allowed);
-        assert_eq!(denied.reason, "external_policy_denied");
-
-        for near_miss in [
-            "MCP__GENERAL-COMPLETION__ZCODE_GENERAL_COMPLETE",
-            "mcp__general-completion__ZCode_general_complete",
-            "mcp__general-completion__zcode_general_complete_extra",
-            "prefix_mcp__general-completion__zcode_general_complete",
-        ] {
-            let decision = launcher.decide_zcode_permission(
-                &serde_json::json!({"toolName":near_miss,"input":{}}),
-                ExternalDecision::Allow,
-            );
-            assert!(!decision.allowed, "{profile:?}: {near_miss}");
-            assert_eq!(decision.reason, "permission_request_unrecognized");
-        }
-
-        let review_ledger = launcher.decide_zcode_permission(
-            &serde_json::json!({
-                "toolName":"mcp__review-ledger__review_finalize",
-                "input":{}
-            }),
-            ExternalDecision::Allow,
-        );
-        assert!(!review_ledger.allowed);
-        assert_eq!(
-            review_ledger.reason,
-            "review_ledger_unavailable_for_general_task"
-        );
-        for unchanged_unknown in ["Bash", "mcp__other__zcode_general_complete"] {
-            let decision = launcher.decide_zcode_permission(
-                &serde_json::json!({"toolName":unchanged_unknown,"input":{}}),
-                ExternalDecision::Allow,
-            );
-            assert!(!decision.allowed);
-            assert_eq!(decision.reason, "permission_request_unrecognized");
-        }
-        let write = launcher.decide_zcode_permission(
-            &serde_json::json!({
-                "toolName":"write",
-                "input":{"path":prepared.worktree.path.join("src/lib.rs")}
-            }),
-            ExternalDecision::Allow,
-        );
-        assert_eq!(write.allowed, tracked_write_allowed, "{profile:?}");
-        let git = launcher.decide_zcode_permission(
-            &serde_json::json!({"toolName":"git_ref_mutation","input":{}}),
-            ExternalDecision::Allow,
-        );
-        assert!(!git.allowed);
-        assert_eq!(git.reason, "git_ref_mutation_denied");
-        let network = launcher.decide_zcode_permission(
-            &serde_json::json!({
-                "toolName":"network",
-                "input":{"target":"https://example.invalid"}
-            }),
-            ExternalDecision::Allow,
-        );
-        assert!(!network.allowed);
-        assert_eq!(network.reason, "network_not_enforced_and_request_denied");
-        let execute = launcher.decide_zcode_permission(
-            &serde_json::json!({
-                "toolName":"execute",
-                "input":{"program":"/bin/sh","args":[],"cwd":prepared.worktree.path}
-            }),
-            ExternalDecision::Allow,
-        );
-        assert!(!execute.allowed);
-        assert_eq!(execute.reason, "command_not_allowlisted");
-    }
-}
-
-#[test]
-fn internal_named_check_permission_is_exact_selected_and_profile_scoped() {
-    const TOOL: &str = "mcp__general-completion__zcode_general_run_check";
-    let f = Fixture::new();
-    for (profile, readonly_safe, expected) in [
-        (GeneralProfile::AnalysisReadonly, true, true),
-        (GeneralProfile::AnalysisReadonly, false, false),
-        (GeneralProfile::TestRunner, false, true),
-        (GeneralProfile::ImplementationWorktree, false, true),
-    ] {
-        let manifest = f.manifest(profile);
-        let named = BTreeMap::from([(
-            "unit".into(),
-            GeneralNamedCommand {
-                command: ValidationCommand {
-                    program: PathBuf::from("/usr/bin/true"),
-                    args: Vec::new(),
-                    cwd: ".".into(),
-                    timeout_ms: 1_000,
-                    max_output_bytes: 1_024,
-                },
-                readonly_safe,
-            },
-        )]);
-        let prepared = f
-            .preparer()
-            .prepare_named_submission(&manifest, &named)
-            .unwrap();
-        let launcher = prepared.launcher().unwrap();
-        let request = serde_json::json!({
-            "toolName":TOOL,
-            "input":{"command_id":"unit"}
-        });
-        assert_eq!(
-            launcher
-                .decide_zcode_permission(&request, ExternalDecision::Allow)
-                .allowed,
-            expected,
-            "{profile:?} readonly_safe={readonly_safe}"
-        );
-        assert!(
-            !launcher
-                .decide_zcode_permission(&request, ExternalDecision::Deny)
-                .allowed
-        );
-        for denied in [
-            serde_json::json!({"toolName":TOOL,"input":{"command_id":"unknown"}}),
-            serde_json::json!({"toolName":TOOL,"input":{"command_id":"unit","args":[]}}),
-            serde_json::json!({"toolName":"mcp__general-completion__zcode_general_run_check_extra","input":{"command_id":"unit"}}),
-            serde_json::json!({"toolName":"mcp__general-completion__Zcode_general_run_check","input":{"command_id":"unit"}}),
-        ] {
-            assert!(
-                !launcher
-                    .decide_zcode_permission(&denied, ExternalDecision::Allow)
-                    .allowed
-            );
-        }
-        if expected {
-            let output = launcher.run("unit").unwrap();
-            assert_eq!(output.status_code, Some(0));
-            assert!(!output.timed_out);
-            assert!(!output.cancelled);
-        }
-        let review = PolicyLauncher::new(
-            prepared.worktree.path.clone(),
-            prepared.scratch_root.clone(),
-            prepared.artifact_root.join("result.json"),
-            vec![prepared.prompt_path.clone()],
-            prepared.validation_commands.clone(),
-            false,
-            PolicyCapabilities::default(),
-        )
-        .unwrap();
-        assert!(
-            !review
-                .decide_zcode_permission(&request, ExternalDecision::Allow)
-                .allowed
-        );
-        let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked);
-        assert!(completion.cleaned);
-    }
 }
 
 #[test]

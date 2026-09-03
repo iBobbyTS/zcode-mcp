@@ -1,9 +1,10 @@
 #![cfg(unix)]
 
 use review_preparation::{
-    NetworkPolicy, ReviewKind, ReviewManifest, ReviewPreparer, RoundKind, ScratchPolicy,
+    general_launch_prompt, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
+    GENERAL_TASK_SCHEMA,
 };
-use review_store::{JobState, NewJob, Store};
+use review_store::{BudgetRequest, EffectiveBudget, JobState, NewJob, NewTask, Store, TaskKind};
 use std::{
     io::{Read, Write},
     os::unix::net::UnixListener,
@@ -14,7 +15,7 @@ use std::{
 };
 use zcode_driver::{observe_process, observe_process_group};
 use zcode_reviewd::rpc::{
-    JobStateView, ReadinessResultView, RespondInput, ResponseDecision, RpcClient, RpcMethod,
+    ReadinessResultView, RespondInput, ResponseDecision, RpcClient, RpcMethod,
     RpcOutcome, RpcRequest, RpcSuccess, RPC_VERSION,
 };
 
@@ -126,44 +127,60 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     let daemon_executable = env!("CARGO_BIN_EXE_zcode-reviewd");
     let repository = create_repository(directory.path());
     let head = git_text(&repository, &["rev-parse", "HEAD"]);
-    let prepared = ReviewPreparer
-        .prepare(&ReviewManifest {
-            schema: "sectioned-zcode-review/v1".into(),
-            review_kind: ReviewKind::Code,
-            feature_id: "feature".into(),
-            section_id: "S04".into(),
-            round_kind: RoundKind::InitialBounded,
+    let manifest = GeneralTaskManifest {
+            schema: GENERAL_TASK_SCHEMA.into(),
+            task_id: "daemon-job".into(),
             repository,
-            base_ref: head.clone(),
-            head_ref: head,
-            plan_path: ".agent-work/PLAN.md".into(),
-            context_paths: Vec::new(),
-            scope_paths: vec!["src".into()],
-            forbidden_input_globs: Vec::new(),
+            base_ref: head,
+            profile: GeneralProfile::AnalysisReadonly,
+            prompt: "permission input".into(),
+            repo_context: vec!["src/lib.rs".into()],
+            attachments: Vec::new(),
+            write_manifest: Vec::new(),
+            scratch_root: ".agent-work/scratch/daemon-job".into(),
+            artifact_root: ".agent-work/artifacts/daemon-job".into(),
+            budget: None,
             validation_commands: Default::default(),
-            report_target: ".agent-work/reviews/daemon/report.md".into(),
-            scratch_root: ".agent-work/scratch/jobs".into(),
-            model: None,
-            fresh_session: true,
-            network_policy: NetworkPolicy::Deny,
-            scratch_policy: ScratchPolicy::Isolated,
+            retain_partial: false,
             idempotency_key: "daemon-key".into(),
-        })
+        };
+    let prepared = GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_submission(&manifest)
         .unwrap();
-    let mut queued = NewJob::new("daemon-job", prepared.worktree.path.to_string_lossy());
+    let agent_id = prepared.task_id.clone();
+    let mut queued = NewJob::new(&agent_id, prepared.worktree.path.to_string_lossy());
     queued.idempotency_key = Some(prepared.idempotency_key.clone());
-    queued.review_kind = Some("code".into());
     queued.feature_id = Some("feature".into());
-    queued.section_id = Some("S04".into());
-    queued.round_kind = Some("INITIAL_BOUNDED".into());
-    queued.report_path = Some(prepared.report_target.to_string_lossy().into_owned());
-    queued.runtime_hash = Some("fake".into());
-    queued.initial_prompt = "permission input".into();
-    queued.prepared_launch_json = Some(prepared.canonical_json().unwrap());
-    queued.prepared_launch_sha256 = Some(prepared.prepared_sha256);
+    queued.initial_prompt = general_launch_prompt(&prepared, &manifest.prompt).unwrap();
+    queued.prepared_launch_json = Some(serde_json::to_string(&prepared).unwrap());
+    queued.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    let budget = EffectiveBudget {
+        absolute_wall_time_ms: prepared.effective_budget.absolute_wall_time_ms,
+        runtime_activity_idle_timeout_ms: prepared.effective_budget.runtime_activity_idle_timeout_ms,
+        model_stream_idle_timeout_ms: prepared.effective_budget.model_stream_idle_timeout_ms,
+        tool_call_timeout_ms: prepared.effective_budget.tool_call_timeout_ms,
+        input_wait_timeout_ms: prepared.effective_budget.input_wait_timeout_ms,
+        max_turns: prepared.effective_budget.max_turns,
+        max_tool_calls: prepared.effective_budget.max_tool_calls,
+        max_context_bytes: prepared.effective_budget.max_context_bytes,
+        max_result_bytes: prepared.effective_budget.max_result_bytes,
+        max_artifact_bytes: prepared.effective_budget.max_artifact_bytes,
+    };
     Store::open(&database)
         .unwrap()
-        .enqueue_job(&queued)
+        .enqueue_task(&NewTask {
+            job: queued,
+            public_agent_id: agent_id.clone(),
+            task_kind: TaskKind::General,
+            review_id: None,
+            continuation_of: None,
+            repository: prepared.repository.to_string_lossy().into_owned(),
+            feature_id: "feature".into(),
+            ownership_token: "daemon-process-test".into(),
+            budget: BudgetRequest::Limits(budget),
+            retain_partial: false,
+        })
         .unwrap();
     let mut daemon = Command::new(daemon_executable)
         .env("ZCODE_REVIEWD_DATABASE", &database)
@@ -185,17 +202,15 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
             client
                 .call(&request(
                     "status",
-                    RpcMethod::Status {
-                        agent_id: "daemon-job".into(),
+                    RpcMethod::TaskStatus {
+                        agent_id: agent_id.clone(),
                     },
                 ))
                 .unwrap(),
         );
         if matches!(
             status,
-            RpcSuccess::Status { ref job }
-                if job.state == JobStateView::Running
-                    && job.zcode_session_id.as_deref() == Some("fake-session-7f3a")
+            RpcSuccess::TaskStatus { ref task } if task.phase == "RUNNING"
         ) {
             break;
         }
@@ -210,7 +225,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let permission = loop {
         if let Some(request) = store
-            .pending_requests("daemon-job")
+            .pending_requests(&agent_id)
             .unwrap()
             .into_iter()
             .find(|request| request.request_type == "permission")
@@ -227,8 +242,8 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         client
             .call(&request(
                 "respond-local-policy",
-                RpcMethod::Respond(RespondInput {
-                    agent_id: "daemon-job".into(),
+                RpcMethod::TaskRespond(RespondInput {
+                    agent_id: agent_id.clone(),
                     request_id: permission.request_id.clone(),
                     decision: ResponseDecision::Allow,
                     content: None,
@@ -237,7 +252,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
             .unwrap(),
     );
     let persisted = store
-        .pending_request("daemon-job", &permission.request_id)
+        .pending_request(&agent_id, &permission.request_id)
         .unwrap()
         .unwrap();
     assert_eq!(persisted.response_decision.as_deref(), Some("deny"));
@@ -284,17 +299,17 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
             reconnected
                 .call(&request(
                     "status-again",
-                    RpcMethod::Status {
-                        agent_id: "daemon-job".into(),
+                    RpcMethod::TaskStatus {
+                        agent_id: agent_id.clone(),
                     },
                 ))
                 .unwrap()
         ),
-        RpcSuccess::Status { ref job } if job.state == JobStateView::Running
+        RpcSuccess::TaskStatus { ref task } if task.phase == "RUNNING"
     ));
     let identity = Store::open(&database)
         .unwrap()
-        .get_job("daemon-job")
+        .get_job(&agent_id)
         .unwrap()
         .unwrap()
         .process_identity
@@ -332,7 +347,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .is_empty());
     let job = Store::open(&database)
         .unwrap()
-        .get_job("daemon-job")
+        .get_job(&agent_id)
         .unwrap()
         .unwrap();
     assert_eq!(job.state, JobState::Cancelled);
