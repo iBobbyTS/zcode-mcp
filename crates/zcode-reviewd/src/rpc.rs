@@ -1437,19 +1437,14 @@ impl RpcService {
                 validate_text(&input.ownership_token, "ownership_token", 512)?;
                 validate_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
                 validate_command_ids(&input.required_command_ids, "required_command_ids")?;
-                let mut command_ids = input.allowed_command_ids;
-                for command_id in input.required_command_ids {
-                    if !command_ids.contains(&command_id) {
-                        command_ids.push(command_id);
-                    }
-                }
                 let submitted = self
                     .scheduler
                     .enqueue_general_with_commands(
                         &input.manifest,
                         &input.feature_id,
                         &input.ownership_token,
-                        &command_ids,
+                        &input.allowed_command_ids,
+                        &input.required_command_ids,
                     )
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {

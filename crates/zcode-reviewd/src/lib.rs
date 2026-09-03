@@ -6,7 +6,8 @@ use review_store::{
     StoredProcessIdentity, TaskKind, TaskOutcome, TaskRecord, TaskResult,
     TaskSubmissionDisposition, TerminalUpdate, TurnState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt, fs, io,
@@ -205,7 +206,6 @@ enum ActivitySampleKind {
 struct ActivitySample {
     source: ActivitySource,
     observed_at: Instant,
-    stream_key: Option<String>,
     kind: ActivitySampleKind,
 }
 
@@ -266,7 +266,6 @@ struct PassiveActivityState {
     active_tools: HashMap<String, PassiveToolKind>,
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
-    session_streams: HashSet<String>,
     telemetry_degraded: bool,
 }
 
@@ -297,20 +296,6 @@ impl PassiveActivityTracker {
         }
 
         let mut admitted = true;
-        if let Some(stream_key) = parsed.stream_key.as_ref() {
-            if parsed.source == ActivitySource::Session {
-                state.session_streams.insert(stream_key.clone());
-                state.samples.retain(|_, sample| {
-                    sample.source != ActivitySource::Telemetry
-                        || sample.stream_key.as_ref() != Some(stream_key)
-                });
-            } else if parsed.source == ActivitySource::Telemetry
-                && state.session_streams.contains(stream_key)
-            {
-                admitted = false;
-            }
-        }
-
         if admitted {
             if let (Some(identity), Some(sample)) = (parsed.identity.as_ref(), parsed.sample) {
                 let replace = match state.samples.get(identity) {
@@ -329,7 +314,6 @@ impl PassiveActivityTracker {
                         ActivitySample {
                             source: parsed.source,
                             observed_at: now,
-                            stream_key: parsed.stream_key.clone(),
                             kind: sample,
                         },
                     );
@@ -1781,12 +1765,77 @@ pub fn classify_restart(identity: &ProcessIdentity) -> RuntimeTerminal {
 
 #[derive(Clone)]
 enum TaskRoute {
-    General(Box<PreparedGeneralTask>),
+    General(Box<PreparedGeneralTask>, Vec<String>),
     Review(Box<PreparedLaunchSpec>),
     Legacy,
 }
 
 const REVIEW_TASK_SCHEMA: &str = "sectioned-zcode-review/v1";
+const GENERAL_DAEMON_CONTRACT_SCHEMA: &str = "zcode-general-daemon-contract/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneralDaemonContract {
+    schema: String,
+    original_manifest_sha256: String,
+    prepared_sha256: String,
+    required_command_ids: Vec<String>,
+}
+
+fn daemon_contract_digest(contract: &GeneralDaemonContract) -> Result<String, String> {
+    let encoded = serde_json::to_vec(&(
+        contract.schema.as_str(),
+        contract.original_manifest_sha256.as_str(),
+        &contract.required_command_ids,
+    ))
+    .map_err(|_| "general daemon contract could not be encoded".to_owned())?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn bind_general_daemon_contract(
+    prepared: &mut PreparedGeneralTask,
+    required_command_ids: &[String],
+) -> Result<String, String> {
+    let mut required_command_ids = required_command_ids.to_vec();
+    required_command_ids.sort();
+    required_command_ids.dedup();
+    if required_command_ids
+        .iter()
+        .any(|id| !prepared.validation_commands.contains_key(id))
+    {
+        return Err("required command is not selected by the prepared task".into());
+    }
+    let original_manifest_sha256 = prepared.manifest_sha256.clone();
+    let mut contract = GeneralDaemonContract {
+        schema: GENERAL_DAEMON_CONTRACT_SCHEMA.into(),
+        original_manifest_sha256,
+        prepared_sha256: String::new(),
+        required_command_ids,
+    };
+    prepared.manifest_sha256 = daemon_contract_digest(&contract)?;
+    prepared.prepared_sha256.clear();
+    prepared.prepared_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(prepared)
+                .map_err(|_| "prepared general task could not be encoded".to_owned())?,
+        )
+    );
+    contract.prepared_sha256 = prepared.prepared_sha256.clone();
+    let mut value = serde_json::to_value(prepared)
+        .map_err(|_| "prepared general task could not be encoded".to_owned())?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| "prepared general task must be an object".to_owned())?
+        .insert(
+            "daemon_contract".into(),
+            serde_json::to_value(contract)
+                .map_err(|_| "general daemon contract could not be encoded".to_owned())?,
+        );
+    let json = serde_json::to_string(&value)
+        .map_err(|_| "prepared general task could not be encoded".to_owned())?;
+    Ok(json)
+}
 
 fn task_route(job: &Job) -> Result<TaskRoute, String> {
     let Some(json) = job.prepared_launch_json.as_deref() else {
@@ -1796,17 +1845,45 @@ fn task_route(job: &Job) -> Result<TaskRoute, String> {
         serde_json::from_str(json).map_err(|_| "stored prepared launch is invalid")?;
     match value.get("schema").and_then(serde_json::Value::as_str) {
         Some(review_preparation::GENERAL_TASK_SCHEMA) => {
-            let prepared: PreparedGeneralTask = serde_json::from_value(value)
+            let prepared: PreparedGeneralTask = serde_json::from_value(value.clone())
                 .map_err(|_| "stored general preparation is invalid")?;
             prepared
                 .validate_digest()
                 .map_err(|_| "stored general preparation digest is invalid")?;
-            if job.prepared_launch_sha256.as_deref() != Some(prepared.prepared_sha256.as_str())
+            let (required_command_ids, expected_digest) = match value.get("daemon_contract") {
+                Some(contract) => {
+                    let contract: GeneralDaemonContract = serde_json::from_value(contract.clone())
+                        .map_err(|_| "stored general daemon contract is invalid")?;
+                    if contract.schema != GENERAL_DAEMON_CONTRACT_SCHEMA
+                        || contract.prepared_sha256 != prepared.prepared_sha256
+                        || contract
+                            .required_command_ids
+                            .windows(2)
+                            .any(|pair| pair[0] >= pair[1])
+                        || contract
+                            .required_command_ids
+                            .iter()
+                            .any(|id| !prepared.validation_commands.contains_key(id))
+                    {
+                        return Err("stored general daemon contract is invalid".into());
+                    }
+                    let digest = daemon_contract_digest(&contract)?;
+                    if prepared.manifest_sha256 != digest {
+                        return Err("stored general daemon contract digest is invalid".into());
+                    }
+                    (
+                        contract.required_command_ids,
+                        prepared.prepared_sha256.clone(),
+                    )
+                }
+                None => (Vec::new(), prepared.prepared_sha256.clone()),
+            };
+            if job.prepared_launch_sha256.as_deref() != Some(expected_digest.as_str())
                 || job.workspace_path != prepared.worktree.path.to_string_lossy()
             {
                 return Err("stored job does not match its general preparation".into());
             }
-            Ok(TaskRoute::General(Box::new(prepared)))
+            Ok(TaskRoute::General(Box::new(prepared), required_command_ids))
         }
         Some(REVIEW_TASK_SCHEMA) => {
             let prepared: PreparedLaunchSpec = serde_json::from_value(value)
@@ -1828,10 +1905,10 @@ fn task_route(job: &Job) -> Result<TaskRoute, String> {
 
 fn validate_task_route(task: Option<&TaskRecord>, route: &TaskRoute) -> Result<(), String> {
     match (task.map(|task| task.task_kind), route) {
-        (Some(TaskKind::General), TaskRoute::General(_))
+        (Some(TaskKind::General), TaskRoute::General(_, _))
         | (Some(TaskKind::Review | TaskKind::ReviewContinuation), TaskRoute::Review(_))
         | (None, TaskRoute::Review(_) | TaskRoute::Legacy) => Ok(()),
-        (None, TaskRoute::General(_)) => {
+        (None, TaskRoute::General(_, _)) => {
             Err("general prepared launch requires V2 task metadata".into())
         }
         (Some(_), _) => Err("durable task kind does not match prepared launch route".into()),
@@ -1842,7 +1919,7 @@ fn route_policy(
     route: &TaskRoute,
 ) -> review_preparation::PreparationResult<Option<PolicyLauncher>> {
     match route {
-        TaskRoute::General(prepared) => prepared.launcher().map(Some),
+        TaskRoute::General(prepared, _) => prepared.launcher().map(Some),
         TaskRoute::Review(prepared) => prepared.launcher().map(Some),
         TaskRoute::Legacy => Ok(None),
     }
@@ -2072,7 +2149,7 @@ where
             match task_route(job)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
             {
-                TaskRoute::General(prepared) => {
+                TaskRoute::General(prepared, _) => {
                     prepared
                         .launcher()
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -3141,6 +3218,45 @@ fn task_outcome(outcome: CompletionOutcome) -> TaskOutcome {
     }
 }
 
+fn run_required_general_checks(
+    prepared: &PreparedGeneralTask,
+    required_command_ids: &[String],
+) -> Result<Vec<String>, &'static str> {
+    if required_command_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    prepared
+        .validate_digest()
+        .map_err(|_| "REQUIRED_CHECK_PREPARED_TASK_INVALID")?;
+    let policy = prepared
+        .launcher()
+        .map_err(|_| "REQUIRED_CHECK_POLICY_INVALID")?;
+    let cancellation = AtomicBool::new(false);
+    let mut verified = Vec::with_capacity(required_command_ids.len());
+    for command_id in required_command_ids {
+        let command = prepared
+            .validation_commands
+            .get(command_id)
+            .ok_or("REQUIRED_CHECK_NOT_PREPARED")?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(command.timeout_ms))
+            .ok_or("REQUIRED_CHECK_DEADLINE_INVALID")?;
+        let output = policy
+            .run_cancellable(command_id, deadline, &cancellation)
+            .map_err(|_| "REQUIRED_CHECK_EXECUTION_FAILED")?;
+        if output.status_code != Some(0)
+            || output.timed_out
+            || output.cancelled
+            || output.stdout_truncated
+            || output.stderr_truncated
+        {
+            return Err("REQUIRED_CHECK_FAILED");
+        }
+        verified.push(command_id.clone());
+    }
+    Ok(verified)
+}
+
 fn minimal_task_result(outcome: CompletionOutcome, summary: &str, reason_code: &str) -> TaskResult {
     TaskResult {
         outcome: task_outcome(outcome),
@@ -3836,7 +3952,7 @@ impl Scheduler {
         feature_id: &str,
         ownership_token: &str,
     ) -> Result<SubmittedTask, SchedulerError> {
-        self.enqueue_general_with_commands(manifest, feature_id, ownership_token, &[])
+        self.enqueue_general_with_commands(manifest, feature_id, ownership_token, &[], &[])
     }
 
     pub fn enqueue_general_with_commands(
@@ -3844,7 +3960,8 @@ impl Scheduler {
         manifest: &GeneralTaskManifest,
         feature_id: &str,
         ownership_token: &str,
-        command_ids: &[String],
+        allowed_command_ids: &[String],
+        required_command_ids: &[String],
     ) -> Result<SubmittedTask, SchedulerError> {
         if feature_id.is_empty() || ownership_token.is_empty() {
             return Err(SchedulerError::InvalidConfig(
@@ -3856,16 +3973,22 @@ impl Scheduler {
             .iter()
             .map(|attachment| attachment.allowed_root.clone())
             .collect();
+        let mut command_ids = allowed_command_ids.to_vec();
+        for command_id in required_command_ids {
+            if !command_ids.contains(command_id) {
+                command_ids.push(command_id.clone());
+            }
+        }
         let named_commands = self.inner.general_commands.resolve(
             &manifest.repository,
             manifest.profile,
-            command_ids,
+            &command_ids,
         )?;
-        let prepared = GeneralTaskPreparer::new(attachment_roots)
+        let mut prepared = GeneralTaskPreparer::new(attachment_roots)
             .and_then(|preparer| preparer.prepare_named_submission(manifest, &named_commands))
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-        let prepared_json = serde_json::to_string(&prepared)
-            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        let prepared_json = bind_general_daemon_contract(&mut prepared, required_command_ids)
+            .map_err(SchedulerError::InvalidConfig)?;
         let initial_prompt = general_initial_prompt(&prepared)?;
         let mut job = NewJob::new(
             prepared.task_id.clone(),
@@ -4188,7 +4311,7 @@ impl Scheduler {
             .ledger_mcp
             .as_ref()
             .map(|config| match &route {
-                TaskRoute::General(_) => vec![config.general_server_for(&claim.job.agent_id)],
+                TaskRoute::General(_, _) => vec![config.general_server_for(&claim.job.agent_id)],
                 TaskRoute::Review(_) if task.is_some() => {
                     vec![config.task_server_for(
                         &claim.job.agent_id,
@@ -4491,7 +4614,7 @@ impl Scheduler {
         terminal: UnstartedTerminal<'_>,
     ) -> Result<JobState, SchedulerError> {
         match route {
-            TaskRoute::General(prepared) => {
+            TaskRoute::General(prepared, _) => {
                 let completion = finalized_general(
                     prepared,
                     terminal.outcome,
@@ -4628,7 +4751,8 @@ impl Scheduler {
                 })
             })
         };
-        if let Some((TaskRoute::General(prepared), task, submission)) = route_and_submission.clone()
+        if let Some((TaskRoute::General(prepared, required), task, submission)) =
+            route_and_submission.clone()
         {
             sink.attempt.request_stop(&runtime.turn_snapshot());
             sink.attempt.force_terminating();
@@ -4653,7 +4777,7 @@ impl Scheduler {
                         agent_id,
                         owner_epoch,
                         sink,
-                        route: &TaskRoute::General(prepared),
+                        route: &TaskRoute::General(prepared, required),
                         task: task.as_ref(),
                     },
                     TerminalDecision {
@@ -4676,7 +4800,7 @@ impl Scheduler {
                 self.finish_unstarted_route(
                     agent_id,
                     owner_epoch,
-                    &TaskRoute::General(prepared),
+                    &TaskRoute::General(prepared, required),
                     task.as_ref(),
                     UnstartedTerminal {
                         outcome,
@@ -4885,7 +5009,7 @@ impl Scheduler {
         } = decision;
         sink.attempt.terminalize();
         match route {
-            TaskRoute::General(prepared) => {
+            TaskRoute::General(prepared, required_command_ids) => {
                 let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
                     let outcome = match &terminal {
                         RuntimeTerminal::Completed(_) if natural_completion => {
@@ -4902,15 +5026,37 @@ impl Scheduler {
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
-                let mut completion = if natural_completion
-                    && matches!(terminal, RuntimeTerminal::Completed(_))
-                {
+                let required_checks =
+                    if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
+                        run_required_general_checks(prepared, required_command_ids)
+                    } else {
+                        Ok(Vec::new())
+                    };
+                let mut completion = if let Err(reason_code) = required_checks.as_ref() {
+                    let mut completion =
+                        GeneralFinalizer::finalize(prepared, CompletionOutcome::Failed);
+                    completion.summary = "daemon required named check failed".into();
+                    completion.reason_code = Some((*reason_code).into());
+                    completion
+                } else if natural_completion && matches!(terminal, RuntimeTerminal::Completed(_)) {
                     match general_submission {
-                        Some(submission) => {
+                        Some(mut submission) => {
+                            if !required_command_ids.is_empty() {
+                                for command_id in required_checks.unwrap_or_default() {
+                                    if !submission.checks.contains(&command_id) {
+                                        submission.checks.push(command_id);
+                                    }
+                                }
+                            }
                             GeneralFinalizer::finalize_submission(prepared, &submission)
                         }
                         None => {
-                            GeneralFinalizer::finalize(prepared, CompletionOutcome::ResultInvalid)
+                            let mut completion = GeneralFinalizer::finalize(
+                                prepared,
+                                CompletionOutcome::ResultInvalid,
+                            );
+                            completion.checks = required_checks.unwrap_or_default();
+                            completion
                         }
                     }
                 } else {
@@ -6025,7 +6171,7 @@ impl Scheduler {
                         agent_id: agent_id.into(),
                         message: "runtime is not active".into(),
                     })?;
-            let TaskRoute::General(prepared) = &active.route else {
+            let TaskRoute::General(prepared, _) = &active.route else {
                 return Err(SchedulerError::InvalidConfig(
                     "general checks are unavailable for review tasks".into(),
                 ));
@@ -6173,7 +6319,7 @@ impl Scheduler {
                 Arc::clone(&active.check),
             )
         };
-        let TaskRoute::General(prepared) = route else {
+        let TaskRoute::General(prepared, _) = route else {
             return Err(SchedulerError::InvalidConfig(
                 "general completion is unavailable for review tasks".into(),
             ));
@@ -7077,8 +7223,8 @@ mod tests {
             );
         }
         let snapshot = tracker.snapshot_at(base + Duration::from_secs(65));
-        assert_eq!(snapshot.window_60s.reasoning_delta_events, 1);
-        assert_eq!(snapshot.window_60s.reasoning_delta_bytes, 26);
+        assert_eq!(snapshot.window_60s.reasoning_delta_events, 2);
+        assert_eq!(snapshot.window_60s.reasoning_delta_bytes, 29);
         assert_eq!(snapshot.window_60s.text_delta_events, 2);
         assert_eq!(snapshot.window_60s.text_delta_bytes, 7);
         assert_eq!(snapshot.latest_text_tail, "visible");
@@ -9834,7 +9980,7 @@ exec tail -f /dev/null
         .with_general_command_catalog(catalog)
         .unwrap();
         let selected = scheduler
-            .enqueue_general_with_commands(&manifest, "feature", "owner", &["unit".into()])
+            .enqueue_general_with_commands(&manifest, "feature", "owner", &["unit".into()], &[])
             .unwrap();
         let prepared = prepared_general(&selected.job);
         assert_eq!(prepared.validation_commands.len(), 1);
@@ -9860,6 +10006,7 @@ exec tail -f /dev/null
             "feature",
             "owner",
             &["unit".into(), "unit".into()],
+            &[],
         );
         assert!(matches!(duplicate, Err(SchedulerError::InvalidConfig(_))));
         let unknown = scheduler.enqueue_general_with_commands(
@@ -9867,6 +10014,7 @@ exec tail -f /dev/null
             "feature",
             "owner",
             &["unknown".into()],
+            &[],
         );
         assert!(matches!(unknown, Err(SchedulerError::InvalidConfig(_))));
         let mut disallowed_manifest = general_manifest(directory.path(), "profile-selection", None);
@@ -9877,6 +10025,7 @@ exec tail -f /dev/null
             "feature",
             "owner",
             &["unit".into()],
+            &[],
         );
         assert!(matches!(disallowed, Err(SchedulerError::InvalidConfig(_))));
 
@@ -9930,6 +10079,80 @@ exec tail -f /dev/null
                 if message.contains("named check timeout exceeds")
         ));
         scheduler.stop_job(&selected.job.agent_id).unwrap();
+    }
+
+    #[test]
+    fn required_named_checks_are_daemon_bound_and_rerun_on_the_final_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = general_manifest(directory.path(), "required-final-tree", None);
+        manifest.profile = GeneralProfile::ImplementationWorktree;
+        manifest.write_manifest = vec!["src".into()];
+        let repository = manifest.repository.clone();
+        let catalog_path = write_general_command_catalog(
+            directory.path(),
+            serde_json::json!([{
+                "repository":repository,
+                "command_id":"required",
+                "command":{
+                    "program":"/bin/test",
+                    "args":["-f","src/lib.rs"],
+                    "cwd":".",
+                    "timeout_ms":1000,
+                    "max_output_bytes":1024
+                },
+                "allowed_profiles":["implementation_worktree"],
+                "readonly_safe":false
+            }]),
+        );
+        let store = Arc::new(Store::open(directory.path().join("required.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "required-owner",
+            Arc::clone(&store),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_commands(&manifest, "feature", "owner", &[], &["required".into()])
+            .unwrap();
+        let agent_id = submitted.job.agent_id.clone();
+        let prepared = prepared_general(&submitted.job);
+        let route = task_route(&submitted.job).unwrap();
+        let TaskRoute::General(_, required) = route else {
+            panic!("generic route was not prepared");
+        };
+        assert_eq!(required, vec!["required"]);
+
+        scheduler.start_ready().unwrap();
+        std::fs::remove_file(prepared.worktree.path.join("src/lib.rs")).unwrap();
+        scheduler
+            .submit_general_completion(
+                &agent_id,
+                GeneralCompletionSubmission {
+                    requested_outcome: CompletionOutcome::Succeeded,
+                    summary: "model reported success".into(),
+                    checks: vec!["untrusted-model-claim".into()],
+                    residual_gaps: Vec::new(),
+                    artifact_intents: Vec::new(),
+                },
+            )
+            .unwrap();
+        factory
+            .runtime(&agent_id)
+            .finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"REQUIRED_CHECK_FAILED".into()));
+        assert!(result.result.checks.is_empty());
+        assert_general_workspace_cleaned(&prepared);
     }
 
     #[test]
@@ -10069,7 +10292,7 @@ exec tail -f /dev/null
         .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
         .unwrap();
         let submitted = scheduler
-            .enqueue_general_with_commands(&manifest, "feature", "owner", &["slow".into()])
+            .enqueue_general_with_commands(&manifest, "feature", "owner", &["slow".into()], &[])
             .unwrap();
         let agent_id = submitted.job.agent_id.clone();
         scheduler.start_ready().unwrap();
@@ -10160,7 +10383,13 @@ exec tail -f /dev/null
         };
 
         let first = scheduler
-            .enqueue_general_with_commands(&first_manifest, "feature", "owner", &["race".into()])
+            .enqueue_general_with_commands(
+                &first_manifest,
+                "feature",
+                "owner",
+                &["race".into()],
+                &[],
+            )
             .unwrap();
         let first_id = first.job.agent_id.clone();
         scheduler.start_ready().unwrap();
@@ -10198,7 +10427,13 @@ exec tail -f /dev/null
         let mut raced_manifest = general_manifest(directory.path(), "claim-race", None);
         raced_manifest.profile = GeneralProfile::TestRunner;
         let raced = scheduler
-            .enqueue_general_with_commands(&raced_manifest, "feature", "owner", &["race".into()])
+            .enqueue_general_with_commands(
+                &raced_manifest,
+                "feature",
+                "owner",
+                &["race".into()],
+                &[],
+            )
             .unwrap();
         let raced_id = raced.job.agent_id.clone();
         scheduler.start_ready().unwrap();
@@ -10339,7 +10574,13 @@ exec tail -f /dev/null
                 manifest.write_manifest = vec!["src".into()];
             }
             let submitted = scheduler
-                .enqueue_general_with_commands(&manifest, "feature", "owner", &[command_id.into()])
+                .enqueue_general_with_commands(
+                    &manifest,
+                    "feature",
+                    "owner",
+                    &[command_id.into()],
+                    &[],
+                )
                 .unwrap();
             let agent_id = submitted.job.agent_id.clone();
             let prepared = prepared_general(&submitted.job);

@@ -265,7 +265,7 @@ impl From<ComponentStateView> for PublicComponentState {
 #[schemars(deny_unknown_fields)]
 pub struct PublicAgentCapabilities {
     pub access_modes: Vec<String>,
-    pub profile_defaults: BTreeMap<String, PublicBudget>,
+    pub access_mode_defaults: BTreeMap<String, PublicBudget>,
     pub hard_budget_caps: PublicBudget,
     pub max_rpc_frame_bytes: usize,
     pub max_events: usize,
@@ -276,25 +276,41 @@ pub struct PublicAgentCapabilities {
 }
 
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
-    fn from(value: AgentCapabilitiesView) -> Self {
+    fn from(mut value: AgentCapabilitiesView) -> Self {
+        let access_mode_defaults = [
+            ("read_only", "analysis_readonly"),
+            ("workspace_write", "implementation_worktree"),
+        ]
+        .into_iter()
+        .filter_map(|(access_mode, profile)| {
+            value
+                .profile_defaults
+                .remove(profile)
+                .map(|budget| (access_mode.into(), budget.into()))
+        })
+        .collect();
+        let maturity = [
+            ("read_only", "analysis_readonly"),
+            ("workspace_write", "implementation_worktree"),
+        ]
+        .into_iter()
+        .filter_map(|(access_mode, profile)| {
+            value
+                .maturity
+                .remove(profile)
+                .map(|maturity| (access_mode.into(), maturity.into()))
+        })
+        .collect();
         Self {
             access_modes: vec!["read_only".into(), "workspace_write".into()],
-            profile_defaults: value
-                .profile_defaults
-                .into_iter()
-                .map(|(name, budget)| (name, budget.into()))
-                .collect(),
+            access_mode_defaults,
             hard_budget_caps: value.hard_budget_caps.into(),
             max_rpc_frame_bytes: value.max_rpc_frame_bytes,
             max_events: value.max_events,
             max_wait_ms: value.max_wait_ms,
             max_artifact_chunk_bytes: MAX_ARTIFACT_CHUNK_BYTES,
             named_checks: value.named_checks,
-            maturity: value
-                .maturity
-                .into_iter()
-                .map(|(name, maturity)| (name, maturity.into()))
-                .collect(),
+            maturity,
         }
     }
 }
@@ -2442,5 +2458,85 @@ mod tests {
         let mut duplicate: AgentSpawnInput = serde_json::from_value(base).unwrap();
         duplicate.allowed_command_ids.push("unit".into());
         assert!(general_manifest(&duplicate).is_err());
+    }
+
+    #[test]
+    fn public_capabilities_expose_only_generic_access_modes() {
+        use zcode_reviewd::rpc::AgentCapabilitiesView;
+
+        let mut profile_defaults = BTreeMap::new();
+        for profile in [
+            "analysis_readonly",
+            "implementation_worktree",
+            "test_runner",
+        ] {
+            profile_defaults.insert(
+                profile.into(),
+                GeneralProfile::AnalysisReadonly.default_budget(),
+            );
+        }
+        let raw = AgentCapabilitiesView {
+            task_kinds: vec!["general".into(), "review".into()],
+            profiles: profile_defaults.keys().cloned().collect(),
+            profile_defaults,
+            hard_budget_caps: GeneralProfile::AnalysisReadonly.default_budget(),
+            max_rpc_frame_bytes: 1024,
+            max_events: 128,
+            max_wait_ms: 5000,
+            named_checks: true,
+            maturity: BTreeMap::from([
+                (
+                    "analysis_readonly".into(),
+                    CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+                ),
+                (
+                    "implementation_worktree".into(),
+                    CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+                ),
+                (
+                    "structured_review".into(),
+                    CapabilityMaturityView::BetaReady,
+                ),
+                (
+                    "test_runner".into(),
+                    CapabilityMaturityView::ExperimentalUnverifiedRuntime,
+                ),
+            ]),
+        };
+        let public = serde_json::to_value(PublicAgentCapabilities::from(raw)).unwrap();
+        assert_eq!(
+            public["access_modes"],
+            serde_json::json!(["read_only", "workspace_write"])
+        );
+        assert_eq!(
+            public["access_mode_defaults"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["read_only", "workspace_write"]
+        );
+        assert_eq!(
+            public["maturity"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["read_only", "workspace_write"]
+        );
+        let encoded = public.to_string();
+        for forbidden in [
+            "structured_review",
+            "analysis_readonly",
+            "implementation_worktree",
+            "test_runner",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "public capabilities leaked {forbidden}"
+            );
+        }
     }
 }
