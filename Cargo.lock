@@ -1043,19 +1043,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "review-ledger"
-version = "0.1.0"
-dependencies = [
- "jsonschema",
- "review-preparation",
- "review-store",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
 name = "review-preparation"
 version = "0.1.0"
 dependencies = [
@@ -1820,13 +1807,11 @@ name = "zcode-review-mcp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "review-ledger",
  "review-preparation",
  "review-store",
  "rmcp",
  "rmcp-macros",
  "schemars",
- "sectioned-shadow",
  "serde",
  "serde_json",
  "sha2",
@@ -1843,7 +1828,6 @@ version = "0.1.0"
 dependencies = [
  "jsonschema",
  "libc",
- "review-ledger",
  "review-preparation",
  "review-store",
  "rusqlite",

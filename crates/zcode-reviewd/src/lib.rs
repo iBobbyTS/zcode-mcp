@@ -1,4 +1,3 @@
-use review_ledger::{LedgerError, LedgerManager, ToolResult, VerifiedArtifact, REVIEW_FINALIZE};
 use review_store::{
     ArtifactKind, BudgetRequest, EffectiveBudget, Job, JobClaim, JobState, LifecycleWrite,
     MessageState, NewArtifact, NewJob, NewTask, PendingRequestState,
@@ -33,9 +32,6 @@ use zcode_protocol::{
 };
 
 mod budget;
-pub mod general_mcp;
-pub mod ledger_mcp;
-pub mod orchestration;
 pub mod prompts;
 pub mod rpc;
 
@@ -44,7 +40,7 @@ use review_preparation::{
     canonical_general_repository, general_launch_prompt, validate_general_named_command,
     CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralCompletionSubmission,
     GeneralFinalizer, GeneralNamedCommand, GeneralProfile, GeneralTaskManifest,
-    GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, PreparedLaunchSpec,
+    GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask,
     ValidatedPermissionDenial, ValidationCommand, ValidationOutput,
     MAX_VALIDATION_COMMAND_TIMEOUT_MS,
 };
@@ -61,52 +57,6 @@ pub enum RuntimeLoss {
     EventStreamLost,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewFailure {
-    PreparedLaunchInvalid,
-    MissingFinalization,
-    EvidenceIncomplete,
-    ReportMissing,
-    ReportInvalid,
-    ProvenanceMismatch,
-    SourceIntegrity,
-    CleanupFailed,
-    LedgerMalformed,
-    FinalizationConflict,
-}
-
-impl ReviewFailure {
-    fn code(self) -> &'static str {
-        match self {
-            Self::PreparedLaunchInvalid => "PREPARED_LAUNCH_INVALID",
-            Self::MissingFinalization => "REVIEW_NOT_FINALIZED",
-            Self::EvidenceIncomplete => "REVIEW_EVIDENCE_INCOMPLETE",
-            Self::ReportMissing => "REVIEW_REPORT_MISSING",
-            Self::ReportInvalid => "REVIEW_REPORT_INVALID",
-            Self::ProvenanceMismatch => "REVIEW_PROVENANCE_MISMATCH",
-            Self::SourceIntegrity => "SOURCE_INTEGRITY_FAILED",
-            Self::CleanupFailed => "WORKTREE_CLEANUP_FAILED",
-            Self::LedgerMalformed => "REVIEW_LEDGER_INVALID",
-            Self::FinalizationConflict => "REVIEW_FINALIZE_CONFLICT",
-        }
-    }
-
-    fn reason(self) -> &'static str {
-        match self {
-            Self::PreparedLaunchInvalid => "prepared_launch_invalid",
-            Self::MissingFinalization => "review_not_finalized",
-            Self::EvidenceIncomplete => "review_evidence_incomplete",
-            Self::ReportMissing => "review_report_missing",
-            Self::ReportInvalid => "review_report_invalid",
-            Self::ProvenanceMismatch => "review_provenance_mismatch",
-            Self::SourceIntegrity => "source_integrity_failed",
-            Self::CleanupFailed => "worktree_cleanup_failed",
-            Self::LedgerMalformed => "review_ledger_invalid",
-            Self::FinalizationConflict => "review_finalize_conflict",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeTerminal {
     Stopped(StopOutcome),
@@ -115,7 +65,6 @@ pub enum RuntimeTerminal {
     Exited(ChildExit),
     FailedRuntimeLost(RuntimeLoss),
     Orphaned(RuntimeLoss),
-    ReviewFailed(ReviewFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +131,7 @@ pub struct PassiveActivitySnapshot {
     pub latest_text_updated_at: Option<u64>,
     pub latest_text_truncated: bool,
     pub active_tools: Vec<PassiveActiveTool>,
+    pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,
     pub telemetry_degraded: bool,
 }
@@ -263,7 +213,7 @@ struct PassiveActivityState {
     latest_text_tail: String,
     latest_text_updated_at: Option<u64>,
     latest_text_truncated: bool,
-    active_tools: HashMap<String, PassiveToolKind>,
+    active_tools: HashMap<String, (PassiveToolKind, Instant)>,
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
     telemetry_degraded: bool,
@@ -362,7 +312,10 @@ impl PassiveActivityTracker {
             }
             Some(ActivityTransition::ToolScheduled | ActivityTransition::ToolStarted) => {
                 if let Some(tool_call_id) = parsed.tool_call_id {
-                    state.active_tools.insert(tool_call_id, parsed.tool_kind);
+                    state
+                        .active_tools
+                        .entry(tool_call_id)
+                        .or_insert((parsed.tool_kind, now));
                 }
             }
             Some(
@@ -430,7 +383,7 @@ impl PassiveActivityTracker {
         let mut active_tools = state
             .active_tools
             .iter()
-            .map(|(tool_call_id, kind)| PassiveActiveTool {
+            .map(|(tool_call_id, (kind, _))| PassiveActiveTool {
                 tool_call_id: tool_call_id.clone(),
                 kind: *kind,
             })
@@ -455,6 +408,11 @@ impl PassiveActivityTracker {
             latest_text_updated_at: state.latest_text_updated_at,
             latest_text_truncated: state.latest_text_truncated,
             active_tools,
+            oldest_active_tool_age_ms: state
+                .active_tools
+                .values()
+                .map(|(_, at)| duration_millis(now.saturating_duration_since(*at)))
+                .max(),
             window_60s: window,
             telemetry_degraded: state.telemetry_degraded,
         }
@@ -790,69 +748,6 @@ pub struct SessionReady {
     pub session_id: String,
     pub initial_turn_id: Option<String>,
     pub observed_model: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InternalLedgerMcpConfig {
-    pub command: PathBuf,
-    pub socket: PathBuf,
-    pub runtime_sha256: Option<String>,
-}
-
-impl InternalLedgerMcpConfig {
-    pub fn server_for(&self, agent_id: &str) -> StdioMcpServer {
-        StdioMcpServer {
-            name: "review-ledger".into(),
-            command: self.command.to_string_lossy().into_owned(),
-            args: vec![
-                "--ledger-mcp".into(),
-                "--socket".into(),
-                self.socket.to_string_lossy().into_owned(),
-                "--agent-id".into(),
-                agent_id.into(),
-            ],
-            env: Vec::new(),
-        }
-    }
-
-    pub fn task_server_for(
-        &self,
-        agent_id: &str,
-        attempt_sequence: u64,
-        run_idempotency_key: &str,
-    ) -> StdioMcpServer {
-        StdioMcpServer {
-            name: "review-ledger".into(),
-            command: self.command.to_string_lossy().into_owned(),
-            args: vec![
-                "--task-ledger-mcp".into(),
-                "--socket".into(),
-                self.socket.to_string_lossy().into_owned(),
-                "--agent-id".into(),
-                agent_id.into(),
-                "--attempt-sequence".into(),
-                attempt_sequence.to_string(),
-                "--run-idempotency-key".into(),
-                run_idempotency_key.into(),
-            ],
-            env: Vec::new(),
-        }
-    }
-
-    pub fn general_server_for(&self, agent_id: &str) -> StdioMcpServer {
-        StdioMcpServer {
-            name: "general-completion".into(),
-            command: self.command.to_string_lossy().into_owned(),
-            args: vec![
-                "--general-mcp".into(),
-                "--socket".into(),
-                self.socket.to_string_lossy().into_owned(),
-                "--agent-id".into(),
-                agent_id.into(),
-            ],
-            env: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1766,11 +1661,8 @@ pub fn classify_restart(identity: &ProcessIdentity) -> RuntimeTerminal {
 #[derive(Clone)]
 enum TaskRoute {
     General(Box<PreparedGeneralTask>, Vec<String>),
-    Review(Box<PreparedLaunchSpec>),
-    Legacy,
 }
 
-const REVIEW_TASK_SCHEMA: &str = "sectioned-zcode-review/v1";
 const GENERAL_DAEMON_CONTRACT_SCHEMA: &str = "zcode-general-daemon-contract/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1839,7 +1731,7 @@ fn bind_general_daemon_contract(
 
 fn task_route(job: &Job) -> Result<TaskRoute, String> {
     let Some(json) = job.prepared_launch_json.as_deref() else {
-        return Ok(TaskRoute::Legacy);
+        return Err("prepared generic launch is required".into());
     };
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|_| "stored prepared launch is invalid")?;
@@ -1885,33 +1777,17 @@ fn task_route(job: &Job) -> Result<TaskRoute, String> {
             }
             Ok(TaskRoute::General(Box::new(prepared), required_command_ids))
         }
-        Some(REVIEW_TASK_SCHEMA) => {
-            let prepared: PreparedLaunchSpec = serde_json::from_value(value)
-                .map_err(|_| "stored review preparation is invalid")?;
-            prepared
-                .validate_digest()
-                .map_err(|_| "stored review preparation digest is invalid")?;
-            if job.prepared_launch_sha256.as_deref() != Some(prepared.prepared_sha256.as_str())
-                || job.workspace_path != prepared.worktree.path.to_string_lossy()
-            {
-                return Err("stored job does not match its review preparation".into());
-            }
-            Ok(TaskRoute::Review(Box::new(prepared)))
-        }
         Some(_) => Err("stored prepared launch uses an unknown task schema".into()),
-        None => Ok(TaskRoute::Legacy),
+        None => Err("stored prepared launch omitted task schema".into()),
     }
 }
 
 fn validate_task_route(task: Option<&TaskRecord>, route: &TaskRoute) -> Result<(), String> {
     match (task.map(|task| task.task_kind), route) {
-        (Some(TaskKind::General), TaskRoute::General(_, _))
-        | (Some(TaskKind::Review | TaskKind::ReviewContinuation), TaskRoute::Review(_))
-        | (None, TaskRoute::Review(_) | TaskRoute::Legacy) => Ok(()),
+        (Some(TaskKind::General), TaskRoute::General(_, _)) => Ok(()),
         (None, TaskRoute::General(_, _)) => {
             Err("general prepared launch requires V2 task metadata".into())
         }
-        (Some(_), _) => Err("durable task kind does not match prepared launch route".into()),
     }
 }
 
@@ -1920,8 +1796,6 @@ fn route_policy(
 ) -> review_preparation::PreparationResult<Option<PolicyLauncher>> {
     match route {
         TaskRoute::General(prepared, _) => prepared.launcher().map(Some),
-        TaskRoute::Review(prepared) => prepared.launcher().map(Some),
-        TaskRoute::Legacy => Ok(None),
     }
 }
 
@@ -2153,17 +2027,6 @@ where
                     prepared
                         .launcher()
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-                }
-                TaskRoute::Review(prepared) => {
-                    prepared
-                        .validate_for_launch()
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-                }
-                TaskRoute::Legacy => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "prepared launch is required",
-                    ));
                 }
             }
         }
@@ -2512,9 +2375,6 @@ struct SchedulerInner {
     factory: Arc<dyn RuntimeFactory>,
     config: SchedulerConfig,
     monotonic_clock: Arc<dyn MonotonicClock>,
-    ledger: Option<Arc<LedgerManager>>,
-    ledger_mcp: Option<InternalLedgerMcpConfig>,
-    review_completion: Option<Arc<orchestration::ReviewCompletionGate>>,
     general_commands: Arc<GeneralCommandCatalog>,
     #[cfg(test)]
     preflight_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -2672,11 +2532,6 @@ struct ActiveRuntime {
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     check: Arc<ActiveCheck>,
     budget: Option<Arc<AttemptBudget>>,
-    semantic_progress: Option<Arc<Mutex<SemanticProgressClock>>>,
-}
-
-struct SemanticProgressClock {
-    last_advanced: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -2721,22 +2576,6 @@ struct TerminalDecision {
     forced_outcome: Option<(CompletionOutcome, String)>,
 }
 
-struct ReviewTerminalResolution {
-    terminal: RuntimeTerminal,
-    lifecycle_terminal: RuntimeTerminal,
-    review_committed: bool,
-}
-
-impl ReviewTerminalResolution {
-    fn unchanged(terminal: RuntimeTerminal) -> Self {
-        Self {
-            lifecycle_terminal: terminal.clone(),
-            terminal,
-            review_committed: false,
-        }
-    }
-}
-
 struct MonitorContext {
     agent_id: String,
     owner_epoch: u64,
@@ -2750,7 +2589,6 @@ struct MonitorContext {
     general_submission: Arc<Mutex<Option<GeneralCompletionSubmission>>>,
     budget: Option<Arc<AttemptBudget>>,
     check: Arc<ActiveCheck>,
-    semantic_progress: Option<Arc<Mutex<SemanticProgressClock>>>,
 }
 
 type ActiveSession = (
@@ -3505,11 +3343,6 @@ fn lifecycle_projection(
             serde_json::json!({"kind": "orphaned", "reason": runtime_loss_name(loss)}),
             runtime_loss_redaction(loss),
         ),
-        RuntimeEvent::Terminal(RuntimeTerminal::ReviewFailed(failure)) => (
-            "runtime.review_failed",
-            serde_json::json!({"kind": "review_failed", "reason": failure.reason()}),
-            "allowlisted",
-        ),
     };
     LifecycleProjection {
         event_type,
@@ -3595,11 +3428,6 @@ fn terminal_update(terminal: &RuntimeTerminal) -> TerminalUpdate {
             state: JobState::Orphaned,
             failure_code: Some("ORPHANED".into()),
             failure_message: Some(runtime_loss_name(loss).into()),
-        },
-        RuntimeTerminal::ReviewFailed(failure) => TerminalUpdate {
-            state: JobState::Failed,
-            failure_code: Some(failure.code().into()),
-            failure_message: Some(failure.reason().into()),
         },
     }
 }
@@ -3777,9 +3605,6 @@ impl Scheduler {
                 monotonic_clock: Arc::new(ProcessMonotonicClock {
                     origin: Instant::now(),
                 }),
-                ledger: None,
-                ledger_mcp: None,
-                review_completion: None,
                 general_commands: Arc::new(GeneralCommandCatalog::default()),
                 #[cfg(test)]
                 preflight_hook: None,
@@ -3816,32 +3641,6 @@ impl Scheduler {
         Ok(self)
     }
 
-    pub fn with_ledger(
-        mut self,
-        ledger: Arc<LedgerManager>,
-        config: InternalLedgerMcpConfig,
-    ) -> Result<Self, SchedulerError> {
-        if !Arc::ptr_eq(&ledger.store(), &self.inner.store) {
-            return Err(SchedulerError::InvalidConfig(
-                "ledger and scheduler must share one store".into(),
-            ));
-        }
-        if !config.command.is_absolute() || !config.socket.is_absolute() {
-            return Err(SchedulerError::InvalidConfig(
-                "internal ledger command and socket must be absolute".into(),
-            ));
-        }
-        let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
-            SchedulerError::InvalidConfig("ledger must attach before scheduler cloning".into())
-        })?;
-        inner.review_completion = Some(Arc::new(orchestration::ReviewCompletionGate::new(
-            Arc::clone(&ledger),
-        )));
-        inner.ledger = Some(ledger);
-        inner.ledger_mcp = Some(config);
-        Ok(self)
-    }
-
     #[cfg(test)]
     fn with_preflight_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Arc::get_mut(&mut self.inner)
@@ -3865,21 +3664,6 @@ impl Scheduler {
         }
     }
 
-    pub fn ledger(&self) -> Option<Arc<LedgerManager>> {
-        self.inner.ledger.as_ref().map(Arc::clone)
-    }
-
-    pub(crate) fn review_runtime_hash(&self) -> Option<String> {
-        self.inner
-            .ledger_mcp
-            .as_ref()
-            .and_then(|config| config.runtime_sha256.clone())
-    }
-
-    pub(crate) fn review_completion_enabled(&self) -> bool {
-        self.inner.review_completion.is_some()
-    }
-
     pub(crate) fn named_checks_enabled(&self) -> bool {
         !self.inner.general_commands.is_empty()
     }
@@ -3892,6 +3676,7 @@ impl Scheduler {
         Ok(self.inner.store.enqueue_job(job)?)
     }
 
+    #[cfg(any())]
     pub fn enqueue_prepared(
         &self,
         agent_id: impl Into<String>,
@@ -3999,9 +3784,13 @@ impl Scheduler {
         job.prepared_launch_json = Some(prepared_json);
         job.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
         let budget = EffectiveBudget {
-            wall_time_ms: prepared.effective_budget.wall_time_ms,
-            semantic_soft_timeout_ms: prepared.effective_budget.semantic_soft_timeout_ms,
-            semantic_hard_timeout_ms: prepared.effective_budget.semantic_hard_timeout_ms,
+            absolute_wall_time_ms: prepared.effective_budget.absolute_wall_time_ms,
+            runtime_activity_idle_timeout_ms: prepared
+                .effective_budget
+                .runtime_activity_idle_timeout_ms,
+            model_stream_idle_timeout_ms: prepared.effective_budget.model_stream_idle_timeout_ms,
+            tool_call_timeout_ms: prepared.effective_budget.tool_call_timeout_ms,
+            input_wait_timeout_ms: prepared.effective_budget.input_wait_timeout_ms,
             max_turns: prepared.effective_budget.max_turns,
             max_tool_calls: prepared.effective_budget.max_tool_calls,
             max_context_bytes: prepared.effective_budget.max_context_bytes,
@@ -4106,11 +3895,6 @@ impl Scheduler {
                 "startup reconciliation requires an empty active set".into(),
             ));
         }
-        if let Some(ledger) = &self.inner.ledger {
-            ledger
-                .recover_all()
-                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-        }
         Ok(self.inner.store.reconcile_startup()?)
     }
 
@@ -4132,28 +3916,6 @@ impl Scheduler {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    fn ensure_job_ledger(&self, job: &Job, route: &TaskRoute) -> Result<(), SchedulerError> {
-        let TaskRoute::Review(prepared) = route else {
-            return Ok(());
-        };
-        let Some(ledger) = &self.inner.ledger else {
-            return Err(SchedulerError::InvalidConfig(
-                "review task requires a ledger".into(),
-            ));
-        };
-        ledger
-            .initialize(
-                &job.agent_id,
-                prepared,
-                self.inner
-                    .ledger_mcp
-                    .as_ref()
-                    .and_then(|config| config.runtime_sha256.as_deref()),
-            )
-            .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-        Ok(())
     }
 
     fn start_claim(&self, claim: JobClaim) -> Result<bool, SchedulerError> {
@@ -4212,21 +3974,6 @@ impl Scheduler {
             if let Some(hook) = &self.inner.preflight_hook {
                 hook();
             }
-        }
-        if let Err(error) = self.ensure_job_ledger(&claim.job, &route) {
-            let message = error.to_string();
-            self.finish_unstarted_route(
-                &claim.job.agent_id,
-                claim.owner_epoch,
-                &route,
-                task.as_ref(),
-                UnstartedTerminal {
-                    outcome: CompletionOutcome::Failed,
-                    reason_code: "REPORT_INITIALIZATION_FAILED",
-                    message: &message,
-                },
-            )?;
-            return Err(error);
         }
         let policy = match route_policy(&route) {
             Ok(policy) => policy.map(Arc::new),
@@ -4305,26 +4052,7 @@ impl Scheduler {
                 });
             }
         };
-        let mcp_servers = self
-            .inner
-            .ledger_mcp
-            .as_ref()
-            .map(|config| match &route {
-                // Generic agents have no model-authored completion/check MCP;
-                // the daemon observes runtime events and executes required
-                // named checks during finalization.
-                TaskRoute::General(_, _) => Vec::new(),
-                TaskRoute::Review(_) if task.is_some() => {
-                    vec![config.task_server_for(
-                        &claim.job.agent_id,
-                        task.as_ref().map(|task| task.attempt_sequence).unwrap_or(1),
-                        &runtime_agent_id,
-                    )]
-                }
-                TaskRoute::Review(_) => vec![config.server_for(&claim.job.agent_id)],
-                TaskRoute::Legacy => Vec::new(),
-            })
-            .unwrap_or_default();
+        let mcp_servers = Vec::new();
         let (bootstrap_timeout, wall_bounded_bootstrap) =
             match budget.as_ref().and_then(|budget| budget.remaining()) {
                 Some(remaining) => (
@@ -4418,17 +4146,6 @@ impl Scheduler {
             start_token: identity.start_token,
         });
         let operation = Arc::new(Mutex::new(()));
-        let semantic_progress = task.as_ref().and_then(|task| {
-            matches!(
-                task.task_kind,
-                TaskKind::Review | TaskKind::ReviewContinuation
-            )
-            .then(|| {
-                Arc::new(Mutex::new(SemanticProgressClock {
-                    last_advanced: self.inner.monotonic_clock.now(),
-                }))
-            })
-        });
         let general_submission = Arc::new(Mutex::new(None));
         let check = Arc::new(ActiveCheck::default());
         let ready_turn_state = match runtime.turn_snapshot() {
@@ -4459,7 +4176,6 @@ impl Scheduler {
                     general_submission: Arc::clone(&general_submission),
                     check: Arc::clone(&check),
                     budget: budget.as_ref().map(Arc::clone),
-                    semantic_progress: semantic_progress.as_ref().map(Arc::clone),
                 },
             );
         }
@@ -4522,47 +4238,6 @@ impl Scheduler {
             )?;
             return Ok(false);
         }
-        if matches!(&route, TaskRoute::Review(_)) {
-            let ledger = self
-                .inner
-                .ledger
-                .as_ref()
-                .expect("review ledger was validated before runtime spawn");
-            if let Err(error) = ledger.record_runtime(
-                &claim.job.agent_id,
-                self.inner
-                    .ledger_mcp
-                    .as_ref()
-                    .and_then(|config| config.runtime_sha256.as_deref()),
-                &session.session_id,
-                session.observed_model.as_deref(),
-            ) {
-                let _ = self.cleanup_registered_runtime(
-                    &claim.job.agent_id,
-                    claim.owner_epoch,
-                    &runtime,
-                    &sink,
-                    Some(("REPORT_PROVENANCE_FAILED", error.to_string())),
-                );
-                return Err(SchedulerError::InvalidConfig(error.to_string()));
-            }
-            if let Some(task) = task.as_ref() {
-                if let Err(error) = self.inner.store.initialize_review_progress(
-                    &claim.job.agent_id,
-                    task.attempt_sequence,
-                    &runtime_agent_id,
-                ) {
-                    let _ = self.cleanup_registered_runtime(
-                        &claim.job.agent_id,
-                        claim.owner_epoch,
-                        &runtime,
-                        &sink,
-                        Some(("REVIEW_PROGRESS_INIT_FAILED", error.to_string())),
-                    );
-                    return Err(SchedulerError::Store(error));
-                }
-            }
-        }
         let current = match self.inner.store.get_job(&claim.job.agent_id) {
             Ok(current) => current,
             Err(error) => {
@@ -4602,7 +4277,6 @@ impl Scheduler {
             general_submission,
             budget,
             check,
-            semantic_progress,
         });
         Ok(true)
     }
@@ -4625,47 +4299,6 @@ impl Scheduler {
                 );
                 self.persist_general_completion(agent_id, prepared, &completion)
             }
-            TaskRoute::Review(_) => {
-                let _ = self.review_terminal(
-                    agent_id,
-                    RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::SessionLost),
-                    false,
-                    false,
-                );
-                if task.is_some() {
-                    self.inner.store.store_task_result(
-                        agent_id,
-                        &minimal_task_result(
-                            terminal.outcome,
-                            terminal.message,
-                            terminal.reason_code,
-                        ),
-                    )?;
-                    Ok(self
-                        .inner
-                        .store
-                        .get_job(agent_id)?
-                        .ok_or_else(|| {
-                            SchedulerError::Store(StoreError::InvalidState(
-                                "terminal task job disappeared".into(),
-                            ))
-                        })?
-                        .state)
-                } else {
-                    Ok(self.inner.store.fail_claim(
-                        agent_id,
-                        owner_epoch,
-                        terminal.reason_code,
-                        terminal.message,
-                    )?)
-                }
-            }
-            TaskRoute::Legacy => Ok(self.inner.store.fail_claim(
-                agent_id,
-                owner_epoch,
-                terminal.reason_code,
-                terminal.message,
-            )?),
         }
     }
 
@@ -4818,77 +4451,9 @@ impl Scheduler {
             self.release_active(agent_id, owner_epoch);
             return result;
         }
-        if let Some((TaskRoute::Review(prepared), Some(task), _)) = route_and_submission {
-            sink.attempt.request_stop(&runtime.turn_snapshot());
-            sink.attempt.force_terminating();
-            let terminal = runtime.stop(stop_grace);
-            let (outcome, reason) = if cancellation_wins {
-                (CompletionOutcome::Cancelled, "CANCELLED".into())
-            } else if let Some((code, _)) = failure {
-                (CompletionOutcome::Failed, code.into())
-            } else {
-                (
-                    CompletionOutcome::Cancelled,
-                    "REVIEW_START_CANCELLED".into(),
-                )
-            };
-            let result = self.finish_routed_terminal(
-                TerminalTarget {
-                    agent_id,
-                    owner_epoch,
-                    sink,
-                    route: &TaskRoute::Review(prepared),
-                    task: Some(&task),
-                },
-                TerminalDecision {
-                    terminal,
-                    natural_completion: false,
-                    general_submission: None,
-                    forced_outcome: Some((outcome, reason)),
-                },
-            );
-            self.release_active(agent_id, owner_epoch);
-            return result;
-        }
-        let preclassified = failure.map(|(code, message)| {
-            self.inner
-                .store
-                .fail_claim(agent_id, owner_epoch, code, &message)
-        });
-        sink.attempt.request_stop(&runtime.turn_snapshot());
-        sink.attempt.force_terminating();
-        let terminal = runtime.stop(stop_grace);
-        let terminal = self.review_terminal(agent_id, terminal, false, false);
-        let finished = sink.finish(&terminal.terminal);
-        self.release_active(agent_id, owner_epoch);
-
-        if let Some(result) = preclassified {
-            match result {
-                Ok(state) => return Ok(state),
-                Err(error) => {
-                    self.record_failure(agent_id, error.to_string());
-                    return Err(SchedulerError::Store(error));
-                }
-            }
-        }
-        match finished {
-            Ok(state) => Ok(state),
-            Err(error) => {
-                self.record_failure(agent_id, error.to_string());
-                match self.inner.store.fail_claim(
-                    agent_id,
-                    owner_epoch,
-                    "TERMINAL_WRITE_FAILED",
-                    &error.to_string(),
-                ) {
-                    Ok(state) => Ok(state),
-                    Err(fallback) => {
-                        self.record_failure(agent_id, fallback.to_string());
-                        Err(SchedulerError::Store(fallback))
-                    }
-                }
-            }
-        }
+        Err(SchedulerError::InvalidConfig(
+            "active generic route disappeared during cleanup".into(),
+        ))
     }
 
     fn fail_closed_control(
@@ -4924,73 +4489,6 @@ impl Scheduler {
         Ok(())
     }
 
-    fn review_terminal(
-        &self,
-        agent_id: &str,
-        terminal: RuntimeTerminal,
-        natural_completion: bool,
-        completion_allowed: bool,
-    ) -> ReviewTerminalResolution {
-        let Some(gate) = &self.inner.review_completion else {
-            return ReviewTerminalResolution::unchanged(terminal);
-        };
-        let job = match self.inner.store.get_job(agent_id) {
-            Ok(Some(job)) => job,
-            Ok(None) | Err(_) if natural_completion => {
-                return ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(
-                    ReviewFailure::ReportMissing,
-                ))
-            }
-            Ok(None) | Err(_) => return ReviewTerminalResolution::unchanged(terminal),
-        };
-        if completion_allowed
-            && natural_completion
-            && matches!(terminal, RuntimeTerminal::Completed(_))
-        {
-            return match gate.complete(&job) {
-                Ok(()) => ReviewTerminalResolution {
-                    lifecycle_terminal: terminal.clone(),
-                    terminal,
-                    review_committed: true,
-                },
-                Err(failure) => {
-                    ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(failure))
-                }
-            };
-        }
-        if completion_allowed {
-            if let RuntimeTerminal::Exited(exit) = &terminal {
-                match gate.has_durable_finalization(&job) {
-                    Ok(true) => {
-                        return match gate.complete(&job) {
-                            Ok(()) => ReviewTerminalResolution {
-                                terminal: RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
-                                    exit.clone(),
-                                )),
-                                lifecycle_terminal: terminal,
-                                review_committed: true,
-                            },
-                            Err(failure) => ReviewTerminalResolution::unchanged(
-                                RuntimeTerminal::ReviewFailed(failure),
-                            ),
-                        };
-                    }
-                    Ok(false) => {}
-                    Err(failure) => {
-                        let _ = gate.cleanup_nonclean(&job);
-                        return ReviewTerminalResolution::unchanged(RuntimeTerminal::ReviewFailed(
-                            failure,
-                        ));
-                    }
-                }
-            }
-        }
-        if let Err(error) = gate.cleanup_nonclean(&job) {
-            self.record_failure(agent_id, error.reason().into());
-        }
-        ReviewTerminalResolution::unchanged(terminal)
-    }
-
     fn finish_routed_terminal(
         &self,
         target: TerminalTarget<'_>,
@@ -5021,9 +4519,9 @@ impl Scheduler {
                         RuntimeTerminal::FailedRuntimeLost(_) | RuntimeTerminal::Orphaned(_) => {
                             CompletionOutcome::RuntimeLost
                         }
-                        RuntimeTerminal::Completed(_)
-                        | RuntimeTerminal::FailedTurn(_)
-                        | RuntimeTerminal::ReviewFailed(_) => CompletionOutcome::Failed,
+                        RuntimeTerminal::Completed(_) | RuntimeTerminal::FailedTurn(_) => {
+                            CompletionOutcome::Failed
+                        }
                         // A child exit without an observed turn boundary is
                         // a runtime loss, not a model-reported task failure.
                         // This keeps COMPLETED reserved for a matching
@@ -5090,74 +4588,6 @@ impl Scheduler {
                         self.record_failure(agent_id, error.to_string());
                         self.persist_general_completion(agent_id, prepared, &completion)
                     }
-                }
-            }
-            TaskRoute::Review(_) | TaskRoute::Legacy => {
-                let resolution = self.review_terminal(
-                    agent_id,
-                    terminal,
-                    natural_completion,
-                    forced_outcome.is_none(),
-                );
-                if task.is_some() {
-                    let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
-                        let outcome = match &resolution.terminal {
-                            RuntimeTerminal::Completed(_) if resolution.review_committed => {
-                                CompletionOutcome::Succeeded
-                            }
-                            RuntimeTerminal::Stopped(_) => CompletionOutcome::Cancelled,
-                            RuntimeTerminal::FailedRuntimeLost(_)
-                            | RuntimeTerminal::Orphaned(_)
-                            | RuntimeTerminal::Exited(_) => CompletionOutcome::RuntimeLost,
-                            RuntimeTerminal::ReviewFailed(failure) => {
-                                return (CompletionOutcome::Failed, failure.code().into())
-                            }
-                            RuntimeTerminal::Completed(_) | RuntimeTerminal::FailedTurn(_) => {
-                                CompletionOutcome::Failed
-                            }
-                        };
-                        (outcome, "RUNTIME_TERMINAL".into())
-                    });
-                    let result =
-                        if resolution.review_committed && outcome == CompletionOutcome::Succeeded {
-                            finalized_review_task_result()
-                        } else {
-                            minimal_task_result(outcome, &reason, &reason)
-                        };
-                    match sink.finish_task_result(&resolution.lifecycle_terminal, &result) {
-                        Ok(state) => Ok(state),
-                        Err(error) => {
-                            self.record_failure(agent_id, error.to_string());
-                            let fallback_result = if result.outcome == TaskOutcome::Succeeded
-                                && sink.error().is_some()
-                            {
-                                minimal_task_result(
-                                    CompletionOutcome::RuntimeLost,
-                                    "LIFECYCLE_SINK_FAILED",
-                                    "LIFECYCLE_SINK_FAILED",
-                                )
-                            } else {
-                                result.clone()
-                            };
-                            if self.inner.store.task_result(agent_id)?.is_none() {
-                                self.inner
-                                    .store
-                                    .store_task_result(agent_id, &fallback_result)?;
-                            }
-                            Ok(self
-                                .inner
-                                .store
-                                .get_job(agent_id)?
-                                .ok_or_else(|| {
-                                    SchedulerError::Store(StoreError::InvalidState(
-                                        "terminal review task disappeared".into(),
-                                    ))
-                                })?
-                                .state)
-                        }
-                    }
-                } else {
-                    self.finish_terminal_or_fail(agent_id, owner_epoch, sink, &resolution.terminal)
                 }
             }
         }
@@ -5342,13 +4772,10 @@ impl Scheduler {
             general_submission,
             budget,
             check,
-            semantic_progress,
         } = context;
         let scheduler = self.clone();
         thread::spawn(move || {
             let mut handled_generation = 0;
-            let mut finalization_reserve_sent = false;
-            let mut semantic_idle_since = None;
             loop {
                 if let Some(violation) = budget.as_ref().and_then(|budget| budget.violation()) {
                     if violation == budget::BudgetViolation::WallTime {
@@ -5410,18 +4837,47 @@ impl Scheduler {
                     }
                     return;
                 }
-                let activity = runtime.activity_snapshot();
-                if activity.turn.active {
-                    semantic_idle_since = None;
-                    let timeout_reason = if activity.transport_idle_elapsed.is_some_and(|elapsed| {
-                        elapsed >= scheduler.inner.config.transport_idle_timeout
-                    }) {
-                        Some("TRANSPORT_IDLE_TIMEOUT")
-                    } else if activity
-                        .model_request_elapsed
-                        .is_some_and(|elapsed| elapsed >= scheduler.inner.config.model_call_timeout)
+                if let Some(task) = task.as_ref() {
+                    let passive = sink.activity.snapshot();
+                    let now_ms = activity_wall_now_millis();
+                    let input_wait_age = scheduler
+                        .inner
+                        .store
+                        .pending_requests(&agent_id)
+                        .ok()
+                        .and_then(|requests| {
+                            requests
+                                .into_iter()
+                                .filter(|request| {
+                                    matches!(
+                                        request.state,
+                                        PendingRequestState::Pending | PendingRequestState::Sending
+                                    )
+                                })
+                                .map(|request| now_ms.saturating_sub(request.created_at.max(0) as u64))
+                                .max()
+                        });
+                    let limits = &task.effective_budget;
+                    let timeout_reason = if input_wait_age
+                        .is_some_and(|age| age >= limits.input_wait_timeout_ms)
                     {
-                        Some("MODEL_CALL_TIMEOUT")
+                        Some("INPUT_WAIT_TIMEOUT")
+                    } else if passive.oldest_active_tool_age_ms
+                        .is_some_and(|age| age >= limits.tool_call_timeout_ms)
+                    {
+                        Some("TOOL_CALL_TIMEOUT")
+                    } else if passive.model_request_active
+                        && passive
+                            .model_last_delta_age_ms
+                            .or(passive.model_request_age_ms)
+                            .is_some_and(|age| age >= limits.model_stream_idle_timeout_ms)
+                    {
+                        Some("MODEL_STREAM_IDLE_TIMEOUT")
+                    } else if passive
+                        .last_activity_age_ms
+                        .is_some_and(|age| age >= limits.runtime_activity_idle_timeout_ms)
+                    {
+                        Some("RUNTIME_ACTIVITY_IDLE_TIMEOUT")
                     } else {
                         None
                     };
@@ -5435,178 +4891,13 @@ impl Scheduler {
                             &operation,
                             &attempt,
                             &route,
-                            task.as_ref(),
+                            Some(task),
                             &check,
                             reason,
                         ) {
                             scheduler.record_failure(&agent_id, error.to_string());
                         }
                         return;
-                    }
-                } else if activity.turn.boundary.is_some() && semantic_idle_since.is_none() {
-                    semantic_idle_since = Some(scheduler.inner.monotonic_clock.now());
-                }
-                if let (Some(task), Some(semantic_progress)) =
-                    (task.as_ref(), semantic_progress.as_ref())
-                {
-                    let now = scheduler.inner.monotonic_clock.now();
-                    let last_advanced = semantic_progress.lock().unwrap().last_advanced;
-                    let semantic_start = semantic_idle_since
-                        .map(|idle| idle.max(last_advanced))
-                        .unwrap_or(now);
-                    let elapsed = now.saturating_sub(semantic_start);
-                    let soft =
-                        Duration::from_millis(task.effective_budget.semantic_soft_timeout_ms);
-                    let hard =
-                        Duration::from_millis(task.effective_budget.semantic_hard_timeout_ms);
-                    if !activity.turn.active && elapsed >= soft {
-                        let Ok(_guard) = operation.try_lock() else {
-                            continue;
-                        };
-                        let current = scheduler.inner.store.get_job(&agent_id);
-                        let latest_now = scheduler.inner.monotonic_clock.now();
-                        let latest_progress = semantic_progress.lock().unwrap().last_advanced;
-                        let latest_elapsed = latest_now.saturating_sub(
-                            semantic_idle_since
-                                .map(|idle| idle.max(latest_progress))
-                                .unwrap_or(latest_now),
-                        );
-                        let still_current = current
-                            .as_ref()
-                            .ok()
-                            .and_then(|job| job.as_ref())
-                            .is_some_and(|job| {
-                                job.owner_epoch == owner_epoch
-                                    && job.state == JobState::Running
-                                    && !job.stop_requested
-                                    && !job.close_requested
-                            });
-                        if !still_current || latest_elapsed < soft {
-                            continue;
-                        }
-                        if latest_elapsed >= hard {
-                            drop(_guard);
-                            if let Err(error) = scheduler.finish_monitor_timeout(
-                                &agent_id,
-                                owner_epoch,
-                                &runtime,
-                                &sink,
-                                &session_id,
-                                &operation,
-                                &attempt,
-                                &route,
-                                Some(task),
-                                &check,
-                                "SEMANTIC_NO_PROGRESS_TIMEOUT",
-                            ) {
-                                scheduler.record_failure(&agent_id, error.to_string());
-                            }
-                            return;
-                        }
-                        if !finalization_reserve_sent {
-                            match scheduler.inner.store.claim_review_progress_nudge(&agent_id) {
-                                Ok(true) => {
-                                    if let Err(error) = scheduler.queue_monitor_message(
-                                        &agent_id,
-                                        attempt.attempt_sequence(),
-                                        "convergence-nudge",
-                                        "CONVERGENCE_NUDGE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write findings and validation, and reserve time for one truthful review_finalize. If evidence remains unavailable, record a coverage gap and finalize rather than fabricating it.",
-                                    ) {
-                                        scheduler.record_failure(
-                                            &agent_id,
-                                            format!("semantic progress nudge failed: {error}"),
-                                        );
-                                    } else {
-                                        if !runtime.turn_snapshot().active {
-                                            let deadline = scheduler.control_deadline();
-                                            if let Err(error) = scheduler.deliver_next_message(
-                                                &agent_id,
-                                                &session_id,
-                                                &runtime,
-                                                &attempt,
-                                                deadline,
-                                            ) {
-                                                scheduler.record_failure(
-                                                    &agent_id,
-                                                    format!("semantic progress nudge failed: {error}"),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(false) => {}
-                                Err(error) => {
-                                    scheduler.record_failure(&agent_id, error.to_string())
-                                }
-                            }
-                        }
-                    }
-                }
-                if !finalization_reserve_sent
-                    && semantic_progress.is_some()
-                    && budget
-                        .as_ref()
-                        .is_some_and(|budget| budget.finalization_reserve_due())
-                {
-                    let Ok(_guard) = operation.try_lock() else {
-                        // A control operation already owns precedence. Do not
-                        // block the monitor before its next budget/cancel poll.
-                        continue;
-                    };
-                    let current = scheduler.inner.store.get_job(&agent_id);
-                    let still_current = current
-                        .as_ref()
-                        .ok()
-                        .and_then(|job| job.as_ref())
-                        .is_some_and(|job| {
-                            job.owner_epoch == owner_epoch
-                                && job.state == JobState::Running
-                                && !job.stop_requested
-                                && !job.close_requested
-                        });
-                    let finalized = current
-                        .as_ref()
-                        .ok()
-                        .and_then(|job| job.as_ref())
-                        .and_then(|job| {
-                            scheduler
-                                .inner
-                                .review_completion
-                                .as_ref()
-                                .map(|gate| (gate, job))
-                        })
-                        .is_some_and(|(gate, job)| {
-                            gate.has_durable_finalization(job).unwrap_or(false)
-                        });
-                    if still_current && !finalized {
-                        finalization_reserve_sent = true;
-                        if let Err(error) = scheduler.queue_monitor_message(
-                            &agent_id,
-                            attempt.attempt_sequence(),
-                            "finalization-reserve",
-                            "FINALIZATION_RESERVE: Do not retry a denied semantic operation. Prefer Read and the prepared review inputs, close open evidence questions, write truthful findings and validation, and call review_finalize with any unavailable evidence recorded as a coverage gap. You may finish one already-defined narrow check; do not begin broad exploration. This reminder does not prohibit unrelated legal Bash.",
-                        ) {
-                            scheduler.record_failure(
-                                &agent_id,
-                                format!("finalization reserve reminder failed: {error}"),
-                            );
-                        } else {
-                            if !runtime.turn_snapshot().active {
-                                let deadline = scheduler.control_deadline();
-                                if let Err(error) = scheduler.deliver_next_message(
-                                    &agent_id,
-                                    &session_id,
-                                    &runtime,
-                                    &attempt,
-                                    deadline,
-                                ) {
-                                    scheduler.record_failure(
-                                        &agent_id,
-                                        format!("finalization reserve reminder failed: {error}"),
-                                    );
-                                }
-                            }
-                        }
                     }
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
@@ -5694,28 +4985,23 @@ impl Scheduler {
                     ) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            let review_waits_for_convergence = boundary == TurnBoundary::Completed
-                                && semantic_progress.is_some()
-                                && scheduler
-                                    .inner
-                                    .store
-                                    .get_job(&agent_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|job| {
-                                        scheduler
-                                            .inner
-                                            .review_completion
-                                            .as_ref()
-                                            .map(|gate| (gate, job))
+                            let pending = scheduler
+                                .inner
+                                .store
+                                .pending_requests(&agent_id)
+                                .map(|requests| {
+                                    requests.into_iter().any(|request| {
+                                        matches!(
+                                            request.state,
+                                            PendingRequestState::Pending
+                                                | PendingRequestState::Sending
+                                        )
                                     })
-                                    .is_some_and(|(gate, job)| {
-                                        !gate.has_durable_finalization(&job).unwrap_or(false)
-                                    });
-                            if review_waits_for_convergence {
-                                // Ledger finalization may arrive just after the natural
-                                // boundary; revisit this boundary instead of terminalizing
-                                // or permanently suppressing the completion check.
+                                })
+                                .unwrap_or(true);
+                            if boundary == TurnBoundary::Completed && pending {
+                                // A completed boundary cannot race past an unresolved typed
+                                // request. Resolution must drive a new matching turn boundary.
                                 handled_generation = handled_generation.saturating_sub(1);
                                 continue;
                             }
@@ -5830,6 +5116,7 @@ impl Scheduler {
         }
     }
 
+    #[cfg(any())]
     pub fn call_review_tool(
         &self,
         agent_id: &str,
@@ -5907,6 +5194,7 @@ impl Scheduler {
         }
     }
 
+    #[cfg(any())]
     pub fn call_task_review_tool(
         &self,
         agent_id: &str,
@@ -6120,6 +5408,7 @@ impl Scheduler {
         }
     }
 
+    #[cfg(any())]
     #[allow(clippy::too_many_arguments)]
     fn fail_active_review_locked(
         &self,
@@ -6147,6 +5436,7 @@ impl Scheduler {
         self.release_active(agent_id, owner_epoch);
     }
 
+    #[cfg(any())]
     pub fn verify_review_artifact(
         &self,
         agent_id: &str,
@@ -6164,6 +5454,7 @@ impl Scheduler {
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
     }
 
+    #[cfg(any())]
     pub fn run_general_check(
         &self,
         agent_id: &str,
@@ -6301,6 +5592,7 @@ impl Scheduler {
         })
     }
 
+    #[cfg(any())]
     pub fn submit_general_completion(
         &self,
         agent_id: &str,

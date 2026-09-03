@@ -350,8 +350,6 @@ pub enum JobListScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     General,
-    Review,
-    ReviewContinuation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,45 +403,30 @@ impl TaskKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::General => "GENERAL",
-            Self::Review => "REVIEW",
-            Self::ReviewContinuation => "REVIEW_CONTINUATION",
         }
     }
     fn parse(value: &str) -> StoreResult<Self> {
         match value {
             "GENERAL" => Ok(Self::General),
-            "REVIEW" => Ok(Self::Review),
-            "REVIEW_CONTINUATION" => Ok(Self::ReviewContinuation),
             other => Err(StoreError::InvalidState(format!(
                 "unknown task kind {other}"
             ))),
         }
     }
-    pub fn is_legacy_review(self) -> bool {
-        self == Self::Review
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveBudget {
-    pub wall_time_ms: u64,
-    #[serde(default = "default_semantic_soft_timeout_ms")]
-    pub semantic_soft_timeout_ms: u64,
-    #[serde(default = "default_semantic_hard_timeout_ms")]
-    pub semantic_hard_timeout_ms: u64,
+    pub absolute_wall_time_ms: u64,
+    pub runtime_activity_idle_timeout_ms: u64,
+    pub model_stream_idle_timeout_ms: u64,
+    pub tool_call_timeout_ms: u64,
+    pub input_wait_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
     pub max_result_bytes: u64,
     pub max_artifact_bytes: u64,
-}
-
-const fn default_semantic_soft_timeout_ms() -> u64 {
-    300_000
-}
-
-const fn default_semantic_hard_timeout_ms() -> u64 {
-    600_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,9 +574,11 @@ pub struct EnqueuedTask {
 }
 
 const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
-    wall_time_ms: 3_600_000,
-    semantic_soft_timeout_ms: default_semantic_soft_timeout_ms(),
-    semantic_hard_timeout_ms: default_semantic_hard_timeout_ms(),
+    absolute_wall_time_ms: 3_600_000,
+    runtime_activity_idle_timeout_ms: 90_000,
+    model_stream_idle_timeout_ms: 90_000,
+    tool_call_timeout_ms: 300_000,
+    input_wait_timeout_ms: 300_000,
     max_turns: 32,
     max_tool_calls: 128,
     max_context_bytes: 1_048_576,
@@ -601,9 +586,11 @@ const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
     max_artifact_bytes: 16_777_216,
 };
 const MAX_BUDGET: EffectiveBudget = EffectiveBudget {
-    wall_time_ms: 86_400_000,
-    semantic_soft_timeout_ms: 86_399_999,
-    semantic_hard_timeout_ms: 86_400_000,
+    absolute_wall_time_ms: 86_400_000,
+    runtime_activity_idle_timeout_ms: 86_400_000,
+    model_stream_idle_timeout_ms: 86_400_000,
+    tool_call_timeout_ms: 86_400_000,
+    input_wait_timeout_ms: 86_400_000,
     max_turns: 1024,
     max_tool_calls: 4096,
     max_context_bytes: 16_777_216,
@@ -988,6 +975,7 @@ pub struct StoredPendingRequest {
     pub state: PendingRequestState,
     pub response_decision: Option<String>,
     pub response_content: Option<String>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4013,35 +4001,12 @@ fn validate_task(task: &NewTask) -> StoreResult<()> {
             "duplicated legacy/new task identity fields disagree".into(),
         ));
     }
-    match task.task_kind {
-        TaskKind::General
-            if task.review_id.is_some()
-                || task.job.review_kind.is_some()
-                || task.continuation_of.is_some() =>
-        {
-            Err(StoreError::InvalidState(
-                "general task cannot carry review identity".into(),
-            ))
-        }
-        TaskKind::Review
-            if task.review_id.is_none()
-                || task.job.review_kind.is_none()
-                || task.continuation_of.is_some() =>
-        {
-            Err(StoreError::InvalidState(
-                "fresh review requires review_id/review_kind and no continuation".into(),
-            ))
-        }
-        TaskKind::ReviewContinuation
-            if task.review_id.is_none()
-                || task.job.review_kind.is_none()
-                || task.continuation_of.is_none() =>
-        {
-            Err(StoreError::InvalidState(
-                "review continuation requires review_id and parent".into(),
-            ))
-        }
-        _ => Ok(()),
+    if task.review_id.is_some() || task.job.review_kind.is_some() || task.continuation_of.is_some() {
+        Err(StoreError::InvalidState(
+            "generic task cannot carry retired review identity".into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -4102,15 +4067,11 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
         BudgetRequest::Limits(value) => value.clone(),
     };
     let pairs = [
-        (value.wall_time_ms, MAX_BUDGET.wall_time_ms),
-        (
-            value.semantic_soft_timeout_ms,
-            MAX_BUDGET.semantic_soft_timeout_ms,
-        ),
-        (
-            value.semantic_hard_timeout_ms,
-            MAX_BUDGET.semantic_hard_timeout_ms,
-        ),
+        (value.absolute_wall_time_ms, MAX_BUDGET.absolute_wall_time_ms),
+        (value.runtime_activity_idle_timeout_ms, MAX_BUDGET.runtime_activity_idle_timeout_ms),
+        (value.model_stream_idle_timeout_ms, MAX_BUDGET.model_stream_idle_timeout_ms),
+        (value.tool_call_timeout_ms, MAX_BUDGET.tool_call_timeout_ms),
+        (value.input_wait_timeout_ms, MAX_BUDGET.input_wait_timeout_ms),
         (value.max_turns, MAX_BUDGET.max_turns),
         (value.max_tool_calls, MAX_BUDGET.max_tool_calls),
         (value.max_context_bytes, MAX_BUDGET.max_context_bytes),
@@ -4120,11 +4081,6 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
     if pairs.iter().any(|(value, cap)| *value == 0 || value > cap) {
         return Err(StoreError::InvalidState(
             "budget limit is zero or above hard cap".into(),
-        ));
-    }
-    if value.semantic_hard_timeout_ms <= value.semantic_soft_timeout_ms {
-        return Err(StoreError::InvalidState(
-            "semantic hard timeout must exceed soft timeout".into(),
         ));
     }
     Ok(value)
@@ -4164,95 +4120,8 @@ fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
 }
 
 fn continuation_identity(connection: &Connection, task: &NewTask) -> StoreResult<(u64, bool)> {
-    if task.task_kind != TaskKind::ReviewContinuation {
-        return Ok((1, task.task_kind == TaskKind::Review));
-    }
-    let parent_id = task.continuation_of.as_deref().unwrap();
-    let parent = query_task_record(connection, parent_id)?.ok_or_else(|| {
-        StoreError::InvalidState(format!("unknown continuation parent {parent_id}"))
-    })?;
-    if parent.public_agent_id != task.public_agent_id
-        || parent.review_id != task.review_id
-        || parent.review_kind != task.job.review_kind
-        || !matches!(
-            parent.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        )
-    {
-        return Err(StoreError::Conflict(
-            "continuation identity or kind is incompatible".into(),
-        ));
-    }
-    let parent_job = query_job(connection, parent_id)?
-        .ok_or_else(|| StoreError::InvalidState("continuation parent job missing".into()))?;
-    if parent_job.closed_at.is_some() || parent.phase != TaskPhase::Terminal {
-        return Err(StoreError::Conflict(
-            "continuation parent is active, closed, or ineligible".into(),
-        ));
-    }
-    let active: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM task_attempts WHERE public_agent_id=?1 AND phase<>'TERMINAL'",
-        [&task.public_agent_id],
-        |row| row.get(0),
-    )?;
-    if active != 0 {
-        return Err(StoreError::Conflict(
-            "public agent already has an active attempt".into(),
-        ));
-    }
-    let final_signal = connection
-        .query_row(
-            "SELECT signal FROM review_finalizations WHERE agent_id=?1",
-            [parent_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let eligible_signal = final_signal.as_deref().is_some_and(|signal| {
-        matches!(
-            signal,
-            "findings_present"
-                | "no_findings_observed"
-                | "incomplete_evidence"
-                | "unable_to_review"
-        )
-    });
-    let runtime_outcome = connection
-        .query_row(
-            "SELECT outcome FROM task_results WHERE execution_agent_id=?1",
-            [parent_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let eligible_runtime = runtime_outcome.as_deref().is_some_and(|outcome| {
-        matches!(
-            outcome,
-            "FAILED" | "CANCELLED" | "TIMED_OUT" | "BUDGET_EXHAUSTED" | "RUNTIME_LOST"
-        )
-    });
-    if !eligible_signal && !eligible_runtime {
-        return Err(StoreError::Conflict(
-            "continuation parent lacks an eligible final signal or runtime outcome".into(),
-        ));
-    }
-    let latest: i64 = connection
-        .query_row(
-            "SELECT MAX(attempt_sequence) FROM task_attempts WHERE public_agent_id=?1",
-            [&task.public_agent_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )?
-        .unwrap_or(0);
-    if i64_to_u64(latest)? != parent.attempt_sequence {
-        return Err(StoreError::Conflict(
-            "continuation parent is not latest attempt".into(),
-        ));
-    }
-    Ok((
-        parent
-            .attempt_sequence
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidState("attempt sequence overflow".into()))?,
-        false,
-    ))
+    let _ = (connection, task);
+    Ok((1, false))
 }
 
 fn validate_result(result: &TaskResult) -> StoreResult<()> {
@@ -4452,7 +4321,7 @@ fn query_pending_request(
     let row = connection
         .query_row(
             "SELECT request_id, agent_id, correlation_id, request_type,
-                    payload_json, state, response_decision, response_content
+                    payload_json, state, response_decision, response_content, created_at
              FROM pending_requests WHERE request_id = ?1",
             [request_id],
             |row| {
@@ -4465,6 +4334,7 @@ fn query_pending_request(
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
@@ -4479,6 +4349,7 @@ fn query_pending_request(
             state,
             response_decision,
             response_content,
+            created_at,
         )| {
             let state = match state.as_str() {
                 "PENDING" => PendingRequestState::Pending,
@@ -4499,6 +4370,7 @@ fn query_pending_request(
                 state,
                 response_decision,
                 response_content,
+                created_at,
             })
         },
     )

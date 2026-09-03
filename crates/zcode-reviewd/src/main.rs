@@ -1,10 +1,8 @@
-use review_ledger::LedgerManager;
 use review_store::Store;
-use sha2::{Digest, Sha256};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
     env, fs,
-    io::{self, BufReader, Read},
+    io,
     path::{Path, PathBuf},
     process::Command,
     sync::{atomic::AtomicBool, Arc},
@@ -12,11 +10,9 @@ use std::{
     time::Duration,
 };
 #[cfg(debug_assertions)]
-use std::{io::Write, os::unix::net::UnixStream};
-use zcode_reviewd::{
-    general_mcp, ledger_mcp, rpc::ServerOptions, CommandRuntimeFactory, Daemon,
-    GeneralCommandCatalog, InternalLedgerMcpConfig, RuntimeFactory, Scheduler, SchedulerConfig,
-};
+use std::{io::{Read, Write}, os::unix::net::UnixStream};
+use zcode_reviewd::{rpc::ServerOptions, CommandRuntimeFactory, Daemon, GeneralCommandCatalog,
+    RuntimeFactory, Scheduler, SchedulerConfig};
 
 struct Config {
     database: PathBuf,
@@ -29,15 +25,6 @@ const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--ledger-mcp")) {
-        return run_ledger_mcp(false).map_err(Into::into);
-    }
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--task-ledger-mcp")) {
-        return run_ledger_mcp(true).map_err(Into::into);
-    }
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--general-mcp")) {
-        return run_general_mcp().map_err(Into::into);
-    }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
@@ -47,9 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let store = Arc::new(Store::open(&config.database)?);
-    let ledger = Arc::new(LedgerManager::new(Arc::clone(&store)));
     let runtime = config.runtime.clone();
-    let runtime_sha256 = runtime.as_deref().map(file_sha256).transpose()?;
     let factory = Arc::new(CommandRuntimeFactory::new_prepared(
         move |_job: &review_store::Job| runtime_command(runtime.as_deref()),
     ));
@@ -66,15 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_factory,
         production_scheduler_config(),
     )?
-    .with_general_command_catalog(command_catalog)?
-    .with_ledger(
-        ledger,
-        InternalLedgerMcpConfig {
-            command: fs::canonicalize(env::current_exe()?)?,
-            socket: config.socket.clone(),
-            runtime_sha256,
-        },
-    )?;
+    .with_general_command_catalog(command_catalog)?;
     let daemon = match Daemon::start_with_shutdown(
         &config.socket,
         scheduler,
@@ -206,123 +183,6 @@ fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
     } else {
         Ok(env::current_dir()?.join(path))
     }
-}
-
-fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 32 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn run_ledger_mcp(task_scoped: bool) -> io::Result<()> {
-    let mut socket = None;
-    let mut agent_id = None;
-    let mut attempt_sequence = None;
-    let mut run_idempotency_key = None;
-    let mut arguments = env::args_os().skip(2);
-    while let Some(argument) = arguments.next() {
-        let value = arguments.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ledger MCP option is missing a value",
-            )
-        })?;
-        match argument.to_string_lossy().as_ref() {
-            "--socket" => socket = Some(PathBuf::from(value)),
-            "--agent-id" => agent_id = Some(value.to_string_lossy().into_owned()),
-            "--attempt-sequence" => {
-                attempt_sequence = Some(value.to_string_lossy().parse::<u64>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "attempt sequence is invalid")
-                })?);
-            }
-            "--run-idempotency-key" => {
-                run_idempotency_key = Some(value.to_string_lossy().into_owned())
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown ledger MCP option",
-                ))
-            }
-        }
-    }
-    let socket = socket
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--socket is required"))?;
-    let agent_id = agent_id
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--agent-id is required"))?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    if task_scoped {
-        ledger_mcp::serve_task(
-            &socket,
-            &agent_id,
-            attempt_sequence.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--attempt-sequence is required",
-                )
-            })?,
-            run_idempotency_key.as_deref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--run-idempotency-key is required",
-                )
-            })?,
-            BufReader::new(stdin.lock()),
-            stdout.lock(),
-        )
-    } else {
-        ledger_mcp::serve(
-            &socket,
-            &agent_id,
-            BufReader::new(stdin.lock()),
-            stdout.lock(),
-        )
-    }
-}
-
-fn run_general_mcp() -> io::Result<()> {
-    let mut socket = None;
-    let mut agent_id = None;
-    let mut arguments = env::args_os().skip(2);
-    while let Some(argument) = arguments.next() {
-        let value = arguments.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "general MCP option is missing a value",
-            )
-        })?;
-        match argument.to_string_lossy().as_ref() {
-            "--socket" => socket = Some(PathBuf::from(value)),
-            "--agent-id" => agent_id = Some(value.to_string_lossy().into_owned()),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown general MCP option",
-                ))
-            }
-        }
-    }
-    let socket = socket
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--socket is required"))?;
-    let agent_id = agent_id
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--agent-id is required"))?;
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    general_mcp::serve(
-        &socket,
-        &agent_id,
-        BufReader::new(stdin.lock()),
-        stdout.lock(),
-    )
 }
 
 fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {

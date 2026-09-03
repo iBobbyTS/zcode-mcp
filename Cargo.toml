@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/runtime-preflight", "crates/zcode-protocol", "crates/zcode-driver", "crates/zcode-fake-runtime", "crates/review-store", "crates/review-preparation", "crates/review-ledger", "crates/zcode-reviewd", "crates/zcode-review-mcp", "crates/sectioned-shadow"]
+members = ["crates/runtime-preflight", "crates/zcode-protocol", "crates/zcode-driver", "crates/zcode-fake-runtime", "crates/review-store", "crates/review-preparation", "crates/zcode-reviewd", "crates/zcode-review-mcp", "crates/sectioned-shadow"]
 resolver = "2"
 
 [workspace.package]

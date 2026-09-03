@@ -8,7 +8,6 @@ license.workspace = true
 zcode-driver = { path = "../zcode-driver" }
 review-store = { path = "../review-store" }
 review-preparation = { path = "../review-preparation" }
-review-ledger = { path = "../review-ledger" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zcode-protocol = { path = "../zcode-protocol" }

@@ -42,7 +42,6 @@ struct BudgetState {
 #[derive(Debug)]
 pub(crate) struct AttemptBudget {
     deadline: Instant,
-    wall_time: Duration,
     max_turns: u64,
     max_tool_calls: u64,
     state: Mutex<BudgetState>,
@@ -51,11 +50,11 @@ pub(crate) struct AttemptBudget {
 impl AttemptBudget {
     #[cfg(test)]
     pub(crate) fn new(limits: &BudgetLimits) -> Self {
-        Self::with_limits(limits.wall_time_ms, limits.max_turns, limits.max_tool_calls)
+        Self::with_limits(limits.absolute_wall_time_ms, limits.max_turns, limits.max_tool_calls)
     }
 
     pub(crate) fn from_effective(limits: &EffectiveBudget) -> Self {
-        Self::with_limits(limits.wall_time_ms, limits.max_turns, limits.max_tool_calls)
+        Self::with_limits(limits.absolute_wall_time_ms, limits.max_turns, limits.max_tool_calls)
     }
 
     fn with_limits(wall_time_ms: u64, max_turns: u64, max_tool_calls: u64) -> Self {
@@ -63,7 +62,6 @@ impl AttemptBudget {
             deadline: Instant::now()
                 .checked_add(Duration::from_millis(wall_time_ms))
                 .unwrap_or_else(Instant::now),
-            wall_time: Duration::from_millis(wall_time_ms),
             max_turns,
             max_tool_calls,
             state: Mutex::new(BudgetState {
@@ -127,15 +125,6 @@ impl AttemptBudget {
         self.deadline
     }
 
-    pub(crate) fn finalization_reserve_due(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        let turns_remaining = self.max_turns.saturating_sub(state.turns.len() as u64);
-        let wall_due = self
-            .remaining()
-            .is_some_and(|remaining| remaining <= self.wall_time / 5);
-        wall_due || turns_remaining <= 2
-    }
-
     #[cfg(test)]
     fn counts(&self) -> (u64, usize) {
         let state = self.state.lock().unwrap();
@@ -174,9 +163,11 @@ mod tests {
 
     fn limits() -> BudgetLimits {
         BudgetLimits {
-            wall_time_ms: 10_000,
-            semantic_soft_timeout_ms: 300_000,
-            semantic_hard_timeout_ms: 600_000,
+            absolute_wall_time_ms: 10_000,
+            runtime_activity_idle_timeout_ms: 1_000,
+            model_stream_idle_timeout_ms: 1_000,
+            tool_call_timeout_ms: 1_000,
+            input_wait_timeout_ms: 1_000,
             max_turns: 2,
             max_tool_calls: 1,
             max_context_bytes: 1,

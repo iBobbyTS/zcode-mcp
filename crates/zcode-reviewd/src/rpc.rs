@@ -1,22 +1,14 @@
 use crate::{
-    orchestration::{
-        MinimalStructuredReviewContinuation, OrchestrationError, ReviewJobOrchestrator,
-        StructuredReviewContinuation, StructuredReviewProjection, StructuredReviewSubmission,
-    },
-    GeneralCheckResult, MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow,
+    MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow,
     PassiveToolKind, ResponseDisposition, RuntimePreflightResult, Scheduler, SchedulerError,
 };
-use review_ledger::{
-    ArtifactIntegrity, ToolResult, VerifiedArtifact, MAX_TOOL_ID_BYTES, MAX_TOOL_TEXT_CHARS,
-};
-use review_preparation::{canonical_general_repository, ReviewManifest};
 use review_preparation::{
-    BudgetLimits, GeneralCompletionSubmission, GeneralProfile, GeneralTaskManifest,
-    PreparedGeneralTask, PreparedLaunchSpec,
+    canonical_general_repository, BudgetLimits, GeneralProfile, GeneralTaskManifest,
+    PreparedGeneralTask,
 };
 use review_store::{
     DeadlineRead, EffectiveBudget, Job, JobListScope, JobState, NewJob, PendingRequestState,
-    ReviewProgressState, Store, StoreError, StoredArtifact, StoredEvent, StoredPendingRequest,
+    Store, StoreError, StoredArtifact, StoredEvent, StoredPendingRequest,
     StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
     TaskSubmissionDisposition, TurnState, WaitSnapshot,
 };
@@ -75,8 +67,6 @@ pub enum RpcMethod {
     SubmitGeneral {
         input: GeneralSubmitInput,
     },
-    GeneralComplete(GeneralCompleteInput),
-    GeneralRunCheck(GeneralRunCheckInput),
     TaskStatus {
         agent_id: String,
     },
@@ -103,21 +93,6 @@ pub enum RpcMethod {
     },
     TaskReap {
         agent_id: String,
-    },
-    SpawnReview {
-        manifest: ReviewManifest,
-    },
-    SubmitReview {
-        manifest: ReviewManifest,
-    },
-    SubmitStructuredReview {
-        input: StructuredReviewSubmission,
-    },
-    ContinueStructuredReview {
-        input: StructuredReviewContinuation,
-    },
-    ContinueStructuredReviewMinimal {
-        input: MinimalStructuredReviewContinuation,
     },
     Enqueue {
         job: NewJobInput,
@@ -147,8 +122,6 @@ pub enum RpcMethod {
     Reap {
         agent_id: String,
     },
-    TaskReviewTool(ReviewToolInput),
-    ReviewTool(ReviewToolInput),
 }
 
 impl RpcMethod {
@@ -158,8 +131,6 @@ impl RpcMethod {
             "system_status"
                 | "system_ensure_ready"
                 | "submit_general"
-                | "general_complete"
-                | "general_run_check"
                 | "task_status"
                 | "task_list"
                 | "task_pending"
@@ -173,11 +144,6 @@ impl RpcMethod {
                 | "task_artifact"
                 | "task_close"
                 | "task_reap"
-                | "spawn_review"
-                | "submit_review"
-                | "submit_structured_review"
-                | "continue_structured_review"
-                | "continue_structured_review_minimal"
                 | "enqueue"
                 | "start"
                 | "status"
@@ -191,8 +157,6 @@ impl RpcMethod {
                 | "list"
                 | "close"
                 | "reap"
-                | "task_review_tool"
-                | "review_tool"
         )
     }
 }
@@ -262,20 +226,6 @@ pub struct GeneralSubmitInput {
     pub allowed_command_ids: Vec<String>,
     #[serde(default)]
     pub required_command_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneralCompleteInput {
-    pub agent_id: String,
-    pub submission: GeneralCompletionSubmission,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GeneralRunCheckInput {
-    pub agent_id: String,
-    pub command_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,14 +390,6 @@ pub struct ResultQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewToolInput {
-    pub agent_id: String,
-    pub tool: String,
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub version: u16,
     pub request_id: Option<String>,
@@ -498,12 +440,6 @@ pub enum RpcSuccess {
         task: TaskView,
         disposition: SubmissionDispositionView,
     },
-    GeneralCompletionAccepted {
-        accepted: bool,
-    },
-    GeneralCheckCompleted {
-        result: GeneralCheckResultView,
-    },
     TaskStatus {
         task: TaskView,
     },
@@ -535,22 +471,6 @@ pub enum RpcSuccess {
     },
     TaskArtifact {
         chunk: TaskArtifactChunkView,
-    },
-    ReviewSpawned {
-        job: JobView,
-        prompt_sha256: String,
-        resumed_existing: bool,
-        counts_as_independent: bool,
-        capabilities: ReviewCapabilitiesView,
-    },
-    ReviewSubmitted {
-        job: JobView,
-        prompt_sha256: String,
-        resumed_existing: bool,
-        capabilities: ReviewCapabilitiesView,
-    },
-    StructuredReviewSubmitted {
-        review: StructuredReviewProjection,
     },
     Enqueued {
         job: JobView,
@@ -594,9 +514,6 @@ pub enum RpcSuccess {
     Reaped {
         state: JobStateView,
         resources_reaped: bool,
-    },
-    ReviewTool {
-        result: ToolResult,
     },
 }
 
@@ -700,6 +617,7 @@ pub struct AgentCapabilitiesView {
     pub maturity: BTreeMap<String, CapabilityMaturityView>,
 }
 
+#[cfg(any())]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneralCheckResultView {
     pub command_id: String,
@@ -712,6 +630,7 @@ pub struct GeneralCheckResultView {
     pub timed_out: bool,
 }
 
+#[cfg(any())]
 impl From<GeneralCheckResult> for GeneralCheckResultView {
     fn from(value: GeneralCheckResult) -> Self {
         Self {
@@ -730,14 +649,10 @@ impl From<GeneralCheckResult> for GeneralCheckResultView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub agent_id: String,
-    pub review_id: Option<String>,
-    pub task_kind: String,
     pub access_mode: String,
     pub phase: String,
     pub attempt_sequence: u64,
     pub effective_budget: EffectiveBudget,
-    pub independent_evidence: bool,
-    pub fresh_session_observed: bool,
     pub stop_requested: bool,
     pub close_requested: bool,
     pub closed: bool,
@@ -822,54 +737,6 @@ pub struct TaskResultView {
     pub residual_gaps: Vec<String>,
     pub artifacts: Vec<review_store::ResultArtifact>,
     pub result_sha256: String,
-    pub review_evidence: Option<TaskReviewEvidenceView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskReviewEvidenceView {
-    pub final_signal: String,
-    pub finalized: bool,
-    pub report_revision: u64,
-    pub finalization_revision: u64,
-    pub artifact: TaskArtifactMetadataView,
-    pub counts: TaskReviewEvidenceCountsView,
-    pub independence: TaskReviewIndependenceView,
-    pub validation_provenance: TaskValidationProvenanceView,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskReviewEvidenceCountsView {
-    pub checkpoints: u64,
-    pub findings: u64,
-    pub open_findings: u64,
-    pub validations: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskReviewIndependenceView {
-    pub independent_evidence: bool,
-    pub fresh_session_observed: bool,
-    pub counts_as_independent: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskValidationProvenanceView {
-    pub daemon_verification: TaskDaemonVerificationView,
-    pub model_attestation: TaskModelAttestationView,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskDaemonVerificationView {
-    pub source_integrity_verified: bool,
-    pub finalized_report_verified: bool,
-    pub artifact_digest_verified: bool,
-    pub validation_records_structurally_verified: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskModelAttestationView {
-    pub present: bool,
-    pub validation_record_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1264,7 +1131,8 @@ pub enum ArtifactIntegrityView {
     LegacyUnverified,
 }
 
-impl From<ArtifactIntegrity> for ArtifactIntegrityView {
+#[cfg(any())]
+impl From<review_ledger::ArtifactIntegrity> for ArtifactIntegrityView {
     fn from(value: ArtifactIntegrity) -> Self {
         match value {
             ArtifactIntegrity::Valid => Self::Valid,
@@ -1296,7 +1164,6 @@ pub struct ArtifactView {
 pub struct RpcService {
     scheduler: Scheduler,
     store: Arc<Store>,
-    orchestrator: Option<ReviewJobOrchestrator>,
     service_generation: String,
 }
 
@@ -1315,15 +1182,9 @@ impl RpcService {
         // installation/preflight has its own activation_generation and must
         // never control the public restart-scoped service generation.
         let service_generation = opaque_generation()?;
-        let orchestrator = ReviewJobOrchestrator::new_with_service_generation(
-            scheduler.clone(),
-            service_generation.clone(),
-        )
-        .ok();
         Ok(Self {
             scheduler,
             store,
-            orchestrator,
             service_generation,
         })
     }
@@ -1450,6 +1311,7 @@ impl RpcService {
                     disposition: submitted.disposition.into(),
                 })
             }
+            #[cfg(any())]
             RpcMethod::GeneralComplete(input) => {
                 validate_id(&input.agent_id, "agent_id")?;
                 let accepted = self
@@ -1458,6 +1320,7 @@ impl RpcService {
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralCompletionAccepted { accepted })
             }
+            #[cfg(any())]
             RpcMethod::GeneralRunCheck(input) => {
                 validate_id(&input.agent_id, "agent_id")?;
                 validate_text(&input.command_id, "command_id", 256)?;
@@ -1671,6 +1534,7 @@ impl RpcService {
                     resources_reaped,
                 })
             }
+            #[cfg(any())]
             RpcMethod::SpawnReview { manifest } => {
                 let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
                     RpcError::new(
@@ -1692,6 +1556,7 @@ impl RpcService {
                     capabilities,
                 })
             }
+            #[cfg(any())]
             RpcMethod::SubmitReview { manifest } => {
                 let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
                     RpcError::new(
@@ -1710,6 +1575,7 @@ impl RpcService {
                     capabilities,
                 })
             }
+            #[cfg(any())]
             RpcMethod::SubmitStructuredReview { input } => {
                 let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
                     RpcError::new(
@@ -1722,6 +1588,7 @@ impl RpcService {
                     .map_err(map_orchestration)?;
                 Ok(RpcSuccess::StructuredReviewSubmitted { review })
             }
+            #[cfg(any())]
             RpcMethod::ContinueStructuredReview { input } => {
                 let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
                     RpcError::new(
@@ -1734,6 +1601,7 @@ impl RpcService {
                     .map_err(map_orchestration)?;
                 Ok(RpcSuccess::StructuredReviewSubmitted { review })
             }
+            #[cfg(any())]
             RpcMethod::ContinueStructuredReviewMinimal { input } => {
                 let orchestrator = self.orchestrator.as_ref().ok_or_else(|| {
                     RpcError::new(
@@ -1860,6 +1728,7 @@ impl RpcService {
                     resources_reaped,
                 })
             }
+            #[cfg(any())]
             RpcMethod::TaskReviewTool(input) => {
                 validate_id(&input.agent_id, "agent_id")?;
                 let task = self
@@ -1885,6 +1754,7 @@ impl RpcService {
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::ReviewTool { result })
             }
+            #[cfg(any())]
             RpcMethod::ReviewTool(input) => {
                 self.require_legacy_job(&input.agent_id)?;
                 validate_text(&input.tool, "review tool", 128)?;
@@ -1970,10 +1840,6 @@ impl RpcService {
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
         let prepared_repository = serde_json::from_str::<PreparedGeneralTask>(prepared_json)
             .map(|prepared| prepared.repository)
-            .or_else(|_| {
-                serde_json::from_str::<PreparedLaunchSpec>(prepared_json)
-                    .map(|prepared| prepared.repository)
-            })
             .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
         if prepared_repository.to_string_lossy() != task.repository {
             return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
@@ -1989,56 +1855,6 @@ impl RpcService {
             .store
             .task_result(&task.execution_agent_id)
             .map_err(map_store)?;
-        if matches!(
-            task.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        ) {
-            let source_valid = result.as_ref().is_some_and(|stored| {
-                stored.result.outcome == TaskOutcome::Succeeded && !stored.result.partial
-            });
-            if !source_valid {
-                return Ok(Vec::new());
-            }
-            let Some(verified) = self
-                .scheduler
-                .verify_review_artifact(&task.execution_agent_id, 0)
-                .map_err(map_scheduler)?
-            else {
-                return Ok(Vec::new());
-            };
-            if !verified.finalized || verified.integrity != ArtifactIntegrity::Valid {
-                return Ok(Vec::new());
-            }
-            let (Some(expected_sha256), Some(expected_bytes)) =
-                (verified.expected_sha256, verified.expected_bytes)
-            else {
-                return Ok(Vec::new());
-            };
-            if expected_bytes == 0 || !valid_sha256(&expected_sha256) {
-                return Ok(Vec::new());
-            }
-            let artifact = self
-                .store
-                .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
-                .map_err(map_store)?
-                .into_iter()
-                .find(|artifact| {
-                    artifact.artifact_type == "review_report"
-                        && artifact.path == verified.locator
-                        && artifact.sha256 == expected_sha256
-                        && artifact.bytes == expected_bytes
-                });
-            return Ok(artifact
-                .map(|artifact| {
-                    vec![TaskArtifactMetadataView {
-                        artifact_id: artifact.artifact_id,
-                        kind: "report_markdown".into(),
-                        sha256: artifact.sha256,
-                        size_bytes: artifact.bytes,
-                    }]
-                })
-                .unwrap_or_default());
-        }
         let allowed = result
             .as_ref()
             .map(|stored| {
@@ -2074,103 +1890,12 @@ impl RpcService {
 
     fn task_result_view(
         &self,
-        job: &Job,
-        task: &TaskRecord,
+        _job: &Job,
+        _task: &TaskRecord,
         stored: StoredTaskResult,
-        artifacts: &[TaskArtifactMetadataView],
+        _artifacts: &[TaskArtifactMetadataView],
     ) -> Result<TaskResultView, RpcError> {
-        let mut view = TaskResultView::from(stored);
-        if !matches!(
-            task.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        ) || view.outcome != TaskOutcome::Succeeded
-        {
-            return Ok(view);
-        }
-
-        let Some(snapshot) = self
-            .store
-            .review_snapshot(&task.execution_agent_id)
-            .map_err(map_store)?
-        else {
-            return Ok(view);
-        };
-        let Some(finalization) = snapshot.finalization.as_ref() else {
-            return Ok(view);
-        };
-        let Some(final_signal) = snapshot.report.final_signal.as_deref() else {
-            return Ok(view);
-        };
-        if !snapshot.report.finalized
-            || finalization.status.as_deref() != Some(final_signal)
-            || snapshot.report.published_revision != Some(snapshot.report.current_revision)
-            || snapshot.checkpoints.is_empty()
-            || snapshot.validations.is_empty()
-        {
-            return Ok(view);
-        }
-        let [artifact] = artifacts else {
-            return Ok(view);
-        };
-        if artifact.kind != "report_markdown"
-            || artifact.size_bytes == 0
-            || !valid_sha256(&artifact.sha256)
-        {
-            return Ok(view);
-        }
-        let fresh_session_observed = job
-            .zcode_session_id
-            .as_deref()
-            .is_some_and(|session| !session.trim().is_empty());
-        let Ok(validations) = u64::try_from(snapshot.validations.len()) else {
-            return Ok(view);
-        };
-        let Ok(checkpoints) = u64::try_from(snapshot.checkpoints.len()) else {
-            return Ok(view);
-        };
-        let Ok(findings) = u64::try_from(snapshot.findings.len()) else {
-            return Ok(view);
-        };
-        let Ok(open_findings) = u64::try_from(
-            snapshot
-                .findings
-                .iter()
-                .filter(|finding| finding.status.as_deref() == Some("open"))
-                .count(),
-        ) else {
-            return Ok(view);
-        };
-        view.review_evidence = Some(TaskReviewEvidenceView {
-            final_signal: final_signal.to_owned(),
-            finalized: true,
-            report_revision: snapshot.report.current_revision,
-            finalization_revision: finalization.revision,
-            artifact: artifact.clone(),
-            counts: TaskReviewEvidenceCountsView {
-                checkpoints,
-                findings,
-                open_findings,
-                validations,
-            },
-            independence: TaskReviewIndependenceView {
-                independent_evidence: task.independent_evidence,
-                fresh_session_observed,
-                counts_as_independent: task.independent_evidence && fresh_session_observed,
-            },
-            validation_provenance: TaskValidationProvenanceView {
-                daemon_verification: TaskDaemonVerificationView {
-                    source_integrity_verified: true,
-                    finalized_report_verified: true,
-                    artifact_digest_verified: true,
-                    validation_records_structurally_verified: true,
-                },
-                model_attestation: TaskModelAttestationView {
-                    present: true,
-                    validation_record_count: validations,
-                },
-            },
-        });
-        Ok(view)
+        Ok(TaskResultView::from(stored))
     }
 
     fn task_artifact_chunk(
@@ -2255,82 +1980,18 @@ impl RpcService {
                 nudge_sent: None,
             });
         }
-        let progress_state = if matches!(
-            task.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        ) {
-            self.store
-                .review_progress(&task.execution_agent_id)
-                .map_err(map_store)?
-        } else {
-            None
-        };
-        let wall_now_ms = wall_now_millis();
         for event in stored
             .into_iter()
             .filter(|event| event.attempt_sequence == task.attempt_sequence)
         {
-            let projected = if event.event_type == "review.progress"
-                && matches!(
-                    task.task_kind,
-                    TaskKind::Review | TaskKind::ReviewContinuation
-                ) {
-                Some((
-                    "review_progress",
-                    "{}".to_owned(),
-                    "allowlisted",
-                    project_review_progress(task, &event, progress_state.as_ref(), wall_now_ms),
-                ))
-            } else {
-                public_pending_request_id(&event).map(|request_id| {
-                    (
-                        "pending_request",
-                        serde_json::json!({"request_id": request_id}).to_string(),
-                        "bounded",
-                        None,
-                    )
-                })
-            };
-            if let Some((event_type, payload_json, redaction_level, progress)) = projected {
+            if let Some(request_id) = public_pending_request_id(&event) {
                 events.push(TaskEventView {
                     sequence: 0,
                     source_sequence: event.source_sequence,
                     attempt_sequence: task.attempt_sequence,
-                    event_type: event_type.into(),
-                    payload_json,
-                    redaction_level: redaction_level.into(),
-                    stage: progress.as_ref().map(|progress| progress.stage),
-                    summary: progress.as_ref().map(|progress| progress.summary.clone()),
-                    counters: progress
-                        .as_ref()
-                        .and_then(|progress| progress.counters.clone()),
-                    last_progress_at: progress.as_ref().map(|progress| progress.last_progress_at),
-                    semantic_idle_ms: progress.as_ref().map(|progress| progress.semantic_idle_ms),
-                    nudge_sent: progress.as_ref().map(|progress| progress.nudge_sent),
-                });
-            }
-        }
-        if matches!(
-            task.task_kind,
-            TaskKind::Review | TaskKind::ReviewContinuation
-        ) {
-            let snapshot = self
-                .store
-                .review_snapshot(&task.execution_agent_id)
-                .map_err(map_store)?;
-            if let Some(snapshot) = snapshot
-                .filter(|snapshot| snapshot.report.finalized && snapshot.finalization.is_some())
-            {
-                events.push(TaskEventView {
-                    sequence: 0,
-                    source_sequence: 0,
-                    attempt_sequence: task.attempt_sequence,
-                    event_type: "review_finalized".into(),
-                    payload_json: serde_json::json!({
-                        "revision": snapshot.report.current_revision,
-                    })
-                    .to_string(),
-                    redaction_level: "allowlisted".into(),
+                    event_type: "pending_request".into(),
+                    payload_json: serde_json::json!({"request_id": request_id}).to_string(),
+                    redaction_level: "bounded".into(),
                     stage: None,
                     summary: None,
                     counters: None,
@@ -2600,16 +2261,6 @@ impl RpcService {
             ));
         }
         let job = self.require_legacy_job(&query.agent_id)?;
-        if let Some(verified) = self
-            .scheduler
-            .verify_review_artifact(&query.agent_id, query.preview_bytes)
-            .map_err(map_scheduler)?
-        {
-            return Ok(RpcSuccess::Result {
-                job: job.into(),
-                artifact: Some(verified_artifact_view(verified, query.preview_bytes)),
-            });
-        }
         let artifact = self
             .store
             .artifacts(&query.agent_id, 1)
@@ -2648,10 +2299,6 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
     );
     let maturity = BTreeMap::from([
         (
-            "structured_review".into(),
-            CapabilityMaturityView::BetaReady,
-        ),
-        (
             "analysis_readonly".into(),
             CapabilityMaturityView::ExperimentalUnverifiedRuntime,
         ),
@@ -2665,17 +2312,15 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
         ),
     ]);
     AgentCapabilitiesView {
-        task_kinds: vec![
-            "general".into(),
-            "review".into(),
-            "review_continuation".into(),
-        ],
+        task_kinds: vec!["general".into()],
         profiles: profile_defaults.keys().cloned().collect(),
         profile_defaults,
         hard_budget_caps: BudgetLimits {
-            wall_time_ms: 86_400_000,
-            semantic_soft_timeout_ms: 86_399_999,
-            semantic_hard_timeout_ms: 86_400_000,
+            absolute_wall_time_ms: 86_400_000,
+            runtime_activity_idle_timeout_ms: 86_400_000,
+            model_stream_idle_timeout_ms: 86_400_000,
+            tool_call_timeout_ms: 86_400_000,
+            input_wait_timeout_ms: 86_400_000,
             max_turns: 1_024,
             max_tool_calls: 4_096,
             max_context_bytes: 16_777_216,
@@ -2808,10 +2453,6 @@ fn verified_artifact_chunk(
 }
 
 fn task_view(job: Job, task: TaskRecord) -> TaskView {
-    let fresh_session_observed = job
-        .zcode_session_id
-        .as_deref()
-        .is_some_and(|session| !session.trim().is_empty());
     let access_mode = job
         .prepared_launch_json
         .as_deref()
@@ -2826,13 +2467,6 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
         .to_owned();
     TaskView {
         agent_id: task.public_agent_id,
-        review_id: task.review_id,
-        task_kind: match task.task_kind {
-            TaskKind::General => "general",
-            TaskKind::Review => "review",
-            TaskKind::ReviewContinuation => "review_continuation",
-        }
-        .into(),
         access_mode,
         phase: match task.phase {
             TaskPhase::Queued => "QUEUED",
@@ -2845,8 +2479,6 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
         .into(),
         attempt_sequence: task.attempt_sequence,
         effective_budget: task.effective_budget,
-        independent_evidence: task.independent_evidence,
-        fresh_session_observed,
         stop_requested: job.stop_requested,
         close_requested: job.close_requested,
         closed: job.closed_at.is_some(),
@@ -2934,11 +2566,8 @@ fn task_frame_budget_view(job: Job, task: TaskRecord) -> TaskView {
     // observed if task state changes between page construction and the wait
     // response. Stable identifiers and effective budgets retain their exact
     // serialized representation.
-    view.task_kind = "review_continuation".into();
     view.access_mode = "workspace_write".into();
     view.phase = "WAITING_INPUT".into();
-    view.independent_evidence = false;
-    view.fresh_session_observed = false;
     view.stop_requested = false;
     view.close_requested = false;
     view.closed = false;
@@ -2961,7 +2590,6 @@ impl From<StoredTaskResult> for TaskResultView {
             residual_gaps: stored.result.residual_gaps,
             artifacts: stored.result.artifacts,
             result_sha256: stored.result_sha256,
-            review_evidence: None,
         }
     }
 }
@@ -2986,6 +2614,7 @@ struct ProjectedReviewProgress {
     nudge_sent: bool,
 }
 
+#[cfg(any())]
 fn project_review_progress(
     task: &TaskRecord,
     event: &StoredEvent,
@@ -3159,7 +2788,11 @@ fn artifact_view(artifact: StoredArtifact, requested: usize) -> ArtifactView {
     }
 }
 
-fn verified_artifact_view(artifact: VerifiedArtifact, requested: usize) -> ArtifactView {
+#[cfg(any())]
+fn verified_artifact_view(
+    artifact: review_ledger::VerifiedArtifact,
+    requested: usize,
+) -> ArtifactView {
     let preview_state = if requested == 0 {
         PreviewState::NotRequested
     } else if artifact.preview.is_some() {
@@ -3399,6 +3032,7 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
     }
 }
 
+#[cfg(any())]
 fn map_orchestration(error: OrchestrationError) -> RpcError {
     match error {
         OrchestrationError::Contract("REVIEW_BASH_POLICY_UNVERIFIED") => {

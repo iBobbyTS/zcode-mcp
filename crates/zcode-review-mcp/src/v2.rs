@@ -95,7 +95,11 @@ impl From<PublicAccessMode> for GeneralProfile {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicBudget {
-    pub wall_time_ms: u64,
+    pub absolute_wall_time_ms: u64,
+    pub runtime_activity_idle_timeout_ms: u64,
+    pub model_stream_idle_timeout_ms: u64,
+    pub tool_call_timeout_ms: u64,
+    pub input_wait_timeout_ms: u64,
     pub max_turns: u64,
     pub max_tool_calls: u64,
     pub max_context_bytes: u64,
@@ -106,9 +110,11 @@ pub struct PublicBudget {
 impl From<PublicBudget> for BudgetLimits {
     fn from(value: PublicBudget) -> Self {
         Self {
-            wall_time_ms: value.wall_time_ms,
-            semantic_soft_timeout_ms: review_preparation::default_semantic_soft_timeout_ms(),
-            semantic_hard_timeout_ms: review_preparation::default_semantic_hard_timeout_ms(),
+            absolute_wall_time_ms: value.absolute_wall_time_ms,
+            runtime_activity_idle_timeout_ms: value.runtime_activity_idle_timeout_ms,
+            model_stream_idle_timeout_ms: value.model_stream_idle_timeout_ms,
+            tool_call_timeout_ms: value.tool_call_timeout_ms,
+            input_wait_timeout_ms: value.input_wait_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -121,7 +127,11 @@ impl From<PublicBudget> for BudgetLimits {
 impl From<BudgetLimits> for PublicBudget {
     fn from(value: BudgetLimits) -> Self {
         Self {
-            wall_time_ms: value.wall_time_ms,
+            absolute_wall_time_ms: value.absolute_wall_time_ms,
+            runtime_activity_idle_timeout_ms: value.runtime_activity_idle_timeout_ms,
+            model_stream_idle_timeout_ms: value.model_stream_idle_timeout_ms,
+            tool_call_timeout_ms: value.tool_call_timeout_ms,
+            input_wait_timeout_ms: value.input_wait_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -134,7 +144,11 @@ impl From<BudgetLimits> for PublicBudget {
 impl From<EffectiveBudget> for PublicBudget {
     fn from(value: EffectiveBudget) -> Self {
         Self {
-            wall_time_ms: value.wall_time_ms,
+            absolute_wall_time_ms: value.absolute_wall_time_ms,
+            runtime_activity_idle_timeout_ms: value.runtime_activity_idle_timeout_ms,
+            model_stream_idle_timeout_ms: value.model_stream_idle_timeout_ms,
+            tool_call_timeout_ms: value.tool_call_timeout_ms,
+            input_wait_timeout_ms: value.input_wait_timeout_ms,
             max_turns: value.max_turns,
             max_tool_calls: value.max_tool_calls,
             max_context_bytes: value.max_context_bytes,
@@ -1699,15 +1713,19 @@ mod generic_tests {
     #[test]
     fn public_budget_contains_only_runtime_and_absolute_limits() {
         let budget = PublicBudget {
-            wall_time_ms: 1,
-            max_turns: 2,
-            max_tool_calls: 3,
-            max_context_bytes: 4,
-            max_result_bytes: 5,
-            max_artifact_bytes: 6,
+            absolute_wall_time_ms: 1,
+            runtime_activity_idle_timeout_ms: 2,
+            model_stream_idle_timeout_ms: 3,
+            tool_call_timeout_ms: 4,
+            input_wait_timeout_ms: 5,
+            max_turns: 6,
+            max_tool_calls: 7,
+            max_context_bytes: 8,
+            max_result_bytes: 9,
+            max_artifact_bytes: 10,
         };
         let value = serde_json::to_value(budget).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert_eq!(value.as_object().unwrap().len(), 10);
         assert!(!value.to_string().contains("semantic"));
     }
 
