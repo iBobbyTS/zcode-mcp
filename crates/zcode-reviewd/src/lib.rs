@@ -2792,6 +2792,12 @@ fn persist_general_result(
     prepared: &PreparedGeneralTask,
     completion: &GeneralCompletion,
 ) -> Result<(), StoreError> {
+    let result = task_result(completion);
+    if !general_result_response_fits(store, agent_id, completion, &result)? {
+        return Err(StoreError::InvalidState(
+            "task result exceeds private RPC response frame".into(),
+        ));
+    }
     for artifact in &completion.artifacts {
         let path = general_artifact_path(prepared, artifact.kind);
         let inserted = store.insert_artifact(&NewArtifact {
@@ -2817,7 +2823,56 @@ fn persist_general_result(
             }
         }
     }
-    store.store_task_result(agent_id, &task_result(completion))
+    store.store_task_result(agent_id, &result)
+}
+
+fn general_result_response_fits(
+    store: &Store,
+    agent_id: &str,
+    completion: &GeneralCompletion,
+    result: &TaskResult,
+) -> Result<bool, StoreError> {
+    let job = store
+        .get_job(agent_id)?
+        .ok_or_else(|| StoreError::InvalidState("terminal result job disappeared".into()))?;
+    let task = store
+        .task_by_execution_agent_id(agent_id)?
+        .ok_or_else(|| StoreError::InvalidState("terminal result task disappeared".into()))?;
+    let mut artifacts = completion
+        .artifacts
+        .iter()
+        .map(|artifact| rpc::TaskArtifactMetadataView {
+            artifact_id: artifact.artifact_id.clone(),
+            kind: general_artifact_type(artifact.kind).into(),
+            sha256: artifact.sha256.clone(),
+            size_bytes: artifact.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+    Ok(rpc::terminal_result_response_fits(
+        &job, &task, result, &artifacts,
+    ))
+}
+
+fn invalidate_untransportable_completion(
+    prepared: &PreparedGeneralTask,
+    completion: &mut GeneralCompletion,
+) {
+    for artifact in &completion.artifacts {
+        let path = general_artifact_path(prepared, artifact.kind);
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                completion.cleaned = false;
+            }
+        }
+    }
+    completion.outcome = CompletionOutcome::ResultInvalid;
+    completion.reason_code = Some("RESULT_RESPONSE_FRAME_EXCEEDED".into());
+    completion.summary = "terminal result exceeds private RPC response frame".into();
+    completion.checks.clear();
+    completion.residual_gaps.clear();
+    completion.artifacts.clear();
+    completion.artifact = None;
 }
 
 fn general_artifact_type(kind: GeneralArtifactKind) -> &'static str {
@@ -4190,6 +4245,17 @@ impl Scheduler {
                     && completion.outcome != CompletionOutcome::Blocked
                 {
                     completion.reason_code = Some(reason);
+                }
+                if completion.outcome == CompletionOutcome::Succeeded {
+                    let result = task_result(&completion);
+                    if !general_result_response_fits(
+                        &self.inner.store,
+                        agent_id,
+                        &completion,
+                        &result,
+                    )? {
+                        invalidate_untransportable_completion(prepared, &mut completion);
+                    }
                 }
                 match sink.finish_general(&terminal, prepared, &completion) {
                     Ok(state) => Ok(state),

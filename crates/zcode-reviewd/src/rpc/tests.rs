@@ -22,7 +22,7 @@ use std::{
     },
 };
 use zcode_driver::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
-use zcode_protocol::{RequestEnvelope, WireMessage};
+use zcode_protocol::{EventEnvelope, RequestEnvelope, WireMessage};
 
 struct FakeRuntime {
     sink: Arc<dyn LifecycleSink>,
@@ -52,17 +52,43 @@ impl FakeRuntime {
         self.sink.emit(LifecycleRecord { sequence, event });
     }
 
-    fn finish(&self) -> RuntimeTerminal {
+    fn emit_text_delta(&self, event_id: &str, delta: &str) {
+        self.emit(RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type": "model.streaming",
+                    "eventId": event_id,
+                    "payload": {
+                        "kind": "text_delta",
+                        "delta": delta,
+                    },
+                }),
+            },
+        ))));
+    }
+
+    fn publish_terminal(&self, outcome: RuntimeTerminal) -> RuntimeTerminal {
         let mut terminal = self.terminal.lock().unwrap();
         if let Some(terminal) = terminal.as_ref() {
             return terminal.clone();
         }
-        let outcome =
-            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))));
         self.emit(RuntimeEvent::Terminal(outcome.clone()));
         *terminal = Some(outcome.clone());
         self.changed.notify_all();
         outcome
+    }
+
+    fn finish(&self) -> RuntimeTerminal {
+        self.publish_terminal(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )))
+    }
+
+    fn complete(&self) -> RuntimeTerminal {
+        self.publish_terminal(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )))
     }
 }
 
@@ -502,6 +528,61 @@ fn cancel_and_close_return_the_reaped_generic_task_without_followup_rpc() {
     assert!(closed_task.close_requested);
     assert!(closed_task.closed);
     assert!(closed_task.reaped);
+}
+
+#[test]
+fn oversized_terminal_text_persists_a_readable_result_invalid_response() {
+    let fixture = fixture();
+    let (_, agent_id) = submit_general_fixture(
+        &fixture,
+        "result-frame-limit",
+        "feature-result-frame",
+        "owner-result-frame",
+    );
+    fixture.scheduler.start_ready().unwrap();
+    let task = fixture.store.get_task(&agent_id).unwrap().unwrap();
+    let runtime = fixture.factory.runtime(&task.execution_agent_id);
+    let visible_text = "x".repeat(140 * 1024);
+    assert!(visible_text.len() < task.effective_budget.max_result_bytes as usize);
+    runtime.emit_text_delta("result-frame-text", &visible_text);
+    runtime.complete();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.store.get_task(&agent_id).unwrap().unwrap().phase != TaskPhase::Terminal {
+        assert!(Instant::now() < deadline, "task did not reach terminal");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let response = client(&fixture.socket)
+        .call(&request(
+            "large-result",
+            RpcMethod::TaskResult {
+                agent_id,
+                attempt_sequence: None,
+            },
+        ))
+        .unwrap();
+    match response.outcome {
+        RpcOutcome::Success { result } => match *result {
+            RpcSuccess::TaskResult {
+                result: Some(result),
+                artifacts,
+                ..
+            } => {
+                assert_eq!(result.outcome, TaskOutcome::ResultInvalid);
+                assert_eq!(
+                    result.summary,
+                    "terminal result exceeds private RPC response frame"
+                );
+                assert!(result
+                    .residual_gaps
+                    .contains(&"RESULT_RESPONSE_FRAME_EXCEEDED".into()));
+                assert!(artifacts.is_empty());
+            }
+            other => panic!("unexpected task result response: {other:?}"),
+        },
+        RpcOutcome::Error { error } => panic!("large result was not readable: {error:?}"),
+    }
 }
 
 fn request(request_id: &str, method: RpcMethod) -> RpcRequest {

@@ -9,7 +9,7 @@ use review_preparation::{
 use review_store::{
     EffectiveBudget, Job, PendingRequestState, Store, StoreError, StoredArtifact,
     StoredPendingRequest, StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase,
-    TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
+    TaskQueryScope, TaskRecord, TaskResult, TaskSubmissionDisposition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1364,6 +1364,31 @@ impl From<StoredTaskResult> for TaskResultView {
             result_sha256: stored.result_sha256,
         }
     }
+}
+
+pub(crate) fn terminal_result_response_fits(
+    job: &Job,
+    task: &TaskRecord,
+    result: &TaskResult,
+    artifacts: &[TaskArtifactMetadataView],
+) -> bool {
+    let mut task = task_view(job.clone(), task.clone());
+    task.phase = "TERMINAL".into();
+    let response = RpcResponse::success(
+        "r".repeat(MAX_REQUEST_ID_BYTES),
+        RpcSuccess::TaskResult {
+            task,
+            result: Some(TaskResultView::from(StoredTaskResult {
+                result: result.clone(),
+                result_sha256: "0".repeat(64),
+                // `false` is the longer JSON spelling, so this remains safe
+                // for both retained and non-retained terminal results.
+                retained: false,
+            })),
+            artifacts: artifacts.to_vec(),
+        },
+    );
+    serde_json::to_vec(&response).is_ok_and(|frame| frame.len() <= MAX_FRAME_BYTES)
 }
 
 fn pending_request_view(
