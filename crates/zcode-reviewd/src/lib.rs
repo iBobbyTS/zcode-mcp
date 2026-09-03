@@ -2766,6 +2766,15 @@ struct StoreLifecycleSink {
     write_state: Mutex<SinkWriteState>,
     #[cfg(test)]
     after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_natural_completion_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NaturalCompletionAdmission {
+    Ready,
+    Blocked { pending: bool, queued: bool },
+    Bypass,
 }
 
 #[derive(Default)]
@@ -2804,12 +2813,36 @@ impl StoreLifecycleSink {
             write_state: Mutex::new(SinkWriteState::default()),
             #[cfg(test)]
             after_admission_hook: Mutex::new(None),
+            #[cfg(test)]
+            before_natural_completion_hook: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     fn set_after_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.after_admission_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_before_natural_completion_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.before_natural_completion_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn begin_natural_completion(&self) -> Result<NaturalCompletionAdmission, StoreError> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_natural_completion_hook.lock().unwrap().clone() {
+            hook();
+        }
+        let mut attempt = self.attempt.state.lock().unwrap();
+        if attempt.phase != AttemptRuntimePhase::Running {
+            return Ok(NaturalCompletionAdmission::Bypass);
+        }
+        let (pending, queued) = self.store.completion_blockers(&self.agent_id)?;
+        if pending || queued {
+            return Ok(NaturalCompletionAdmission::Blocked { pending, queued });
+        }
+        attempt.phase = AttemptRuntimePhase::Terminal;
+        Ok(NaturalCompletionAdmission::Ready)
     }
 
     fn finish(&self, terminal: &RuntimeTerminal) -> Result<JobState, StoreError> {
@@ -4853,18 +4886,22 @@ impl Scheduler {
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
                     let _guard = operation.lock().unwrap();
-                    if attempt.ingress_reason() == Some("LATE_AFTER_STOP") {
+                    let natural = matches!(terminal, RuntimeTerminal::Completed(_));
+                    if !natural && attempt.ingress_reason() == Some("LATE_AFTER_STOP") {
                         return;
                     }
-                    let natural = matches!(terminal, RuntimeTerminal::Completed(_));
                     if natural {
-                        match scheduler.inner.store.completion_blockers(&agent_id) {
-                            Ok((true, _)) | Err(_) => {
+                        match sink.begin_natural_completion() {
+                            Ok(NaturalCompletionAdmission::Blocked { pending: true, .. })
+                            | Err(_) => {
                                 drop(_guard);
                                 thread::sleep(Duration::from_millis(10));
                                 continue;
                             }
-                            Ok((false, true)) => {
+                            Ok(NaturalCompletionAdmission::Blocked {
+                                pending: false,
+                                queued: true,
+                            }) => {
                                 match scheduler.deliver_next_message(
                                     &agent_id,
                                     &session_id,
@@ -4876,7 +4913,10 @@ impl Scheduler {
                                         drop(_guard);
                                         continue;
                                     }
-                                    Ok(None) => {}
+                                    Ok(None) => {
+                                        drop(_guard);
+                                        continue;
+                                    }
                                     Err(error) => {
                                         scheduler.record_failure(&agent_id, error.to_string());
                                         drop(_guard);
@@ -4884,7 +4924,12 @@ impl Scheduler {
                                     }
                                 }
                             }
-                            Ok((false, false)) => {}
+                            Ok(NaturalCompletionAdmission::Ready)
+                            | Ok(NaturalCompletionAdmission::Bypass) => {}
+                            Ok(NaturalCompletionAdmission::Blocked {
+                                pending: false,
+                                queued: false,
+                            }) => unreachable!("blocked completion has a blocker"),
                         }
                     }
                     check.cancel();
@@ -4945,7 +4990,7 @@ impl Scheduler {
                         continue;
                     };
                     let _guard = operation.lock().unwrap();
-                    if attempt.ingress_reason().is_some() {
+                    if boundary != TurnBoundary::Completed && attempt.ingress_reason().is_some() {
                         return;
                     }
                     let current = runtime.turn_snapshot();
@@ -4957,25 +5002,37 @@ impl Scheduler {
                     }
                     handled_generation = turn.generation;
                     let deadline = scheduler.control_deadline();
-                    match scheduler.deliver_next_message(
-                        &agent_id,
-                        &session_id,
-                        &runtime,
-                        &attempt,
-                        deadline,
-                    ) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            let completion_blocked = scheduler
-                                .inner
-                                .store
-                                .completion_blockers(&agent_id)
-                                .map(|(pending, queued)| pending || queued)
-                                .unwrap_or(true);
-                            if boundary == TurnBoundary::Completed && completion_blocked {
+                    let delivery = if boundary == TurnBoundary::Completed {
+                        match sink.begin_natural_completion() {
+                            Ok(NaturalCompletionAdmission::Ready)
+                            | Ok(NaturalCompletionAdmission::Bypass) => Ok(None),
+                            Ok(NaturalCompletionAdmission::Blocked {
+                                pending: false,
+                                queued: true,
+                            }) => scheduler.deliver_next_message(
+                                &agent_id,
+                                &session_id,
+                                &runtime,
+                                &attempt,
+                                deadline,
+                            ),
+                            Ok(NaturalCompletionAdmission::Blocked { .. }) | Err(_) => {
                                 handled_generation = handled_generation.saturating_sub(1);
                                 continue;
                             }
+                        }
+                    } else {
+                        scheduler.deliver_next_message(
+                            &agent_id,
+                            &session_id,
+                            &runtime,
+                            &attempt,
+                            deadline,
+                        )
+                    };
+                    match delivery {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
                             check.cancel();
                             let terminal = runtime.finish_turn(
                                 boundary,
@@ -7758,6 +7815,99 @@ exec tail -f /dev/null
         queued_runtime.complete_turn(TurnBoundary::Completed);
         let completed = wait_for_task_result(&store, &queued_id);
         assert_eq!(completed.result.outcome, TaskOutcome::Succeeded);
+    }
+
+    #[test]
+    fn admitted_permission_linearizes_before_turn_completed() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "permission-completion-race", None),
+                "feature",
+                "owner",
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.job);
+        let agent_id = submitted.job.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        let sink = {
+            let state = scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&agent_id).unwrap().sink)
+        };
+
+        let rendezvous = Arc::new(Barrier::new(3));
+        let admission_once = Arc::new(AtomicBool::new(false));
+        sink.set_after_admission_hook(Arc::new({
+            let rendezvous = Arc::clone(&rendezvous);
+            let admission_once = Arc::clone(&admission_once);
+            move || {
+                if !admission_once.swap(true, Ordering::AcqRel) {
+                    rendezvous.wait();
+                }
+            }
+        }));
+        let completion_once = Arc::new(AtomicBool::new(false));
+        sink.set_before_natural_completion_hook(Arc::new({
+            let rendezvous = Arc::clone(&rendezvous);
+            let completion_once = Arc::clone(&completion_once);
+            move || {
+                if !completion_once.swap(true, Ordering::AcqRel) {
+                    rendezvous.wait();
+                }
+            }
+        }));
+
+        let emitter = {
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                runtime.emit_event(RuntimeEvent::Driver(Inbound::Message(
+                    WireMessage::Request(RequestEnvelope {
+                        id: WireId::String("permission-completion-wire".into()),
+                        method: INTERACTION_REQUEST_PERMISSION.into(),
+                        params: permission_offer("Read", serde_json::json!({"path":"src/lib.rs"})),
+                    }),
+                )));
+            })
+        };
+        runtime.complete_turn(TurnBoundary::Completed);
+        rendezvous.wait();
+        emitter.join().unwrap();
+
+        let pending = wait_until_condition(|| {
+            store
+                .pending_requests(&agent_id)
+                .unwrap()
+                .into_iter()
+                .find(|request| request.state == PendingRequestState::Pending)
+        });
+        let wait_calls = runtime.wait_terminal_calls.load(Ordering::Acquire);
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        wait_until_condition(|| {
+            (runtime.wait_terminal_calls.load(Ordering::Acquire) > wait_calls).then_some(())
+        });
+        assert!(store.task_result(&agent_id).unwrap().is_none());
+        assert_eq!(scheduler.active_count(), 1);
+        assert_eq!(runtime.stop_calls(), 0);
+        assert!(prepared.worktree.path.exists());
+
+        assert_eq!(
+            scheduler
+                .respond_job(&agent_id, &pending.request_id, "deny", None)
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        let completed = wait_for_task_result(&store, &agent_id);
+        assert_eq!(completed.result.outcome, TaskOutcome::Succeeded);
+        assert!(!completed
+            .result
+            .residual_gaps
+            .contains(&"GENERAL_COMPLETION_PERSIST_FAILED".into()));
+        assert_eq!(scheduler.active_count(), 0);
+        assert_general_workspace_cleaned(&prepared);
     }
 
     fn wait_for_task_result(store: &Store, execution_id: &str) -> review_store::StoredTaskResult {
