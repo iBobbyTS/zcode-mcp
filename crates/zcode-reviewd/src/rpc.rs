@@ -3,13 +3,13 @@ use crate::{
     ResponseDisposition, Scheduler, SchedulerError,
 };
 use review_preparation::{
-    canonical_general_repository, BudgetLimits, GeneralProfile, GeneralTaskManifest,
+    canonical_general_repository, AccessMode, BudgetLimits, GeneralTaskManifest,
     PreparedGeneralTask,
 };
 use review_store::{
-    EffectiveBudget, Job, PendingRequestState, Store, StoreError, StoredArtifact,
-    StoredPendingRequest, StoredTaskResult, TaskKind, TaskOutcome, TaskPageFilter, TaskPhase,
-    TaskQueryScope, TaskRecord, TaskResult, TaskSubmissionDisposition,
+    EffectiveBudget, PendingRequestState, Store, StoreError, StoredArtifact, StoredPendingRequest,
+    StoredTaskResult, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
+    TaskResult, TaskSubmissionDisposition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,10 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const RPC_VERSION: u16 = 11;
+pub const RPC_VERSION: u16 = 12;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 const MAX_REQUEST_ID_BYTES: usize = 128;
-pub const MAX_LIST_JOBS: usize = 100;
+pub const MAX_LIST_TASKS: usize = 100;
 pub const MAX_PENDING_REQUESTS: usize = 100;
 pub const MAX_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 pub const MAX_WAIT: Duration = Duration::from_secs(5);
@@ -53,27 +53,18 @@ pub struct RpcRequest {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum RpcMethod {
     SystemStatus,
-    SubmitGeneral {
-        input: GeneralSubmitInput,
-    },
+    SubmitGeneral { input: GeneralSubmitInput },
     TaskList(TaskListQuery),
     TaskPoll(TaskPollQuery),
     TaskMessage(MessageInput),
     TaskRespond(RespondInput),
-    TaskCancel {
-        agent_id: String,
-    },
-    TaskResult {
-        agent_id: String,
-        #[serde(default)]
-        attempt_sequence: Option<u64>,
-    },
+    TaskCancel { agent_id: String },
+    TaskResult { agent_id: String },
     TaskArtifact(TaskArtifactQuery),
-    TaskClose {
-        agent_id: String,
-    },
+    TaskClose { agent_id: String },
 }
 
 impl RpcMethod {
@@ -100,15 +91,13 @@ pub struct TaskListQuery {
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
-    pub feature_id: Option<String>,
-    #[serde(default)]
-    pub ownership_token: Option<String>,
+    pub group_id: Option<String>,
     #[serde(default)]
     pub phase: Option<TaskPhaseFilter>,
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
     #[serde(default)]
-    pub profile: Option<GeneralProfile>,
+    pub access_mode: Option<AccessMode>,
     #[serde(default)]
     pub cursor: Option<String>,
     pub limit: usize,
@@ -142,8 +131,6 @@ impl From<TaskPhaseFilter> for TaskPhase {
 #[serde(deny_unknown_fields)]
 pub struct TaskArtifactQuery {
     pub agent_id: String,
-    #[serde(default)]
-    pub attempt_sequence: Option<u64>,
     pub artifact_id: String,
     pub offset_bytes: u64,
     pub limit_bytes: usize,
@@ -153,8 +140,8 @@ pub struct TaskArtifactQuery {
 #[serde(deny_unknown_fields)]
 pub struct GeneralSubmitInput {
     pub manifest: GeneralTaskManifest,
-    pub feature_id: String,
-    pub ownership_token: String,
+    #[serde(default)]
+    pub group_id: Option<String>,
     #[serde(default)]
     pub allowed_command_ids: Vec<String>,
     #[serde(default)]
@@ -332,9 +319,8 @@ pub struct SystemStatusView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapabilitiesView {
-    pub task_kinds: Vec<String>,
-    pub profiles: Vec<String>,
-    pub profile_defaults: BTreeMap<String, BudgetLimits>,
+    pub access_modes: Vec<String>,
+    pub access_mode_defaults: BTreeMap<String, BudgetLimits>,
     pub hard_budget_caps: BudgetLimits,
     pub max_rpc_frame_bytes: usize,
     pub max_wait_ms: u64,
@@ -347,7 +333,7 @@ pub struct TaskView {
     pub agent_id: String,
     pub access_mode: String,
     pub phase: String,
-    pub attempt_sequence: u64,
+    pub outcome: Option<TaskOutcome>,
     pub effective_budget: EffectiveBudget,
     pub stop_requested: bool,
     pub close_requested: bool,
@@ -422,7 +408,7 @@ pub struct TaskActivityView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskResultView {
     pub outcome: TaskOutcome,
-    pub summary: String,
+    pub final_text: String,
     pub partial: bool,
     pub retained: bool,
     pub base_commit: Option<String>,
@@ -672,27 +658,27 @@ impl RpcService {
                 status: self.system_status(),
             }),
             RpcMethod::SubmitGeneral { input } => {
-                validate_text(&input.feature_id, "feature_id", 256)?;
-                validate_text(&input.ownership_token, "ownership_token", 512)?;
+                if let Some(group_id) = input.group_id.as_deref() {
+                    validate_text(group_id, "group_id", 256)?;
+                }
                 validate_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
                 validate_command_ids(&input.required_command_ids, "required_command_ids")?;
                 let submitted = self
                     .scheduler
                     .enqueue_general_with_commands(
                         &input.manifest,
-                        &input.feature_id,
-                        &input.ownership_token,
+                        input.group_id.as_deref(),
                         &input.allowed_command_ids,
                         &input.required_command_ids,
                     )
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
-                    task: task_view(submitted.job, submitted.task),
+                    task: task_view(submitted.task),
                     disposition: submitted.disposition.into(),
                 })
             }
             RpcMethod::TaskList(query) => {
-                if query.limit == 0 || query.limit > MAX_LIST_JOBS {
+                if query.limit == 0 || query.limit > MAX_LIST_TASKS {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
                         "task list limit is outside the allowed range",
@@ -700,12 +686,7 @@ impl RpcService {
                 }
                 for (field, value, cap) in [
                     ("repository", query.repository.as_deref(), 4096usize),
-                    ("feature_id", query.feature_id.as_deref(), 256usize),
-                    (
-                        "ownership_token",
-                        query.ownership_token.as_deref(),
-                        512usize,
-                    ),
+                    ("group_id", query.group_id.as_deref(), 256usize),
                 ] {
                     if let Some(value) = value {
                         validate_text(value, field, cap)?;
@@ -714,10 +695,7 @@ impl RpcService {
                 if let Some(cursor) = query.cursor.as_deref() {
                     validate_text(cursor, "cursor", 64)?;
                 }
-                if query.repository.is_none()
-                    && query.feature_id.is_none()
-                    && query.ownership_token.is_none()
-                {
+                if query.repository.is_none() && query.group_id.is_none() {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
                         "at least one task list scope is required",
@@ -732,20 +710,18 @@ impl RpcService {
                         RpcError::new(RpcErrorCode::Validation, "repository scope is invalid")
                     })?
                     .map(|repository| repository.to_string_lossy().into_owned());
-                let profile = query.profile.map(general_profile_name);
+                let access_mode = query.access_mode.map(access_mode_name);
                 let page = self
                     .store
                     .list_task_page(
                         TaskQueryScope {
                             repository: canonical_repository.as_deref(),
-                            feature_id: query.feature_id.as_deref(),
-                            ownership_token: query.ownership_token.as_deref(),
+                            group_id: query.group_id.as_deref(),
                         },
-                        Some(TaskKind::General),
                         TaskPageFilter {
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
-                            profile,
+                            access_mode,
                         },
                         query.cursor.as_deref().map(parse_task_cursor).transpose()?,
                         query.limit,
@@ -753,14 +729,7 @@ impl RpcService {
                     .map_err(map_store)?;
                 let mut views = Vec::with_capacity(page.tasks.len());
                 for task in page.tasks {
-                    let job = self
-                        .store
-                        .get_job(&task.execution_agent_id)
-                        .map_err(map_store)?
-                        .ok_or_else(|| {
-                            RpcError::new(RpcErrorCode::Internal, "task job disappeared")
-                        })?;
-                    views.push(task_view(job, task));
+                    views.push(task_view(task));
                 }
                 Ok(RpcSuccess::TaskListed {
                     tasks: views,
@@ -769,7 +738,7 @@ impl RpcService {
             }
             RpcMethod::TaskPoll(query) => self.task_poll(query),
             RpcMethod::TaskMessage(input) => {
-                let (_, task) = self.require_task(&input.agent_id)?;
+                let task = self.require_task(&input.agent_id)?;
                 validate_id(&input.message_id, "message_id")?;
                 // The generic control plane only queues clarification.  A
                 // terminal task must be resumed by creating a new agent;
@@ -784,89 +753,85 @@ impl RpcService {
                 validate_text(&input.content, "content", 16 * 1024)?;
                 let disposition = self
                     .scheduler
-                    .message_job(
-                        &task.execution_agent_id,
+                    .queue_message(
+                        &task.agent_id,
                         &input.message_id,
                         &input.mode,
                         &input.content,
                     )
                     .map_err(map_scheduler)?;
-                let (job, task) = self.require_task(&input.agent_id)?;
+                let task = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Message {
                     disposition: disposition.into(),
-                    task: task_view(job, task),
+                    task: task_view(task),
                 })
             }
             RpcMethod::TaskRespond(input) => {
-                let (_, task) = self.require_task(&input.agent_id)?;
+                let task = self.require_task(&input.agent_id)?;
                 validate_id(&input.request_id, "request_id")?;
                 if let Some(content) = input.content.as_deref() {
                     validate_text(content, "response content", 16 * 1024)?;
                 }
                 let outcome = self
                     .scheduler
-                    .respond_job(
-                        &task.execution_agent_id,
+                    .respond_request(
+                        &task.agent_id,
                         &input.request_id,
                         input.decision.as_str(),
                         input.content.as_deref(),
                     )
                     .map_err(map_scheduler)?;
-                let (job, task) = self.require_task(&input.agent_id)?;
+                let task = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Respond {
                     outcome: outcome.into(),
-                    task: task_view(job, task),
+                    task: task_view(task),
                 })
             }
             RpcMethod::TaskCancel { agent_id } => {
-                let (_, task) = self.require_task(&agent_id)?;
+                let task = self.require_task(&agent_id)?;
                 self.scheduler
-                    .stop_job(&task.execution_agent_id)
+                    .cancel_task(&task.agent_id)
                     .map_err(map_scheduler)?;
                 self.scheduler
-                    .reap_job(&task.execution_agent_id)
+                    .reap_task(&task.agent_id)
                     .map_err(map_scheduler)?;
-                let (job, task) = self.require_task(&agent_id)?;
+                let task = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Stopped {
-                    task: task_view(job, task),
+                    task: task_view(task),
                 })
             }
-            RpcMethod::TaskResult {
-                agent_id,
-                attempt_sequence,
-            } => {
-                let (job, task) = self.require_task_attempt(&agent_id, attempt_sequence)?;
+            RpcMethod::TaskResult { agent_id } => {
+                let task = self.require_task(&agent_id)?;
                 let artifacts = self.task_artifact_metadata(&task)?;
                 let result = self
                     .store
-                    .task_result(&task.execution_agent_id)
+                    .task_result(&task.agent_id)
                     .map_err(map_store)?
-                    .map(|stored| self.task_result_view(&job, &task, stored, &artifacts))
+                    .map(|stored| self.task_result_view(stored))
                     .transpose()?;
                 Ok(RpcSuccess::TaskResult {
-                    task: task_view(job, task),
+                    task: task_view(task),
                     result,
                     artifacts,
                 })
             }
             RpcMethod::TaskArtifact(query) => {
-                let (_, task) =
-                    self.require_task_attempt(&query.agent_id, query.attempt_sequence)?;
+                let task = self.require_task(&query.agent_id)?;
                 Ok(RpcSuccess::TaskArtifact {
                     chunk: self.task_artifact_chunk(&task, &query)?,
                 })
             }
             RpcMethod::TaskClose { agent_id } => {
-                let (_, task) = self.require_task(&agent_id)?;
+                let task = self.require_task(&agent_id)?;
                 self.scheduler
-                    .close_job(&task.execution_agent_id)
+                    .close_task(&task.agent_id)
                     .map_err(map_scheduler)?;
                 self.scheduler
-                    .reap_job(&task.execution_agent_id)
+                    .reap_task(&task.agent_id)
                     .map_err(map_scheduler)?;
-                let (job, task) = self.require_task(&agent_id)?;
+                let task = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Closed {
-                    task: task_view(job, task),
+                    task: task_view(task),
                 })
             }
         }
@@ -897,69 +862,32 @@ impl RpcService {
         }
     }
 
-    fn require_task(&self, agent_id: &str) -> Result<(Job, TaskRecord), RpcError> {
+    fn require_task(&self, agent_id: &str) -> Result<TaskRecord, RpcError> {
         validate_id(agent_id, "agent_id")?;
         let task = self
             .store
             .get_task(agent_id)
             .map_err(map_store)?
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        self.require_task_record(task)
-    }
-
-    fn require_task_attempt(
-        &self,
-        agent_id: &str,
-        attempt_sequence: Option<u64>,
-    ) -> Result<(Job, TaskRecord), RpcError> {
-        let latest = self.require_task(agent_id)?;
-        let Some(attempt_sequence) = attempt_sequence else {
-            return Ok(latest);
-        };
-        if attempt_sequence == 0 {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "attempt_sequence must be positive",
-            ));
-        }
-        if latest.1.attempt_sequence == attempt_sequence {
-            return Ok(latest);
-        }
-        let task = self
-            .store
-            .get_task_attempt(agent_id, attempt_sequence)
-            .map_err(map_store)?
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task attempt was not found"))?;
-        self.require_task_record(task)
-    }
-
-    fn require_task_record(&self, task: TaskRecord) -> Result<(Job, TaskRecord), RpcError> {
-        let job = self
-            .store
-            .get_job(&task.execution_agent_id)
-            .map_err(map_store)?
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let prepared_json = job
-            .prepared_launch_json
-            .as_deref()
-            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let prepared_repository = serde_json::from_str::<PreparedGeneralTask>(prepared_json)
-            .map(|prepared| prepared.repository)
+        let prepared = serde_json::from_str::<PreparedGeneralTask>(&task.prepared_launch_json)
             .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        if prepared_repository.to_string_lossy() != task.repository {
+        let prepared_access_mode = match prepared.access_mode {
+            AccessMode::ReadOnly => "read_only",
+            AccessMode::WorkspaceWrite => "workspace_write",
+        };
+        if prepared.repository.to_string_lossy() != task.repository
+            || prepared_access_mode != task.access_mode
+        {
             return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
         }
-        Ok((job, task))
+        Ok(task)
     }
 
     fn task_artifact_metadata(
         &self,
         task: &TaskRecord,
     ) -> Result<Vec<TaskArtifactMetadataView>, RpcError> {
-        let result = self
-            .store
-            .task_result(&task.execution_agent_id)
-            .map_err(map_store)?;
+        let result = self.store.task_result(&task.agent_id).map_err(map_store)?;
         let allowed = result
             .as_ref()
             .map(|stored| {
@@ -974,7 +902,7 @@ impl RpcService {
         let mut projected = Vec::new();
         for artifact in self
             .store
-            .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+            .artifacts(&task.agent_id, MAX_PENDING_REQUESTS)
             .map_err(map_store)?
         {
             let permitted = allowed
@@ -993,13 +921,7 @@ impl RpcService {
         Ok(projected)
     }
 
-    fn task_result_view(
-        &self,
-        _job: &Job,
-        _task: &TaskRecord,
-        stored: StoredTaskResult,
-        _artifacts: &[TaskArtifactMetadataView],
-    ) -> Result<TaskResultView, RpcError> {
+    fn task_result_view(&self, stored: StoredTaskResult) -> Result<TaskResultView, RpcError> {
         Ok(TaskResultView::from(stored))
     }
 
@@ -1028,7 +950,7 @@ impl RpcService {
         }
         let stored = self
             .store
-            .artifacts(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+            .artifacts(&task.agent_id, MAX_PENDING_REQUESTS)
             .map_err(map_store)?
             .into_iter()
             .find(|artifact| artifact.artifact_id == query.artifact_id)
@@ -1045,28 +967,26 @@ impl RpcService {
         }
         let deadline = Instant::now() + Duration::from_millis(query.timeout_ms);
         loop {
-            let (job, task) = self.require_task(&query.agent_id)?;
-            let policy = self.scheduler.active_policy(&task.execution_agent_id);
+            let task = self.require_task(&query.agent_id)?;
+            let policy = self.scheduler.active_policy(&task.agent_id);
             let pending_requests = self
                 .store
-                .pending_requests_bounded(&task.execution_agent_id, MAX_PENDING_REQUESTS)
+                .pending_requests_bounded(&task.agent_id, MAX_PENDING_REQUESTS)
                 .map_err(map_store)?
                 .into_iter()
                 .map(|request| pending_request_view(policy.as_deref(), request))
                 .collect::<Vec<_>>();
             let result_available = self
                 .store
-                .task_result(&task.execution_agent_id)
+                .task_result(&task.agent_id)
                 .map_err(map_store)?
                 .is_some();
-            let activity = self
-                .scheduler
-                .passive_activity_snapshot(&task.execution_agent_id);
+            let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
             let revision = activity
                 .as_ref()
                 .map(|activity| activity.revision)
                 .unwrap_or(0)
-                .max(job.last_event_seq);
+                .max(task.last_event_seq);
             let terminal = task.phase == TaskPhase::Terminal;
             let now = Instant::now();
             if revision > query.after_revision
@@ -1080,7 +1000,7 @@ impl RpcService {
                     && now >= deadline;
                 return Ok(RpcSuccess::TaskPoll {
                     activity: task_activity_view(task.phase, activity),
-                    task: task_view(job, task),
+                    task: task_view(task),
                     revision,
                     next_revision: revision,
                     pending_requests,
@@ -1102,37 +1022,25 @@ fn opaque_generation() -> Result<String, RpcServiceConfigError> {
 }
 
 fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
-    let mut profile_defaults = BTreeMap::new();
-    profile_defaults.insert(
-        "analysis_readonly".into(),
-        GeneralProfile::AnalysisReadonly.default_budget(),
+    let mut access_mode_defaults = BTreeMap::new();
+    access_mode_defaults.insert(
+        "workspace_write".into(),
+        AccessMode::WorkspaceWrite.default_budget(),
     );
-    profile_defaults.insert(
-        "implementation_worktree".into(),
-        GeneralProfile::ImplementationWorktree.default_budget(),
-    );
-    profile_defaults.insert(
-        "test_runner".into(),
-        GeneralProfile::TestRunner.default_budget(),
-    );
+    access_mode_defaults.insert("read_only".into(), AccessMode::ReadOnly.default_budget());
     let maturity = BTreeMap::from([
         (
-            "analysis_readonly".into(),
+            "read_only".into(),
             CapabilityMaturityView::ExperimentalUnverifiedRuntime,
         ),
         (
-            "implementation_worktree".into(),
-            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
-        ),
-        (
-            "test_runner".into(),
+            "workspace_write".into(),
             CapabilityMaturityView::ExperimentalUnverifiedRuntime,
         ),
     ]);
     AgentCapabilitiesView {
-        task_kinds: vec!["general".into()],
-        profiles: profile_defaults.keys().cloned().collect(),
-        profile_defaults,
+        access_modes: access_mode_defaults.keys().cloned().collect(),
+        access_mode_defaults,
         hard_budget_caps: BudgetLimits {
             absolute_wall_time_ms: 86_400_000,
             runtime_activity_idle_timeout_ms: 86_400_000,
@@ -1152,11 +1060,10 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
     }
 }
 
-fn general_profile_name(profile: GeneralProfile) -> &'static str {
-    match profile {
-        GeneralProfile::AnalysisReadonly => "analysis_readonly",
-        GeneralProfile::ImplementationWorktree => "implementation_worktree",
-        GeneralProfile::TestRunner => "test_runner",
+fn access_mode_name(access_mode: AccessMode) -> &'static str {
+    match access_mode {
+        AccessMode::ReadOnly => "read_only",
+        AccessMode::WorkspaceWrite => "workspace_write",
     }
 }
 
@@ -1239,22 +1146,10 @@ fn verified_artifact_chunk(
     })
 }
 
-fn task_view(job: Job, task: TaskRecord) -> TaskView {
-    let access_mode = job
-        .prepared_launch_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<PreparedGeneralTask>(json).ok())
-        .map(|prepared| match prepared.profile {
-            GeneralProfile::AnalysisReadonly => "read_only",
-            GeneralProfile::ImplementationWorktree | GeneralProfile::TestRunner => {
-                "workspace_write"
-            }
-        })
-        .unwrap_or("read_only")
-        .to_owned();
+fn task_view(task: TaskRecord) -> TaskView {
     TaskView {
-        agent_id: task.public_agent_id,
-        access_mode,
+        agent_id: task.agent_id,
+        access_mode: task.access_mode,
         phase: match task.phase {
             TaskPhase::Queued => "QUEUED",
             TaskPhase::Preparing => "PREPARING",
@@ -1264,12 +1159,12 @@ fn task_view(job: Job, task: TaskRecord) -> TaskView {
             TaskPhase::Terminal => "TERMINAL",
         }
         .into(),
-        attempt_sequence: task.attempt_sequence,
+        outcome: task.outcome,
         effective_budget: task.effective_budget,
-        stop_requested: job.stop_requested,
-        close_requested: job.close_requested,
-        closed: job.closed_at.is_some(),
-        reaped: job.reaped_at.is_some(),
+        stop_requested: task.stop_requested,
+        close_requested: task.close_requested,
+        closed: task.closed_at.is_some(),
+        reaped: task.reaped_at.is_some(),
     }
 }
 
@@ -1351,7 +1246,7 @@ impl From<StoredTaskResult> for TaskResultView {
     fn from(stored: StoredTaskResult) -> Self {
         Self {
             outcome: stored.result.outcome,
-            summary: stored.result.summary,
+            final_text: stored.result.final_text,
             partial: stored.result.partial,
             retained: stored.retained,
             base_commit: stored.result.base_commit,
@@ -1367,25 +1262,24 @@ impl From<StoredTaskResult> for TaskResultView {
 }
 
 pub(crate) fn terminal_result_response_fits(
-    job: &Job,
     task: &TaskRecord,
     result: &TaskResult,
     artifacts: &[TaskArtifactMetadataView],
 ) -> bool {
     let worst_case_request_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
-    terminal_result_response_size(job, task, result, artifacts, &worst_case_request_id)
+    terminal_result_response_size(task, result, artifacts, &worst_case_request_id)
         .is_some_and(|size| size <= MAX_FRAME_BYTES)
 }
 
 fn terminal_result_response_size(
-    job: &Job,
     task: &TaskRecord,
     result: &TaskResult,
     artifacts: &[TaskArtifactMetadataView],
     request_id: &str,
 ) -> Option<usize> {
-    let mut task = task_view(job.clone(), task.clone());
+    let mut task = task_view(task.clone());
     task.phase = "TERMINAL".into();
+    task.outcome = Some(result.outcome);
     let response = RpcResponse::success(
         request_id.into(),
         RpcSuccess::TaskResult {
@@ -1568,6 +1462,9 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
 
 fn map_store(error: StoreError) -> RpcError {
     match error {
+        StoreError::LegacySchemaUnsupported => {
+            RpcError::new(RpcErrorCode::Persistence, "LEGACY_SCHEMA_UNSUPPORTED")
+        }
         StoreError::Sqlite(_) => {
             RpcError::new(RpcErrorCode::Persistence, "durable store operation failed")
         }

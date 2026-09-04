@@ -1,4 +1,4 @@
-use crate::{PreparationError, PreparationResult};
+use crate::{AccessMode, PreparationError, PreparationResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -81,14 +81,6 @@ fn is_false(value: &bool) -> bool {
 pub enum ExternalDecision {
     Allow,
     Deny,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyMode {
-    ReviewReadonly,
-    GeneralReadonly,
-    GeneralTest,
-    GeneralImplementation { tracked_write_roots: Vec<PathBuf> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +204,8 @@ pub struct PolicyLauncher {
     commands: BTreeMap<String, PreparedCommand>,
     network_allowed: bool,
     capabilities: PolicyCapabilities,
-    mode: PolicyMode,
+    access_mode: AccessMode,
+    tracked_write_roots: Vec<PathBuf>,
 }
 
 impl PolicyLauncher {
@@ -253,10 +246,12 @@ impl PolicyLauncher {
             commands,
             network_allowed,
             capabilities,
-            mode: PolicyMode::ReviewReadonly,
+            access_mode: AccessMode::ReadOnly,
+            tracked_write_roots: Vec::new(),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn for_general(
         worktree: PathBuf,
         scratch_root: PathBuf,
@@ -264,7 +259,8 @@ impl PolicyLauncher {
         readable_inputs: Vec<PathBuf>,
         commands: BTreeMap<String, PreparedCommand>,
         capabilities: PolicyCapabilities,
-        mode: PolicyMode,
+        access_mode: AccessMode,
+        mut tracked_write_roots: Vec<PathBuf>,
     ) -> PreparationResult<Self> {
         let mut launcher = Self::new(
             worktree,
@@ -275,11 +271,8 @@ impl PolicyLauncher {
             false,
             capabilities,
         )?;
-        launcher.mode = mode;
-        if let PolicyMode::GeneralImplementation {
-            tracked_write_roots,
-        } = &mut launcher.mode
-        {
+        launcher.access_mode = access_mode;
+        if access_mode == AccessMode::WorkspaceWrite {
             for root in tracked_write_roots.iter_mut() {
                 *root = lexical_confined_path(&launcher.worktree, root)?;
                 if protected_worktree_path(&launcher.worktree, root) {
@@ -288,7 +281,12 @@ impl PolicyLauncher {
                     ));
                 }
             }
+        } else if !tracked_write_roots.is_empty() {
+            return Err(PreparationError::Policy(
+                "read-only access cannot define tracked write roots".into(),
+            ));
         }
+        launcher.tracked_write_roots = tracked_write_roots;
         Ok(launcher)
     }
 
@@ -366,7 +364,7 @@ impl PolicyLauncher {
         };
         let input = params.get("input").unwrap_or(&serde_json::Value::Null);
         if tool_name == "Bash" {
-            if !matches!(self.mode, PolicyMode::ReviewReadonly) {
+            if self.access_mode != AccessMode::ReadOnly {
                 return PermissionDecision {
                     allowed: false,
                     reason: "permission_request_unrecognized",
@@ -600,7 +598,7 @@ impl PolicyLauncher {
     pub fn run_cancellable(
         &self,
         command_id: &str,
-        attempt_deadline: Instant,
+        task_deadline: Instant,
         cancellation: &AtomicBool,
     ) -> PreparationResult<ValidationOutput> {
         let prepared = self.commands.get(command_id).ok_or_else(|| {
@@ -627,7 +625,7 @@ impl PolicyLauncher {
         if !decision.allowed {
             return Err(PreparationError::Policy(decision.reason.into()));
         }
-        execute(prepared, attempt_deadline, cancellation)
+        execute(prepared, task_deadline, cancellation)
     }
 
     fn hard_deny_reason(&self, request: &PermissionRequest) -> Option<&'static str> {
@@ -791,20 +789,20 @@ impl PolicyLauncher {
             if protected_worktree_path(&self.worktree, target) {
                 return Some("protected_worktree_metadata_denied");
             }
-            return match &self.mode {
-                PolicyMode::GeneralImplementation {
-                    tracked_write_roots,
-                } if tracked_write_roots
-                    .iter()
-                    .any(|root| target.starts_with(root)) =>
+            return match self.access_mode {
+                AccessMode::WorkspaceWrite
+                    if self
+                        .tracked_write_roots
+                        .iter()
+                        .any(|root| target.starts_with(root)) =>
                 {
                     None
                 }
-                PolicyMode::GeneralImplementation { .. } => Some("tracked_path_not_allowlisted"),
-                _ => Some("tracked_writes_denied_for_profile"),
+                AccessMode::WorkspaceWrite => Some("tracked_path_not_allowlisted"),
+                AccessMode::ReadOnly => Some("tracked_writes_denied_for_access_mode"),
             };
         }
-        if !matches!(self.mode, PolicyMode::ReviewReadonly) && target.starts_with(report_root) {
+        if target.starts_with(report_root) {
             return Some("daemon_artifact_root_denied");
         }
         if target == self.scratch_root
@@ -2464,7 +2462,7 @@ fn validate_git_path_value(
 
 fn execute(
     prepared: &PreparedCommand,
-    attempt_deadline: Instant,
+    task_deadline: Instant,
     cancellation: &AtomicBool,
 ) -> PreparationResult<ValidationOutput> {
     let mut command = Command::new(&prepared.program);
@@ -2496,8 +2494,8 @@ fn execute(
     let stderr_reader = spawn_reader(stderr, max_stderr, Arc::clone(&output_limited));
     let command_deadline = Instant::now()
         .checked_add(Duration::from_millis(prepared.timeout_ms))
-        .unwrap_or(attempt_deadline);
-    let deadline = command_deadline.min(attempt_deadline);
+        .unwrap_or(task_deadline);
+    let deadline = command_deadline.min(task_deadline);
     let (status, timed_out, cancelled) = loop {
         if let Some(status) = child.try_wait()? {
             break (status, false, false);

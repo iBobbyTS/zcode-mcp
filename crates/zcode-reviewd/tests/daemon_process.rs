@@ -1,10 +1,10 @@
 #![cfg(unix)]
 
 use review_preparation::{
-    general_launch_prompt, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
+    general_launch_prompt, AccessMode, GeneralTaskManifest, GeneralTaskPreparer,
     GENERAL_TASK_SCHEMA,
 };
-use review_store::{BudgetRequest, EffectiveBudget, JobState, NewJob, NewTask, Store, TaskKind};
+use review_store::{BudgetRequest, EffectiveBudget, NewTask, Store, TaskPhase};
 use std::{
     io::{Read, Write},
     os::unix::net::UnixListener,
@@ -61,10 +61,10 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     let head = git_text(&repository, &["rev-parse", "HEAD"]);
     let manifest = GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
-        task_id: "daemon-job".into(),
+        agent_id: "daemon-job".into(),
         repository,
         base_ref: head,
-        profile: GeneralProfile::AnalysisReadonly,
+        access_mode: AccessMode::ReadOnly,
         prompt: "permission input".into(),
         repo_context: vec!["src/lib.rs".into()],
         attachments: Vec::new(),
@@ -80,13 +80,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .unwrap()
         .prepare_submission(&manifest)
         .unwrap();
-    let agent_id = prepared.task_id.clone();
-    let mut queued = NewJob::new(&agent_id, prepared.worktree.path.to_string_lossy());
-    queued.idempotency_key = Some(prepared.idempotency_key.clone());
-    queued.feature_id = Some("feature".into());
-    queued.initial_prompt = general_launch_prompt(&prepared, &manifest.prompt).unwrap();
-    queued.prepared_launch_json = Some(serde_json::to_string(&prepared).unwrap());
-    queued.prepared_launch_sha256 = Some(prepared.prepared_sha256.clone());
+    let agent_id = prepared.agent_id.clone();
     let budget = EffectiveBudget {
         absolute_wall_time_ms: prepared.effective_budget.absolute_wall_time_ms,
         runtime_activity_idle_timeout_ms: prepared
@@ -103,13 +97,17 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     };
     Store::open(&database)
         .unwrap()
-        .enqueue_task(&NewTask {
-            job: queued,
-            public_agent_id: agent_id.clone(),
-            task_kind: TaskKind::General,
+        .enqueue_task_authoritative(&NewTask {
+            agent_id: agent_id.clone(),
+            idempotency_key: prepared.idempotency_key.clone(),
             repository: prepared.repository.to_string_lossy().into_owned(),
-            feature_id: "feature".into(),
-            ownership_token: "daemon-process-test".into(),
+            group_id: Some("daemon-process-test".into()),
+            access_mode: "read_only".into(),
+            workspace_path: prepared.worktree.path.to_string_lossy().into_owned(),
+            runtime_hash: None,
+            prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
+            prepared_launch_sha256: prepared.prepared_sha256.clone(),
+            initial_prompt: general_launch_prompt(&prepared, &manifest.prompt).unwrap(),
             budget: BudgetRequest::Limits(budget),
             retain_partial: false,
         })
@@ -144,7 +142,8 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         );
         if matches!(
             status,
-            RpcSuccess::TaskPoll { ref task, .. } if task.phase == "RUNNING"
+            RpcSuccess::TaskPoll { ref task, .. }
+                if matches!(task.phase.as_str(), "RUNNING" | "WAITING_INPUT")
         ) {
             break;
         }
@@ -241,11 +240,12 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
                 ))
                 .unwrap()
         ),
-        RpcSuccess::TaskPoll { ref task, .. } if task.phase == "RUNNING"
+        RpcSuccess::TaskPoll { ref task, .. }
+            if matches!(task.phase.as_str(), "RUNNING" | "WAITING_INPUT")
     ));
     let identity = Store::open(&database)
         .unwrap()
-        .get_job(&agent_id)
+        .get_task(&agent_id)
         .unwrap()
         .unwrap()
         .process_identity
@@ -283,10 +283,10 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .is_empty());
     let job = Store::open(&database)
         .unwrap()
-        .get_job(&agent_id)
+        .get_task(&agent_id)
         .unwrap()
         .unwrap();
-    assert_eq!(job.state, JobState::Cancelled);
+    assert_eq!(job.phase, TaskPhase::Terminal);
     assert!(job.closed_at.is_some());
 }
 
@@ -336,7 +336,20 @@ fn signal_before_daemon_start_exits_without_socket_runtime_or_durable_activation
     gate_listener.set_nonblocking(true).unwrap();
     let store = Store::open(&database).unwrap();
     store
-        .enqueue_job(&NewJob::new("startup-job", "/workspace"))
+        .enqueue_task_authoritative(&NewTask {
+            agent_id: "startup-job".into(),
+            idempotency_key: "startup-job".into(),
+            repository: "/workspace".into(),
+            group_id: None,
+            access_mode: "read_only".into(),
+            workspace_path: "/workspace".into(),
+            runtime_hash: None,
+            prepared_launch_json: "{}".into(),
+            prepared_launch_sha256: "prepared".into(),
+            initial_prompt: "test".into(),
+            budget: BudgetRequest::Omitted,
+            retain_partial: false,
+        })
         .unwrap();
     drop(store);
 
@@ -408,8 +421,8 @@ fn signal_before_daemon_start_exits_without_socket_runtime_or_durable_activation
     ));
 
     let store = Store::open(&database).unwrap();
-    let job = store.get_job("startup-job").unwrap().unwrap();
-    assert_eq!(job.state, JobState::Queued);
+    let job = store.get_task("startup-job").unwrap().unwrap();
+    assert_eq!(job.phase, TaskPhase::Queued);
     assert!(
         job.process_identity.is_none(),
         "a runtime process group started"

@@ -1,9 +1,8 @@
 use review_preparation::{
-    general_control_header, general_launch_prompt, AttachmentInput, CompletionOutcome,
-    ExternalDecision, GeneralArtifactKind, GeneralCompletion, GeneralFinalizer,
-    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
-    PermissionRequest, PolicyCapabilities, PolicyLauncher, PreparationError, PreparedGeneralTask,
-    ValidationCommand, GENERAL_TASK_SCHEMA,
+    general_control_header, general_launch_prompt, AccessMode, AttachmentInput, CompletionOutcome,
+    ExternalDecision, GeneralCompletion, GeneralFinalizer, GeneralNamedCommand,
+    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PolicyCapabilities,
+    PolicyLauncher, PreparationError, PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,7 +22,7 @@ struct Fixture {
 }
 
 #[test]
-fn review_policy_protects_generic_agent_metadata_without_filename_heuristics() {
+fn readonly_policy_protects_generic_agent_metadata_without_filename_heuristics() {
     let f = Fixture::new();
     let scratch = f.repository.join("policy-scratch");
     let reports = f.repository.join("policy-reports");
@@ -121,13 +120,13 @@ impl Fixture {
             head,
         }
     }
-    fn manifest(&self, profile: GeneralProfile) -> GeneralTaskManifest {
+    fn manifest(&self, access_mode: AccessMode) -> GeneralTaskManifest {
         GeneralTaskManifest {
             schema: GENERAL_TASK_SCHEMA.into(),
-            task_id: "task-1".into(),
+            agent_id: "task-1".into(),
             repository: self.repository.clone(),
             base_ref: self.head.clone(),
-            profile,
+            access_mode,
             prompt: "Inspect and produce the bounded result.".into(),
             repo_context: vec!["README.md".into()],
             attachments: vec![AttachmentInput {
@@ -135,7 +134,7 @@ impl Fixture {
                 source_path: self.attachments.join("notes.txt"),
                 allowed_root: self.attachments.clone(),
             }],
-            write_manifest: if profile == GeneralProfile::ImplementationWorktree {
+            write_manifest: if access_mode == AccessMode::WorkspaceWrite {
                 vec!["src".into()]
             } else {
                 vec![]
@@ -145,7 +144,7 @@ impl Fixture {
             budget: None,
             validation_commands: BTreeMap::new(),
             retain_partial: false,
-            idempotency_key: format!("task-1-{profile:?}"),
+            idempotency_key: format!("task-1-{access_mode:?}"),
         }
     }
     fn preparer(&self) -> GeneralTaskPreparer {
@@ -154,15 +153,15 @@ impl Fixture {
 }
 
 #[test]
-fn preparation_snapshots_immutable_context_and_uses_profile_defaults() {
+fn preparation_snapshots_immutable_context_and_uses_access_mode_defaults() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     assert_eq!(
         prepared.effective_budget,
-        GeneralProfile::AnalysisReadonly.default_budget()
+        AccessMode::ReadOnly.default_budget()
     );
     assert!(prepared
         .worktree
@@ -187,7 +186,7 @@ fn preparation_snapshots_immutable_context_and_uses_profile_defaults() {
 #[test]
 fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.prompt = "Analyze the bounded input without an operational reminder.".into();
     let named = BTreeMap::from([(
         "unit".into(),
@@ -209,7 +208,7 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     let header = general_control_header(&prepared).unwrap();
     assert_eq!(header, general_control_header(&prepared).unwrap());
     assert!(header.starts_with("--- BEGIN DAEMON GENERAL CONTROL"));
-    assert!(header.contains("\"profile\": \"test_runner\""));
+    assert!(header.contains("\"access_mode\": \"read_only\""));
     assert!(header.contains("\"command_id\": \"unit\""));
     assert!(header.contains("daemon finalizes a matching turn.completed boundary"));
     assert!(header.contains("daemon owns outcome classification"));
@@ -233,8 +232,8 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
         .unwrap();
     assert_eq!(general_control_header(&replay).unwrap(), header);
 
-    let mut different = f.manifest(GeneralProfile::TestRunner);
-    different.task_id = "different-control".into();
+    let mut different = f.manifest(AccessMode::ReadOnly);
+    different.agent_id = "different-control".into();
     different.idempotency_key = "different-control".into();
     different.prompt = manifest.prompt.clone();
     let mut changed_named = named.clone();
@@ -246,20 +245,20 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     assert_ne!(general_control_header(&changed).unwrap(), header);
     assert_ne!(changed.manifest_sha256, prepared.manifest_sha256);
 
-    let mut implementation = f.manifest(GeneralProfile::ImplementationWorktree);
-    implementation.task_id = "implementation-control".into();
+    let mut implementation = f.manifest(AccessMode::WorkspaceWrite);
+    implementation.agent_id = "implementation-control".into();
     implementation.idempotency_key = "implementation-control".into();
     implementation.prompt = manifest.prompt.clone();
     let implementation = f.preparer().prepare_submission(&implementation).unwrap();
     let implementation_header = general_control_header(&implementation).unwrap();
-    assert!(implementation_header.contains("\"profile\": \"implementation_worktree\""));
+    assert!(implementation_header.contains("\"access_mode\": \"workspace_write\""));
     assert!(implementation_header.contains("\"write_manifest\": [\n    \"src\""));
     assert!(!implementation_header.contains("changes_patch"));
     assert_ne!(implementation.manifest_sha256, prepared.manifest_sha256);
 
-    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
-    assert!(GeneralFinalizer::finalize(&changed, CompletionOutcome::Blocked).cleaned);
-    assert!(GeneralFinalizer::finalize(&implementation, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed).cleaned);
+    assert!(GeneralFinalizer::finalize(&changed, CompletionOutcome::Failed).cleaned);
+    assert!(GeneralFinalizer::finalize(&implementation, CompletionOutcome::Failed).cleaned);
 }
 
 #[test]
@@ -277,7 +276,7 @@ fn named_command_identity_uses_pinned_base_canonical_cwd() {
     fs::remove_file(f.repository.join("command-cwd")).unwrap();
     symlink("current", f.repository.join("command-cwd")).unwrap();
 
-    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.base_ref = pinned_base;
     manifest.idempotency_key = "pinned-command-cwd".into();
     let named = BTreeMap::from([(
@@ -313,13 +312,13 @@ fn named_command_identity_uses_pinned_base_canonical_cwd() {
         .unwrap();
     assert_eq!(replay.manifest_sha256, prepared.manifest_sha256);
     assert_eq!(general_control_header(&replay).unwrap(), header);
-    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed).cleaned);
 }
 
 #[test]
 fn composed_prompt_budget_checks_zero_inputs_at_exact_boundary_and_reaps_rejection() {
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.repo_context.clear();
     manifest.attachments.clear();
     manifest.idempotency_key = "composed-prompt-budget".into();
@@ -328,9 +327,9 @@ fn composed_prompt_budget_checks_zero_inputs_at_exact_boundary_and_reaps_rejecti
     let exact_bytes = general_launch_prompt(&generous, &manifest.prompt)
         .unwrap()
         .len() as u64;
-    assert!(GeneralFinalizer::finalize(&generous, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&generous, CompletionOutcome::Failed).cleaned);
 
-    let mut exact_budget = GeneralProfile::AnalysisReadonly.default_budget();
+    let mut exact_budget = AccessMode::ReadOnly.default_budget();
     exact_budget.max_context_bytes = exact_bytes;
     manifest.budget = Some(exact_budget.clone());
     let exact = f.preparer().prepare_submission(&manifest).unwrap();
@@ -340,7 +339,7 @@ fn composed_prompt_budget_checks_zero_inputs_at_exact_boundary_and_reaps_rejecti
             .len() as u64,
         exact_bytes
     );
-    assert!(GeneralFinalizer::finalize(&exact, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&exact, CompletionOutcome::Failed).cleaned);
 
     exact_budget.max_context_bytes = exact_bytes - 1;
     manifest.budget = Some(exact_budget);
@@ -363,9 +362,9 @@ fn composed_prompt_budget_checks_zero_inputs_at_exact_boundary_and_reaps_rejecti
 }
 
 #[test]
-fn legacy_general_command_digest_remains_valid_and_readonly_true_is_identity_bound() {
+fn inline_command_digest_remains_valid_and_readonly_true_is_identity_bound() {
     let f = Fixture::new();
-    let mut legacy_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let mut legacy_manifest = f.manifest(AccessMode::ReadOnly);
     legacy_manifest.validation_commands.insert(
         "unit".into(),
         ValidationCommand {
@@ -384,10 +383,10 @@ fn legacy_general_command_digest_remains_valid_and_readonly_true_is_identity_bou
         .is_none());
     let restored: PreparedGeneralTask = serde_json::from_str(&canonical).unwrap();
     restored.validate_digest().unwrap();
-    assert!(GeneralFinalizer::finalize(&restored, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&restored, CompletionOutcome::Failed).cleaned);
 
-    let mut named_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
-    named_manifest.task_id = "task-readonly-safe".into();
+    let mut named_manifest = f.manifest(AccessMode::ReadOnly);
+    named_manifest.agent_id = "task-readonly-safe".into();
     named_manifest.idempotency_key = "task-readonly-safe".into();
     let named = BTreeMap::from([(
         "unit".into(),
@@ -417,13 +416,13 @@ fn legacy_general_command_digest_remains_valid_and_readonly_true_is_identity_bou
         .unwrap()
         .readonly_safe = false;
     assert!(tampered.validate_digest().is_err());
-    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed).cleaned);
 }
 
 #[test]
-fn empty_named_selection_reuses_legacy_identity_and_nonempty_changes_conflict() {
+fn empty_named_selection_reuses_direct_identity_and_nonempty_changes_conflict() {
     let f = Fixture::new();
-    let legacy_manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let legacy_manifest = f.manifest(AccessMode::ReadOnly);
     let legacy = f.preparer().prepare_submission(&legacy_manifest).unwrap();
     let replayed = f
         .preparer()
@@ -449,10 +448,10 @@ fn empty_named_selection_reuses_legacy_identity_and_nonempty_changes_conflict() 
             .prepare_named_submission(&legacy_manifest, &selected),
         Err(PreparationError::IdempotencyConflict(_))
     ));
-    assert!(GeneralFinalizer::finalize(&legacy, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&legacy, CompletionOutcome::Failed).cleaned);
 
-    let mut selected_manifest = f.manifest(GeneralProfile::TestRunner);
-    selected_manifest.task_id = "task-selected-identity".into();
+    let mut selected_manifest = f.manifest(AccessMode::ReadOnly);
+    selected_manifest.agent_id = "task-selected-identity".into();
     selected_manifest.idempotency_key = "task-selected-identity".into();
     let mut selected = selected;
     selected.get_mut("unit").unwrap().readonly_safe = false;
@@ -482,7 +481,7 @@ fn empty_named_selection_reuses_legacy_identity_and_nonempty_changes_conflict() 
             .prepare_named_submission(&selected_manifest, &definition_changed),
         Err(PreparationError::IdempotencyConflict(_))
     ));
-    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked).cleaned);
+    assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed).cleaned);
 }
 
 #[test]
@@ -491,7 +490,7 @@ fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
     let other = f._temp.path().join("other");
     fs::create_dir_all(&other).unwrap();
     fs::write(other.join("x.txt"), "x").unwrap();
-    let mut m = f.manifest(GeneralProfile::AnalysisReadonly);
+    let mut m = f.manifest(AccessMode::ReadOnly);
     m.attachments[0] = AttachmentInput {
         logical_name: "x".into(),
         source_path: other.join("x.txt"),
@@ -506,36 +505,36 @@ fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
         f.attachments.join("linked.txt"),
     )
     .unwrap();
-    m = f.manifest(GeneralProfile::AnalysisReadonly);
+    m = f.manifest(AccessMode::ReadOnly);
     m.attachments[0].source_path = f.attachments.join("linked.txt");
     assert!(matches!(
         f.preparer().prepare(&m),
         Err(PreparationError::PathEscape { .. }) | Err(PreparationError::SymlinkInput(_))
     ));
     fs::write(f.attachments.join("identity.pem"), "secret").unwrap();
-    m = f.manifest(GeneralProfile::AnalysisReadonly);
+    m = f.manifest(AccessMode::ReadOnly);
     m.attachments[0].source_path = f.attachments.join("identity.pem");
     assert!(matches!(
         f.preparer().prepare(&m),
         Err(PreparationError::CredentialInput(_))
     ));
     fs::write(f.attachments.join(".env"), "TOKEN=value").unwrap();
-    m = f.manifest(GeneralProfile::AnalysisReadonly);
+    m = f.manifest(AccessMode::ReadOnly);
     m.attachments[0].source_path = f.attachments.join(".env");
     assert!(matches!(
         f.preparer().prepare(&m),
         Err(PreparationError::CredentialInput(_))
     ));
-    m = f.manifest(GeneralProfile::AnalysisReadonly);
-    let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+    m = f.manifest(AccessMode::ReadOnly);
+    let mut budget = AccessMode::ReadOnly.default_budget();
     budget.max_turns = 0;
     m.budget = Some(budget);
     assert!(matches!(
         f.preparer().prepare(&m),
         Err(PreparationError::InvalidManifest(_))
     ));
-    m = f.manifest(GeneralProfile::AnalysisReadonly);
-    let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+    m = f.manifest(AccessMode::ReadOnly);
+    let mut budget = AccessMode::ReadOnly.default_budget();
     budget.absolute_wall_time_ms = 86_400_001;
     m.budget = Some(budget);
     assert!(matches!(
@@ -545,10 +544,10 @@ fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
 }
 
 #[test]
-fn failed_preparation_reaps_worktree_and_profile_set_is_closed() {
+fn failed_preparation_reaps_worktree_and_access_mode_set_is_closed() {
     let f = Fixture::new();
     let before = git(&f.repository, &["worktree", "list", "--porcelain"]);
-    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.validation_commands.insert(
         "bad".into(),
         review_preparation::ValidationCommand {
@@ -570,19 +569,19 @@ fn failed_preparation_reaps_worktree_and_profile_set_is_closed() {
             .next()
             .is_none()
     );
-    assert!(serde_json::from_str::<GeneralProfile>("\"review_readonly\"").is_err());
+    assert!(serde_json::from_str::<AccessMode>("\"review_readonly\"").is_err());
     assert_eq!(
-        serde_json::to_string(&GeneralProfile::TestRunner).unwrap(),
-        "\"test_runner\""
+        serde_json::to_string(&AccessMode::ReadOnly).unwrap(),
+        "\"read_only\""
     );
 }
 
 #[test]
-fn profile_policy_allows_only_frozen_implementation_paths() {
+fn access_policy_allows_only_frozen_workspace_write_paths() {
     let f = Fixture::new();
     let readonly = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     let readonly_policy = readonly.launcher().unwrap();
     assert!(
@@ -595,7 +594,7 @@ fn profile_policy_allows_only_frozen_implementation_paths() {
     );
     let implementation = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     let policy = implementation.launcher().unwrap();
     assert!(
@@ -645,7 +644,7 @@ fn official_file_path_permissions_reuse_the_bounded_file_policy() {
     let f = Fixture::new();
     let implementation = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     let policy = implementation.launcher().unwrap();
     let worktree = &implementation.worktree.path;
@@ -735,19 +734,17 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
     );
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
         "pub fn value() -> u8 { 2 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
-    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
+    assert_eq!(completion.outcome, CompletionOutcome::Completed);
     assert!(completion.cleaned);
-    let artifact = completion.artifact.unwrap();
-    assert!(!artifact.partial);
-    assert_eq!(artifact.kind, GeneralArtifactKind::ChangesPatch);
+    let artifact = completion.changes_patch.unwrap();
     assert!(!prepared.worktree.path.exists());
     let patch = fs::read(prepared.artifact_root.join("changes.patch")).unwrap();
     assert!(String::from_utf8_lossy(&patch).contains("value() -> u8 { 2 }"));
@@ -787,7 +784,7 @@ fn daemon_finalizer_commits_detached_patch_without_moving_source_refs() {
 #[test]
 fn implementation_context_covered_by_write_manifest_can_finalize() {
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
+    let mut manifest = f.manifest(AccessMode::WorkspaceWrite);
     manifest.repo_context = vec!["src/lib.rs".into()];
     manifest.write_manifest = vec!["src".into()];
     let prepared = f.preparer().prepare(&manifest).unwrap();
@@ -797,11 +794,11 @@ fn implementation_context_covered_by_write_manifest_can_finalize() {
     )
     .unwrap();
 
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
-    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert_eq!(completion.outcome, CompletionOutcome::Completed);
     assert!(completion.cleaned);
-    let artifact = completion.artifact.unwrap();
+    let artifact = completion.changes_patch.unwrap();
     assert_eq!(artifact.changed_paths, ["src/lib.rs"]);
     let head = artifact.head_commit.as_deref().unwrap();
     assert_eq!(git(&f.repository, &["cat-file", "-t", head]), "commit");
@@ -818,7 +815,7 @@ fn implementation_context_outside_write_manifest_remains_immutable() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("README.md"),
@@ -826,7 +823,7 @@ fn implementation_context_outside_write_manifest_remains_immutable() {
     )
     .unwrap();
 
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(
@@ -841,40 +838,40 @@ fn readonly_change_becomes_result_invalid() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
         "pub fn value() -> u8 { 8 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(
         completion.reason_code.as_deref(),
-        Some("READONLY_PROFILE_MODIFIED_TRACKED_STATE")
+        Some("READ_ONLY_MODIFIED_TRACKED_STATE")
     );
     assert!(completion.cleaned);
 }
 
 #[test]
-fn blocked_without_changes_cleans_and_has_no_partial_artifact() {
+fn failed_without_changes_cleans_and_has_no_partial_artifact() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Blocked);
-    assert_eq!(completion.outcome, CompletionOutcome::Blocked);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed);
+    assert_eq!(completion.outcome, CompletionOutcome::Failed);
     assert!(completion.cleaned);
-    assert!(completion.artifact.is_none());
+    assert!(completion.changes_patch.is_none());
     assert!(!prepared.worktree.path.exists());
 }
 
 #[test]
 fn null_budget_and_idempotency_conflicts_are_rejected() {
     let f = Fixture::new();
-    let value = serde_json::to_value(f.manifest(GeneralProfile::AnalysisReadonly)).unwrap();
+    let value = serde_json::to_value(f.manifest(AccessMode::ReadOnly)).unwrap();
     let mut null_budget = value.clone();
     null_budget["budget"] = serde_json::Value::Null;
     assert!(serde_json::from_value::<GeneralTaskManifest>(null_budget).is_err());
@@ -883,7 +880,7 @@ fn null_budget_and_idempotency_conflicts_are_rejected() {
     assert!(serde_json::from_value::<GeneralTaskManifest>(omitted).is_ok());
 
     let preparer = f.preparer();
-    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let manifest = f.manifest(AccessMode::ReadOnly);
     let first = preparer.prepare(&manifest).unwrap();
     assert_eq!(
         preparer.prepare(&manifest).unwrap().prepared_sha256,
@@ -896,9 +893,7 @@ fn null_budget_and_idempotency_conflicts_are_rejected() {
         Err(PreparationError::IdempotencyConflict(_))
     ));
     assert!(first.prompt_path.exists());
-    let compatible = preparer
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
-        .unwrap();
+    let compatible = preparer.prepare(&f.manifest(AccessMode::ReadOnly)).unwrap();
     assert_eq!(compatible.prepared_sha256, first.prepared_sha256);
     assert!(compatible.worktree.path.exists());
 }
@@ -908,7 +903,7 @@ fn partial_patch_retention_follows_submission_opt_in() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
@@ -917,11 +912,11 @@ fn partial_patch_retention_follows_submission_opt_in() {
     .unwrap();
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed);
     assert_eq!(completion.outcome, CompletionOutcome::Failed);
-    assert!(completion.artifact.is_none());
+    assert!(completion.changes_patch.is_none());
     assert!(completion.cleaned);
 
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
+    let mut manifest = f.manifest(AccessMode::WorkspaceWrite);
     manifest.retain_partial = true;
     let prepared = f.preparer().prepare(&manifest).unwrap();
     fs::write(
@@ -930,17 +925,16 @@ fn partial_patch_retention_follows_submission_opt_in() {
     )
     .unwrap();
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::TimedOut);
-    let artifact = completion.artifact.unwrap();
-    assert!(artifact.partial);
-    assert_eq!(artifact.kind, GeneralArtifactKind::ChangesPatch);
+    let artifact = completion.changes_patch.unwrap();
+    assert_eq!(artifact.changed_paths, ["src/lib.rs"]);
     assert!(completion.cleaned);
 }
 
 #[test]
 fn artifact_limit_failure_is_result_invalid_and_reaped() {
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
-    let mut budget = GeneralProfile::ImplementationWorktree.default_budget();
+    let mut manifest = f.manifest(AccessMode::WorkspaceWrite);
+    let mut budget = AccessMode::WorkspaceWrite.default_budget();
     budget.max_artifact_bytes = 1;
     manifest.budget = Some(budget);
     let prepared = f.preparer().prepare(&manifest).unwrap();
@@ -949,7 +943,7 @@ fn artifact_limit_failure_is_result_invalid_and_reaped() {
         "pub fn value() -> u8 { 9 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(
         completion.reason_code.as_deref(),
@@ -967,8 +961,8 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     git(&f.repository, &["commit", "-m", "large base context"]);
     f.head = git(&f.repository, &["rev-parse", "HEAD"]);
     fs::write(f.repository.join("README.md"), "small source drift\n").unwrap();
-    let mut manifest = f.manifest(GeneralProfile::AnalysisReadonly);
-    let mut budget = GeneralProfile::AnalysisReadonly.default_budget();
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
+    let mut budget = AccessMode::ReadOnly.default_budget();
     budget.max_context_bytes = 512;
     manifest.budget = Some(budget);
     assert!(matches!(
@@ -980,12 +974,12 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     fs::write(f.repository.join("README.md"), vec![b'y'; 4096]).unwrap();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     assert_eq!(prepared.context[0].size_bytes, b"fixture\n".len() as u64);
     fs::write(&prepared.prompt_path, "mutated prepared prompt").unwrap();
     assert!(prepared.launcher().is_err());
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(
         completion.reason_code.as_deref(),
         Some("PREPARED_CONTENT_INVALID")
@@ -996,12 +990,12 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     fs::write(&prepared.attachments[0].prepared_path, "replacement").unwrap();
     assert!(prepared.launcher().is_err());
     assert_eq!(
-        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded)
+        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed)
             .reason_code
             .as_deref(),
         Some("PREPARED_CONTENT_INVALID")
@@ -1010,7 +1004,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("README.md"),
@@ -1019,7 +1013,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     .unwrap();
     assert!(prepared.launcher().is_err());
     assert_eq!(
-        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded)
+        GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed)
             .reason_code
             .as_deref(),
         Some("PREPARED_CONTENT_INVALID")
@@ -1034,8 +1028,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     fs::remove_file(f.repository.join("README.md")).unwrap();
     fs::write(f.repository.join("README.md"), "regular source drift\n").unwrap();
     assert!(matches!(
-        f.preparer()
-            .prepare(&f.manifest(GeneralProfile::AnalysisReadonly)),
+        f.preparer().prepare(&f.manifest(AccessMode::ReadOnly)),
         Err(PreparationError::SymlinkInput(_))
     ));
 }
@@ -1045,7 +1038,7 @@ fn precreated_history_and_attached_head_are_rejected() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
@@ -1065,7 +1058,7 @@ fn precreated_history_and_attached_head_are_rejected() {
             "pre-created history",
         ],
     );
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(
         completion.reason_code.as_deref(),
         Some("PREFINALIZATION_HEAD_INVALID")
@@ -1076,10 +1069,10 @@ fn precreated_history_and_attached_head_are_rejected() {
     git(&f.repository, &["branch", "spare", &f.head]);
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     git(&prepared.worktree.path, &["checkout", "spare"]);
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(
         completion.reason_code.as_deref(),
         Some("PREFINALIZATION_HEAD_INVALID")
@@ -1125,14 +1118,14 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
     assert!(!fsmonitor_canary.exists());
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
         "pub fn value() -> u8 { 6 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(completion.reason_code.as_deref(), Some("UNSAFE_GIT_CONFIG"));
     assert!(!canary.exists());
@@ -1153,19 +1146,19 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
     );
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
         "pub fn value() -> u8 { 7 }\n",
     )
     .unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(completion.reason_code.as_deref(), Some("UNSAFE_GIT_CONFIG"));
     assert!(!diff_canary.exists());
 
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::ImplementationWorktree);
+    let mut manifest = f.manifest(AccessMode::WorkspaceWrite);
     manifest.write_manifest = vec!["vendor".into()];
     let prepared = f.preparer().prepare(&manifest).unwrap();
     let nested = prepared.worktree.path.join("vendor/sub");
@@ -1185,7 +1178,7 @@ fn daemon_git_blocks_hooks_external_diff_and_gitlinks() {
             "nested",
         ],
     );
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(
         completion.reason_code.as_deref(),
         Some("GITLINK_CHANGE_DENIED")
@@ -1198,7 +1191,7 @@ fn ordinary_filename_containing_gitlink_mode_digits_is_allowed() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/160000_notes.txt"),
@@ -1206,12 +1199,12 @@ fn ordinary_filename_containing_gitlink_mode_digits_is_allowed() {
     )
     .unwrap();
 
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
-    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
+    assert_eq!(completion.outcome, CompletionOutcome::Completed);
     assert!(completion.cleaned);
     assert_eq!(
-        completion.artifact.unwrap().changed_paths,
+        completion.changes_patch.unwrap().changed_paths,
         ["src/160000_notes.txt"]
     );
 }
@@ -1221,18 +1214,18 @@ fn model_authored_scratch_files_never_become_public_artifacts() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     let output_root = prepared.scratch_root.join("agent-artifacts");
     fs::create_dir_all(&output_root).unwrap();
     fs::write(output_root.join("report.md"), "model supplied\n").unwrap();
     fs::write(output_root.join("check-report.json"), "{}\n").unwrap();
 
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
-    assert_eq!(completion.outcome, CompletionOutcome::Succeeded);
-    assert!(completion.artifacts.is_empty());
-    assert!(completion.artifact.is_none());
+    assert_eq!(completion.outcome, CompletionOutcome::Completed);
+    assert!(completion.changes_patch.is_none());
+    assert!(completion.changes_patch.is_none());
     assert!(!prepared.artifact_root.join("report.md").exists());
     assert!(!prepared.artifact_root.join("check-report.json").exists());
     assert!(!prepared.prompt_path.exists());
@@ -1245,11 +1238,11 @@ fn preexisting_artifact_root_content_is_rejected_without_adoption() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     fs::write(prepared.artifact_root.join("foreign.txt"), "untrusted\n").unwrap();
 
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
     assert_eq!(
         completion.reason_code.as_deref(),
@@ -1268,7 +1261,7 @@ fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::ImplementationWorktree))
+        .prepare(&f.manifest(AccessMode::WorkspaceWrite))
         .unwrap();
     fs::write(
         prepared.worktree.path.join("src/lib.rs"),
@@ -1279,7 +1272,7 @@ fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
     let owner_root = job_root.parent().unwrap();
     let original = fs::metadata(owner_root).unwrap().permissions();
     fs::set_permissions(owner_root, fs::Permissions::from_mode(0o500)).unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     fs::set_permissions(owner_root, original).unwrap();
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert_eq!(
@@ -1287,13 +1280,13 @@ fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
         Some("TASK_ROOT_CLEANUP_FAILED")
     );
     assert!(!completion.cleaned);
-    assert!(completion.artifact.is_some());
-    assert_eq!(completion.artifacts.len(), 1);
+    assert!(completion.changes_patch.is_some());
+    assert!(completion.changes_patch.is_some());
     assert!(prepared.artifact_root.join("changes.patch").is_file());
 
     let cleanup = GeneralFinalizer::retry_cleanup(&prepared, &completion);
     assert!(cleanup.cleaned);
-    assert!(cleanup.artifact.is_some());
+    assert!(cleanup.changes_patch.is_some());
     assert!(prepared.artifact_root.join("changes.patch").is_file());
 }
 
@@ -1302,10 +1295,10 @@ fn missing_worktree_with_stale_git_registration_is_not_cleaned() {
     let f = Fixture::new();
     let prepared = f
         .preparer()
-        .prepare(&f.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&f.manifest(AccessMode::ReadOnly))
         .unwrap();
     fs::remove_dir_all(&prepared.worktree.path).unwrap();
-    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Succeeded);
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
     assert!(!completion.cleaned);
     assert_eq!(
@@ -1318,7 +1311,7 @@ fn missing_worktree_with_stale_git_registration_is_not_cleaned() {
 #[test]
 fn preparation_failure_retries_cleanup_and_leaves_truthful_residue() {
     let f = Fixture::new();
-    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.validation_commands.insert(
         "missing".into(),
         review_preparation::ValidationCommand {
@@ -1333,7 +1326,7 @@ fn preparation_failure_retries_cleanup_and_leaves_truthful_residue() {
     let scratch = f.repository.join(".agent-work/scratch/general");
     assert!(fs::read_dir(&scratch).unwrap().next().is_none());
 
-    let mut manifest = f.manifest(GeneralProfile::TestRunner);
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
     manifest.scratch_root = ".agent-work/scratch/general/symlink-root".into();
     let linked = f
         .repository
@@ -1347,7 +1340,7 @@ fn preparation_failure_retries_cleanup_and_leaves_truthful_residue() {
 #[test]
 fn stale_prepared_record_never_returns_dangling_task_and_retries_deterministically() {
     let f = Fixture::new();
-    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let manifest = f.manifest(AccessMode::ReadOnly);
     let prepared = f.preparer().prepare(&manifest).unwrap();
     let record = prepared
         .worktree
@@ -1377,7 +1370,7 @@ fn stale_prepared_record_never_returns_dangling_task_and_retries_deterministical
 #[test]
 fn malformed_prepared_record_cleans_registered_worktree_before_private_root() {
     let f = Fixture::new();
-    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let manifest = f.manifest(AccessMode::ReadOnly);
     let prepared = f.preparer().prepare(&manifest).unwrap();
     let job_root = prepared
         .worktree
@@ -1402,7 +1395,7 @@ fn malformed_prepared_record_cleans_registered_worktree_before_private_root() {
 #[test]
 fn tampered_record_path_cleans_real_registration_without_touching_external_path() {
     let f = Fixture::new();
-    let manifest = f.manifest(GeneralProfile::AnalysisReadonly);
+    let manifest = f.manifest(AccessMode::ReadOnly);
     let prepared = f.preparer().prepare(&manifest).unwrap();
     let job_root = prepared
         .worktree
@@ -1439,11 +1432,11 @@ fn retry_cleanup_with_corrupt_a_pointing_to_b_is_fail_closed_and_non_destructive
     let b = Fixture::new();
     let prepared_a = a
         .preparer()
-        .prepare(&a.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&a.manifest(AccessMode::ReadOnly))
         .unwrap();
     let prepared_b = b
         .preparer()
-        .prepare(&b.manifest(GeneralProfile::AnalysisReadonly))
+        .prepare(&b.manifest(AccessMode::ReadOnly))
         .unwrap();
     let mut corrupt = prepared_a.clone();
     corrupt.worktree = prepared_b.worktree.clone();
@@ -1455,8 +1448,7 @@ fn retry_cleanup_with_corrupt_a_pointing_to_b_is_fail_closed_and_non_destructive
         summary: "preserve".into(),
         checks: vec!["check".into()],
         residual_gaps: vec![],
-        artifacts: vec![],
-        artifact: None,
+        changes_patch: None,
         cleaned: false,
     };
     let retried = GeneralFinalizer::retry_cleanup(&corrupt, &persisted);

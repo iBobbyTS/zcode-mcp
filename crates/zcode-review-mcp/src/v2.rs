@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use review_preparation::{
-    AttachmentInput, BudgetLimits, GeneralProfile, GeneralTaskManifest, GENERAL_TASK_SCHEMA,
+    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, GENERAL_TASK_SCHEMA,
 };
 use review_store::{EffectiveBudget, TaskOutcome};
 use rmcp::{
@@ -81,11 +81,11 @@ pub enum PublicAccessMode {
     WorkspaceWrite,
 }
 
-impl From<PublicAccessMode> for GeneralProfile {
+impl From<PublicAccessMode> for AccessMode {
     fn from(value: PublicAccessMode) -> Self {
         match value {
-            PublicAccessMode::ReadOnly => Self::AnalysisReadonly,
-            PublicAccessMode::WorkspaceWrite => Self::ImplementationWorktree,
+            PublicAccessMode::ReadOnly => Self::ReadOnly,
+            PublicAccessMode::WorkspaceWrite => Self::WorkspaceWrite,
         }
     }
 }
@@ -211,27 +211,27 @@ pub struct PublicAgentCapabilities {
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
     fn from(mut value: AgentCapabilitiesView) -> Self {
         let access_mode_defaults = [
-            ("read_only", "analysis_readonly"),
-            ("workspace_write", "implementation_worktree"),
+            ("read_only", "read_only"),
+            ("workspace_write", "workspace_write"),
         ]
         .into_iter()
-        .filter_map(|(access_mode, profile)| {
+        .filter_map(|(public_name, access_mode)| {
             value
-                .profile_defaults
-                .remove(profile)
-                .map(|budget| (access_mode.into(), budget.into()))
+                .access_mode_defaults
+                .remove(access_mode)
+                .map(|budget| (public_name.into(), budget.into()))
         })
         .collect();
         let maturity = [
-            ("read_only", "analysis_readonly"),
-            ("workspace_write", "implementation_worktree"),
+            ("read_only", "read_only"),
+            ("workspace_write", "workspace_write"),
         ]
         .into_iter()
-        .filter_map(|(access_mode, profile)| {
+        .filter_map(|(public_name, access_mode)| {
             value
                 .maturity
-                .remove(profile)
-                .map(|maturity| (access_mode.into(), maturity.into()))
+                .remove(access_mode)
+                .map(|maturity| (public_name.into(), maturity.into()))
         })
         .collect();
         Self {
@@ -289,8 +289,8 @@ pub struct AgentSpawnInput {
     pub base_ref: String,
     pub access_mode: PublicAccessMode,
     pub prompt: String,
-    pub feature_id: String,
-    pub ownership_token: String,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    pub group_id: Option<String>,
     pub idempotency_key: String,
     #[serde(default)]
     pub write_manifest: Vec<String>,
@@ -321,7 +321,6 @@ pub struct AgentSpawnOutput {
     pub agent_id: String,
     pub submission_disposition: SubmissionDisposition,
     pub phase: String,
-    pub attempt_sequence: u64,
     pub effective_budget: PublicBudget,
     pub capabilities: PublicAgentCapabilities,
 }
@@ -338,7 +337,7 @@ pub struct PublicTask {
     pub agent_id: String,
     pub access_mode: String,
     pub phase: String,
-    pub attempt_sequence: u64,
+    pub outcome: Option<PublicOutcome>,
     pub effective_budget: PublicBudget,
     pub cancel_requested: bool,
     pub close_requested: bool,
@@ -352,7 +351,7 @@ impl From<TaskView> for PublicTask {
             agent_id: value.agent_id,
             access_mode: value.access_mode,
             phase: value.phase,
-            attempt_sequence: value.attempt_sequence,
+            outcome: value.outcome.map(Into::into),
             effective_budget: value.effective_budget.into(),
             cancel_requested: value.stop_requested,
             close_requested: value.close_requested,
@@ -365,8 +364,7 @@ impl From<TaskView> for PublicTask {
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PublicOutcome {
-    Succeeded,
-    Blocked,
+    Completed,
     Failed,
     Cancelled,
     TimedOut,
@@ -378,8 +376,7 @@ pub enum PublicOutcome {
 impl From<TaskOutcome> for PublicOutcome {
     fn from(value: TaskOutcome) -> Self {
         match value {
-            TaskOutcome::Succeeded => Self::Succeeded,
-            TaskOutcome::Blocked => Self::Blocked,
+            TaskOutcome::Completed => Self::Completed,
             TaskOutcome::Failed => Self::Failed,
             TaskOutcome::Cancelled => Self::Cancelled,
             TaskOutcome::TimedOut => Self::TimedOut,
@@ -447,7 +444,7 @@ impl TryFrom<TaskResultView> for PublicResult {
     fn try_from(value: TaskResultView) -> Result<Self, Self::Error> {
         Ok(Self {
             outcome: value.outcome.into(),
-            final_text: value.summary,
+            final_text: value.final_text,
             partial: value.partial,
             retained: value.retained,
             base_commit: value.base_commit,
@@ -467,9 +464,7 @@ pub struct AgentListInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     pub repository: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
-    pub feature_id: Option<String>,
-    #[serde(default, deserialize_with = "optional_non_null")]
-    pub ownership_token: Option<String>,
+    pub group_id: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub phase: Option<PublicTaskPhase>,
     #[serde(default, deserialize_with = "optional_non_null")]
@@ -509,8 +504,7 @@ impl From<PublicTaskPhase> for TaskPhaseFilter {
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PublicOutcomeFilter {
-    Succeeded,
-    Blocked,
+    Completed,
     Failed,
     Cancelled,
     TimedOut,
@@ -522,8 +516,7 @@ pub enum PublicOutcomeFilter {
 impl From<PublicOutcomeFilter> for TaskOutcome {
     fn from(value: PublicOutcomeFilter) -> Self {
         match value {
-            PublicOutcomeFilter::Succeeded => Self::Succeeded,
-            PublicOutcomeFilter::Blocked => Self::Blocked,
+            PublicOutcomeFilter::Completed => Self::Completed,
             PublicOutcomeFilter::Failed => Self::Failed,
             PublicOutcomeFilter::Cancelled => Self::Cancelled,
             PublicOutcomeFilter::TimedOut => Self::TimedOut,
@@ -709,7 +702,6 @@ pub enum PublicMessageDisposition {
 #[schemars(deny_unknown_fields)]
 pub struct AgentSendOutput {
     pub disposition: PublicMessageDisposition,
-    pub attempt_sequence: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -730,7 +722,6 @@ pub struct AgentRespondOutput {
     pub effective_decision: PublicDecision,
     pub policy_overrode: bool,
     pub policy_reason_code: Option<String>,
-    pub attempt_sequence: u64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -743,8 +734,6 @@ pub struct AgentStateOutput {
 #[serde(deny_unknown_fields)]
 pub struct AgentResultInput {
     pub agent_id: String,
-    #[serde(default, deserialize_with = "optional_non_null")]
-    pub attempt_sequence: Option<u64>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub artifact_id: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
@@ -805,7 +794,7 @@ impl SubagentMcp {
             .call(&request)
             .map_err(public_transport_error)?;
         if response.version != RPC_VERSION {
-            return Err("protocol_version_mismatch: incompatible review daemon".into());
+            return Err("protocol_version_mismatch: incompatible agent daemon".into());
         }
         match response.outcome {
             RpcOutcome::Success { result } => Ok(*result),
@@ -816,12 +805,8 @@ impl SubagentMcp {
     fn result(
         &self,
         agent_id: String,
-        attempt_sequence: Option<u64>,
     ) -> Result<(PublicTask, Option<PublicResult>, Vec<PublicArtifact>), String> {
-        match self.rpc(RpcMethod::TaskResult {
-            agent_id,
-            attempt_sequence,
-        })? {
+        match self.rpc(RpcMethod::TaskResult { agent_id })? {
             RpcSuccess::TaskResult {
                 task,
                 result,
@@ -862,12 +847,6 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
         ("repository", input.repository.as_str(), MAX_PATH_BYTES),
         ("base_ref", input.base_ref.as_str(), MAX_ID_BYTES),
         ("prompt", input.prompt.as_str(), MAX_PROMPT_BYTES),
-        ("feature_id", input.feature_id.as_str(), 256),
-        (
-            "ownership_token",
-            input.ownership_token.as_str(),
-            MAX_ID_BYTES,
-        ),
         (
             "idempotency_key",
             input.idempotency_key.as_str(),
@@ -876,19 +855,22 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
     ] {
         validate_text(value, field, max)?;
     }
+    if let Some(group_id) = input.group_id.as_deref() {
+        validate_text(group_id, "group_id", 256)?;
+    }
     let repository = PathBuf::from(&input.repository);
     if !repository.is_absolute() {
         return Err("validation: repository must be absolute".into());
     }
     validate_public_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
     validate_public_command_ids(&input.required_command_ids, "required_command_ids")?;
-    let task_id = "daemon-prepared".to_owned();
+    let agent_id = "daemon-prepared".to_owned();
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
-        task_id: task_id.clone(),
+        agent_id: agent_id.clone(),
         repository,
         base_ref: input.base_ref.clone(),
-        profile: input.access_mode.into(),
+        access_mode: input.access_mode.into(),
         prompt: input.prompt.clone(),
         repo_context: input.repo_context.iter().map(PathBuf::from).collect(),
         attachments: input
@@ -898,13 +880,13 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
             .collect::<Result<Vec<_>, _>>()?,
         write_manifest: input.write_manifest.iter().map(PathBuf::from).collect(),
         scratch_root: PathBuf::from(".agent-work/scratch/general"),
-        artifact_root: PathBuf::from(".agent-work/artifacts").join(task_id),
+        artifact_root: PathBuf::from(".agent-work/artifacts").join(agent_id),
         budget: Some(
             input
                 .budget
                 .clone()
                 .map(Into::into)
-                .unwrap_or_else(|| GeneralProfile::from(input.access_mode).default_budget()),
+                .unwrap_or_else(|| AccessMode::from(input.access_mode).default_budget()),
         ),
         validation_commands: BTreeMap::new(),
         retain_partial: input.retain_partial,
@@ -932,7 +914,7 @@ fn validate_public_command_ids(command_ids: &[String], field: &str) -> Result<()
     Ok(())
 }
 
-fn project_response(value: ResponseOutcomeView, attempt_sequence: u64) -> AgentRespondOutput {
+fn project_response(value: ResponseOutcomeView) -> AgentRespondOutput {
     let requested_decision = if value.requested_decision == "allow" {
         PublicDecision::Allow
     } else {
@@ -960,7 +942,6 @@ fn project_response(value: ResponseOutcomeView, attempt_sequence: u64) -> AgentR
         effective_decision,
         policy_overrode: value.policy_overrode,
         policy_reason_code: value.policy_reason_code,
-        attempt_sequence,
     }
 }
 
@@ -1013,8 +994,7 @@ impl SubagentMcp {
         let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral {
             input: GeneralSubmitInput {
                 manifest,
-                feature_id: input.feature_id,
-                ownership_token: input.ownership_token,
+                group_id: input.group_id,
                 allowed_command_ids: input.allowed_command_ids,
                 required_command_ids: input.required_command_ids,
             },
@@ -1033,7 +1013,6 @@ impl SubagentMcp {
                 SubmissionDispositionView::Existing => SubmissionDisposition::Existing,
             },
             phase: task.phase,
-            attempt_sequence: task.attempt_sequence,
             effective_budget: task.effective_budget.into(),
             capabilities,
         }))
@@ -1100,19 +1079,15 @@ impl SubagentMcp {
         if !(1..=100).contains(&input.limit) {
             return Err("validation: limit must be between 1 and 100".into());
         }
-        if input.repository.is_none()
-            && input.feature_id.is_none()
-            && input.ownership_token.is_none()
-        {
+        if input.repository.is_none() && input.group_id.is_none() {
             return Err("validation: at least one list scope is required".into());
         }
         match self.rpc(RpcMethod::TaskList(TaskListQuery {
             repository: input.repository,
-            feature_id: input.feature_id,
-            ownership_token: input.ownership_token,
+            group_id: input.group_id,
             phase: input.phase.map(Into::into),
             outcome: input.outcome.map(Into::into),
-            profile: input.access_mode.map(Into::into),
+            access_mode: input.access_mode.map(Into::into),
             cursor: input.cursor,
             limit: input.limit,
         }))? {
@@ -1145,7 +1120,7 @@ impl SubagentMcp {
             mode: "queue".into(),
             content: input.content,
         }))? {
-            RpcSuccess::Message { disposition, task } => Ok(Json(AgentSendOutput {
+            RpcSuccess::Message { disposition, .. } => Ok(Json(AgentSendOutput {
                 disposition: match disposition {
                     zcode_reviewd::rpc::MessageDispositionView::Queued => {
                         PublicMessageDisposition::Queued
@@ -1160,7 +1135,6 @@ impl SubagentMcp {
                         PublicMessageDisposition::Failed
                     }
                 },
-                attempt_sequence: task.attempt_sequence,
             })),
             _ => Err(protocol_error()),
         }
@@ -1195,9 +1169,7 @@ impl SubagentMcp {
             decision,
             content: input.reason,
         }))? {
-            RpcSuccess::Respond { outcome, task } => {
-                Ok(Json(project_response(outcome, task.attempt_sequence)))
-            }
+            RpcSuccess::Respond { outcome, .. } => Ok(Json(project_response(outcome))),
             _ => Err(protocol_error()),
         }
     }
@@ -1252,8 +1224,7 @@ impl SubagentMcp {
                     .into(),
             );
         }
-        let (task, result, artifacts) =
-            self.result(input.agent_id.clone(), input.attempt_sequence)?;
+        let (task, result, artifacts) = self.result(input.agent_id.clone())?;
         let artifact_chunk = if let (Some(artifact_id), Some(offset_bytes), Some(limit_bytes)) =
             (input.artifact_id, input.offset_bytes, input.limit_bytes)
         {
@@ -1271,7 +1242,6 @@ impl SubagentMcp {
             }
             match self.rpc(RpcMethod::TaskArtifact(TaskArtifactQuery {
                 agent_id: input.agent_id,
-                attempt_sequence: input.attempt_sequence,
                 artifact_id: artifact_id.clone(),
                 offset_bytes,
                 limit_bytes,
@@ -1375,12 +1345,21 @@ mod generic_tests {
             "zcode_agent_wait",
             concat!("review", "_id"),
             concat!("review", "_evidence"),
-            "report_markdown",
-            "check_report",
+            concat!("report_", "markdown"),
+            concat!("check_", "report"),
             concat!("artifact", "_intents"),
             "semantic_soft_timeout_ms",
             "semantic_hard_timeout_ms",
             "interrupt_and_continue",
+            concat!("attempt_", "sequence"),
+            concat!("public_", "agent_id"),
+            concat!("execution_", "agent_id"),
+            concat!("feature_", "id"),
+            concat!("ownership_", "token"),
+            concat!("task_", "kind"),
+            concat!("analysis_", "readonly"),
+            concat!("implementation_", "worktree"),
+            concat!("test_", "runner"),
         ] {
             assert!(
                 !encoded.contains(forbidden),
@@ -1415,8 +1394,7 @@ mod generic_tests {
             "base_ref": "a".repeat(40),
             "access_mode": "workspace_write",
             "prompt": "run checks",
-            "feature_id": "feature",
-            "ownership_token": "owner",
+            "group_id": "feature",
             "idempotency_key": "key",
             "write_manifest": ["src/lib.rs"],
             "allowed_command_ids": ["unit"],

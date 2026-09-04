@@ -1,6 +1,6 @@
 use crate::{
-    PolicyCapabilities, PolicyLauncher, PolicyMode, PreparationError, PreparationResult,
-    PreparedCommand, PreparedWorktree, WorktreeManager,
+    PolicyCapabilities, PolicyLauncher, PreparationError, PreparationResult, PreparedCommand,
+    PreparedWorktree, WorktreeManager,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,10 +23,9 @@ static GENERAL_PREPARATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum GeneralProfile {
-    AnalysisReadonly,
-    ImplementationWorktree,
-    TestRunner,
+pub enum AccessMode {
+    ReadOnly,
+    WorkspaceWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,10 +43,10 @@ pub struct BudgetLimits {
     pub max_artifact_bytes: u64,
 }
 
-impl GeneralProfile {
+impl AccessMode {
     pub fn default_budget(self) -> BudgetLimits {
         match self {
-            Self::AnalysisReadonly => BudgetLimits {
+            Self::ReadOnly => BudgetLimits {
                 absolute_wall_time_ms: 600_000,
                 runtime_activity_idle_timeout_ms: 90_000,
                 model_stream_idle_timeout_ms: 90_000,
@@ -59,7 +58,7 @@ impl GeneralProfile {
                 max_result_bytes: 256_000,
                 max_artifact_bytes: 2_000_000,
             },
-            Self::ImplementationWorktree => BudgetLimits {
+            Self::WorkspaceWrite => BudgetLimits {
                 absolute_wall_time_ms: 1_800_000,
                 runtime_activity_idle_timeout_ms: 90_000,
                 model_stream_idle_timeout_ms: 90_000,
@@ -70,18 +69,6 @@ impl GeneralProfile {
                 max_context_bytes: 4_000_000,
                 max_result_bytes: 512_000,
                 max_artifact_bytes: 16_000_000,
-            },
-            Self::TestRunner => BudgetLimits {
-                absolute_wall_time_ms: 900_000,
-                runtime_activity_idle_timeout_ms: 90_000,
-                model_stream_idle_timeout_ms: 90_000,
-                tool_call_timeout_ms: 600_000,
-                input_wait_timeout_ms: 300_000,
-                max_turns: 16,
-                max_tool_calls: 120,
-                max_context_bytes: 2_000_000,
-                max_result_bytes: 512_000,
-                max_artifact_bytes: 8_000_000,
             },
         }
     }
@@ -114,10 +101,10 @@ pub struct AttachmentInput {
 #[serde(deny_unknown_fields)]
 pub struct GeneralTaskManifest {
     pub schema: String,
-    pub task_id: String,
+    pub agent_id: String,
     pub repository: PathBuf,
     pub base_ref: String,
-    pub profile: GeneralProfile,
+    pub access_mode: AccessMode,
     pub prompt: String,
     #[serde(default)]
     pub repo_context: Vec<PathBuf>,
@@ -177,10 +164,10 @@ pub struct PreparedContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedGeneralTask {
     pub schema: String,
-    pub task_id: String,
+    pub agent_id: String,
     pub repository: PathBuf,
     pub base_sha: String,
-    pub profile: GeneralProfile,
+    pub access_mode: AccessMode,
     pub prompt_path: PathBuf,
     pub prompt_sha256: String,
     pub context: Vec<PreparedContext>,
@@ -200,7 +187,7 @@ pub struct PreparedGeneralTask {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct GeneralControlContract {
     schema: &'static str,
-    profile: GeneralProfile,
+    access_mode: AccessMode,
     caller_prompt_sha256: String,
     caller_prompt_size_bytes: u64,
     repo_context: Vec<PathBuf>,
@@ -248,8 +235,7 @@ impl PreparedGeneralTask {
     fn validate_finalization_content(&self) -> PreparationResult<()> {
         self.validate_immutable_inputs()?;
         for context in &self.context {
-            let writable_implementation_context = self.profile
-                == GeneralProfile::ImplementationWorktree
+            let writable_implementation_context = self.access_mode == AccessMode::WorkspaceWrite
                 && self
                     .write_manifest
                     .iter()
@@ -291,13 +277,6 @@ impl PreparedGeneralTask {
                 .iter()
                 .map(|context| self.worktree.path.join(&context.repository_relative)),
         );
-        let mode = match self.profile {
-            GeneralProfile::AnalysisReadonly => PolicyMode::GeneralReadonly,
-            GeneralProfile::TestRunner => PolicyMode::GeneralTest,
-            GeneralProfile::ImplementationWorktree => PolicyMode::GeneralImplementation {
-                tracked_write_roots: self.write_manifest.clone(),
-            },
-        };
         PolicyLauncher::for_general(
             self.worktree.path.clone(),
             self.scratch_root.clone(),
@@ -305,7 +284,8 @@ impl PreparedGeneralTask {
             inputs,
             self.validation_commands.clone(),
             PolicyCapabilities::default(),
-            mode,
+            self.access_mode,
+            self.write_manifest.clone(),
         )
     }
 }
@@ -391,7 +371,7 @@ impl GeneralTaskPreparer {
         let effective_budget = manifest
             .budget
             .clone()
-            .unwrap_or_else(|| manifest.profile.default_budget());
+            .unwrap_or_else(|| manifest.access_mode.default_budget());
         validate_budget(&effective_budget)?;
         let context_paths = manifest
             .repo_context
@@ -403,13 +383,12 @@ impl GeneralTaskPreparer {
             .iter()
             .map(|p| confined_relative(p))
             .collect::<PreparationResult<Vec<_>>>()?;
-        if manifest.profile == GeneralProfile::ImplementationWorktree && write_manifest.is_empty() {
+        if manifest.access_mode == AccessMode::WorkspaceWrite && write_manifest.is_empty() {
             return Err(PreparationError::InvalidManifest(
-                "implementation_worktree requires write_manifest".into(),
+                "workspace_write requires write_manifest".into(),
             ));
         }
-        if manifest.profile != GeneralProfile::ImplementationWorktree && !write_manifest.is_empty()
-        {
+        if manifest.access_mode != AccessMode::WorkspaceWrite && !write_manifest.is_empty() {
             return Err(PreparationError::InvalidManifest(
                 "write_manifest is implementation-only".into(),
             ));
@@ -423,11 +402,11 @@ impl GeneralTaskPreparer {
             .artifact_root
             .file_name()
             .and_then(|name| name.to_str())
-            != Some(manifest.task_id.as_str())
+            != Some(manifest.agent_id.as_str())
         {
             return Err(PreparationError::InvalidPath {
                 path: manifest.artifact_root.clone(),
-                reason: "artifact root must be bound to task_id".into(),
+                reason: "artifact root must be bound to agent_id".into(),
             });
         }
         let scratch_parent = canonical_existing_parent(&repository, &manifest.scratch_root)?;
@@ -462,7 +441,7 @@ impl GeneralTaskPreparer {
                     &existing.scratch_root,
                 )?;
                 let expected_control = control_contract_from_prepared_commands(
-                    manifest.profile,
+                    manifest.access_mode,
                     hash(manifest.prompt.as_bytes()),
                     manifest.prompt.len() as u64,
                     normalized_paths(&context_paths),
@@ -525,7 +504,7 @@ impl GeneralTaskPreparer {
             let validation_commands =
                 prepare_general_commands(manifest, named_commands, &worktree.path, &scratch_root)?;
             let control_contract = control_contract_from_prepared_commands(
-                manifest.profile,
+                manifest.access_mode,
                 hash(manifest.prompt.as_bytes()),
                 manifest.prompt.len() as u64,
                 normalized_paths(&context_paths),
@@ -566,10 +545,10 @@ impl GeneralTaskPreparer {
             )?;
             let mut prepared = PreparedGeneralTask {
                 schema: manifest.schema.clone(),
-                task_id: manifest.task_id.clone(),
+                agent_id: manifest.agent_id.clone(),
                 repository: repository.clone(),
                 base_sha: base_sha.clone(),
-                profile: manifest.profile,
+                access_mode: manifest.access_mode,
                 prompt_path,
                 prompt_sha256: hash(manifest.prompt.as_bytes()),
                 context,
@@ -628,7 +607,7 @@ impl GeneralTaskPreparer {
         named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
     ) -> PreparationResult<PreparedGeneralTask> {
         let repository = canonical_general_repository(&manifest.repository)?;
-        let task_id = format!(
+        let agent_id = format!(
             "ztask-{}",
             hash(&serde_json::to_vec(&(
                 repository.as_path(),
@@ -637,8 +616,8 @@ impl GeneralTaskPreparer {
         );
         let mut canonical = manifest.clone();
         canonical.repository = repository;
-        canonical.task_id = task_id.clone();
-        canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(task_id);
+        canonical.agent_id = agent_id.clone();
+        canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(agent_id);
         self.prepare_internal(&canonical, named_commands)
     }
 }
@@ -678,7 +657,7 @@ fn prepare_general_commands(
 }
 
 fn control_contract_from_prepared_commands(
-    profile: GeneralProfile,
+    access_mode: AccessMode,
     caller_prompt_sha256: String,
     caller_prompt_size_bytes: u64,
     repo_context: Vec<PathBuf>,
@@ -716,7 +695,7 @@ fn control_contract_from_prepared_commands(
             })
             .collect::<PreparationResult<Vec<_>>>()?;
     Ok(control_contract(
-        profile,
+        access_mode,
         caller_prompt_sha256,
         caller_prompt_size_bytes,
         repo_context,
@@ -739,7 +718,7 @@ fn control_contract_from_prepared_with_prompt_size(
     caller_prompt_size_bytes: u64,
 ) -> PreparationResult<GeneralControlContract> {
     control_contract_from_prepared_commands(
-        prepared.profile,
+        prepared.access_mode,
         prepared.prompt_sha256.clone(),
         caller_prompt_size_bytes,
         normalized_paths(
@@ -756,7 +735,7 @@ fn control_contract_from_prepared_with_prompt_size(
 }
 
 fn control_contract(
-    profile: GeneralProfile,
+    access_mode: AccessMode,
     caller_prompt_sha256: String,
     caller_prompt_size_bytes: u64,
     repo_context: Vec<PathBuf>,
@@ -765,7 +744,7 @@ fn control_contract(
 ) -> GeneralControlContract {
     GeneralControlContract {
         schema: GENERAL_CONTROL_SCHEMA,
-        profile,
+        access_mode,
         caller_prompt_sha256,
         caller_prompt_size_bytes,
         repo_context,
@@ -827,8 +806,7 @@ pub fn validate_general_named_command(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CompletionOutcome {
-    Succeeded,
-    Blocked,
+    Completed,
     Failed,
     Cancelled,
     TimedOut,
@@ -838,23 +816,14 @@ pub enum CompletionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactMetadata {
+pub struct ChangesPatch {
     pub artifact_id: String,
-    pub kind: GeneralArtifactKind,
     pub sha256: String,
     pub size_bytes: u64,
-    pub partial: bool,
     pub head_commit: Option<String>,
     pub base_sha: String,
     pub changed_paths: Vec<String>,
     pub diff_stat: Option<String>,
-    pub media_type: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GeneralArtifactKind {
-    ChangesPatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -864,8 +833,7 @@ pub struct GeneralCompletion {
     pub summary: String,
     pub checks: Vec<String>,
     pub residual_gaps: Vec<String>,
-    pub artifacts: Vec<ArtifactMetadata>,
-    pub artifact: Option<ArtifactMetadata>,
+    pub changes_patch: Option<ChangesPatch>,
     pub cleaned: bool,
 }
 
@@ -887,7 +855,35 @@ impl GeneralFinalizer {
         Self::finish(prepared, requested, String::new(), Vec::new(), Vec::new())
     }
 
+    pub fn finalize_completed_tree(prepared: &PreparedGeneralTask) -> GeneralCompletion {
+        Self::prepare(
+            prepared,
+            CompletionOutcome::Completed,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    pub fn finish_cleanup(
+        prepared: &PreparedGeneralTask,
+        completion: GeneralCompletion,
+    ) -> GeneralCompletion {
+        Self::cleanup(prepared, completion)
+    }
+
     fn finish(
+        prepared: &PreparedGeneralTask,
+        requested: CompletionOutcome,
+        summary: String,
+        checks: Vec<String>,
+        residual_gaps: Vec<String>,
+    ) -> GeneralCompletion {
+        let completion = Self::prepare(prepared, requested, summary, checks, residual_gaps);
+        Self::cleanup(prepared, completion)
+    }
+
+    fn prepare(
         prepared: &PreparedGeneralTask,
         requested: CompletionOutcome,
         summary: String,
@@ -901,14 +897,7 @@ impl GeneralFinalizer {
             checks.clone(),
             residual_gaps.clone(),
         ) {
-            Ok(mut completion) => {
-                completion.cleaned = cleanup_after_failure(prepared);
-                if !completion.cleaned {
-                    completion.outcome = CompletionOutcome::ResultInvalid;
-                    completion.reason_code = Some("TASK_ROOT_CLEANUP_FAILED".into());
-                }
-                completion
-            }
+            Ok(completion) => completion,
             Err(code) => {
                 if code != "ARTIFACT_ROOT_NOT_EMPTY" {
                     cleanup_failed_artifact_outputs(prepared);
@@ -919,12 +908,36 @@ impl GeneralFinalizer {
                     summary,
                     checks,
                     residual_gaps,
-                    artifacts: Vec::new(),
-                    artifact: None,
+                    changes_patch: None,
                     cleaned: cleanup_if_trusted(prepared),
                 }
             }
         }
+    }
+
+    fn cleanup(
+        prepared: &PreparedGeneralTask,
+        mut completion: GeneralCompletion,
+    ) -> GeneralCompletion {
+        let preparation_already_attempted = completion.reason_code.as_deref().is_some_and(|code| {
+            matches!(
+                code,
+                "PREPARED_TASK_INVALID"
+                    | "PREPARED_CONTENT_INVALID"
+                    | "WORKTREE_IDENTITY_INVALID"
+                    | "PREFINALIZATION_HEAD_INVALID"
+                    | "ARTIFACT_ROOT_NOT_EMPTY"
+                    | "READ_ONLY_MODIFIED_TRACKED_STATE"
+            )
+        });
+        if !completion.cleaned && !preparation_already_attempted {
+            completion.cleaned = cleanup_after_failure(prepared);
+            if !completion.cleaned {
+                completion.outcome = CompletionOutcome::ResultInvalid;
+                completion.reason_code = Some("TASK_ROOT_CLEANUP_FAILED".into());
+            }
+        }
+        completion
     }
     fn try_finalize(
         prepared: &PreparedGeneralTask,
@@ -942,47 +955,33 @@ impl GeneralFinalizer {
         let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
         prefinalization_integrity(prepared, &manager)?;
         ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
-        let mut artifacts = Vec::new();
-        let mut artifact = None;
-        match prepared.profile {
-            GeneralProfile::AnalysisReadonly | GeneralProfile::TestRunner => {
+        let mut changes_patch = None;
+        match prepared.access_mode {
+            AccessMode::ReadOnly => {
                 let d = manager
                     .capture_integrity(&prepared.worktree)
                     .map_err(|_| "WORKTREE_INTEGRITY_FAILED".to_owned())?;
                 if !d.worktree_clean {
-                    return Err("READONLY_PROFILE_MODIFIED_TRACKED_STATE".into());
+                    return Err("READ_ONLY_MODIFIED_TRACKED_STATE".into());
                 }
             }
-            GeneralProfile::ImplementationWorktree => {
-                let retain = matches!(
-                    requested,
-                    CompletionOutcome::Succeeded | CompletionOutcome::Blocked
-                ) || (prepared.retain_partial
-                    && matches!(
-                        requested,
-                        CompletionOutcome::Failed
-                            | CompletionOutcome::Cancelled
-                            | CompletionOutcome::TimedOut
-                            | CompletionOutcome::BudgetExhausted
-                    ));
+            AccessMode::WorkspaceWrite => {
+                let retain = requested == CompletionOutcome::Completed
+                    || (prepared.retain_partial
+                        && matches!(
+                            requested,
+                            CompletionOutcome::Failed
+                                | CompletionOutcome::Cancelled
+                                | CompletionOutcome::TimedOut
+                                | CompletionOutcome::BudgetExhausted
+                        ));
                 if retain {
-                    artifact = finalize_patch(prepared, requested != CompletionOutcome::Succeeded)?;
-                    if let Some(patch) = &artifact {
-                        artifacts.push(patch.clone());
-                    }
+                    changes_patch = finalize_patch(prepared)?;
                 }
             }
-        }
-        if artifacts
-            .iter()
-            .map(|artifact| artifact.size_bytes)
-            .sum::<u64>()
-            > prepared.effective_budget.max_artifact_bytes
-        {
-            return Err("ARTIFACT_LIMIT_EXCEEDED".into());
         }
         let mut cleanup_worktree = prepared.worktree.clone();
-        if let Some(a) = &artifact {
+        if let Some(a) = &changes_patch {
             if let Some(head) = &a.head_commit {
                 cleanup_worktree.head_sha = head.clone();
             }
@@ -999,19 +998,16 @@ impl GeneralFinalizer {
             summary,
             checks,
             residual_gaps,
-            artifacts,
-            artifact,
+            changes_patch,
             cleaned: false,
         })
     }
 }
 
 fn cleanup_failed_artifact_outputs(prepared: &PreparedGeneralTask) {
-    for name in ["changes.patch", "changes.manifest.json"] {
-        let path = prepared.artifact_root.join(name);
-        if path.parent() == Some(prepared.artifact_root.as_path()) {
-            let _ = fs::remove_file(path);
-        }
+    let path = prepared.artifact_root.join("changes.patch");
+    if path.parent() == Some(prepared.artifact_root.as_path()) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -1182,17 +1178,14 @@ fn ensure_directory_empty(path: &Path, code: &'static str) -> Result<(), String>
     Ok(())
 }
 
-fn finalize_patch(
-    prepared: &PreparedGeneralTask,
-    partial: bool,
-) -> Result<Option<ArtifactMetadata>, String> {
+fn finalize_patch(prepared: &PreparedGeneralTask) -> Result<Option<ChangesPatch>, String> {
     let status = git_bytes(
         &prepared.worktree.path,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     let paths = parse_status_paths(&status)?;
     if paths.is_empty() {
-        return if partial {
+        return if prepared.retain_partial {
             Ok(None)
         } else {
             Err("IMPLEMENTATION_HAS_NO_CHANGES".into())
@@ -1288,23 +1281,15 @@ fn finalize_patch(
         ],
     )?)
     .map_err(|_| "DIFF_STAT_INVALID".to_owned())?;
-    let metadata = ArtifactMetadata {
-        artifact_id: hash(format!("{}:{}", prepared.task_id, digest).as_bytes()),
-        kind: GeneralArtifactKind::ChangesPatch,
+    let metadata = ChangesPatch {
+        artifact_id: hash(format!("{}:{}", prepared.agent_id, digest).as_bytes()),
         sha256: digest,
         size_bytes: patch.len() as u64,
-        partial,
         head_commit: Some(head),
         base_sha: prepared.base_sha.clone(),
         changed_paths: paths,
         diff_stat: Some(diff_stat),
-        media_type: "application/vnd.git-diff".into(),
     };
-    atomic_write(
-        &prepared.artifact_root.join("changes.manifest.json"),
-        &serde_json::to_vec_pretty(&metadata).map_err(|_| "ARTIFACT_MANIFEST_FAILED".to_owned())?,
-    )
-    .map_err(|_| "ARTIFACT_MANIFEST_FAILED".to_owned())?;
     Ok(Some(metadata))
 }
 
@@ -1314,11 +1299,11 @@ fn validate_manifest(m: &GeneralTaskManifest) -> PreparationResult<()> {
             "unsupported general task schema".into(),
         ));
     }
-    if m.task_id.is_empty()
+    if m.agent_id.is_empty()
         || m.idempotency_key.is_empty()
-        || m.task_id.len() > 256
+        || m.agent_id.len() > 256
         || m.idempotency_key.len() > 512
-        || !m.task_id.bytes().all(identifier_byte)
+        || !m.agent_id.bytes().all(identifier_byte)
         || !m.idempotency_key.bytes().all(identifier_byte)
         || m.prompt.trim().is_empty()
         || m.prompt.len() > MAX_PROMPT_BYTES

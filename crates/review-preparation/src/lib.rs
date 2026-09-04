@@ -270,17 +270,16 @@ pub fn review_bash_policy_sha256() -> String {
 
 pub use general::{
     canonical_general_repository, general_control_header, general_launch_prompt,
-    validate_general_named_command, ArtifactMetadata, AttachmentInput, BudgetLimits,
-    CompletionOutcome, GeneralArtifactKind, GeneralCompletion, GeneralFinalizer,
-    GeneralNamedCommand, GeneralProfile, GeneralTaskManifest, GeneralTaskPreparer,
-    PreparedAttachment, PreparedContext, PreparedGeneralTask, PublicAttachment,
-    GENERAL_CONTROL_SCHEMA, GENERAL_TASK_SCHEMA,
+    validate_general_named_command, AccessMode, AttachmentInput, BudgetLimits, ChangesPatch,
+    CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralNamedCommand,
+    GeneralTaskManifest, GeneralTaskPreparer, PreparedAttachment, PreparedContext,
+    PreparedGeneralTask, PublicAttachment, GENERAL_CONTROL_SCHEMA, GENERAL_TASK_SCHEMA,
 };
 
 pub use manifest::{ValidationCommand, MAX_VALIDATION_COMMAND_TIMEOUT_MS};
 pub use policy::{
     ExternalDecision, PermissionDecision, PermissionRequest, PolicyCapabilities, PolicyLauncher,
-    PolicyMode, PreparedCommand, SandboxEnforcement, ValidatedPermissionDenial, ValidationOutput,
+    PreparedCommand, SandboxEnforcement, ValidatedPermissionDenial, ValidationOutput,
 };
 pub use worktree::{CleanupRecord, IntegrityDiagnostics, PreparedWorktree, WorktreeManager};
 

@@ -40,14 +40,14 @@ struct BudgetState {
 }
 
 #[derive(Debug)]
-pub(crate) struct AttemptBudget {
+pub(crate) struct RuntimeBudget {
     deadline: Instant,
     max_turns: u64,
     max_tool_calls: u64,
     state: Mutex<BudgetState>,
 }
 
-impl AttemptBudget {
+impl RuntimeBudget {
     #[cfg(test)]
     pub(crate) fn new(limits: &BudgetLimits) -> Self {
         Self::with_limits(
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn duplicate_tool_updates_count_once_and_ambiguous_identity_fails_closed() {
-        let budget = AttemptBudget::new(&limits());
+        let budget = RuntimeBudget::new(&limits());
         budget.observe(&event(
             "tool.updated",
             serde_json::json!({"toolCallId":"tool-1"}),
@@ -206,7 +206,7 @@ mod tests {
         ));
         assert_eq!(budget.violation(), Some(BudgetViolation::ToolCallLimit));
 
-        let ambiguous = AttemptBudget::new(&limits());
+        let ambiguous = RuntimeBudget::new(&limits());
         ambiguous.observe(&event(
             "tool.updated",
             serde_json::json!({"toolName":"Bash"}),
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn duplicate_turn_identity_counts_once_and_ambiguous_identity_fails_closed() {
-        let budget = AttemptBudget::new(&limits());
+        let budget = RuntimeBudget::new(&limits());
         budget.observe(&event(
             "turn.started",
             serde_json::json!({"turnId":"turn-1"}),
@@ -237,14 +237,14 @@ mod tests {
         assert_eq!(budget.counts(), (2, 0));
         assert_eq!(budget.violation(), None);
 
-        let missing = AttemptBudget::new(&limits());
+        let missing = RuntimeBudget::new(&limits());
         missing.observe(&event("turn.started", serde_json::json!({})));
         assert_eq!(
             missing.violation(),
             Some(BudgetViolation::AmbiguousTurnIdentity)
         );
 
-        let conflicting = AttemptBudget::new(&limits());
+        let conflicting = RuntimeBudget::new(&limits());
         let Inbound::Message(WireMessage::Event(mut event)) =
             event("turn.started", serde_json::json!({"turnId":"turn-1"}))
         else {
