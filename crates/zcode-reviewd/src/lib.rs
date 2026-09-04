@@ -2675,6 +2675,8 @@ struct StoreLifecycleSink {
     after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     before_natural_completion_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_result_persist_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2721,6 +2723,8 @@ impl StoreLifecycleSink {
             after_admission_hook: Mutex::new(None),
             #[cfg(test)]
             before_natural_completion_hook: Mutex::new(None),
+            #[cfg(test)]
+            after_result_persist_hook: Mutex::new(None),
         }
     }
 
@@ -2732,6 +2736,11 @@ impl StoreLifecycleSink {
     #[cfg(test)]
     fn set_before_natural_completion_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.before_natural_completion_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn set_after_result_persist_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_result_persist_hook.lock().unwrap() = Some(hook);
     }
 
     fn begin_natural_completion(&self) -> Result<NaturalCompletionAdmission, StoreError> {
@@ -2787,6 +2796,10 @@ impl StoreLifecycleSink {
         let reap_after_persist =
             completion.cleaned && terminal_proves_process_group_reaped(terminal);
         persist_general_result(&self.store, &self.agent_id, prepared, completion)?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_result_persist_hook.lock().unwrap().clone() {
+            hook();
+        }
         if reap_after_persist {
             self.store.reap_task(&self.agent_id)?;
         }
@@ -8284,6 +8297,134 @@ exit 7
             }
             other => panic!("unexpected public result: {other:?}"),
         }
+        assert_general_workspace_cleaned(&prepared);
+    }
+
+    #[test]
+    fn task_result_rpc_reads_immutable_result_and_artifact_before_reap() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let mut manifest = general_manifest(directory.path(), "result-before-reap", None);
+        manifest.access_mode = AccessMode::WorkspaceWrite;
+        manifest.write_manifest = vec!["src".into()];
+        let submitted = scheduler
+            .enqueue_general(&manifest, Some("feature"))
+            .unwrap();
+        let agent_id = submitted.task.agent_id.clone();
+        let prepared = prepared_general(&submitted.task);
+        scheduler.start_ready().unwrap();
+        std::fs::write(
+            prepared.worktree.path.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .unwrap();
+
+        let sink = {
+            let state = scheduler.inner.state.lock().unwrap();
+            Arc::clone(&state.active.get(&agent_id).unwrap().sink)
+        };
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        sink.set_after_result_persist_hook(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                entered.wait();
+                release.wait();
+            }
+        }));
+
+        let service = rpc::RpcService::new(scheduler.clone(), Arc::clone(&store)).unwrap();
+        let runtime = factory.runtime(&agent_id);
+        let finisher = {
+            let runtime = Arc::clone(&runtime);
+            thread::spawn(move || {
+                runtime.emit_text_delta("result-before-reap-text", "persisted result");
+                runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                )))
+            })
+        };
+
+        entered.wait();
+        let intermediate = service
+            .dispatch(rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        let (intermediate_task, intermediate_result, intermediate_artifacts) = match intermediate {
+            rpc::RpcSuccess::TaskResult {
+                task,
+                result: Some(result),
+                artifacts,
+            } => (task, result, artifacts),
+            other => panic!("unexpected intermediate task result response: {other:?}"),
+        };
+        let intermediate_artifact_id = intermediate_artifacts
+            .first()
+            .expect("workspace-write result must publish a patch artifact")
+            .artifact_id
+            .clone();
+        let intermediate_chunk = match service
+            .dispatch(rpc::RpcMethod::TaskArtifact(rpc::TaskArtifactQuery {
+                agent_id: agent_id.clone(),
+                artifact_id: intermediate_artifact_id,
+                offset_bytes: 0,
+                limit_bytes: rpc::MAX_ARTIFACT_CHUNK_BYTES,
+            }))
+            .unwrap()
+        {
+            rpc::RpcSuccess::TaskArtifact { chunk } => chunk,
+            other => panic!("unexpected intermediate artifact response: {other:?}"),
+        };
+        let intermediate_reaped = intermediate_task.reaped;
+        let intermediate_result_sha256 = intermediate_result.result_sha256.clone();
+        let intermediate_result_artifacts = intermediate_result.artifacts.clone();
+
+        release.wait();
+        finisher.join().unwrap();
+
+        assert_eq!(intermediate_task.phase, "TERMINAL");
+        assert!(!intermediate_reaped);
+        let final_response = service
+            .dispatch(rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        let (final_task, final_result, final_artifacts) = match final_response {
+            rpc::RpcSuccess::TaskResult {
+                task,
+                result: Some(result),
+                artifacts,
+            } => (task, result, artifacts),
+            other => panic!("unexpected final task result response: {other:?}"),
+        };
+        assert!(final_task.reaped);
+        assert_eq!(final_result.result_sha256, intermediate_result_sha256);
+        assert_eq!(final_result.artifacts, intermediate_result_artifacts);
+        assert_eq!(final_artifacts, intermediate_artifacts);
+        assert_eq!(final_result, intermediate_result);
+        assert!(store
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .reaped_at
+            .is_some());
+
+        let final_chunk = match service
+            .dispatch(rpc::RpcMethod::TaskArtifact(rpc::TaskArtifactQuery {
+                agent_id,
+                artifact_id: intermediate_chunk.artifact_id.clone(),
+                offset_bytes: 0,
+                limit_bytes: rpc::MAX_ARTIFACT_CHUNK_BYTES,
+            }))
+            .unwrap()
+        {
+            rpc::RpcSuccess::TaskArtifact { chunk } => chunk,
+            other => panic!("unexpected final artifact response: {other:?}"),
+        };
+        assert_eq!(final_chunk, intermediate_chunk);
+        assert!(final_chunk.eof);
+        assert!(!final_chunk.bytes.is_empty());
         assert_general_workspace_cleaned(&prepared);
     }
 
