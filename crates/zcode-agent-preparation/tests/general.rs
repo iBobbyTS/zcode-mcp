@@ -711,6 +711,98 @@ fn owner_roots_symlinks_secret_types_and_budget_fail_closed() {
 }
 
 #[test]
+fn attachment_metadata_paths_are_forbidden_without_filename_heuristics() {
+    let f = Fixture::new();
+    let metadata_root = f.repository.join(".agent-work");
+    fs::create_dir_all(metadata_root.join("reviews")).unwrap();
+    fs::create_dir_all(metadata_root.join("runtime")).unwrap();
+    fs::write(
+        metadata_root.join("reviews/review-notes.txt"),
+        "review metadata\n",
+    )
+    .unwrap();
+    fs::write(metadata_root.join("runtime/runtime-state.json"), "{}\n").unwrap();
+
+    let preparer =
+        GeneralTaskPreparer::new(vec![f.attachments.clone(), f.repository.clone()]).unwrap();
+    for (name, source) in [
+        ("reviews", metadata_root.join("reviews/review-notes.txt")),
+        ("runtime", metadata_root.join("runtime/runtime-state.json")),
+    ] {
+        let mut manifest = f.manifest(AccessMode::ReadOnly);
+        manifest.agent_id = format!("metadata-{name}");
+        manifest.idempotency_key = format!("metadata-{name}");
+        manifest.artifact_root =
+            PathBuf::from(format!(".agent-work/artifacts/{}", manifest.agent_id));
+        manifest.attachments = vec![AttachmentInput {
+            logical_name: name.into(),
+            source_path: source,
+            allowed_root: f.repository.clone(),
+        }];
+        assert!(matches!(
+            preparer.prepare(&manifest),
+            Err(PreparationError::ForbiddenInput(_)),
+        ));
+    }
+}
+
+#[test]
+fn attachment_canonical_target_entering_agent_metadata_is_forbidden() {
+    let f = Fixture::new();
+    let metadata_root = f.repository.join(".agent-work/runtime");
+    fs::create_dir_all(&metadata_root).unwrap();
+    fs::write(metadata_root.join("canonical-target.txt"), "metadata\n").unwrap();
+    symlink(".agent-work/runtime", f.repository.join("metadata-alias")).unwrap();
+
+    let mut manifest = f.manifest(AccessMode::ReadOnly);
+    manifest.agent_id = "metadata-canonical-target".into();
+    manifest.idempotency_key = "metadata-canonical-target".into();
+    manifest.artifact_root = PathBuf::from(".agent-work/artifacts/metadata-canonical-target");
+    manifest.attachments = vec![AttachmentInput {
+        logical_name: "canonical-target".into(),
+        source_path: f.repository.join("metadata-alias/canonical-target.txt"),
+        allowed_root: f.repository.clone(),
+    }];
+    let preparer = GeneralTaskPreparer::new(vec![f.repository.clone()]).unwrap();
+    assert!(matches!(
+        preparer.prepare(&manifest),
+        Err(PreparationError::ForbiddenInput(_)),
+    ));
+}
+
+#[test]
+fn ordinary_review_named_attachment_files_remain_allowed() {
+    let f = Fixture::new();
+    let preparer = f.preparer();
+    for (index, name) in [
+        "gpt-raw-notes.txt",
+        "gpt-admission-notes.txt",
+        "glm-raw-notes.txt",
+        "glm-admission-notes.txt",
+        "review-notes.txt",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = f.attachments.join(name);
+        fs::write(&source, "ordinary attachment\n").unwrap();
+        let mut manifest = f.manifest(AccessMode::ReadOnly);
+        manifest.agent_id = format!("ordinary-attachment-{index}");
+        manifest.idempotency_key = format!("ordinary-attachment-{index}");
+        manifest.artifact_root =
+            PathBuf::from(format!(".agent-work/artifacts/{}", manifest.agent_id));
+        manifest.attachments = vec![AttachmentInput {
+            logical_name: name.to_owned(),
+            source_path: source,
+            allowed_root: f.attachments.clone(),
+        }];
+        let prepared = preparer.prepare(&manifest).unwrap();
+        assert_eq!(prepared.attachments.len(), 1);
+        assert!(GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed).cleaned);
+    }
+}
+
+#[test]
 fn failed_preparation_reaps_worktree_and_access_mode_set_is_closed() {
     let f = Fixture::new();
     let before = git(&f.repository, &["worktree", "list", "--porcelain"]);

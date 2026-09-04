@@ -1,3 +1,4 @@
+use crate::policy::is_agent_metadata_path;
 use crate::{
     PolicyCapabilities, PolicyLauncher, PreparationError, PreparationResult, PreparedCommand,
     PreparedWorktree, WorktreeManager,
@@ -1614,7 +1615,13 @@ fn snapshot_attachments(
                     "attachment root is not owner-approved".into(),
                 ));
             }
+            if is_agent_metadata_path(&a.source_path) {
+                return Err(PreparationError::ForbiddenInput(a.source_path.clone()));
+            }
             let source = fs::canonicalize(&a.source_path)?;
+            if is_agent_metadata_path(&source) {
+                return Err(PreparationError::ForbiddenInput(source));
+            }
             if !source.starts_with(&allowed)
                 || fs::symlink_metadata(&a.source_path)?
                     .file_type()
