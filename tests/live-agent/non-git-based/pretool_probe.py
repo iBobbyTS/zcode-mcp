@@ -96,7 +96,7 @@ def make_read_fixture(root: Path) -> tuple[Path, str]:
 
 
 def validate_write_evidence(evidence: dict[str, object]) -> None:
-    if evidence.get("outcome") != "SUCCEEDED" or evidence.get("phase") != "TERMINAL":
+    if evidence.get("outcome") != "COMPLETED" or evidence.get("phase") != "TERMINAL":
         raise RuntimeError("official write did not complete successfully")
     if evidence.get("changed_files") != [WRITE_FILE]:
         raise RuntimeError("official write changed_files did not match the manifest")

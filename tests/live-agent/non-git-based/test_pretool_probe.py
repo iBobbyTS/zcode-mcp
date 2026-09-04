@@ -39,7 +39,7 @@ class PreToolProbeContractTests(unittest.TestCase):
 
     def test_write_oracle_requires_success_check_applicable_patch_and_reap(self) -> None:
         valid = {
-            "outcome": "SUCCEEDED", "phase": "TERMINAL", "changed_files": [WRITE_FILE],
+            "outcome": "COMPLETED", "phase": "TERMINAL", "changed_files": [WRITE_FILE],
             "checks": [WRITE_CHECK_ID],
             "artifacts": [{"kind": "changes_patch", "verified": True, "applicable": True}],
             "resources_reaped": True, "daemon_reaped": True,
@@ -49,6 +49,17 @@ class PreToolProbeContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 with self.assertRaises(RuntimeError):
                     validate_write_evidence(dict(valid, **{field: False}))
+
+    def test_write_oracle_rejects_legacy_succeeded_outcome(self) -> None:
+        legacy = {
+            "outcome": "SUCCEEDED", "phase": "TERMINAL", "changed_files": [WRITE_FILE],
+            "checks": [WRITE_CHECK_ID],
+            "artifacts": [{"kind": "changes_patch", "verified": True, "applicable": True}],
+            "resources_reaped": True, "daemon_reaped": True,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "did not complete successfully"):
+            validate_write_evidence(legacy)
 
     def test_read_oracle_requires_scheduled_read_typed_deny_and_reap(self) -> None:
         valid = {
