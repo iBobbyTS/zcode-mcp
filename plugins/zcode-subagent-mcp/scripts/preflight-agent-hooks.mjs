@@ -51,6 +51,8 @@ const dangerous = run(`find . -delete`);
 assert.equal(JSON.parse(dangerous.stdout).hookSpecificOutput.permissionDecision, 'deny');
 assert.equal(fs.readFileSync(canary, 'utf8'), 'unchanged\n');
 const generation = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
+assert.equal(typeof generation.service_generation, 'string');
+assert.notEqual(generation.service_generation.length, 0);
 const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 assert.equal(generation.effective_config_path, path.resolve(configPath));
 assert.equal(generation.effective_config_sha256, hashFile(configPath));

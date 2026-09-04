@@ -42,7 +42,10 @@ const active = config?.hooks?.enabled === true && Object.entries(expectedScripts
 const hashFile = (file) => {
   try { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); } catch { return null; }
 };
+const configuredServiceGeneration = process.env.ZCODE_AGENT_SERVICE_GENERATION;
 const ok = active && provenance.hook_activation_verified === true &&
+  typeof provenance.service_generation === 'string' && provenance.service_generation.length > 0 &&
+  (!configuredServiceGeneration || provenance.service_generation === configuredServiceGeneration) &&
   provenance.effective_hook_version === provenance.expected_hook_version &&
   provenance.effective_hook_sha256 === provenance.expected_hook_sha256 &&
   provenance.effective_hook_sha256 === hashFile(provenance.effective_hook_path) &&

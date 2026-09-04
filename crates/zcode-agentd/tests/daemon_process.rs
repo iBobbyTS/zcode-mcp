@@ -31,6 +31,63 @@ fn fake_runtime() -> PathBuf {
         ))
 }
 
+fn hook_provenance(root: &Path) -> (PathBuf, String) {
+    let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/zcode-subagent-mcp")
+        .canonicalize()
+        .unwrap();
+    let config = root.join("hook-config.json");
+    let provenance = root.join("hook-provenance.json");
+    let guard = plugin_root.join("hooks/check-bash-readonly.mjs");
+    let file = plugin_root.join("hooks/check-agent-files.mjs");
+    let audit = plugin_root.join("hooks/audit-bash-result.mjs");
+    let process_hook = |matcher: &str, path: &Path| {
+        serde_json::json!({
+            "matcher": matcher,
+            "hooks": [{
+                "type": "process",
+                "command": "node",
+                "args": [path],
+                "timeoutMs": 5000
+            }]
+        })
+    };
+    let value = serde_json::json!({
+        "hooks": {
+            "events": {
+                "PreToolUse": [process_hook("Bash", &guard), process_hook("^(Read|Grep|Glob|Write|Edit|Delete|Move)$", &file)],
+                "PostToolUse": [process_hook("Bash", &audit)],
+                "PostToolUseFailure": [process_hook("Bash", &audit)]
+            }
+        }
+    });
+    std::fs::write(&config, serde_json::to_vec(&value).unwrap()).unwrap();
+    let installer = plugin_root.join("scripts/install-agent-hooks.mjs");
+    let preflight = plugin_root.join("scripts/preflight-agent-hooks.mjs");
+    for script in [&installer, &preflight] {
+        let output = Command::new("node")
+            .arg(script)
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--provenance",
+                provenance.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} failed: {}",
+            script.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provenance).unwrap()).unwrap();
+    let generation = record["service_generation"].as_str().unwrap().to_owned();
+    (provenance, generation)
+}
+
 fn request(request_id: &str, method: RpcMethod) -> RpcRequest {
     RpcRequest {
         version: RPC_VERSION,
@@ -47,6 +104,54 @@ fn success(response: zcode_agentd::rpc::RpcResponse) -> RpcSuccess {
 }
 
 #[test]
+fn daemon_rejects_missing_hook_provenance_before_socket_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("missing-provenance.sqlite3");
+    let socket = directory.path().join("private").join("missing.sock");
+    let daemon_executable = env!("CARGO_BIN_EXE_zcode-agentd");
+    let mut daemon = Command::new(daemon_executable)
+        .env("ZCODE_AGENTD_STORE", &database)
+        .env("ZCODE_AGENTD_SOCKET", &socket)
+        .env("ZCODE_AGENT_SERVICE_GENERATION", "daemon-test")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = daemon.wait().unwrap();
+    assert!(!status.success());
+    assert!(!socket.exists());
+    let mut stderr = String::new();
+    daemon
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(stderr.contains("provenance"), "{stderr}");
+}
+
+#[test]
+fn daemon_rejects_hook_provenance_from_another_service_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("mismatched-provenance.sqlite3");
+    let socket = directory.path().join("private").join("mismatched.sock");
+    let (provenance, _) = hook_provenance(directory.path());
+    let daemon_executable = env!("CARGO_BIN_EXE_zcode-agentd");
+    let mut daemon = Command::new(daemon_executable)
+        .env("ZCODE_AGENTD_STORE", &database)
+        .env("ZCODE_AGENTD_SOCKET", &socket)
+        .env("ZCODE_AGENT_HOOK_PROVENANCE", &provenance)
+        .env("ZCODE_AGENT_SERVICE_GENERATION", "different-daemon")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = daemon.wait().unwrap();
+    assert!(!status.success());
+    assert!(!socket.exists());
+}
+
+#[test]
 fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("zcode-agent.sqlite3");
@@ -57,6 +162,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         "workspace fake runtime binary is required"
     );
     let daemon_executable = env!("CARGO_BIN_EXE_zcode-agentd");
+    let (hook_file, service_generation) = hook_provenance(directory.path());
     let repository = create_repository(directory.path());
     let head = git_text(&repository, &["rev-parse", "HEAD"]);
     let manifest = GeneralTaskManifest {
@@ -116,6 +222,8 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .env("ZCODE_AGENTD_STORE", &database)
         .env("ZCODE_AGENTD_SOCKET", &socket)
         .env("ZCODE_RUNTIME_PATH", &runtime)
+        .env("ZCODE_AGENT_HOOK_PROVENANCE", &hook_file)
+        .env("ZCODE_AGENT_SERVICE_GENERATION", &service_generation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -126,6 +234,16 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         thread::sleep(Duration::from_millis(10));
     }
     let client = RpcClient::new(&socket, Duration::from_secs(2));
+    match success(
+        client
+            .call(&request("system-status", RpcMethod::SystemStatus))
+            .unwrap(),
+    ) {
+        RpcSuccess::SystemStatus { status } => {
+            assert_eq!(status.service_generation, service_generation)
+        }
+        other => panic!("unexpected status response: {other:?}"),
+    }
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         let status = success(
@@ -199,6 +317,8 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         .env("ZCODE_AGENTD_STORE", &database)
         .env("ZCODE_AGENTD_SOCKET", &second_socket)
         .env("ZCODE_RUNTIME_PATH", &runtime)
+        .env("ZCODE_AGENT_HOOK_PROVENANCE", &hook_file)
+        .env("ZCODE_AGENT_SERVICE_GENERATION", &service_generation)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -355,10 +475,13 @@ fn signal_before_daemon_start_exits_without_socket_runtime_or_durable_activation
 
     let daemon_executable = env!("CARGO_BIN_EXE_zcode-agentd");
     let runtime = fake_runtime();
+    let (hook_file, service_generation) = hook_provenance(directory.path());
     let mut daemon = Command::new(daemon_executable)
         .env("ZCODE_AGENTD_STORE", &database)
         .env("ZCODE_AGENTD_SOCKET", &socket)
         .env("ZCODE_RUNTIME_PATH", &runtime)
+        .env("ZCODE_AGENT_HOOK_PROVENANCE", &hook_file)
+        .env("ZCODE_AGENT_SERVICE_GENERATION", &service_generation)
         .env("ZCODE_AGENTD_TEST_STARTUP_GATE", &gate_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

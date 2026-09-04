@@ -2,7 +2,7 @@
 
 ## Facade restart
 
-The MCP facade is stateless. Restart it with the same `ZCODE_AGENTD_SOCKET`, then use `zcode_agent_poll` or `zcode_agent_result` with the durable `agent_id`. `service_generation` changes only when the daemon changes.
+The MCP facade is stateless. Restart it with the same `ZCODE_AGENTD_SOCKET`, then use `zcode_agent_poll` or `zcode_agent_result` with the durable `agent_id`. The configured `service_generation` is bound to the installed Hook provenance and is reused across daemon restarts; reinstalling or regenerating that provenance changes it. Do not confuse this configured binding with a facade restart or a task identity.
 
 ## Daemon restart
 

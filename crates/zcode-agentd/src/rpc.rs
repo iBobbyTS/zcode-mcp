@@ -569,10 +569,13 @@ impl RpcService {
         if !Arc::ptr_eq(&scheduler.store(), &store) {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
-        // This identity is scoped to the daemon process lifetime.  Hook
-        // installation/preflight has its own activation_generation and must
-        // never control the public restart-scoped service generation.
-        let service_generation = opaque_generation()?;
+        // The daemon startup verifies this configured generation against the
+        // installed generic hook provenance. Direct in-process fixtures may
+        // omit the environment and retain an opaque local identity.
+        let service_generation = std::env::var("ZCODE_AGENT_SERVICE_GENERATION")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(opaque_generation()?);
         Ok(Self {
             scheduler,
             store,

@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -19,6 +20,102 @@ struct Fixture {
     repository: PathBuf,
     attachments: PathBuf,
     head: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyCorpus {
+    allow: Vec<PolicyCorpusEntry>,
+    deny: Vec<PolicyCorpusEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyCorpusEntry {
+    command: String,
+    reason_class: String,
+}
+
+fn policy_reason_class(reason: &str, command: &str) -> &'static str {
+    if reason == "agent_bash_allowlisted" {
+        return "allow";
+    }
+    if reason.starts_with("shell_") {
+        return "shell";
+    }
+    if reason.starts_with("git_") || command.starts_with("git ") {
+        if reason.contains("path") || reason.contains("sensitive") {
+            return "path";
+        }
+        return "git";
+    }
+    if reason.contains("path") || reason.starts_with("sensitive_") || reason.starts_with("symlink_")
+    {
+        return "path";
+    }
+    "stdin"
+}
+
+#[test]
+fn rust_policy_projection_matches_shared_javascript_corpus() {
+    let fixture = Fixture::new();
+    for name in [
+        "gpt-raw-notes.txt",
+        "gpt-admission-notes.txt",
+        "glm-raw-notes.txt",
+        "glm-admission-notes.txt",
+    ] {
+        fs::write(fixture.repository.join(name), "ordinary\n").unwrap();
+    }
+    fs::create_dir_all(fixture.repository.join(".agent-work/runtime")).unwrap();
+    fs::write(
+        fixture.repository.join(".agent-work/runtime/metadata.json"),
+        "{}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.repository.join("scratch")).unwrap();
+    let policy = PolicyLauncher::new(
+        fixture.repository.clone(),
+        fixture.repository.join("scratch"),
+        fixture.repository.join("result.json"),
+        Vec::new(),
+        BTreeMap::new(),
+        false,
+        PolicyCapabilities::default(),
+    )
+    .unwrap();
+    let corpus: PolicyCorpus = serde_json::from_str(include_str!(
+        "../../../plugins/zcode-subagent-mcp/policy-corpus.json"
+    ))
+    .unwrap();
+    for entry in corpus.allow {
+        let PolicyCorpusEntry {
+            command,
+            reason_class,
+        } = entry;
+        let decision = policy.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName": "Bash",
+                "input": {"command": command.clone(), "cwd": fixture.repository}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert!(decision.allowed, "{}: {}", command, decision.reason);
+        assert_eq!(policy_reason_class(decision.reason, &command), reason_class);
+    }
+    for entry in corpus.deny {
+        let PolicyCorpusEntry {
+            command,
+            reason_class,
+        } = entry;
+        let decision = policy.decide_zcode_permission(
+            &serde_json::json!({
+                "toolName": "Bash",
+                "input": {"command": command.clone(), "cwd": fixture.repository}
+            }),
+            ExternalDecision::Allow,
+        );
+        assert!(!decision.allowed, "{} unexpectedly allowed", command);
+        assert_eq!(policy_reason_class(decision.reason, &command), reason_class);
+    }
 }
 
 #[test]

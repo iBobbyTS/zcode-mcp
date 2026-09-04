@@ -16,10 +16,15 @@ Use private absolute database and socket paths outside the target repository:
 export ZCODE_AGENTD_STORE=/absolute/private/zcode-agent.sqlite3
 export ZCODE_AGENTD_SOCKET=/absolute/private/zcode-agent.sock
 export ZCODE_RUNTIME_PATH=/absolute/official/zcode-runtime
+export ZCODE_AGENT_HOOK_PROVENANCE=/absolute/private/zcode-agent-hook-provenance.json
+export ZCODE_AGENT_SERVICE_GENERATION=<service_generation emitted by the hook installer>
 ./target/release/zcode-agentd
 ```
 
 The daemon and Store are the sole durable lifecycle owner. The runtime owner keeps child process, stdio, session, turn, stop, and reap authority. `--database`, `--socket`, `--runtime`, and `--command-catalog` are equivalent CLI options.
+Daemon startup verifies the installed Hook record, including its exact
+`service_generation`, before opening the Store or publishing the private
+socket. Missing, stale, tampered, or mismatched provenance fails closed.
 
 ## Codex MCP
 

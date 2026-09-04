@@ -470,7 +470,7 @@ impl PolicyLauncher {
             _ => {
                 return PermissionDecision {
                     allowed: false,
-                    reason: "cwd_outside_review_roots",
+                    reason: "cwd_outside_agent_roots",
                 }
             }
         };

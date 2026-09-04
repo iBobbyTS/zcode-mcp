@@ -5745,6 +5745,22 @@ impl Daemon {
                 "claim interval must be positive",
             ));
         }
+        let service_generation = std::env::var("ZCODE_AGENT_SERVICE_GENERATION").map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZCODE_AGENT_SERVICE_GENERATION is required",
+            )
+        })?;
+        if !zcode_agent_preparation::agent_bash_hook_provenance_for_service_generation(Some(
+            &service_generation,
+        ))
+        .hook_activation_verified
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "agent hook provenance is missing, stale, or mismatched",
+            ));
+        }
         check_startup_shutdown(&shutdown_requested)?;
         let singleton_lock = SingletonLock::acquire(scheduler.store().database_path())?;
         check_startup_shutdown(&shutdown_requested)?;

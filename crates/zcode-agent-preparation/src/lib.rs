@@ -52,6 +52,11 @@ pub struct AgentHookProvenance {
     pub hook_activation_verified: bool,
     pub activation_method: Option<String>,
     pub activation_generation: Option<String>,
+    /// Binds this installed hook record to the generic daemon configuration.
+    /// The daemon supplies the expected value at startup; it is not inferred
+    /// from the activation artifact itself.
+    #[serde(default)]
+    pub service_generation: Option<String>,
 }
 
 impl Default for AgentHookProvenance {
@@ -75,6 +80,17 @@ pub fn agent_bash_hook_sha256() -> String {
 }
 
 pub fn agent_bash_hook_provenance() -> AgentHookProvenance {
+    let expected_service_generation = std::env::var("ZCODE_AGENT_SERVICE_GENERATION").ok();
+    agent_bash_hook_provenance_for_service_generation(expected_service_generation.as_deref())
+}
+
+/// Load and verify the installed hook record against the daemon generation.
+/// A missing expected generation intentionally fails closed, while callers
+/// that do not yet have a daemon identity can use the legacy-shaped helper
+/// only for untrusted diagnostics.
+pub fn agent_bash_hook_provenance_for_service_generation(
+    expected_service_generation: Option<&str>,
+) -> AgentHookProvenance {
     let daemon_policy_version = AGENT_BASH_POLICY_VERSION.to_owned();
     let daemon_policy_sha256 = agent_bash_daemon_policy_sha256();
     let expected_hook_version = AGENT_BASH_POLICY_VERSION.to_owned();
@@ -101,6 +117,7 @@ pub fn agent_bash_hook_provenance() -> AgentHookProvenance {
         hook_activation_verified: false,
         activation_method: None,
         activation_generation: None,
+        service_generation: None,
     };
     let Some(path) = std::env::var_os("ZCODE_AGENT_HOOK_PROVENANCE") else {
         return unverified();
@@ -119,9 +136,6 @@ pub fn agent_bash_hook_provenance() -> AgentHookProvenance {
         record.effective_file_policy_path.as_deref(),
         record.effective_file_policy_sha256.as_deref(),
     );
-    // `activation_generation` identifies the installed/preflighted hook
-    // artifact. The daemon's restart-scoped service generation is a separate
-    // process identity and is intentionally not coupled to this record.
     let verified = record.hook_activation_verified
         && record.daemon_policy_version == daemon_policy_version
         && record.daemon_policy_sha256 == daemon_policy_sha256
@@ -140,7 +154,10 @@ pub fn agent_bash_hook_provenance() -> AgentHookProvenance {
         && record
             .activation_generation
             .as_deref()
-            .is_some_and(|value| !value.is_empty());
+            .is_some_and(|value| !value.is_empty())
+        && expected_service_generation
+            .filter(|value| !value.is_empty())
+            .is_some_and(|expected| record.service_generation.as_deref() == Some(expected));
     if verified {
         record
     } else {
@@ -286,6 +303,18 @@ fn config_event_references(
                             == Some(expected_path)
                 })
         })
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::agent_bash_hook_provenance_for_service_generation;
+
+    #[test]
+    fn missing_record_cannot_verify_against_a_daemon_generation() {
+        let provenance = agent_bash_hook_provenance_for_service_generation(Some("daemon-test"));
+        assert!(!provenance.hook_activation_verified);
+        assert!(provenance.service_generation.is_none());
+    }
 }
 
 /// Digest of both decision owners that make up the shipped agent Bash policy.

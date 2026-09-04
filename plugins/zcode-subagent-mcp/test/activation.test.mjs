@@ -59,10 +59,17 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
   const preflight = run(preflightScript, ['--config', config, '--provenance', provenance]);
   assert.equal(preflight.status, 0, preflight.stderr);
   const activated = JSON.parse(fs.readFileSync(provenance, 'utf8'));
+  assert.match(activated.service_generation, /^[0-9a-f]{32}$/u);
   assert.equal(activated.effective_file_policy_version, 'zcode-agent-file-policy/v1.0.0');
   assert.equal(activated.effective_file_policy_sha256.length, 64);
   assert.equal(activated.effective_file_wrapper_path.endsWith('/hooks/check-agent-files.mjs'), true);
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 0);
+  assert.equal(run(checkScript, ['--config', config, '--provenance', provenance], {
+    ZCODE_AGENT_SERVICE_GENERATION: activated.service_generation,
+  }).status, 0);
+  assert.equal(run(checkScript, ['--config', config, '--provenance', provenance], {
+    ZCODE_AGENT_SERVICE_GENERATION: 'different-daemon',
+  }).status, 1);
 
   const driftedConfig = JSON.parse(fs.readFileSync(config, 'utf8'));
   for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure']) {
@@ -110,6 +117,23 @@ test('fails closed without changing config when an unknown managed hook is prese
   const result = run(installScript, ['--config', config, '--provenance', provenance]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /unknown managed hook/);
+  assert.deepEqual(fs.readFileSync(config), before);
+  assert.equal(fs.existsSync(provenance), false);
+});
+
+test('validates repository source prerequisites before mutating a copied plugin config', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hooks-copy-'));
+  const copiedRoot = path.join(directory, 'plugin');
+  fs.cpSync(pluginRoot, copiedRoot, { recursive: true });
+  const config = path.join(directory, 'config.json');
+  const provenance = path.join(directory, 'provenance.json');
+  fs.writeFileSync(config, JSON.stringify({ unrelated: { keep: true } }));
+  const before = fs.readFileSync(config);
+  const result = run(path.join(copiedRoot, 'scripts', 'install-agent-hooks.mjs'), [
+    '--config', config,
+    '--provenance', provenance,
+  ]);
+  assert.notEqual(result.status, 0);
   assert.deepEqual(fs.readFileSync(config), before);
   assert.equal(fs.existsSync(provenance), false);
 });

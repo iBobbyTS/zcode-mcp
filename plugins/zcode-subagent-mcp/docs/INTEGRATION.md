@@ -3,7 +3,9 @@
 The plugin root is the only installation surface. `hooks/hooks.json` registers
 the Bash guard, file guard, and metadata-only Bash audit wrapper. The daemon
 consumes the verified record at `ZCODE_AGENT_HOOK_PROVENANCE`; it does not
-derive service identity from the hook generation.
+derive service identity from the hook activation generation. The installer
+emits a separate `service_generation`, and daemon startup accepts it only when
+`ZCODE_AGENT_SERVICE_GENERATION` matches the verified record exactly.
 
 ## Runtime environment
 

@@ -46,7 +46,9 @@ The installer is idempotent and preserves unrelated hook matchers. It refuses
 to replace an unknown managed Bash or file hook. Preflight invokes a safe read,
 denies a destructive canary, and records the installed artifact identity.
 `ZCODE_AGENT_HOOK_PROVENANCE` is the only provenance path consumed by the
-daemon; a missing, stale, or tampered record remains unverified.
+daemon. Export the installer's `service_generation` result as
+`ZCODE_AGENT_SERVICE_GENERATION` for the daemon. A missing, stale, tampered,
+or generation-mismatched record prevents daemon startup.
 
 ## Security contract
 
