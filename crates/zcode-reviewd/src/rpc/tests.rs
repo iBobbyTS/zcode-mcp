@@ -812,6 +812,10 @@ fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
         submit_general_fixture(&fixture, "escaped-result-frame", "feature-escaped-frame");
     fixture.scheduler.start_ready().unwrap();
     let task = fixture.store.get_task(&agent_id).unwrap().unwrap();
+    let mut terminal_task = task.clone();
+    terminal_task.phase = TaskPhase::Terminal;
+    terminal_task.outcome = Some(TaskOutcome::Completed);
+    terminal_task.reaped_at = Some(0);
     let result = |summary: String| TaskResult {
         outcome: TaskOutcome::Completed,
         final_text: summary,
@@ -828,28 +832,34 @@ fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
     let ascii_id = "r".repeat(MAX_REQUEST_ID_BYTES);
     let escaped_id = "\u{1}".repeat(MAX_REQUEST_ID_BYTES);
     assert!(valid_request_id(&escaped_id));
-    let ascii_overhead = terminal_result_response_size(&task, &empty, &[], &ascii_id).unwrap();
-    let escaped_overhead = terminal_result_response_size(&task, &empty, &[], &escaped_id).unwrap();
+    let ascii_overhead =
+        terminal_result_response_size(&terminal_task, &empty, &[], &ascii_id).unwrap();
+    let escaped_overhead =
+        terminal_result_response_size(&terminal_task, &empty, &[], &escaped_id).unwrap();
     assert_eq!(escaped_overhead - ascii_overhead, 5 * MAX_REQUEST_ID_BYTES);
 
     let ascii_only = result("x".repeat(MAX_FRAME_BYTES - ascii_overhead));
     assert_eq!(
-        terminal_result_response_size(&task, &ascii_only, &[], &ascii_id),
+        terminal_result_response_size(&terminal_task, &ascii_only, &[], &ascii_id),
         Some(MAX_FRAME_BYTES)
     );
     assert!(
-        terminal_result_response_size(&task, &ascii_only, &[], &escaped_id).unwrap()
+        terminal_result_response_size(&terminal_task, &ascii_only, &[], &escaped_id).unwrap()
             > MAX_FRAME_BYTES
     );
-    assert!(!terminal_result_response_fits(&task, &ascii_only, &[]));
+    assert!(!terminal_result_response_fits(
+        &terminal_task,
+        &ascii_only,
+        &[]
+    ));
 
     let visible_text = "x".repeat(MAX_FRAME_BYTES - escaped_overhead);
     let safe = result(visible_text.clone());
     assert_eq!(
-        terminal_result_response_size(&task, &safe, &[], &escaped_id),
+        terminal_result_response_size(&terminal_task, &safe, &[], &escaped_id),
         Some(MAX_FRAME_BYTES)
     );
-    assert!(terminal_result_response_fits(&task, &safe, &[]));
+    assert!(terminal_result_response_fits(&terminal_task, &safe, &[]));
 
     let runtime = fixture.factory.runtime(&task.agent_id);
     runtime.emit_text_delta("escaped-result-frame-text", &visible_text);
@@ -866,7 +876,10 @@ fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
     assert_eq!(response.request_id.as_deref(), Some(escaped_id.as_str()));
     let response_size = serde_json::to_vec(&response).unwrap().len();
     assert!(response_size <= MAX_FRAME_BYTES);
-    assert!(response_size >= MAX_FRAME_BYTES - 1);
+    assert!(
+        response_size >= MAX_FRAME_BYTES - 1,
+        "near-cap response was {response_size} bytes"
+    );
     match response.outcome {
         RpcOutcome::Success { result } => match *result {
             RpcSuccess::TaskResult {

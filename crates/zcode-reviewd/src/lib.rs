@@ -2,7 +2,7 @@ use review_store::{
     ArtifactKind, BudgetRequest, EffectiveBudget, LifecycleWrite, MessageState, NewArtifact,
     NewTask, PendingRequestState, PendingResponseClaimDisposition, ResultArtifact, Store,
     StoreError, StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase,
-    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState,
+    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState, MIN_RESULT_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2417,11 +2417,16 @@ struct SchedulerInner {
     preflight_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     response_claim_hook: Mutex<Option<Arc<ResponseClaimHook>>>,
+    #[cfg(test)]
+    result_persist_hook: Mutex<Option<Arc<ResultPersistHook>>>,
     state: Mutex<SchedulerState>,
 }
 
 #[cfg(test)]
 type ResponseClaimHook = dyn Fn(ResponseClaimHookStage, &str) + Send + Sync;
+
+#[cfg(test)]
+type ResultPersistHook = dyn Fn(&str) + Send + Sync;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2771,6 +2776,9 @@ impl StoreLifecycleSink {
             turn_state: None,
         })?;
         persist_general_result(&self.store, &self.agent_id, prepared, completion)?;
+        if completion.cleaned {
+            self.store.reap_task(&self.agent_id)?;
+        }
         state.terminal_written = true;
         self.store
             .get_task(&self.agent_id)?
@@ -2810,7 +2818,32 @@ fn persist_general_result(
             sha256: artifact.sha256.clone(),
             bytes: artifact.size_bytes,
         });
-    store.store_task_result_with_patch(agent_id, &result, patch.as_ref())
+    store_result_with_cancel_precedence(store, agent_id, &result, patch.as_ref())
+}
+
+fn store_result_with_cancel_precedence(
+    store: &Store,
+    agent_id: &str,
+    result: &TaskResult,
+    patch: Option<&NewArtifact>,
+) -> Result<(), StoreError> {
+    match store.store_task_result_with_patch(agent_id, result, patch) {
+        Ok(()) => Ok(()),
+        Err(error @ StoreError::Conflict(_)) => {
+            let task = store.get_task(agent_id)?.ok_or_else(|| {
+                StoreError::InvalidState("terminal result task disappeared".into())
+            })?;
+            if (task.stop_requested || task.close_requested)
+                && result.outcome != TaskOutcome::Cancelled
+                && store.task_result(agent_id)?.is_none()
+            {
+                store.store_task_result(agent_id, &bounded_cancelled_task_result())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn general_result_response_fits(
@@ -2819,9 +2852,12 @@ fn general_result_response_fits(
     completion: &GeneralCompletion,
     result: &TaskResult,
 ) -> Result<bool, StoreError> {
-    let task = store
+    let mut task = store
         .get_task(agent_id)?
         .ok_or_else(|| StoreError::InvalidState("terminal result task disappeared".into()))?;
+    if completion.cleaned {
+        task.reaped_at = Some(0);
+    }
     let artifacts = completion
         .changes_patch
         .iter()
@@ -3023,6 +3059,36 @@ fn minimal_task_result(outcome: CompletionOutcome, summary: &str, reason_code: &
         diff_stat: None,
         checks: Vec::new(),
         residual_gaps: vec![reason_code.into()],
+        artifacts: Vec::new(),
+    }
+}
+
+fn bounded_cancelled_task_result() -> TaskResult {
+    TaskResult {
+        outcome: TaskOutcome::Cancelled,
+        final_text: "task cancelled".into(),
+        partial: true,
+        base_commit: None,
+        head_commit: None,
+        changed_files: Vec::new(),
+        diff_stat: None,
+        checks: Vec::new(),
+        residual_gaps: vec!["CANCELLED".into()],
+        artifacts: Vec::new(),
+    }
+}
+
+fn bounded_result_invalid_task_result() -> TaskResult {
+    TaskResult {
+        outcome: TaskOutcome::ResultInvalid,
+        final_text: "result unavailable".into(),
+        partial: true,
+        base_commit: None,
+        head_commit: None,
+        changed_files: Vec::new(),
+        diff_stat: None,
+        checks: Vec::new(),
+        residual_gaps: vec!["GENERAL_COMPLETION_PERSIST_FAILED".into()],
         artifacts: Vec::new(),
     }
 }
@@ -3449,6 +3515,8 @@ impl Scheduler {
                 preflight_hook: None,
                 #[cfg(test)]
                 response_claim_hook: Mutex::new(None),
+                #[cfg(test)]
+                result_persist_hook: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
             }),
         })
@@ -3495,6 +3563,18 @@ impl Scheduler {
         }
     }
 
+    #[cfg(test)]
+    fn set_result_persist_hook(&self, hook: Arc<ResultPersistHook>) {
+        *self.inner.result_persist_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_result_persist_hook(&self, agent_id: &str) {
+        if let Some(hook) = self.inner.result_persist_hook.lock().unwrap().clone() {
+            hook(agent_id);
+        }
+    }
+
     pub(crate) fn named_checks_enabled(&self) -> bool {
         !self.inner.general_commands.is_empty()
     }
@@ -3518,6 +3598,15 @@ impl Scheduler {
         allowed_command_ids: &[String],
         required_command_ids: &[String],
     ) -> Result<SubmittedTask, SchedulerError> {
+        if manifest
+            .budget
+            .as_ref()
+            .is_some_and(|budget| budget.max_result_bytes < MIN_RESULT_BYTES)
+        {
+            return Err(SchedulerError::InvalidConfig(format!(
+                "max_result_bytes must be at least {MIN_RESULT_BYTES}"
+            )));
+        }
         if group_id.is_some_and(|group_id| group_id.trim().is_empty()) {
             return Err(SchedulerError::InvalidConfig(
                 "group_id cannot be empty when supplied".into(),
@@ -4096,15 +4185,16 @@ impl Scheduler {
         {
             self.record_failure(agent_id, error.to_string());
             if self.inner.store.task_result(agent_id)?.is_none() {
-                self.inner.store.store_task_result(
+                store_result_with_cancel_precedence(
+                    &self.inner.store,
                     agent_id,
-                    &minimal_task_result(
-                        CompletionOutcome::ResultInvalid,
-                        "general completion could not be persisted exactly",
-                        "GENERAL_COMPLETION_PERSIST_FAILED",
-                    ),
+                    &bounded_result_invalid_task_result(),
+                    None,
                 )?;
             }
+        }
+        if completion.cleaned {
+            self.inner.store.reap_task(agent_id)?;
         }
         Ok(self
             .inner
@@ -4403,6 +4493,8 @@ impl Scheduler {
                         compact_untransportable_artifact_projection(&mut completion);
                     }
                 }
+                #[cfg(test)]
+                self.run_result_persist_hook(agent_id);
                 match sink.finish_general(&terminal, prepared, &completion) {
                     Ok(state) => Ok(state),
                     Err(error) => {
@@ -7507,6 +7599,39 @@ exec tail -f /dev/null
     }
 
     #[test]
+    fn result_budget_floor_is_rejected_before_preparation_writes() {
+        let (directory, _store, _factory, scheduler) = scheduler_fixture(1, 1);
+        let mut budget = AccessMode::ReadOnly.default_budget();
+        budget.max_result_bytes = MIN_RESULT_BYTES - 1;
+        let manifest = general_manifest(directory.path(), "tiny-result-budget", Some(budget));
+        assert!(!manifest.repository.join(".agent-work").exists());
+
+        assert!(matches!(
+            scheduler.enqueue_general(&manifest, Some("feature")),
+            Err(SchedulerError::InvalidConfig(message))
+                if message.contains("max_result_bytes must be at least")
+        ));
+        assert!(!manifest.repository.join(".agent-work").exists());
+        assert!(scheduler
+            .store()
+            .startup_recovery_tasks()
+            .unwrap()
+            .is_empty());
+        assert!(
+            serde_json::to_vec(&bounded_cancelled_task_result())
+                .unwrap()
+                .len() as u64
+                <= MIN_RESULT_BYTES
+        );
+        assert!(
+            serde_json::to_vec(&bounded_result_invalid_task_result())
+                .unwrap()
+                .len() as u64
+                <= MIN_RESULT_BYTES
+        );
+    }
+
+    #[test]
     fn required_named_checks_are_daemon_bound_and_rerun_on_the_final_tree() {
         let directory = tempfile::tempdir().unwrap();
         let mut manifest = general_manifest(directory.path(), "required-final-tree", None);
@@ -8586,6 +8711,90 @@ exec tail -f /dev/null
         assert_eq!(succeeded.result.outcome, TaskOutcome::Completed);
         assert_eq!(scheduler.close_task(&late_id).unwrap(), TaskPhase::Terminal);
         assert_eq!(store.task_result(&late_id).unwrap().unwrap(), succeeded);
+    }
+
+    #[test]
+    fn cancellation_between_result_selection_and_persistence_converges_terminal() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "cancel-before-persist", None),
+                Some("feature"),
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id;
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        scheduler.set_result_persist_hook(Arc::new({
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let expected = agent_id.clone();
+            move |observed| {
+                if observed == expected {
+                    entered.wait();
+                    release.wait();
+                }
+            }
+        }));
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta("cancel-before-persist-text", "selected completed result");
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        entered.wait();
+
+        assert_eq!(
+            store.request_stop(&agent_id).unwrap().phase,
+            TaskPhase::Cancelling
+        );
+        assert!(store.task_result(&agent_id).unwrap().is_none());
+        release.wait();
+
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result, bounded_cancelled_task_result());
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Terminal);
+        assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+        assert!(task.reaped_at.is_some());
+        assert_general_workspace_cleaned(&prepared);
+    }
+
+    #[test]
+    fn normal_completion_is_reaped_and_not_recovered_by_a_new_scheduler() {
+        let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "complete-before-restart", None),
+                Some("feature"),
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta("complete-before-restart-text", "completed before restart");
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+
+        let result = wait_for_task_result(&store, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Terminal);
+        assert!(task.reaped_at.is_some());
+        assert_general_workspace_cleaned(&prepared);
+
+        let restarted = Scheduler::new(
+            "restarted-daemon",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        assert!(restarted.reconcile_startup().unwrap().is_empty());
+        assert_eq!(store.task_result(&agent_id).unwrap().unwrap(), result);
     }
 
     #[test]

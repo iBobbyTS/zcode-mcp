@@ -547,6 +547,8 @@ const DEFAULT_BUDGET: EffectiveBudget = EffectiveBudget {
     max_artifact_bytes: 16_777_216,
 };
 
+pub const MIN_RESULT_BYTES: u64 = 512;
+
 const MAX_BUDGET: EffectiveBudget = EffectiveBudget {
     absolute_wall_time_ms: 86_400_000,
     runtime_activity_idle_timeout_ms: 86_400_000,
@@ -1607,6 +1609,11 @@ pub fn resolve_effective_budget(request: &BudgetRequest) -> StoreResult<Effectiv
             "budget limit is zero or above hard cap".into(),
         ));
     }
+    if value.max_result_bytes < MIN_RESULT_BYTES {
+        return Err(StoreError::InvalidState(format!(
+            "max_result_bytes must be at least {MIN_RESULT_BYTES}"
+        )));
+    }
     Ok(value)
 }
 
@@ -2561,7 +2568,8 @@ mod tests {
 
     #[test]
     fn whole_result_budget_accepts_exact_boundary_and_rejects_one_byte_less() {
-        let sample = result(TaskOutcome::Completed);
+        let mut sample = result(TaskOutcome::Completed);
+        sample.final_text = "x".repeat(MIN_RESULT_BYTES as usize);
         let encoded = serde_json::to_vec(&sample).unwrap();
         for (agent_id, limit, accepted) in [
             ("exact", encoded.len() as u64, true),
@@ -2587,6 +2595,42 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn result_budget_floor_fits_truthful_cancel_fallback_and_rejects_less() {
+        let cancelled = TaskResult {
+            outcome: TaskOutcome::Cancelled,
+            final_text: "task cancelled".into(),
+            partial: true,
+            base_commit: None,
+            head_commit: None,
+            changed_files: Vec::new(),
+            diff_stat: None,
+            checks: Vec::new(),
+            residual_gaps: vec!["CANCELLED".into()],
+            artifacts: Vec::new(),
+        };
+        assert!(serde_json::to_vec(&cancelled).unwrap().len() as u64 <= MIN_RESULT_BYTES);
+
+        let (_directory, _path, store) = store();
+        let mut minimum = task("minimum", "/repo", None);
+        minimum.budget = BudgetRequest::Limits(EffectiveBudget {
+            max_result_bytes: MIN_RESULT_BYTES,
+            ..DEFAULT_BUDGET
+        });
+        assert!(store.enqueue_task_authoritative(&minimum).is_ok());
+
+        let mut too_small = task("too-small", "/repo", None);
+        too_small.budget = BudgetRequest::Limits(EffectiveBudget {
+            max_result_bytes: MIN_RESULT_BYTES - 1,
+            ..DEFAULT_BUDGET
+        });
+        assert!(matches!(
+            store.enqueue_task_authoritative(&too_small),
+            Err(StoreError::InvalidState(message))
+                if message.contains("max_result_bytes must be at least")
+        ));
     }
 
     #[test]
