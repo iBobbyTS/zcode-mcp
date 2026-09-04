@@ -1,10 +1,5 @@
 #![cfg(unix)]
 
-use zcode_agent_preparation::{
-    general_launch_prompt, AccessMode, GeneralTaskManifest, GeneralTaskPreparer,
-    GENERAL_TASK_SCHEMA,
-};
-use zcode_agent_store::{BudgetRequest, EffectiveBudget, NewTask, Store, TaskPhase};
 use std::{
     io::{Read, Write},
     os::unix::net::UnixListener,
@@ -13,11 +8,16 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use zcode_driver::{observe_process, observe_process_group};
+use zcode_agent_preparation::{
+    general_launch_prompt, AccessMode, GeneralTaskManifest, GeneralTaskPreparer,
+    GENERAL_TASK_SCHEMA,
+};
+use zcode_agent_store::{BudgetRequest, EffectiveBudget, NewTask, Store, TaskPhase};
 use zcode_agentd::rpc::{
     RespondInput, ResponseDecision, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcSuccess,
     TaskPollQuery, RPC_VERSION,
 };
+use zcode_driver::{observe_process, observe_process_group};
 
 fn fake_runtime() -> PathBuf {
     let executable = std::env::current_exe().unwrap();

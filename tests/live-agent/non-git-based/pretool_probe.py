@@ -41,7 +41,7 @@ def write_catalog(repository: Path) -> dict[str, object]:
                 "timeout_ms": 5000,
                 "max_output_bytes": 1024,
             },
-            "allowed_profiles": ["implementation_worktree"],
+            "allowed_access_modes": ["workspace_write"],
             "readonly_safe": False,
         }],
     }
@@ -174,8 +174,7 @@ def main() -> int:
         sys.executable, str(Path(__file__).with_name("run_matrix.py")),
         "--daemon", str(args.daemon.resolve()), "--facade", str(args.facade.resolve()),
         "--runtime", str(args.runtime.resolve()), "--repository", str(repository),
-        "--base-ref", head, "--feature-id", f"s03-{args.scenario}",
-        "--ownership-token", "s03-pretool-probe",
+        "--base-ref", head, "--group-id", f"s03-{args.scenario}",
         "--idempotency-key", f"s03-{args.scenario}-{uuid.uuid4()}",
         "--poll-timeout-ms", "5000", "--poll-interval-seconds", "15",
         "--max-polls", "60", "--minimal-evidence", *extra,

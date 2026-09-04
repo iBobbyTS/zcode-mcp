@@ -185,7 +185,10 @@ fn effective_config_references_hook(record: &AgentHookProvenance) -> bool {
     if !file_hash_matches(Some(config_path), Some(config_sha256))
         || !file_hash_matches(Some(guard_path), Some(guard_sha256))
         || !file_hash_matches(Some(audit_path), Some(audit_sha256))
-        || !file_hash_matches(Some(file_policy_path), record.effective_file_policy_sha256.as_deref())
+        || !file_hash_matches(
+            Some(file_policy_path),
+            record.effective_file_policy_sha256.as_deref(),
+        )
         || !file_hash_matches(Some(file_wrapper_path), Some(file_wrapper_sha256))
     {
         return false;
@@ -296,14 +299,12 @@ pub fn agent_bash_policy_sha256() -> String {
         ("daemon-rust-policy", include_bytes!("policy.rs").as_slice()),
         (
             "plugin-js-policy",
-            include_bytes!(
-                "../../../plugins/zcode-subagent-mcp/lib/bash-policy.mjs"
-            )
-            .as_slice(),
+            include_bytes!("../../../plugins/zcode-subagent-mcp/lib/bash-policy.mjs").as_slice(),
         ),
         (
             "plugin-js-file-policy",
-            include_bytes!("../../../plugins/zcode-subagent-mcp/lib/agent-file-policy.mjs").as_slice(),
+            include_bytes!("../../../plugins/zcode-subagent-mcp/lib/agent-file-policy.mjs")
+                .as_slice(),
         ),
     ] {
         digest.update((label.len() as u64).to_be_bytes());

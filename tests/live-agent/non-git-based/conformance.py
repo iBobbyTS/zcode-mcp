@@ -113,7 +113,6 @@ def validate_catalog(transport: StdioMCPTransport) -> None:
 def collect_artifact(
     transport: StdioMCPTransport,
     agent_id: str,
-    attempt_sequence: int,
     metadata: Mapping[str, Any],
 ) -> bytes:
     artifact_id = str(metadata["artifact_id"])
@@ -124,7 +123,6 @@ def collect_artifact(
         limit = min(MAX_ARTIFACT_CHUNK_BYTES, size - len(data))
         result = transport.call("zcode_agent_result", {
             "agent_id": agent_id,
-            "attempt_sequence": attempt_sequence,
             "artifact_id": artifact_id,
             "offset_bytes": len(data),
             "limit_bytes": limit,

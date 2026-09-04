@@ -2,7 +2,7 @@
 
 ## Private daemon/facade compatibility
 
-The generic facade and daemon use fail-closed private RPC version 11. A facade
+The generic facade and daemon use fail-closed private RPC version 12. A facade
 or daemon with a different private version is rejected before method dispatch;
 there is no version negotiation or mixed-version fallback.
 

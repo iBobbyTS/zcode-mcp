@@ -1,8 +1,4 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use zcode_agent_preparation::{
-    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, GENERAL_TASK_SCHEMA,
-};
-use zcode_agent_store::{EffectiveBudget, TaskOutcome};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
@@ -19,6 +15,10 @@ use std::{
     },
     time::Duration,
 };
+use zcode_agent_preparation::{
+    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, GENERAL_TASK_SCHEMA,
+};
+use zcode_agent_store::{EffectiveBudget, TaskOutcome};
 use zcode_agentd::rpc::{
     AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
     MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView, RpcClient, RpcMethod,
@@ -33,7 +33,7 @@ use crate::{
     PublicResponseDisposition,
 };
 
-pub const V2_PUBLIC_TOOLS: [&str; 9] = [
+pub const PUBLIC_TOOLS: [&str; 9] = [
     "zcode_agent_cancel",
     "zcode_agent_close",
     "zcode_agent_list",
@@ -932,9 +932,7 @@ fn project_response(value: ResponseOutcomeView) -> AgentRespondOutput {
         zcode_agentd::rpc::ResponseDispositionView::AlreadyResponded => {
             PublicResponseDisposition::AlreadyResponded
         }
-        zcode_agentd::rpc::ResponseDispositionView::InFlight => {
-            PublicResponseDisposition::InFlight
-        }
+        zcode_agentd::rpc::ResponseDispositionView::InFlight => PublicResponseDisposition::InFlight,
     };
     AgentRespondOutput {
         disposition,
@@ -1310,7 +1308,7 @@ impl SubagentMcp {
     }
 }
 
-pub async fn serve_stdio_v2(
+pub async fn serve_stdio(
     socket: PathBuf,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1325,11 +1323,11 @@ pub async fn serve_stdio_v2(
 #[cfg(test)]
 mod generic_tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{io, process::Command};
     use zcode_agent_store::{
         ArtifactKind, NewArtifact, ResultArtifact, Store, TaskRecord, TaskResult, TurnState,
     };
-    use sha2::{Digest, Sha256};
-    use std::{io, process::Command};
     use zcode_agentd::{
         rpc::{RpcServer, RpcService, ServerOptions},
         LifecycleSink, ManagedRuntime, RuntimeFactory, Scheduler, SchedulerConfig,
@@ -1368,7 +1366,7 @@ mod generic_tests {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
-        assert_eq!(names, V2_PUBLIC_TOOLS);
+        assert_eq!(names, PUBLIC_TOOLS);
         let encoded = serde_json::to_string(&tools).unwrap();
         for forbidden in [
             concat!("zcode_", "review_spawn"),

@@ -45,8 +45,7 @@ Review is a normal read-only Agent invocation. Put review instructions in `promp
   "base_ref": "0123456789abcdef0123456789abcdef01234567",
   "prompt": "Review base..HEAD and report concrete findings.",
   "access_mode": "read_only",
-  "feature_id": "feature",
-  "ownership_token": "owner",
+  "group_id": "feature",
   "idempotency_key": "fresh-agent-key",
   "allowed_command_ids": [],
   "required_command_ids": []

@@ -58,6 +58,10 @@ test('install/check/preflight are idempotent, isolated, and provenance-aware', (
 
   const preflight = run(preflightScript, ['--config', config, '--provenance', provenance]);
   assert.equal(preflight.status, 0, preflight.stderr);
+  const activated = JSON.parse(fs.readFileSync(provenance, 'utf8'));
+  assert.equal(activated.effective_file_policy_version, 'zcode-agent-file-policy/v1.0.0');
+  assert.equal(activated.effective_file_policy_sha256.length, 64);
+  assert.equal(activated.effective_file_wrapper_path.endsWith('/hooks/check-agent-files.mjs'), true);
   assert.equal(run(checkScript, ['--config', config, '--provenance', provenance]).status, 0);
 
   const driftedConfig = JSON.parse(fs.readFileSync(config, 'utf8'));

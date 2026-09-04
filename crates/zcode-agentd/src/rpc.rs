@@ -2,15 +2,6 @@ use crate::{
     MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
     ResponseDisposition, Scheduler, SchedulerError,
 };
-use zcode_agent_preparation::{
-    canonical_general_repository, AccessMode, BudgetLimits, GeneralTaskManifest,
-    PreparedGeneralTask,
-};
-use zcode_agent_store::{
-    EffectiveBudget, PendingRequestState, Store, StoreError, StoredArtifact, StoredPendingRequest,
-    StoredTaskResult, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
-    TaskResult, TaskSubmissionDisposition,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +13,15 @@ use std::{
     sync::Arc,
     thread,
     time::{Duration, Instant},
+};
+use zcode_agent_preparation::{
+    canonical_general_repository, AccessMode, BudgetLimits, GeneralTaskManifest,
+    PreparedGeneralTask,
+};
+use zcode_agent_store::{
+    EffectiveBudget, PendingRequestState, Store, StoreError, StoredArtifact, StoredPendingRequest,
+    StoredTaskResult, TaskOutcome, TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
+    TaskResult, TaskSubmissionDisposition,
 };
 
 pub const RPC_VERSION: u16 = 12;

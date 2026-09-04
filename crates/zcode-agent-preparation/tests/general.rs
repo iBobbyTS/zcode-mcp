@@ -1,9 +1,3 @@
-use zcode_agent_preparation::{
-    general_control_header, general_launch_prompt, AccessMode, AttachmentInput, CompletionOutcome,
-    ExternalDecision, GeneralCompletion, GeneralFinalizer, GeneralNamedCommand,
-    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PolicyCapabilities,
-    PolicyLauncher, PreparationError, PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
-};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -13,6 +7,12 @@ use std::{
     process::Command,
 };
 use tempfile::TempDir;
+use zcode_agent_preparation::{
+    general_control_header, general_launch_prompt, AccessMode, AttachmentInput, CompletionOutcome,
+    ExternalDecision, GeneralCompletion, GeneralFinalizer, GeneralNamedCommand,
+    GeneralTaskManifest, GeneralTaskPreparer, PermissionRequest, PolicyCapabilities,
+    PolicyLauncher, PreparationError, PreparedGeneralTask, ValidationCommand, GENERAL_TASK_SCHEMA,
+};
 
 struct Fixture {
     _temp: TempDir,

@@ -1,9 +1,3 @@
-use zcode_agent_store::{
-    ArtifactKind, BudgetRequest, EffectiveBudget, LifecycleWrite, MessageState, NewArtifact,
-    NewTask, PendingRequestState, PendingResponseClaimDisposition, ResultArtifact, Store,
-    StoreError, StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase,
-    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState, MIN_RESULT_BYTES,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,6 +11,12 @@ use std::{
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use zcode_agent_store::{
+    ArtifactKind, BudgetRequest, EffectiveBudget, LifecycleWrite, MessageState, NewArtifact,
+    NewTask, PendingRequestState, PendingResponseClaimDisposition, ResultArtifact, Store,
+    StoreError, StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase,
+    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState, MIN_RESULT_BYTES,
 };
 use zcode_driver::{
     observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
@@ -5820,9 +5820,9 @@ impl Drop for Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcode_agent_preparation::{AccessMode, BudgetLimits, GENERAL_TASK_SCHEMA};
     use std::collections::BTreeMap;
     use std::sync::Barrier;
+    use zcode_agent_preparation::{AccessMode, BudgetLimits, GENERAL_TASK_SCHEMA};
     use zcode_protocol::{EventEnvelope, RequestEnvelope, WireId};
 
     #[test]
@@ -6325,7 +6325,10 @@ sleep 10
 
         let equivalent = permission_offer("Bash", serde_json::json!({"command":"cat './.env'"}));
         let equivalent_denial = policy
-            .validated_zcode_denial(&equivalent, zcode_agent_preparation::ExternalDecision::Allow)
+            .validated_zcode_denial(
+                &equivalent,
+                zcode_agent_preparation::ExternalDecision::Allow,
+            )
             .unwrap();
         cache.observe("hard-2".into(), &equivalent);
         let repeated = cache
@@ -6351,7 +6354,10 @@ sleep 10
             serde_json::json!({"command":"git diff --output=leak.patch"}),
         );
         let git_output_denial = policy
-            .validated_zcode_denial(&git_output, zcode_agent_preparation::ExternalDecision::Allow)
+            .validated_zcode_denial(
+                &git_output,
+                zcode_agent_preparation::ExternalDecision::Allow,
+            )
             .unwrap();
         cache.observe("git-output".into(), &git_output);
         let independent = cache
@@ -8620,7 +8626,10 @@ exit 7
         assert_general_workspace_cleaned(&prepared);
     }
 
-    fn wait_for_task_result(store: &Store, execution_id: &str) -> zcode_agent_store::StoredTaskResult {
+    fn wait_for_task_result(
+        store: &Store,
+        execution_id: &str,
+    ) -> zcode_agent_store::StoredTaskResult {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(result) = store.task_result(execution_id).unwrap() {

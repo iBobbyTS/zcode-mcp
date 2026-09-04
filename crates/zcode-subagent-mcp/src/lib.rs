@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use zcode_agentd::rpc::{PendingRequestStateView, PendingRequestView, RpcError, RpcErrorCode};
 
-pub mod v2;
-pub use v2::{serve_stdio_v2, SubagentMcp, V2_PUBLIC_TOOLS};
+pub mod server;
+pub use server::{serve_stdio, SubagentMcp, PUBLIC_TOOLS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

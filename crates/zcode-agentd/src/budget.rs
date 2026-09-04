@@ -1,11 +1,11 @@
-#[cfg(test)]
-use zcode_agent_preparation::BudgetLimits;
-use zcode_agent_store::EffectiveBudget;
 use std::{
     collections::HashSet,
     sync::Mutex,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use zcode_agent_preparation::BudgetLimits;
+use zcode_agent_store::EffectiveBudget;
 use zcode_driver::Inbound;
 use zcode_protocol::{event_type, WireMessage};
 

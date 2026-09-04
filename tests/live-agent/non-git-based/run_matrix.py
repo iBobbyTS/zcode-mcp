@@ -25,8 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-ref", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--access-mode", choices=["read_only", "workspace_write"], default="read_only")
-    parser.add_argument("--feature-id", default="official-generic-agent")
-    parser.add_argument("--ownership-token", default="live-agent-harness")
+    parser.add_argument("--group-id", default="official-generic-agent")
     parser.add_argument("--idempotency-key", required=True)
     parser.add_argument("--write-manifest", action="append", default=[])
     parser.add_argument("--allowed-command-id", action="append", default=[])
@@ -199,8 +198,7 @@ def main() -> int:
                 "base_ref": args.base_ref,
                 "prompt": args.prompt,
                 "access_mode": args.access_mode,
-                "feature_id": args.feature_id,
-                "ownership_token": args.ownership_token,
+                "group_id": args.group_id,
                 "idempotency_key": args.idempotency_key,
                 "write_manifest": args.write_manifest,
                 "allowed_command_ids": args.allowed_command_id,
@@ -260,7 +258,7 @@ def main() -> int:
             artifact_verification = []
             for artifact in result.get("artifacts", []):
                 content = collect_artifact(
-                    transport, agent_id, int(task["attempt_sequence"]), artifact
+                    transport, agent_id, artifact
                 )
                 artifact_verification.append({
                     "artifact_id": artifact["artifact_id"],

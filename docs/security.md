@@ -15,8 +15,8 @@ accepted only for typed daemon-published pending requests, and local policy may
 override an external allow to deny.
 
 Task listing is never daemon-wide: callers must provide at least one explicit
-repository, feature, or ownership-token scope, which the Store applies before
-the bound. Stable public IDs are not authentication tokens; this is a local,
+repository or group scope, which the Store applies before the bound. Stable
+public IDs are not authentication tokens; this is a local,
 single-user transport without remote or multi-tenant authorization.
 
 Artifact metadata contains only ID, approved kind, SHA-256, and size. Chunk

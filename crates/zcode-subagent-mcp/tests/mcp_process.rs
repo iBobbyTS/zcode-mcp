@@ -50,7 +50,7 @@ fn stdio_catalog_is_exactly_the_generic_nine_tools() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names, zcode_subagent_mcp::V2_PUBLIC_TOOLS);
+    assert_eq!(names, zcode_subagent_mcp::PUBLIC_TOOLS);
     let schema = serde_json::to_string(tools).unwrap();
     for forbidden in [
         concat!("zcode_", "review_"),

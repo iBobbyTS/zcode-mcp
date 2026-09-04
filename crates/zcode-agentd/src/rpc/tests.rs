@@ -4,10 +4,6 @@ use crate::{
     RuntimeEvent, RuntimeFactory, RuntimeOwner, RuntimeTerminal, SchedulerConfig, SessionReady,
     TurnBoundary, TurnSnapshot, GENERAL_COMMAND_CATALOG_SCHEMA,
 };
-use zcode_agent_store::{
-    ArtifactKind, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome, TaskRecord,
-    TaskResult,
-};
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
@@ -21,6 +17,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
+};
+use zcode_agent_store::{
+    ArtifactKind, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome, TaskRecord,
+    TaskResult,
 };
 use zcode_driver::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use zcode_protocol::{EventEnvelope, RequestEnvelope, WireMessage};

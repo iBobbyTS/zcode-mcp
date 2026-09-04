@@ -1,4 +1,3 @@
-use zcode_agent_store::Store;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
     env, fs, io,
@@ -13,6 +12,7 @@ use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
 };
+use zcode_agent_store::Store;
 use zcode_agentd::{
     rpc::ServerOptions, CommandRuntimeFactory, Daemon, GeneralCommandCatalog, RuntimeFactory,
     Scheduler, SchedulerConfig,
