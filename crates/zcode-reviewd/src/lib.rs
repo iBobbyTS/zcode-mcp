@@ -2786,13 +2786,7 @@ impl StoreLifecycleSink {
         })?;
         let reap_after_persist =
             completion.cleaned && terminal_proves_process_group_reaped(terminal);
-        persist_general_result(
-            &self.store,
-            &self.agent_id,
-            prepared,
-            completion,
-            reap_after_persist,
-        )?;
+        persist_general_result(&self.store, &self.agent_id, prepared, completion)?;
         if reap_after_persist {
             self.store.reap_task(&self.agent_id)?;
         }
@@ -2813,10 +2807,9 @@ fn persist_general_result(
     agent_id: &str,
     prepared: &PreparedGeneralTask,
     completion: &GeneralCompletion,
-    reap_after_persist: bool,
 ) -> Result<(), StoreError> {
     let result = task_result(completion);
-    if !general_result_response_fits(store, agent_id, completion, &result, reap_after_persist)? {
+    if !general_result_response_fits(store, agent_id, completion, &result)? {
         return Err(StoreError::InvalidState(
             "task result exceeds private RPC response frame".into(),
         ));
@@ -2869,14 +2862,13 @@ fn general_result_response_fits(
     agent_id: &str,
     completion: &GeneralCompletion,
     result: &TaskResult,
-    reap_after_persist: bool,
 ) -> Result<bool, StoreError> {
     let mut task = store
         .get_task(agent_id)?
         .ok_or_else(|| StoreError::InvalidState("terminal result task disappeared".into()))?;
-    if reap_after_persist {
-        task.reaped_at = Some(0);
-    }
+    // Terminal sizing must reserve the longest legal projection.  Reaping is
+    // a separate cleanup transaction and must never make this preflight optimistic.
+    task.reaped_at = None;
     let artifacts = completion
         .changes_patch
         .iter()
@@ -3806,13 +3798,7 @@ impl Scheduler {
                 message: "startup worktree recovery did not prove cleanup".into(),
             });
         }
-        persist_general_result(
-            &self.inner.store,
-            &task.agent_id,
-            &prepared,
-            &completion,
-            true,
-        )?;
+        persist_general_result(&self.inner.store, &task.agent_id, &prepared, &completion)?;
         self.inner.store.reap_task(&task.agent_id)?;
         Ok(())
     }
@@ -4245,13 +4231,9 @@ impl Scheduler {
         completion: &GeneralCompletion,
         reap_after_persist: bool,
     ) -> Result<TaskPhase, SchedulerError> {
-        if let Err(error) = persist_general_result(
-            &self.inner.store,
-            agent_id,
-            prepared,
-            completion,
-            reap_after_persist,
-        ) {
+        if let Err(error) =
+            persist_general_result(&self.inner.store, agent_id, prepared, completion)
+        {
             self.record_failure(agent_id, error.to_string());
             if self.inner.store.task_result(agent_id)?.is_none() {
                 store_result_with_cancel_precedence(
@@ -4555,13 +4537,8 @@ impl Scheduler {
                 }
                 let reap_after_persist = completion.cleaned && process_group_reaped;
                 let result = task_result(&completion);
-                if !general_result_response_fits(
-                    &self.inner.store,
-                    agent_id,
-                    &completion,
-                    &result,
-                    reap_after_persist,
-                )? {
+                if !general_result_response_fits(&self.inner.store, agent_id, &completion, &result)?
+                {
                     invalidate_untransportable_completion(&mut completion);
                     let result = task_result(&completion);
                     if !general_result_response_fits(
@@ -4569,7 +4546,6 @@ impl Scheduler {
                         agent_id,
                         &completion,
                         &result,
-                        reap_after_persist,
                     )? {
                         compact_untransportable_artifact_projection(&mut completion);
                     }
@@ -5582,26 +5558,6 @@ impl Scheduler {
             .active
             .get(agent_id)
             .and_then(|active| active.policy.as_ref().map(Arc::clone))
-    }
-
-    pub fn reap_task(&self, agent_id: &str) -> Result<TaskPhase, SchedulerError> {
-        let deadline = self.control_deadline();
-        let phase = self
-            .inner
-            .store
-            .get_task(agent_id)?
-            .ok_or_else(|| {
-                SchedulerError::Store(StoreError::InvalidState(format!("unknown task {agent_id}")))
-            })?
-            .phase;
-        if !phase.is_terminal() {
-            return Ok(phase);
-        }
-        deadline
-            .remaining()
-            .ok_or_else(|| Self::control_timeout_error(agent_id))?;
-        self.inner.store.reap_task(agent_id)?;
-        Ok(TaskPhase::Terminal)
     }
 
     pub fn active_count(&self) -> usize {

@@ -29,6 +29,7 @@ struct FakeRuntime {
     sink: Arc<dyn LifecycleSink>,
     next_sequence: AtomicU64,
     terminal: Mutex<Option<RuntimeTerminal>>,
+    stop_terminal: Mutex<Option<RuntimeTerminal>>,
     changed: Condvar,
     turn: Mutex<TurnSnapshot>,
 }
@@ -39,6 +40,7 @@ impl FakeRuntime {
             sink,
             next_sequence: AtomicU64::new(1),
             terminal: Mutex::new(None),
+            stop_terminal: Mutex::new(None),
             changed: Condvar::new(),
             turn: Mutex::new(TurnSnapshot {
                 generation: 0,
@@ -91,6 +93,10 @@ impl FakeRuntime {
             ChildExit::Exited(Some(0)),
         )))
     }
+
+    fn set_stop_terminal(&self, terminal: RuntimeTerminal) {
+        *self.stop_terminal.lock().unwrap() = Some(terminal);
+    }
 }
 
 impl ManagedRuntime for FakeRuntime {
@@ -99,7 +105,12 @@ impl ManagedRuntime for FakeRuntime {
     }
 
     fn stop(&self, _grace: Duration) -> RuntimeTerminal {
-        self.finish()
+        self.stop_terminal
+            .lock()
+            .unwrap()
+            .take()
+            .map(|terminal| self.publish_terminal(terminal))
+            .unwrap_or_else(|| self.finish())
     }
 
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
@@ -644,6 +655,79 @@ fn cancel_and_close_return_the_reaped_generic_task_without_followup_rpc() {
 }
 
 #[test]
+fn public_stop_does_not_mark_runtime_loss_as_reaped_before_restart_recovery() {
+    let cases = [
+        (
+            false,
+            RuntimeTerminal::FailedRuntimeLost(crate::RuntimeLoss::StopFailed(
+                "stop failed while the process group remained live".into(),
+            )),
+        ),
+        (
+            true,
+            RuntimeTerminal::Orphaned(crate::RuntimeLoss::UnknownMembership),
+        ),
+    ];
+
+    for (close, terminal) in cases {
+        let fixture = fixture();
+        let (_, agent_id) = submit_general_fixture(
+            &fixture,
+            if close {
+                "public-close-orphan"
+            } else {
+                "public-cancel-stop-failed"
+            },
+            "feature-recovery-truth",
+        );
+        fixture.scheduler.start_ready().unwrap();
+        let runtime = fixture.factory.runtime(&agent_id);
+        runtime.set_stop_terminal(terminal);
+
+        let task = if close {
+            match fixture
+                .service
+                .dispatch(RpcMethod::TaskClose {
+                    agent_id: agent_id.clone(),
+                })
+                .unwrap()
+            {
+                RpcSuccess::Closed { task } => task,
+                other => panic!("unexpected close result: {other:?}"),
+            }
+        } else {
+            match fixture
+                .service
+                .dispatch(RpcMethod::TaskCancel {
+                    agent_id: agent_id.clone(),
+                })
+                .unwrap()
+            {
+                RpcSuccess::Stopped { task } => task,
+                other => panic!("unexpected cancel result: {other:?}"),
+            }
+        };
+        assert_eq!(task.phase, "TERMINAL");
+        assert!(!task.reaped, "public stop must not perform mark-only reap");
+        let stored_result = fixture.store.task_result(&agent_id).unwrap().unwrap();
+        let stored_task = fixture.store.get_task(&agent_id).unwrap().unwrap();
+        assert!(stored_task.reaped_at.is_none());
+        assert_eq!(stored_result.result.outcome, TaskOutcome::Cancelled);
+
+        assert!(fixture
+            .store
+            .startup_recovery_tasks()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.agent_id == agent_id));
+        assert_eq!(
+            fixture.store.task_result(&agent_id).unwrap().unwrap(),
+            stored_result
+        );
+    }
+}
+
+#[test]
 fn oversized_terminal_text_persists_a_readable_result_invalid_response() {
     let fixture = fixture();
     let (_, agent_id) =
@@ -815,7 +899,6 @@ fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
     let mut terminal_task = task.clone();
     terminal_task.phase = TaskPhase::Terminal;
     terminal_task.outcome = Some(TaskOutcome::Completed);
-    terminal_task.reaped_at = Some(0);
     let result = |summary: String| TaskResult {
         outcome: TaskOutcome::Completed,
         final_text: summary,
@@ -877,7 +960,7 @@ fn near_cap_terminal_result_is_safe_for_maximally_escaped_request_id() {
     let response_size = serde_json::to_vec(&response).unwrap().len();
     assert!(response_size <= MAX_FRAME_BYTES);
     assert!(
-        response_size >= MAX_FRAME_BYTES - 1,
+        response_size >= MAX_FRAME_BYTES - 4,
         "near-cap response was {response_size} bytes"
     );
     match response.outcome {

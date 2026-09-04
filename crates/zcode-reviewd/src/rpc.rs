@@ -792,9 +792,6 @@ impl RpcService {
                 self.scheduler
                     .cancel_task(&task.agent_id)
                     .map_err(map_scheduler)?;
-                self.scheduler
-                    .reap_task(&task.agent_id)
-                    .map_err(map_scheduler)?;
                 let task = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Stopped {
                     task: task_view(task),
@@ -825,9 +822,6 @@ impl RpcService {
                 let task = self.require_task(&agent_id)?;
                 self.scheduler
                     .close_task(&task.agent_id)
-                    .map_err(map_scheduler)?;
-                self.scheduler
-                    .reap_task(&task.agent_id)
                     .map_err(map_scheduler)?;
                 let task = self.require_task(&agent_id)?;
                 Ok(RpcSuccess::Closed {
