@@ -64,6 +64,15 @@ pub enum RuntimeTerminal {
     Orphaned(RuntimeLoss),
 }
 
+fn terminal_proves_process_group_reaped(terminal: &RuntimeTerminal) -> bool {
+    matches!(
+        terminal,
+        RuntimeTerminal::Stopped(_)
+            | RuntimeTerminal::Completed(_)
+            | RuntimeTerminal::FailedTurn(_)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnBoundary {
     Completed,
@@ -2775,8 +2784,16 @@ impl StoreLifecycleSink {
             terminal: None,
             turn_state: None,
         })?;
-        persist_general_result(&self.store, &self.agent_id, prepared, completion)?;
-        if completion.cleaned {
+        let reap_after_persist =
+            completion.cleaned && terminal_proves_process_group_reaped(terminal);
+        persist_general_result(
+            &self.store,
+            &self.agent_id,
+            prepared,
+            completion,
+            reap_after_persist,
+        )?;
+        if reap_after_persist {
             self.store.reap_task(&self.agent_id)?;
         }
         state.terminal_written = true;
@@ -2796,9 +2813,10 @@ fn persist_general_result(
     agent_id: &str,
     prepared: &PreparedGeneralTask,
     completion: &GeneralCompletion,
+    reap_after_persist: bool,
 ) -> Result<(), StoreError> {
     let result = task_result(completion);
-    if !general_result_response_fits(store, agent_id, completion, &result)? {
+    if !general_result_response_fits(store, agent_id, completion, &result, reap_after_persist)? {
         return Err(StoreError::InvalidState(
             "task result exceeds private RPC response frame".into(),
         ));
@@ -2851,11 +2869,12 @@ fn general_result_response_fits(
     agent_id: &str,
     completion: &GeneralCompletion,
     result: &TaskResult,
+    reap_after_persist: bool,
 ) -> Result<bool, StoreError> {
     let mut task = store
         .get_task(agent_id)?
         .ok_or_else(|| StoreError::InvalidState("terminal result task disappeared".into()))?;
-    if completion.cleaned {
+    if reap_after_persist {
         task.reaped_at = Some(0);
     }
     let artifacts = completion
@@ -3118,6 +3137,26 @@ fn finalized_general(
         completion.reason_code = Some(reason_code.into());
     }
     completion
+}
+
+fn unreaped_general(
+    outcome: CompletionOutcome,
+    reason_code: &str,
+    message: &str,
+) -> GeneralCompletion {
+    GeneralCompletion {
+        outcome,
+        reason_code: (outcome != CompletionOutcome::Completed).then(|| reason_code.into()),
+        summary: if message.trim().is_empty() {
+            reason_code.into()
+        } else {
+            message.into()
+        },
+        checks: Vec::new(),
+        residual_gaps: Vec::new(),
+        changes_patch: None,
+        cleaned: false,
+    }
 }
 
 fn runtime_timeout_reason(
@@ -3767,7 +3806,13 @@ impl Scheduler {
                 message: "startup worktree recovery did not prove cleanup".into(),
             });
         }
-        persist_general_result(&self.inner.store, &task.agent_id, &prepared, &completion)?;
+        persist_general_result(
+            &self.inner.store,
+            &task.agent_id,
+            &prepared,
+            &completion,
+            true,
+        )?;
         self.inner.store.reap_task(&task.agent_id)?;
         Ok(())
     }
@@ -3860,6 +3905,7 @@ impl Scheduler {
                         reason_code: "PREPARED_CONTENT_INVALID",
                         message: &message,
                     },
+                    true,
                 )?;
                 return Err(SchedulerError::InvalidConfig(message));
             }
@@ -3894,6 +3940,7 @@ impl Scheduler {
                     reason_code: "WALL_TIME_DEADLINE_EXCEEDED",
                     message: "runtime_lifecycle wall deadline elapsed before runtime spawn",
                 },
+                true,
             )?;
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: claim.task.agent_id,
@@ -3914,6 +3961,7 @@ impl Scheduler {
                         reason_code: "RUNTIME_SPAWN_FAILED",
                         message: &message,
                     },
+                    true,
                 ) {
                     self.record_failure(&claim.task.agent_id, store_error.to_string());
                 }
@@ -3931,7 +3979,8 @@ impl Scheduler {
                     remaining <= self.inner.config.bootstrap_timeout,
                 ),
                 None if budget.is_some() => {
-                    let _ = runtime.stop(self.inner.config.stop_grace);
+                    let terminal = runtime.stop(self.inner.config.stop_grace);
+                    let resources_reaped = terminal_proves_process_group_reaped(&terminal);
                     self.finish_unstarted_route(
                         &claim.task.agent_id,
                         claim.owner_epoch,
@@ -3943,6 +3992,7 @@ impl Scheduler {
                             message:
                                 "runtime_lifecycle wall deadline elapsed before session bootstrap",
                         },
+                        resources_reaped,
                     )?;
                     return Err(SchedulerError::RuntimeCommand {
                         agent_id: claim.task.agent_id,
@@ -3960,7 +4010,8 @@ impl Scheduler {
             Ok(session) => session,
             Err(error) => {
                 let message = error.to_string();
-                let _ = runtime.stop(self.inner.config.stop_grace);
+                let terminal = runtime.stop(self.inner.config.stop_grace);
+                let resources_reaped = terminal_proves_process_group_reaped(&terminal);
                 let wall_timed_out = budget.as_ref().is_some_and(|budget| {
                     budget.violation() == Some(budget::BudgetViolation::WallTime)
                 }) || (wall_bounded_bootstrap
@@ -3980,6 +4031,7 @@ impl Scheduler {
                         reason_code: code,
                         message: &message,
                     },
+                    resources_reaped,
                 ) {
                     self.record_failure(&claim.task.agent_id, store_error.to_string());
                 }
@@ -3996,7 +4048,8 @@ impl Scheduler {
             session.observed_model.as_deref(),
         ) {
             let message = "runtime model did not match the prepared request";
-            let _ = runtime.stop(self.inner.config.stop_grace);
+            let terminal = runtime.stop(self.inner.config.stop_grace);
+            let resources_reaped = terminal_proves_process_group_reaped(&terminal);
             if let Err(error) = self.finish_unstarted_route(
                 &claim.task.agent_id,
                 claim.owner_epoch,
@@ -4007,6 +4060,7 @@ impl Scheduler {
                     reason_code: code,
                     message,
                 },
+                resources_reaped,
             ) {
                 self.record_failure(&claim.task.agent_id, error.to_string());
             }
@@ -4160,16 +4214,26 @@ impl Scheduler {
         route: &TaskRoute,
         _task: Option<&TaskRecord>,
         terminal: UnstartedTerminal<'_>,
+        resources_reaped: bool,
     ) -> Result<TaskPhase, SchedulerError> {
         match route {
             TaskRoute::General(prepared, _) => {
-                let completion = finalized_general(
+                let completion = if resources_reaped {
+                    finalized_general(
+                        prepared,
+                        terminal.outcome,
+                        terminal.reason_code,
+                        terminal.message,
+                    )
+                } else {
+                    unreaped_general(terminal.outcome, terminal.reason_code, terminal.message)
+                };
+                self.persist_general_completion(
+                    agent_id,
                     prepared,
-                    terminal.outcome,
-                    terminal.reason_code,
-                    terminal.message,
-                );
-                self.persist_general_completion(agent_id, prepared, &completion)
+                    &completion,
+                    resources_reaped && completion.cleaned,
+                )
             }
         }
     }
@@ -4179,10 +4243,15 @@ impl Scheduler {
         agent_id: &str,
         prepared: &PreparedGeneralTask,
         completion: &GeneralCompletion,
+        reap_after_persist: bool,
     ) -> Result<TaskPhase, SchedulerError> {
-        if let Err(error) =
-            persist_general_result(&self.inner.store, agent_id, prepared, completion)
-        {
+        if let Err(error) = persist_general_result(
+            &self.inner.store,
+            agent_id,
+            prepared,
+            completion,
+            reap_after_persist,
+        ) {
             self.record_failure(agent_id, error.to_string());
             if self.inner.store.task_result(agent_id)?.is_none() {
                 store_result_with_cancel_precedence(
@@ -4193,7 +4262,7 @@ impl Scheduler {
                 )?;
             }
         }
-        if completion.cleaned {
+        if reap_after_persist {
             self.inner.store.reap_task(agent_id)?;
         }
         Ok(self
@@ -4259,6 +4328,7 @@ impl Scheduler {
                 .request_stop(&runtime.turn_snapshot());
             sink.runtime_lifecycle.force_terminating();
             let terminal = runtime.stop(stop_grace);
+            let resources_reaped = terminal_proves_process_group_reaped(&terminal);
             let current = self.inner.store.get_task(agent_id)?;
             let result = if current.as_ref().is_some_and(|job| {
                 matches!(
@@ -4311,6 +4381,7 @@ impl Scheduler {
                         },
                         message: &message,
                     },
+                    resources_reaped,
                 )
             };
             self.release_active(agent_id, owner_epoch);
@@ -4395,6 +4466,7 @@ impl Scheduler {
                 });
                 let natural_completed =
                     natural_completion && matches!(terminal, RuntimeTerminal::Completed(_));
+                let process_group_reaped = terminal_proves_process_group_reaped(&terminal);
                 let mut completion = if natural_completed {
                     let terminal_text = sink.activity.take_terminal_text();
                     let mut completion = match &terminal_text {
@@ -4468,8 +4540,10 @@ impl Scheduler {
                         }
                     }
                     GeneralFinalizer::finish_cleanup(prepared, completion)
-                } else {
+                } else if process_group_reaped {
                     GeneralFinalizer::finalize(prepared, outcome)
+                } else {
+                    unreaped_general(outcome, &reason, &reason)
                 };
                 if completion.summary.trim().is_empty() {
                     completion.summary = reason.clone();
@@ -4479,9 +4553,15 @@ impl Scheduler {
                 {
                     completion.reason_code = Some(reason);
                 }
+                let reap_after_persist = completion.cleaned && process_group_reaped;
                 let result = task_result(&completion);
-                if !general_result_response_fits(&self.inner.store, agent_id, &completion, &result)?
-                {
+                if !general_result_response_fits(
+                    &self.inner.store,
+                    agent_id,
+                    &completion,
+                    &result,
+                    reap_after_persist,
+                )? {
                     invalidate_untransportable_completion(&mut completion);
                     let result = task_result(&completion);
                     if !general_result_response_fits(
@@ -4489,6 +4569,7 @@ impl Scheduler {
                         agent_id,
                         &completion,
                         &result,
+                        reap_after_persist,
                     )? {
                         compact_untransportable_artifact_projection(&mut completion);
                     }
@@ -4499,7 +4580,12 @@ impl Scheduler {
                     Ok(state) => Ok(state),
                     Err(error) => {
                         self.record_failure(agent_id, error.to_string());
-                        self.persist_general_completion(agent_id, prepared, &completion)
+                        self.persist_general_completion(
+                            agent_id,
+                            prepared,
+                            &completion,
+                            reap_after_persist,
+                        )
                     }
                 }
             }
@@ -5371,6 +5457,7 @@ impl Scheduler {
                                 reason_code: "CANCELLED",
                                 message: "task cancelled before runtime launch",
                             },
+                            true,
                         );
                     }
                     Err(message) => {
@@ -6952,6 +7039,29 @@ exec tail -f /dev/null
     }
 
     #[test]
+    fn terminal_reap_evidence_requires_a_successful_stop_outcome() {
+        let stopped = StopOutcome::AlreadyExited(ChildExit::Exited(Some(0)));
+        assert!(terminal_proves_process_group_reaped(
+            &RuntimeTerminal::Stopped(stopped.clone())
+        ));
+        assert!(terminal_proves_process_group_reaped(
+            &RuntimeTerminal::Completed(stopped.clone())
+        ));
+        assert!(terminal_proves_process_group_reaped(
+            &RuntimeTerminal::FailedTurn(stopped)
+        ));
+        assert!(!terminal_proves_process_group_reaped(
+            &RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed("failed".into()))
+        ));
+        assert!(!terminal_proves_process_group_reaped(
+            &RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership)
+        ));
+        assert!(!terminal_proves_process_group_reaped(
+            &RuntimeTerminal::Exited(ChildExit::Exited(Some(7)))
+        ));
+    }
+
+    #[test]
     fn startup_recovery_reaps_persisted_runtime_and_worktree_before_marking_reaped() {
         let (directory, store, _factory, scheduler) = scheduler_fixture(1, 1);
         let submitted = scheduler
@@ -7049,6 +7159,90 @@ exec tail -f /dev/null
 
         let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed);
         assert!(cleanup.cleaned);
+    }
+
+    #[test]
+    fn orphan_terminal_stays_unreaped_until_restart_recovers_process_and_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path().join("orphan.sqlite3")).unwrap());
+        let descendant_path = directory.path().join("orphan-descendant.pid");
+        let factory = Arc::new(CommandRuntimeFactory::new_prepared({
+            let descendant_path = descendant_path.clone();
+            move |_task: &TaskRecord| -> io::Result<Command> {
+                let mut command = Command::new("sh");
+                command.env("DESCENDANT_PID_FILE", &descendant_path).args([
+                    "-c",
+                    r#"
+IFS= read -r create || exit 1
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"orphan-session"}}}'
+IFS= read -r subscribe || exit 1
+printf '%s\n' '{"id":2,"result":{}}'
+IFS= read -r send || exit 1
+printf '%s\n' '{"id":3,"result":{"turnId":"orphan-turn"}}' '{"method":"session/event","params":{"type":"turn.started","payload":{"turnId":"orphan-turn"}}}'
+sleep 10 </dev/null >/dev/null 2>&1 & child=$!
+printf '%s' "$child" > "$DESCENDANT_PID_FILE"
+exit 7
+"#,
+                ]);
+                Ok(command)
+            }
+        }));
+        let scheduler = Scheduler::new(
+            "orphan-owner",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "orphan-restart", None),
+                Some("feature"),
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id;
+        scheduler.start_ready().unwrap();
+        let descendant = wait_for_pid_file(&descendant_path);
+        let initial_result = wait_for_task_result(&store, &agent_id);
+        wait_until_condition(|| (scheduler.active_count() == 0).then_some(()));
+
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        let identity = task.process_identity.clone().unwrap();
+        assert_eq!(task.phase, TaskPhase::Terminal);
+        assert_eq!(task.outcome, Some(TaskOutcome::RuntimeLost));
+        assert!(task.reaped_at.is_none());
+        assert_eq!(initial_result.result.outcome, TaskOutcome::RuntimeLost);
+        assert!(observe_process(descendant).is_ok());
+        assert!(!observe_process_group(identity.process_group_id)
+            .unwrap()
+            .is_empty());
+        assert!(prepared.worktree.path.exists());
+
+        let restarted = Scheduler::new(
+            "orphan-restart-owner",
+            Arc::clone(&store),
+            Arc::new(FakeFactory::default()),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.reconcile_startup().unwrap(),
+            vec![(agent_id.clone(), TaskOutcome::RuntimeLost)]
+        );
+
+        assert!(observe_process(descendant).is_err());
+        assert!(observe_process_group(identity.process_group_id)
+            .unwrap()
+            .is_empty());
+        assert_general_workspace_cleaned(&prepared);
+        let recovered = store.get_task(&agent_id).unwrap().unwrap();
+        assert!(recovered.reaped_at.is_some());
+        assert_eq!(
+            store.task_result(&agent_id).unwrap().unwrap(),
+            initial_result
+        );
+        std::fs::remove_file(descendant_path).unwrap();
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -736,15 +736,20 @@ pub fn stop_and_reap_persisted_process_group(
     timeout: Duration,
 ) -> io::Result<()> {
     validate_spawn_identity(identity.pid, identity)?;
-    let observed = match observe_process(identity.pid) {
-        Ok(observed) => observed,
+    match observe_process(identity.pid) {
+        Ok(observed) => {
+            validate_same_identity(identity, &observed)?;
+            validate_owned_group(identity, &observe_process_group(identity.pgid)?)?;
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return ensure_group_empty(identity.pgid)
+            let members = observe_process_group(identity.pgid)?;
+            if members.is_empty() {
+                return Ok(());
+            }
+            validate_live_group_after_term(identity, &members)?;
         }
         Err(error) => return Err(error),
-    };
-    validate_same_identity(identity, &observed)?;
-    validate_owned_group(identity, &observe_process_group(identity.pgid)?)?;
+    }
 
     signal_group(identity.pgid, TERM_SIGNAL)?;
     if wait_for_persisted_group_death(identity.pgid, timeout)? {
@@ -1792,6 +1797,28 @@ mod tests {
 
         stop_and_reap_persisted_process_group(&identity, Duration::from_millis(100)).unwrap();
         assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_identity_reaper_recovers_group_after_leader_exit() {
+        let path = capture_path("persisted-orphan");
+        let mut command = Command::new("sh");
+        command.env("DESCENDANT_PID_FILE", &path).args([
+            "-c",
+            "sleep 10 </dev/null >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > \"$DESCENDANT_PID_FILE\"; exit 7",
+        ]);
+        let driver = Driver::spawn(command).unwrap();
+        let identity = driver.identity();
+        let descendant = wait_for_pid_file(&path);
+        assert_eq!(driver.wait().unwrap(), Some(7));
+        assert!(observe_process(identity.pid).is_err());
+        assert!(observe_process(descendant).is_ok());
+
+        stop_and_reap_persisted_process_group(&identity, Duration::from_millis(100)).unwrap();
+
+        assert!(observe_process(descendant).is_err());
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
