@@ -63,7 +63,7 @@ impl IntegrityDiagnostics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupRecord {
     pub repository: PathBuf,
-    pub job_root: PathBuf,
+    pub task_root: PathBuf,
     pub worktree: PathBuf,
     pub expected_head: String,
     pub diagnostics: IntegrityDiagnostics,
@@ -236,7 +236,7 @@ impl WorktreeManager {
         }
         let record = CleanupRecord {
             repository: self.repository.clone(),
-            job_root: self.scratch_root.clone(),
+            task_root: self.scratch_root.clone(),
             worktree: worktree.path.clone(),
             expected_head: worktree.head_sha.clone(),
             diagnostics,
@@ -265,8 +265,8 @@ impl WorktreeManager {
         let mut record: CleanupRecord = serde_json::from_slice(&fs::read(&record_path)?)?;
         if fs::canonicalize(&record.repository)? != self.repository
             || record.repository != self.repository
-            || fs::canonicalize(&record.job_root)? != self.scratch_root
-            || record.job_root != self.scratch_root
+            || fs::canonicalize(&record.task_root)? != self.scratch_root
+            || record.task_root != self.scratch_root
             || fs::canonicalize(&record.scratch_worktrees_root)? != worktrees_root
             || record.scratch_worktrees_root != worktrees_root
             || fs::canonicalize(&record.diagnostic_root)? != diagnostic_root
@@ -351,7 +351,7 @@ impl WorktreeManager {
     }
 
     /// Verify that a prepared worktree has converged to both filesystem and
-    /// Git-registration absence before its private job root is removed.
+    /// Git-registration absence before its private task root is removed.
     pub fn verify_worktree_absent(&self, worktree: &PreparedWorktree) -> PreparationResult<()> {
         let (worktrees_root, diagnostic_root) = self.expected_roots()?;
         let path = fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone());
@@ -400,11 +400,11 @@ impl WorktreeManager {
         Ok(())
     }
 
-    pub fn cleanup_registered_under_job_root(&self, job_root: &Path) -> PreparationResult<()> {
-        let job_root = fs::canonicalize(job_root)?;
-        if job_root != self.scratch_root {
+    pub fn cleanup_registered_under_task_root(&self, task_root: &Path) -> PreparationResult<()> {
+        let task_root = fs::canonicalize(task_root)?;
+        if task_root != self.scratch_root {
             return Err(PreparationError::Worktree(
-                "malformed-record cleanup is not bound to this manager job root".into(),
+                "malformed-record cleanup is not bound to this manager task root".into(),
             ));
         }
         let (worktrees_root, _) = self.expected_roots()?;

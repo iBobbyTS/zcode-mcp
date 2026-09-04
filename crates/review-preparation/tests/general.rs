@@ -1229,8 +1229,8 @@ fn model_authored_scratch_files_never_become_public_artifacts() {
     assert!(!prepared.artifact_root.join("report.md").exists());
     assert!(!prepared.artifact_root.join("check-report.json").exists());
     assert!(!prepared.prompt_path.exists());
-    let job_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
-    assert!(!job_root.exists());
+    let task_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
+    assert!(!task_root.exists());
 }
 
 #[test]
@@ -1268,8 +1268,8 @@ fn cleanup_failure_is_truthful_and_keeps_final_artifact_metadata() {
         "pub fn value() -> u8 { 10 }\n",
     )
     .unwrap();
-    let job_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
-    let owner_root = job_root.parent().unwrap();
+    let task_root = prepared.worktree.scratch_worktrees_root.parent().unwrap();
+    let owner_root = task_root.parent().unwrap();
     let original = fs::metadata(owner_root).unwrap().permissions();
     fs::set_permissions(owner_root, fs::Permissions::from_mode(0o500)).unwrap();
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
@@ -1372,18 +1372,18 @@ fn malformed_prepared_record_cleans_registered_worktree_before_private_root() {
     let f = Fixture::new();
     let manifest = f.manifest(AccessMode::ReadOnly);
     let prepared = f.preparer().prepare(&manifest).unwrap();
-    let job_root = prepared
+    let task_root = prepared
         .worktree
         .scratch_worktrees_root
         .parent()
         .unwrap()
         .to_path_buf();
-    let record = job_root.join("prepared-general.json");
+    let record = task_root.join("prepared-general.json");
     assert!(git(&f.repository, &["worktree", "list", "--porcelain"])
         .contains(prepared.worktree.path.to_str().unwrap()));
     fs::write(&record, b"{malformed").unwrap();
     assert!(f.preparer().prepare(&manifest).is_err());
-    assert!(!job_root.exists());
+    assert!(!task_root.exists());
     assert!(!git(&f.repository, &["worktree", "list", "--porcelain"])
         .contains(prepared.worktree.path.to_str().unwrap()));
 
@@ -1397,13 +1397,13 @@ fn tampered_record_path_cleans_real_registration_without_touching_external_path(
     let f = Fixture::new();
     let manifest = f.manifest(AccessMode::ReadOnly);
     let prepared = f.preparer().prepare(&manifest).unwrap();
-    let job_root = prepared
+    let task_root = prepared
         .worktree
         .scratch_worktrees_root
         .parent()
         .unwrap()
         .to_path_buf();
-    let record = job_root.join("prepared-general.json");
+    let record = task_root.join("prepared-general.json");
     let external = f._temp.path().join("must-survive");
     fs::create_dir_all(&external).unwrap();
     fs::write(external.join("sentinel"), "preserve").unwrap();
@@ -1418,7 +1418,7 @@ fn tampered_record_path_cleans_real_registration_without_touching_external_path(
         fs::read_to_string(external.join("sentinel")).unwrap(),
         "preserve"
     );
-    assert!(!job_root.exists());
+    assert!(!task_root.exists());
     assert!(!git(&f.repository, &["worktree", "list", "--porcelain"])
         .contains(prepared.worktree.path.to_str().unwrap()));
 

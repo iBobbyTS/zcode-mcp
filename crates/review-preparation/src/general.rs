@@ -247,15 +247,15 @@ impl PreparedGeneralTask {
         Ok(())
     }
     fn validate_immutable_inputs(&self) -> PreparationResult<()> {
-        let job_root = self
+        let task_root = self
             .worktree
             .scratch_worktrees_root
             .parent()
-            .ok_or_else(|| PreparationError::Worktree("missing job root".into()))?;
-        verify_confined_file(job_root, &self.prompt_path, &self.prompt_sha256, None)?;
+            .ok_or_else(|| PreparationError::Worktree("missing task root".into()))?;
+        verify_confined_file(task_root, &self.prompt_path, &self.prompt_sha256, None)?;
         for attachment in &self.attachments {
             verify_confined_file(
-                job_root,
+                task_root,
                 &attachment.prepared_path,
                 &attachment.sha256,
                 Some(attachment.size_bytes),
@@ -418,15 +418,15 @@ impl GeneralTaskPreparer {
             Some(_) | None => hash(&serde_json::to_vec(manifest)?),
         };
         let key = hash(format!("{}:{}", repository.display(), manifest.idempotency_key).as_bytes());
-        let job_root = scratch_parent.join(&key);
-        fs::create_dir_all(&job_root)?;
-        let job_root = fs::canonicalize(job_root)?;
-        let prepared_path = job_root.join("prepared-general.json");
+        let task_root = scratch_parent.join(&key);
+        fs::create_dir_all(&task_root)?;
+        let task_root = fs::canonicalize(task_root)?;
+        let prepared_path = task_root.join("prepared-general.json");
         if prepared_path.is_file() {
             let existing_bytes = fs::read(&prepared_path)?;
             let existing = serde_json::from_slice::<PreparedGeneralTask>(&existing_bytes)
                 .map_err(PreparationError::from);
-            let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
+            let manager = WorktreeManager::new(repository.clone(), task_root.clone())?;
             let reusable = existing.and_then(|existing| {
                 validate_reusable_prepared_owner(&existing, &repository, &base_sha, &manager)?;
                 if existing.idempotency_key != manifest.idempotency_key {
@@ -474,7 +474,7 @@ impl GeneralTaskPreparer {
                 Ok(existing) => Ok(existing),
                 Err(error @ PreparationError::IdempotencyConflict(_)) => Err(error),
                 Err(error) => {
-                    let cleanup = cleanup_stale_record(&manager, &job_root, &existing_bytes);
+                    let cleanup = cleanup_stale_record(&manager, &task_root, &existing_bytes);
                     match cleanup {
                         Ok(()) => Err(error),
                         Err(cleanup) => Err(PreparationError::Worktree(format!(
@@ -484,13 +484,13 @@ impl GeneralTaskPreparer {
                 }
             };
         }
-        let manager = WorktreeManager::new(repository.clone(), job_root.clone())?;
-        let expected_worktree_path = job_root.join("worktrees").join(&key);
+        let manager = WorktreeManager::new(repository.clone(), task_root.clone())?;
+        let expected_worktree_path = task_root.join("worktrees").join(&key);
         let worktree = match manager.create(&base_sha, &key) {
             Ok(worktree) => worktree,
             Err(error) => {
                 let cleanup =
-                    bounded_cleanup_unregistered(&manager, &expected_worktree_path, &job_root);
+                    bounded_cleanup_unregistered(&manager, &expected_worktree_path, &task_root);
                 return match cleanup {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(PreparationError::Worktree(format!(
@@ -500,7 +500,7 @@ impl GeneralTaskPreparer {
             }
         };
         let built = (|| {
-            let scratch_root = create_dir(&job_root, "scratch")?;
+            let scratch_root = create_dir(&task_root, "scratch")?;
             let validation_commands =
                 prepare_general_commands(manifest, named_commands, &worktree.path, &scratch_root)?;
             let control_contract = control_contract_from_prepared_commands(
@@ -531,7 +531,7 @@ impl GeneralTaskPreparer {
                 launch_prompt_bytes,
                 effective_budget.max_context_bytes,
             )?;
-            let private_root = create_dir(&job_root, "private-inputs")?;
+            let private_root = create_dir(&task_root, "private-inputs")?;
             let prompt_path = private_root.join("prompt.txt");
             atomic_write(&prompt_path, manifest.prompt.as_bytes())?;
             let prompt_path = fs::canonicalize(prompt_path)?;
@@ -567,7 +567,7 @@ impl GeneralTaskPreparer {
             prepared.prepared_sha256 = hash(&serde_json::to_vec(&prepared)?);
             prepared.validate_digest()?;
             atomic_write(
-                &job_root.join("prepared-general.json"),
+                &task_root.join("prepared-general.json"),
                 &serde_json::to_vec_pretty(&prepared)?,
             )?;
             Ok(prepared)
@@ -575,7 +575,7 @@ impl GeneralTaskPreparer {
         match built {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
-                let cleanup = bounded_cleanup_worktree(&manager, &worktree, &job_root);
+                let cleanup = bounded_cleanup_worktree(&manager, &worktree, &task_root);
                 if let Err(cleanup) = cleanup {
                     return Err(PreparationError::Worktree(format!(
                         "general preparation failed ({error}); cleanup failed ({cleanup})"
@@ -1696,7 +1696,7 @@ fn manager(p: &PreparedGeneralTask) -> PreparationResult<WorktreeManager> {
         .worktree
         .scratch_worktrees_root
         .parent()
-        .ok_or_else(|| PreparationError::Worktree("missing job root".into()))?;
+        .ok_or_else(|| PreparationError::Worktree("missing task root".into()))?;
     WorktreeManager::new(p.repository.clone(), root.into())
 }
 fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
@@ -1732,10 +1732,10 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
             return false;
         }
     }
-    let Some(job_root) = prepared.worktree.scratch_worktrees_root.parent() else {
+    let Some(task_root) = prepared.worktree.scratch_worktrees_root.parent() else {
         return false;
     };
-    if !job_root.exists() {
+    if !task_root.exists() {
         return manager
             .verify_registration_absent(&prepared.worktree.path)
             .is_ok();
@@ -1745,18 +1745,18 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
             .verify_registration_absent(&prepared.worktree.path)
             .is_ok()
     {
-        return cleanup_job_root_path(job_root).is_ok();
+        return cleanup_task_root_path(task_root).is_ok();
     }
     if manager.verify_worktree_absent(&prepared.worktree).is_err() {
         return false;
     }
-    cleanup_job_root_path(job_root).is_ok()
+    cleanup_task_root_path(task_root).is_ok()
 }
 
 fn bounded_cleanup_worktree(
     manager: &WorktreeManager,
     worktree: &PreparedWorktree,
-    job_root: &Path,
+    task_root: &Path,
 ) -> PreparationResult<()> {
     let mut last_error = None;
     for _ in 0..3 {
@@ -1765,7 +1765,7 @@ fn bounded_cleanup_worktree(
             .and_then(|diagnostics| manager.persist_integrity(worktree, diagnostics))
             .and_then(|record| manager.cleanup_from_record(&record).map(|_| ()))
             .and_then(|_| manager.verify_worktree_absent(worktree))
-            .and_then(|_| cleanup_job_root_path(job_root))
+            .and_then(|_| cleanup_task_root_path(task_root))
         {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
@@ -1777,13 +1777,13 @@ fn bounded_cleanup_worktree(
 fn bounded_cleanup_unregistered(
     manager: &WorktreeManager,
     worktree_path: &Path,
-    job_root: &Path,
+    task_root: &Path,
 ) -> PreparationResult<()> {
     let mut last_error = None;
     for _ in 0..3 {
         match manager
             .verify_path_absent(worktree_path)
-            .and_then(|_| cleanup_job_root_path(job_root))
+            .and_then(|_| cleanup_task_root_path(task_root))
         {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
@@ -1819,31 +1819,31 @@ fn validate_reusable_prepared_owner(
 
 fn cleanup_stale_record(
     manager: &WorktreeManager,
-    job_root: &Path,
+    task_root: &Path,
     _record_bytes: &[u8],
 ) -> PreparationResult<()> {
     // A record that already failed digest/content/owner validation is never
     // authority for deletion, even when its JSON shape remains parseable.
-    // Enumerate only manager-bound registrations under the canonical job root.
-    manager.cleanup_registered_under_job_root(job_root)?;
-    cleanup_job_root_path(job_root)
+    // Enumerate only manager-bound registrations under the canonical task root.
+    manager.cleanup_registered_under_task_root(task_root)?;
+    cleanup_task_root_path(task_root)
 }
 fn cleanup_if_trusted(prepared: &PreparedGeneralTask) -> bool {
     prepared.validate_digest().is_ok() && cleanup_after_failure(prepared)
 }
-fn cleanup_job_root_path(job_root: &Path) -> PreparationResult<()> {
-    if !job_root.exists() {
+fn cleanup_task_root_path(task_root: &Path) -> PreparationResult<()> {
+    if !task_root.exists() {
         return Ok(());
     }
-    let root = fs::canonicalize(job_root)?;
+    let root = fs::canonicalize(task_root)?;
     let parent = root
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| PreparationError::Worktree("job root has no parent".into()))?;
+        .ok_or_else(|| PreparationError::Worktree("task root has no parent".into()))?;
     let repository = root
         .ancestors()
         .find(|candidate| candidate.join(".git").exists())
-        .ok_or_else(|| PreparationError::Worktree("job root has no repository ancestor".into()))?;
+        .ok_or_else(|| PreparationError::Worktree("task root has no repository ancestor".into()))?;
     let allowed = repository.join(".agent-work/scratch");
     if root.file_name().is_none()
         || root == parent
@@ -1860,7 +1860,7 @@ fn cleanup_job_root_path(job_root: &Path) -> PreparationResult<()> {
     fs::remove_dir_all(&root)?;
     if root.exists() {
         return Err(PreparationError::Worktree(
-            "job root remains after cleanup".into(),
+            "task root remains after cleanup".into(),
         ));
     }
     Ok(())
