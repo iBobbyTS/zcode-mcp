@@ -50,8 +50,9 @@ test('Rust and JavaScript evaluate the shared bounded policy corpus', () => {
   for (const entry of corpus.recovery) {
     const result = evaluateCommand({ command: entry.command, cwd: root });
     assert.notEqual(result.decision, 'allow', entry.command);
+    assert.equal(reasonClass(result, entry.command), entry.reason_class, entry.command);
     assert.equal(result.retryClass, entry.retry_class, entry.command);
     assert.equal(result.recommendedAction, entry.recommended_action, entry.command);
-    assert.match(result.semanticFingerprint, /^family=.*;category=.*;reason=.*;operand=.*$/u);
+    assert.equal(result.semanticFingerprint, entry.semantic_fingerprint, entry.command);
   }
 });

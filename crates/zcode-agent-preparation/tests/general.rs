@@ -26,12 +26,23 @@ struct Fixture {
 struct PolicyCorpus {
     allow: Vec<PolicyCorpusEntry>,
     deny: Vec<PolicyCorpusEntry>,
+    recovery: Vec<PolicyRecoveryEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PolicyCorpusEntry {
     command: String,
     reason_class: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyRecoveryEntry {
+    command: String,
+    reason_class: String,
+    retry_class: String,
+    recommended_action: String,
+    semantic_fingerprint: String,
+    rust_semantic_fingerprint: String,
 }
 
 fn policy_reason_class(reason: &str, command: &str) -> &'static str {
@@ -52,6 +63,32 @@ fn policy_reason_class(reason: &str, command: &str) -> &'static str {
         return "path";
     }
     "stdin"
+}
+
+fn parse_feedback_fields(feedback: &str) -> (&str, &str, &str) {
+    let fields = feedback
+        .strip_prefix("DENY[")
+        .and_then(|value| value.split(']').next())
+        .expect("Rust denial feedback must expose bounded fields");
+    let mut code = None;
+    let mut retry = None;
+    let mut next = None;
+    for field in fields.split(';') {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key {
+            "code" => code = Some(value),
+            "retry" => retry = Some(value),
+            "next" => next = Some(value),
+            _ => {}
+        }
+    }
+    (
+        code.expect("Rust denial code"),
+        retry.expect("Rust denial retry"),
+        next.expect("Rust denial action"),
+    )
 }
 
 #[test]
@@ -115,6 +152,39 @@ fn rust_policy_projection_matches_shared_javascript_corpus() {
         );
         assert!(!decision.allowed, "{} unexpectedly allowed", command);
         assert_eq!(policy_reason_class(decision.reason, &command), reason_class);
+    }
+    for entry in corpus.recovery {
+        let PolicyRecoveryEntry {
+            command,
+            reason_class,
+            retry_class,
+            recommended_action,
+            semantic_fingerprint,
+            rust_semantic_fingerprint,
+        } = entry;
+        let params = serde_json::json!({
+            "toolName": "Bash",
+            "input": {"command": command.clone(), "cwd": fixture.repository}
+        });
+        let decision = policy.decide_zcode_permission(&params, ExternalDecision::Allow);
+        assert!(!decision.allowed, "{} unexpectedly allowed", command);
+        assert_eq!(policy_reason_class(decision.reason, &command), reason_class);
+        let (_, denial) =
+            policy.decide_zcode_permission_validated(&params, ExternalDecision::Allow);
+        let denial = denial.expect("denied Rust policy request has projection");
+        let feedback = denial.feedback(false);
+        let (reason_code, actual_retry, actual_action) = parse_feedback_fields(&feedback);
+        assert_eq!(actual_retry, retry_class, "{command}: {reason_code}");
+        assert_eq!(
+            actual_action, recommended_action,
+            "{command}: {reason_code}"
+        );
+        assert_eq!(
+            denial.fingerprint().split(';').next(),
+            semantic_fingerprint.split(';').next(),
+            "{command}: family projection"
+        );
+        assert_eq!(denial.fingerprint(), rust_semantic_fingerprint, "{command}");
     }
 }
 

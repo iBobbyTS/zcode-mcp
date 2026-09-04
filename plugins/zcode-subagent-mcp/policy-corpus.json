@@ -59,33 +59,51 @@
   "recovery": [
     {
       "command": "git status && pwd",
+      "reason_class": "shell",
       "retry_class": "split_once",
-      "recommended_action": "split_into_single_commands"
+      "recommended_action": "split_into_single_commands",
+      "semantic_fingerprint": "family=shell;category=composition;reason=shell_composition_or_expansion_denied;operand=compound_command",
+      "rust_semantic_fingerprint": "family=shell;category=composition;reason=shell_composition_or_expansion_denied;operand=compound_command"
     },
     {
       "command": "git -C /tmp status --short",
+      "reason_class": "git",
       "retry_class": "simplify_once",
-      "recommended_action": "remove_denied_option_once"
+      "recommended_action": "remove_denied_option_once",
+      "semantic_fingerprint": "family=git;category=status;reason=git_option_or_mutation_denied;operand=cwd_override",
+      "rust_semantic_fingerprint": "family=git;category=status;reason=git_option_or_mutation_denied;operand=cwd_override"
     },
     {
       "command": "file README.md",
+      "reason_class": "stdin",
       "retry_class": "use_read",
-      "recommended_action": "use_read_or_prepared_inputs"
+      "recommended_action": "use_read_or_prepared_inputs",
+      "semantic_fingerprint": "family=file;category=file;reason=program_not_allowlisted;operand=program",
+      "rust_semantic_fingerprint": "family=file;category=program;reason=command_not_allowlisted;operand=program"
     },
     {
       "command": "cargo test",
+      "reason_class": "stdin",
       "retry_class": "use_named_check",
-      "recommended_action": "use_named_check"
+      "recommended_action": "use_named_check",
+      "semantic_fingerprint": "family=cargo;category=cargo;reason=program_not_allowlisted;operand=program",
+      "rust_semantic_fingerprint": "family=cargo;category=program;reason=command_not_allowlisted;operand=program"
     },
     {
       "command": "cat .env",
+      "reason_class": "path",
       "retry_class": "do_not_retry_equivalent",
-      "recommended_action": "stop_evidence_path"
+      "recommended_action": "stop_evidence_path",
+      "semantic_fingerprint": "family=cat;category=cat;reason=sensitive_path;operand=sensitive_path",
+      "rust_semantic_fingerprint": "family=cat;category=cat;reason=path_outside_agent_roots;operand=sensitive_path"
     },
     {
       "command": "curl https://example.invalid",
+      "reason_class": "stdin",
       "retry_class": "do_not_retry_equivalent",
-      "recommended_action": "stop_evidence_path"
+      "recommended_action": "stop_evidence_path",
+      "semantic_fingerprint": "family=curl;category=curl;reason=program_not_allowlisted;operand=program",
+      "rust_semantic_fingerprint": "family=curl;category=program;reason=command_not_allowlisted;operand=program"
     }
   ]
 }
