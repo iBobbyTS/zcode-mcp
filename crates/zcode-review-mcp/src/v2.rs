@@ -1325,6 +1325,40 @@ pub async fn serve_stdio_v2(
 #[cfg(test)]
 mod generic_tests {
     use super::*;
+    use review_store::{
+        ArtifactKind, NewArtifact, ResultArtifact, Store, TaskRecord, TaskResult, TurnState,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{io, process::Command};
+    use zcode_reviewd::{
+        rpc::{RpcServer, RpcService, ServerOptions},
+        LifecycleSink, ManagedRuntime, RuntimeFactory, Scheduler, SchedulerConfig,
+    };
+
+    struct NeverRuntimeFactory;
+
+    impl RuntimeFactory for NeverRuntimeFactory {
+        fn spawn(
+            &self,
+            _task: &TaskRecord,
+            _sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Err(io::Error::other(
+                "runtime is not used by facade persistence test",
+            ))
+        }
+    }
+
+    fn git(repository: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git failed: {:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
 
     #[test]
     fn exact_generic_catalog_and_no_legacy_symbols() {
@@ -1403,5 +1437,138 @@ mod generic_tests {
         .unwrap();
         input.allowed_command_ids.push("unit".into());
         assert!(general_manifest(&input).is_err());
+    }
+
+    #[tokio::test]
+    async fn immutable_result_and_patch_survive_real_facade_reconstruction() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir_all(repository.join("src")).unwrap();
+        std::fs::write(
+            repository.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .unwrap();
+        git(&repository, &["init"]);
+        git(&repository, &["config", "user.name", "Facade Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "facade@example.invalid"],
+        );
+        git(&repository, &["add", "src/lib.rs"]);
+        git(&repository, &["commit", "-m", "fixture"]);
+        let base_ref = git(&repository, &["rev-parse", "HEAD"]);
+        let repository = std::fs::canonicalize(repository).unwrap();
+        let store = Arc::new(Store::open(directory.path().join("store.sqlite3")).unwrap());
+        let scheduler = Scheduler::new(
+            "facade-test",
+            Arc::clone(&store),
+            Arc::new(NeverRuntimeFactory),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general(
+                &GeneralTaskManifest {
+                    schema: GENERAL_TASK_SCHEMA.into(),
+                    agent_id: "facade-result".into(),
+                    repository: repository.clone(),
+                    base_ref,
+                    access_mode: AccessMode::WorkspaceWrite,
+                    prompt: "produce a patch".into(),
+                    repo_context: vec!["src/lib.rs".into()],
+                    attachments: Vec::new(),
+                    write_manifest: vec!["src".into()],
+                    scratch_root: ".agent-work/scratch/facade-result".into(),
+                    artifact_root: ".agent-work/artifacts/facade-result".into(),
+                    budget: None,
+                    validation_commands: BTreeMap::new(),
+                    retain_partial: false,
+                    idempotency_key: "facade-result-key".into(),
+                },
+                Some("facade-group"),
+            )
+            .unwrap();
+        let agent_id = submitted.task.agent_id.clone();
+        let prepared: review_preparation::PreparedGeneralTask =
+            serde_json::from_str(&submitted.task.prepared_launch_json).unwrap();
+        let claim = store.claim_next("facade-owner", 1, 1).unwrap().unwrap();
+        assert!(store
+            .mark_session_running(
+                &agent_id,
+                claim.owner_epoch,
+                "facade-runtime",
+                None,
+                None,
+                Some(TurnState::Idle),
+            )
+            .unwrap());
+
+        let patch_bytes = b"diff --git a/src/lib.rs b/src/lib.rs\n+facade reconstruction\n";
+        let patch_path = prepared.artifact_root.join("changes.patch");
+        std::fs::write(&patch_path, patch_bytes).unwrap();
+        let patch_sha256 = format!("{:x}", Sha256::digest(patch_bytes));
+        let artifact = NewArtifact {
+            artifact_id: "changes-patch".into(),
+            agent_id: agent_id.clone(),
+            artifact_type: "changes_patch".into(),
+            path: patch_path.to_string_lossy().into_owned(),
+            sha256: patch_sha256.clone(),
+            bytes: patch_bytes.len() as u64,
+        };
+        let result = TaskResult {
+            outcome: TaskOutcome::Completed,
+            final_text: "persisted terminal text".into(),
+            partial: false,
+            base_commit: Some(prepared.base_sha.clone()),
+            head_commit: Some("detached-head".into()),
+            changed_files: vec!["src/lib.rs".into()],
+            diff_stat: Some("src/lib.rs | 1 +".into()),
+            checks: vec!["required".into()],
+            residual_gaps: Vec::new(),
+            artifacts: vec![ResultArtifact {
+                kind: ArtifactKind::ChangesPatch,
+                artifact_id: artifact.artifact_id.clone(),
+                sha256: patch_sha256.clone(),
+            }],
+        };
+        store
+            .store_task_result_with_patch(&agent_id, &result, Some(&artifact))
+            .unwrap();
+
+        let socket = directory.path().join("rpc/facade.sock");
+        let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+        let server = RpcServer::bind(&socket, service, ServerOptions::default()).unwrap();
+        let first = SubagentMcp::new(socket.clone(), Duration::from_secs(1));
+        let (_, first_result, first_artifacts) = first.result(agent_id.clone()).unwrap();
+        assert_eq!(first_result.unwrap().final_text, "persisted terminal text");
+        assert_eq!(first_artifacts.len(), 1);
+        drop(first);
+
+        let reconstructed = SubagentMcp::new(socket, Duration::from_secs(1));
+        let Json(output) = reconstructed
+            .agent_result(Parameters(AgentResultInput {
+                agent_id,
+                artifact_id: Some("changes-patch".into()),
+                offset_bytes: Some(0),
+                limit_bytes: Some(patch_bytes.len()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(output.task.phase, "TERMINAL");
+        let persisted = output.result.unwrap();
+        assert!(matches!(persisted.outcome, PublicOutcome::Completed));
+        assert_eq!(persisted.final_text, "persisted terminal text");
+        assert_eq!(persisted.changed_files, ["src/lib.rs"]);
+        assert_eq!(output.artifacts.len(), 1);
+        assert!(matches!(
+            output.artifacts[0].kind,
+            PublicArtifactKind::ChangesPatch
+        ));
+        let chunk = output.artifact_chunk.unwrap();
+        assert!(chunk.eof);
+        assert_eq!(chunk.sha256, patch_sha256);
+        assert_eq!(BASE64.decode(chunk.bytes_base64).unwrap(), patch_bytes);
+        server.shutdown();
     }
 }

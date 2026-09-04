@@ -270,11 +270,27 @@ impl PreparedGeneralTask {
     pub fn launcher(&self) -> PreparationResult<PolicyLauncher> {
         self.validate_digest()?;
         self.validate_prepared_content()?;
+        self.build_launcher(false)
+    }
+    pub fn final_tree_launcher(&self) -> PreparationResult<PolicyLauncher> {
+        self.validate_digest()?;
+        self.validate_finalization_content()?;
+        self.build_launcher(true)
+    }
+    fn build_launcher(&self, final_tree: bool) -> PreparationResult<PolicyLauncher> {
         let mut inputs = vec![self.prompt_path.clone()];
         inputs.extend(self.attachments.iter().map(|a| a.prepared_path.clone()));
         inputs.extend(
             self.context
                 .iter()
+                .filter(|context| {
+                    !final_tree
+                        || self.access_mode != AccessMode::WorkspaceWrite
+                        || !self
+                            .write_manifest
+                            .iter()
+                            .any(|root| context.repository_relative.starts_with(root))
+                })
                 .map(|context| self.worktree.path.join(&context.repository_relative)),
         );
         PolicyLauncher::for_general(

@@ -19,8 +19,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zcode_driver::{
-    observe_process, observe_process_group, ChildExit, Driver, Inbound, ProcessIdentity,
-    RequestError, StopOutcome,
+    observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
+    Driver, Inbound, ProcessIdentity, RequestError, StopOutcome,
 };
 use zcode_protocol::{
     event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
@@ -2571,6 +2571,10 @@ impl ActiveCheck {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 struct TerminalTarget<'a> {
@@ -2900,7 +2904,7 @@ fn task_outcome(outcome: CompletionOutcome) -> TaskOutcome {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RequiredGeneralChecks {
     succeeded: Vec<String>,
     failure: Option<&'static str>,
@@ -2909,6 +2913,8 @@ struct RequiredGeneralChecks {
 fn run_required_general_checks(
     prepared: &PreparedGeneralTask,
     required_command_ids: &[String],
+    check: &ActiveCheck,
+    absolute_deadline: Instant,
 ) -> RequiredGeneralChecks {
     if required_command_ids.is_empty() {
         return RequiredGeneralChecks::default();
@@ -2919,7 +2925,7 @@ fn run_required_general_checks(
             ..RequiredGeneralChecks::default()
         };
     }
-    let policy = match prepared.launcher() {
+    let policy = match prepared.final_tree_launcher() {
         Ok(policy) => policy,
         Err(_) => {
             return RequiredGeneralChecks {
@@ -2928,34 +2934,64 @@ fn run_required_general_checks(
             };
         }
     };
-    let cancellation = AtomicBool::new(false);
     let mut verified = Vec::with_capacity(required_command_ids.len());
     for command_id in required_command_ids {
+        if check.is_cancelled() {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_CANCELLED"),
+            };
+        }
+        if Instant::now() >= absolute_deadline {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_ABSOLUTE_DEADLINE_EXCEEDED"),
+            };
+        }
         let Some(command) = prepared.validation_commands.get(command_id) else {
             return RequiredGeneralChecks {
                 succeeded: verified,
                 failure: Some("REQUIRED_CHECK_NOT_PREPARED"),
             };
         };
-        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(command.timeout_ms))
+        let Some(command_deadline) = Instant::now()
+            .checked_add(Duration::from_millis(command.timeout_ms))
+            .map(|deadline| deadline.min(absolute_deadline))
         else {
             return RequiredGeneralChecks {
                 succeeded: verified,
                 failure: Some("REQUIRED_CHECK_DEADLINE_INVALID"),
             };
         };
-        let output = match policy.run_cancellable(command_id, deadline, &cancellation) {
+        let output = match policy.run_cancellable(command_id, command_deadline, &check.cancelled) {
             Ok(output) => output,
             Err(_) => {
                 return RequiredGeneralChecks {
                     succeeded: verified,
-                    failure: Some("REQUIRED_CHECK_EXECUTION_FAILED"),
+                    failure: Some(if check.is_cancelled() {
+                        "REQUIRED_CHECK_CANCELLED"
+                    } else if Instant::now() >= absolute_deadline {
+                        "REQUIRED_CHECK_ABSOLUTE_DEADLINE_EXCEEDED"
+                    } else {
+                        "REQUIRED_CHECK_EXECUTION_FAILED"
+                    }),
                 };
             }
         };
+        if output.cancelled || check.is_cancelled() {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_CANCELLED"),
+            };
+        }
+        if output.timed_out && Instant::now() >= absolute_deadline {
+            return RequiredGeneralChecks {
+                succeeded: verified,
+                failure: Some("REQUIRED_CHECK_ABSOLUTE_DEADLINE_EXCEEDED"),
+            };
+        }
         if output.status_code != Some(0)
             || output.timed_out
-            || output.cancelled
             || output.stdout_truncated
             || output.stderr_truncated
         {
@@ -3550,14 +3586,101 @@ impl Scheduler {
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, TaskOutcome)>, SchedulerError> {
         // Startup reconciliation is valid only before this scheduler owns a runtime.
-        // Persisted process identity is never used to signal or reconnect here.
         let active = self.inner.state.lock().unwrap().active.is_empty();
         if !active {
             return Err(SchedulerError::InvalidConfig(
                 "startup reconciliation requires an empty active set".into(),
             ));
         }
-        Ok(self.inner.store.reconcile_startup()?)
+        let tasks = self.inner.store.startup_recovery_tasks()?;
+        let mut recovered = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            self.recover_startup_task(&task)?;
+            let terminal = self.inner.store.get_task(&task.agent_id)?.ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(
+                    "startup recovery task disappeared".into(),
+                ))
+            })?;
+            let outcome = terminal.outcome.ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(
+                    "startup recovery did not terminalize the task".into(),
+                ))
+            })?;
+            recovered.push((task.agent_id, outcome));
+        }
+        Ok(recovered)
+    }
+
+    fn recover_startup_task(&self, task: &TaskRecord) -> Result<(), SchedulerError> {
+        match (&task.runtime_agent_id, &task.process_identity) {
+            (Some(_), Some(identity)) => {
+                stop_and_reap_persisted_process_group(
+                    &ProcessIdentity {
+                        pid: identity.pid,
+                        pgid: identity.process_group_id,
+                        uid: identity.uid,
+                        start_token: identity.start_token.clone(),
+                    },
+                    self.inner.config.stop_grace,
+                )
+                .map_err(|error| SchedulerError::RuntimeCommand {
+                    agent_id: task.agent_id.clone(),
+                    message: format!("startup process-group recovery failed: {error}"),
+                })?;
+            }
+            (None, None) if matches!(task.phase, TaskPhase::Preparing | TaskPhase::Terminal) => {}
+            _ => {
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: task.agent_id.clone(),
+                    message: "startup runtime identity is incomplete; refusing unverified reap"
+                        .into(),
+                })
+            }
+        }
+
+        let route = task_route(task).map_err(SchedulerError::InvalidConfig)?;
+        validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+        let TaskRoute::General(prepared, _) = route;
+        if task.phase == TaskPhase::Terminal {
+            if self.inner.store.task_result(&task.agent_id)?.is_none() {
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: task.agent_id.clone(),
+                    message: "terminal startup recovery task has no immutable result".into(),
+                });
+            }
+            let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::RuntimeLost);
+            if !cleanup.cleaned {
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: task.agent_id.clone(),
+                    message: "terminal startup worktree recovery did not prove cleanup".into(),
+                });
+            }
+            self.inner.store.reap_task(&task.agent_id)?;
+            return Ok(());
+        }
+        let (outcome, reason_code, message) = if task.stop_requested || task.close_requested {
+            (
+                CompletionOutcome::Cancelled,
+                "CANCELLED",
+                "task cancellation was recovered after daemon restart",
+            )
+        } else {
+            (
+                CompletionOutcome::RuntimeLost,
+                "DAEMON_RESTART_RUNTIME_LOST",
+                "daemon restarted while task runtime was active",
+            )
+        };
+        let completion = finalized_general(&prepared, outcome, reason_code, message);
+        if !completion.cleaned {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: task.agent_id.clone(),
+                message: "startup worktree recovery did not prove cleanup".into(),
+            });
+        }
+        persist_general_result(&self.inner.store, &task.agent_id, &prepared, &completion)?;
+        self.inner.store.reap_task(&task.agent_id)?;
+        Ok(())
     }
 
     pub fn start_ready(&self) -> Result<Vec<String>, SchedulerError> {
@@ -4072,6 +4195,7 @@ impl Scheduler {
                         natural_completion: false,
                         forced_outcome: forced,
                     },
+                    None,
                 )
             } else {
                 let (code, message) = failure.unwrap_or((
@@ -4144,6 +4268,7 @@ impl Scheduler {
         &self,
         target: TerminalTarget<'_>,
         decision: TerminalDecision,
+        required_check_control: Option<(&ActiveCheck, Instant)>,
     ) -> Result<TaskPhase, SchedulerError> {
         let TerminalTarget {
             agent_id,
@@ -4193,13 +4318,39 @@ impl Scheduler {
                     if matches!(terminal_text, TerminalText::Visible(_))
                         && completion.outcome == CompletionOutcome::Completed
                     {
-                        let required_checks =
-                            run_required_general_checks(prepared, required_command_ids);
+                        let required_checks = match required_check_control {
+                            Some((check, absolute_deadline)) => run_required_general_checks(
+                                prepared,
+                                required_command_ids,
+                                check,
+                                absolute_deadline,
+                            ),
+                            None if required_command_ids.is_empty() => {
+                                RequiredGeneralChecks::default()
+                            }
+                            None => RequiredGeneralChecks {
+                                failure: Some("REQUIRED_CHECK_CONTROL_UNAVAILABLE"),
+                                ..RequiredGeneralChecks::default()
+                            },
+                        };
                         completion.checks = required_checks.succeeded;
                         if let Some(check_failure) = required_checks.failure {
-                            completion.outcome = CompletionOutcome::Failed;
                             completion.residual_gaps.push(check_failure.into());
-                            completion.reason_code = Some(check_failure.into());
+                            match check_failure {
+                                "REQUIRED_CHECK_CANCELLED" => {
+                                    completion.outcome = CompletionOutcome::Cancelled;
+                                    completion.reason_code = Some("CANCELLED".into());
+                                }
+                                "REQUIRED_CHECK_ABSOLUTE_DEADLINE_EXCEEDED" => {
+                                    completion.outcome = CompletionOutcome::TimedOut;
+                                    completion.reason_code =
+                                        Some("WALL_TIME_DEADLINE_EXCEEDED".into());
+                                }
+                                _ => {
+                                    completion.outcome = CompletionOutcome::Failed;
+                                    completion.reason_code = Some(check_failure.into());
+                                }
+                            }
                         }
                     }
                     match terminal_text {
@@ -4272,6 +4423,8 @@ impl Scheduler {
         sink: &StoreLifecycleSink,
         route: &TaskRoute,
         _task: Option<&TaskRecord>,
+        check: &ActiveCheck,
+        budget: Option<&RuntimeBudget>,
         terminal: RuntimeTerminal,
         natural_completion: bool,
         forced_outcome: Option<(CompletionOutcome, String)>,
@@ -4317,6 +4470,11 @@ impl Scheduler {
                 natural_completion,
                 forced_outcome,
             },
+            if natural_completion {
+                budget.map(|budget| (check, budget.deadline()))
+            } else {
+                None
+            },
         )
     }
 
@@ -4333,6 +4491,7 @@ impl Scheduler {
         route: &TaskRoute,
         task: Option<&TaskRecord>,
         check: &Arc<ActiveCheck>,
+        budget: Option<&RuntimeBudget>,
         reason_code: &str,
     ) -> Result<(), SchedulerError> {
         let stop = self.inner.store.request_runtime_stop(agent_id)?;
@@ -4360,6 +4519,8 @@ impl Scheduler {
             sink,
             route,
             task,
+            check,
+            budget,
             terminal,
             false,
             Some(forced),
@@ -4402,6 +4563,7 @@ impl Scheduler {
                             &route,
                             task.as_ref(),
                             &check,
+                            budget.as_deref(),
                             violation.reason_code(),
                         ) {
                             scheduler.record_failure(&agent_id, error.to_string());
@@ -4433,6 +4595,8 @@ impl Scheduler {
                         &sink,
                         &route,
                         task.as_ref(),
+                        &check,
+                        budget.as_deref(),
                         terminal,
                         false,
                         Some((
@@ -4442,6 +4606,7 @@ impl Scheduler {
                     ) {
                         scheduler.record_failure(&agent_id, error.to_string());
                     }
+                    check.cancel();
                     scheduler.release_active(&agent_id, owner_epoch);
                     if let Err(error) = scheduler.start_ready() {
                         scheduler.record_failure(&agent_id, error.to_string());
@@ -4484,6 +4649,7 @@ impl Scheduler {
                             &route,
                             Some(task),
                             &check,
+                            budget.as_deref(),
                             reason,
                         ) {
                             scheduler.record_failure(&agent_id, error.to_string());
@@ -4539,7 +4705,9 @@ impl Scheduler {
                             }) => unreachable!("blocked completion has a blocker"),
                         }
                     }
-                    check.cancel();
+                    if !natural {
+                        check.cancel();
+                    }
                     if let Err(error) = scheduler.finish_locked_monitor_terminal(
                         &agent_id,
                         owner_epoch,
@@ -4547,12 +4715,15 @@ impl Scheduler {
                         &sink,
                         &route,
                         task.as_ref(),
+                        &check,
+                        budget.as_deref(),
                         terminal,
                         natural,
                         None,
                     ) {
                         scheduler.record_failure(&agent_id, error.to_string());
                     }
+                    check.cancel();
                     scheduler.release_active(&agent_id, owner_epoch);
                     if let Err(error) = scheduler.start_ready() {
                         scheduler.record_failure(&agent_id, error.to_string());
@@ -4575,6 +4746,8 @@ impl Scheduler {
                         &sink,
                         &route,
                         task.as_ref(),
+                        &check,
+                        budget.as_deref(),
                         terminal,
                         false,
                         Some((
@@ -4639,7 +4812,9 @@ impl Scheduler {
                     match delivery {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            check.cancel();
+                            if boundary != TurnBoundary::Completed {
+                                check.cancel();
+                            }
                             let terminal = runtime.finish_turn(
                                 boundary,
                                 deadline.cleanup_grace(scheduler.inner.config.stop_grace),
@@ -4651,12 +4826,15 @@ impl Scheduler {
                                 &sink,
                                 &route,
                                 task.as_ref(),
+                                &check,
+                                budget.as_deref(),
                                 terminal,
                                 boundary == TurnBoundary::Completed,
                                 None,
                             ) {
                                 scheduler.record_failure(&agent_id, error.to_string());
                             }
+                            check.cancel();
                             scheduler.release_active(&agent_id, owner_epoch);
                             if let Err(error) = scheduler.start_ready() {
                                 scheduler.record_failure(&agent_id, error.to_string());
@@ -4677,6 +4855,8 @@ impl Scheduler {
                                 &sink,
                                 &route,
                                 task.as_ref(),
+                                &check,
+                                budget.as_deref(),
                                 terminal,
                                 false,
                                 Some((CompletionOutcome::Failed, "MESSAGE_DELIVERY_FAILED".into())),
@@ -5192,6 +5372,7 @@ impl Scheduler {
                 natural_completion: false,
                 forced_outcome: Some((CompletionOutcome::Cancelled, "CANCELLED".into())),
             },
+            None,
         );
         self.release_active(agent_id, decision.owner_epoch);
         if let Some(error) = close_error {
@@ -6678,6 +6859,106 @@ exec tail -f /dev/null
         );
     }
 
+    #[test]
+    fn startup_recovery_reaps_persisted_runtime_and_worktree_before_marking_reaped() {
+        let (directory, store, _factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "restart-recovery", None),
+                Some("feature"),
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id.clone();
+        let claim = store.claim_next("crashed-daemon", 1, 1).unwrap().unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec tail -f /dev/null"]);
+        let driver = Driver::spawn(command).unwrap();
+        let identity = driver.identity();
+        let stored_identity = StoredProcessIdentity {
+            pid: identity.pid,
+            process_group_id: identity.pgid,
+            uid: identity.uid,
+            start_token: identity.start_token.clone(),
+        };
+        assert!(store
+            .mark_session_running(
+                &agent_id,
+                claim.owner_epoch,
+                "persisted-runtime",
+                Some(&stored_identity),
+                Some("lost-session"),
+                Some(TurnState::Active),
+            )
+            .unwrap());
+        store
+            .insert_pending_request(
+                "restart-pending",
+                &agent_id,
+                "\"lost-request\"",
+                "permission",
+                "{}",
+            )
+            .unwrap();
+        assert!(prepared.worktree.path.exists());
+
+        assert_eq!(
+            scheduler.reconcile_startup().unwrap(),
+            vec![(agent_id.clone(), TaskOutcome::RuntimeLost)]
+        );
+
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+        assert_general_workspace_cleaned(&prepared);
+        assert!(store.pending_requests(&agent_id).unwrap().is_empty());
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Terminal);
+        assert_eq!(task.outcome, Some(TaskOutcome::RuntimeLost));
+        assert!(task.reaped_at.is_some());
+        let result = store.task_result(&agent_id).unwrap().unwrap();
+        assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"DAEMON_RESTART_RUNTIME_LOST".into()));
+        drop(driver);
+    }
+
+    #[test]
+    fn startup_recovery_refuses_incomplete_runtime_identity_without_marking_reaped() {
+        let (directory, store, _factory, scheduler) = scheduler_fixture(1, 1);
+        let submitted = scheduler
+            .enqueue_general(
+                &general_manifest(directory.path(), "restart-incomplete", None),
+                Some("feature"),
+            )
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id;
+        let claim = store.claim_next("crashed-daemon", 1, 1).unwrap().unwrap();
+        assert!(store
+            .mark_session_running(
+                &agent_id,
+                claim.owner_epoch,
+                "runtime-without-identity",
+                None,
+                Some("lost-session"),
+                Some(TurnState::Active),
+            )
+            .unwrap());
+
+        assert!(matches!(
+            scheduler.reconcile_startup(),
+            Err(SchedulerError::RuntimeCommand { .. })
+        ));
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Running);
+        assert!(task.reaped_at.is_none());
+        assert!(prepared.worktree.path.exists());
+
+        let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed);
+        assert!(cleanup.cleaned);
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum FakeStopTurnBehavior {
         Cooperative,
@@ -7230,6 +7511,7 @@ exec tail -f /dev/null
         let directory = tempfile::tempdir().unwrap();
         let mut manifest = general_manifest(directory.path(), "required-final-tree", None);
         manifest.access_mode = AccessMode::WorkspaceWrite;
+        manifest.repo_context = vec!["src/lib.rs".into()];
         manifest.write_manifest = vec!["src".into()];
         let repository = manifest.repository.clone();
         let catalog_path = write_general_command_catalog(
@@ -7303,6 +7585,206 @@ exec tail -f /dev/null
             .residual_gaps
             .contains(&"REQUIRED_CHECK_FAILED".into()));
         assert_eq!(result.result.checks, ["a-successful"]);
+        assert_general_workspace_cleaned(&prepared);
+    }
+
+    #[test]
+    fn required_checks_share_cancel_and_absolute_deadline_and_reap_process_groups() {
+        for (agent_id, cancel, expected_failure) in [
+            ("required-cancel", true, "REQUIRED_CHECK_CANCELLED"),
+            (
+                "required-deadline",
+                false,
+                "REQUIRED_CHECK_ABSOLUTE_DEADLINE_EXCEEDED",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut manifest = general_manifest(directory.path(), agent_id, None);
+            let key = format!(
+                "{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}:{}",
+                        manifest.repository.display(),
+                        manifest.idempotency_key
+                    )
+                    .as_bytes()
+                )
+            );
+            let pid_path = manifest
+                .repository
+                .join(&manifest.scratch_root)
+                .join(key)
+                .join("scratch/check-pids");
+            let script = format!(
+                "import os,subprocess,time;p=subprocess.Popen(['/bin/sleep','10']);open({:?},'w').write(str(os.getpid())+' '+str(p.pid));time.sleep(10)",
+                pid_path.to_string_lossy()
+            );
+            manifest.validation_commands.insert(
+                "long".into(),
+                ValidationCommand {
+                    program: "/usr/bin/python3".into(),
+                    args: vec!["-c".into(), script],
+                    cwd: ".".into(),
+                    timeout_ms: 10_000,
+                    max_output_bytes: 1024,
+                },
+            );
+            let prepared = GeneralTaskPreparer::new(Vec::new())
+                .unwrap()
+                .prepare(&manifest)
+                .unwrap();
+            assert_eq!(prepared.scratch_root, pid_path.parent().unwrap());
+            let worker_prepared = prepared.clone();
+            let check = Arc::new(ActiveCheck::default());
+            let worker_check = Arc::clone(&check);
+            let absolute_deadline = Instant::now()
+                + if cancel {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_secs(1)
+                };
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = run_required_general_checks(
+                    &worker_prepared,
+                    &["long".into()],
+                    &worker_check,
+                    absolute_deadline,
+                );
+                finished_tx.send(result).unwrap();
+            });
+            let pids = wait_until_condition(|| match finished_rx.try_recv() {
+                Ok(result) => panic!("required check exited before publishing pids: {result:?}"),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("required check worker disconnected")
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::fs::read_to_string(&pid_path).ok().and_then(|value| {
+                        let parsed = value
+                            .split_whitespace()
+                            .map(str::parse::<u32>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .ok()?;
+                        (parsed.len() == 2).then_some(parsed)
+                    })
+                }
+            });
+            if cancel {
+                check.cancel();
+            }
+            let result = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(result.failure, Some(expected_failure));
+            assert!(result.succeeded.is_empty());
+            for pid in pids {
+                assert!(
+                    observe_process(pid).is_err(),
+                    "check process {pid} survived"
+                );
+            }
+            let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Failed);
+            assert!(completion.cleaned);
+        }
+    }
+
+    #[test]
+    fn task_cancel_interrupts_the_shared_required_check_and_wins_the_result_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = general_manifest(directory.path(), "required-cancel-race", None);
+        let key = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "{}:{}",
+                    manifest.repository.display(),
+                    manifest.idempotency_key
+                )
+                .as_bytes()
+            )
+        );
+        let pid_path = manifest
+            .repository
+            .join(&manifest.scratch_root)
+            .join(key)
+            .join("scratch/check-pids");
+        let script = format!(
+            "import os,subprocess,time;p=subprocess.Popen(['/bin/sleep','10']);open({:?},'w').write(str(os.getpid())+' '+str(p.pid));time.sleep(10)",
+            pid_path.to_string_lossy()
+        );
+        let catalog_path = write_general_command_catalog(
+            directory.path(),
+            serde_json::json!([{
+                "repository":manifest.repository,
+                "command_id":"long",
+                "command":{
+                    "program":"/usr/bin/python3",
+                    "args":["-c",script],
+                    "cwd":".",
+                    "timeout_ms":10_000,
+                    "max_output_bytes":1024
+                },
+                "allowed_access_modes":["read_only"],
+                "readonly_safe":true
+            }]),
+        );
+        let store =
+            Arc::new(Store::open(directory.path().join("required-cancel.sqlite3")).unwrap());
+        let factory = Arc::new(FakeFactory::default());
+        let scheduler = Scheduler::new(
+            "required-cancel-owner",
+            Arc::clone(&store),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+        .with_general_command_catalog(GeneralCommandCatalog::load(&catalog_path).unwrap())
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_commands(&manifest, Some("feature"), &[], &["long".into()])
+            .unwrap();
+        let prepared = prepared_general(&submitted.task);
+        let agent_id = submitted.task.agent_id;
+        scheduler.start_ready().unwrap();
+        let runtime = factory.runtime(&agent_id);
+        runtime.emit_text_delta(
+            "required-cancel-text",
+            "terminal text survives cancellation",
+        );
+        runtime.finish(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+            ChildExit::Exited(Some(0)),
+        )));
+        let pids = wait_until_condition(|| {
+            std::fs::read_to_string(&pid_path).ok().and_then(|value| {
+                let parsed = value
+                    .split_whitespace()
+                    .map(str::parse::<u32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
+                (parsed.len() == 2).then_some(parsed)
+            })
+        });
+
+        assert_eq!(
+            scheduler.cancel_task(&agent_id).unwrap(),
+            TaskPhase::Terminal
+        );
+        let result = store.task_result(&agent_id).unwrap().unwrap();
+        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
+        assert_eq!(
+            result.result.final_text,
+            "terminal text survives cancellation"
+        );
+        assert!(result
+            .result
+            .residual_gaps
+            .contains(&"REQUIRED_CHECK_CANCELLED".into()));
+        for pid in pids {
+            assert!(
+                observe_process(pid).is_err(),
+                "check process {pid} survived"
+            );
+        }
         assert_general_workspace_cleaned(&prepared);
     }
 

@@ -1077,66 +1077,24 @@ impl Store {
         outcome.ok_or_else(|| StoreError::InvalidState("terminal task has no outcome".into()))
     }
 
-    pub fn reconcile_startup(&self) -> StoreResult<Vec<(String, TaskOutcome)>> {
-        let mut connection = self.connection.lock().unwrap();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = {
-            let mut statement = transaction.prepare(
-                "SELECT agent_id,phase,owner_epoch FROM tasks
-                 WHERE phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
-                 ORDER BY created_at,rowid",
-            )?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-        let mut reconciled = Vec::with_capacity(rows.len());
-        for (agent_id, phase, epoch) in rows {
-            let phase = TaskPhase::parse(&phase)?;
-            apply_terminal(
-                &transaction,
-                &agent_id,
-                i64_to_u64(epoch)?,
-                phase,
-                false,
-                false,
-                &TerminalUpdate {
-                    outcome: TaskOutcome::RuntimeLost,
-                    failure_code: Some("DAEMON_RESTART_RUNTIME_LOST".into()),
-                    failure_message: Some("daemon restarted while task runtime was active".into()),
-                },
-            )?;
-            transaction.execute(
-                "UPDATE tasks SET owner_id=NULL,lease_expires_at=NULL WHERE agent_id=?1",
-                [&agent_id],
-            )?;
-            ensure_minimal_result(
-                &transaction,
-                &agent_id,
-                TaskOutcome::RuntimeLost,
-                "runtime lost during daemon restart",
-                false,
-            )?;
-            reconciled.push((agent_id, TaskOutcome::RuntimeLost));
-        }
-        transaction.execute(
-            "UPDATE messages SET state='QUEUED' WHERE state='SENDING'",
-            [],
+    pub fn startup_recovery_tasks(&self) -> StoreResult<Vec<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT agent_id FROM tasks
+             WHERE phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
+                OR (phase='TERMINAL' AND reaped_at IS NULL)
+             ORDER BY created_at,rowid",
         )?;
-        transaction.execute(
-            "UPDATE pending_requests SET state='PENDING',response_decision=NULL,response_content=NULL
-             WHERE state='SENDING'",
-            [],
-        )?;
-        transaction.commit()?;
-        Ok(reconciled)
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|agent_id| {
+                query_task(&connection, &agent_id)?.ok_or_else(|| {
+                    StoreError::InvalidState("startup recovery task disappeared".into())
+                })
+            })
+            .collect()
     }
 
     pub fn store_task_result(&self, agent_id: &str, result: &TaskResult) -> StoreResult<()> {
@@ -1151,7 +1109,8 @@ impl Store {
     ) -> StoreResult<()> {
         validate_result(result)?;
         validate_result_patch(agent_id, result, patch)?;
-        let digest = task_result_digest(result)?;
+        let canonical = task_result_bytes(result)?;
+        let digest = task_result_digest(&canonical);
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = query_task(&transaction, agent_id)?
@@ -1189,6 +1148,11 @@ impl Store {
                 task.phase
             )));
         }
+        if canonical.len() as u64 > task.effective_budget.max_result_bytes {
+            return Err(StoreError::InvalidState(
+                "task result exceeds effective max_result_bytes".into(),
+            ));
+        }
         if result.outcome == TaskOutcome::Completed {
             let (pending, queued) = completion_blockers_tx(&transaction, agent_id)?;
             if pending || queued {
@@ -1197,10 +1161,10 @@ impl Store {
                 ));
             }
         }
-        if (task.stop_requested || task.close_requested) && result.outcome == TaskOutcome::Completed
+        if (task.stop_requested || task.close_requested) && result.outcome != TaskOutcome::Cancelled
         {
             return Err(StoreError::Conflict(
-                "cancellation wins over late completion".into(),
+                "cancellation or close intent wins over late result".into(),
             ));
         }
         let retained = retain_result(task.retain_partial, result);
@@ -1750,10 +1714,12 @@ fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
     format!("{:x}", sha2::Sha256::digest(canonical))
 }
 
-fn task_result_digest(result: &TaskResult) -> StoreResult<String> {
-    let bytes =
-        serde_json::to_vec(result).map_err(|error| StoreError::InvalidState(error.to_string()))?;
-    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+fn task_result_bytes(result: &TaskResult) -> StoreResult<Vec<u8>> {
+    serde_json::to_vec(result).map_err(|error| StoreError::InvalidState(error.to_string()))
+}
+
+fn task_result_digest(bytes: &[u8]) -> String {
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn validate_result(result: &TaskResult) -> StoreResult<()> {
@@ -2051,7 +2017,7 @@ fn apply_terminal(
         return Err(StoreError::Conflict("task is already terminal".into()));
     }
     let outcome =
-        if (stop_requested || close_requested) && terminal.outcome == TaskOutcome::Completed {
+        if (stop_requested || close_requested) && terminal.outcome != TaskOutcome::Cancelled {
             TaskOutcome::Cancelled
         } else {
             terminal.outcome
@@ -2098,43 +2064,6 @@ fn apply_terminal(
     Ok(outcome)
 }
 
-fn ensure_minimal_result(
-    transaction: &Transaction<'_>,
-    agent_id: &str,
-    outcome: TaskOutcome,
-    final_text: &str,
-    retained: bool,
-) -> StoreResult<()> {
-    let result = TaskResult {
-        outcome,
-        final_text: final_text.into(),
-        partial: true,
-        base_commit: None,
-        head_commit: None,
-        changed_files: Vec::new(),
-        diff_stat: None,
-        checks: Vec::new(),
-        residual_gaps: vec!["runtime result unavailable".into()],
-        artifacts: Vec::new(),
-    };
-    let digest = task_result_digest(&result)?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO task_results(agent_id,outcome,final_text,partial,retained,
-             changed_files_json,checks_json,result_sha256,residual_gaps_json,artifacts_json,completed_at)
-         VALUES (?1,?2,?3,1,?4,'[]','[]',?5,?6,'[]',?7)",
-        params![
-            agent_id,
-            outcome.as_str(),
-            final_text,
-            retained,
-            digest,
-            serde_json::to_string(&result.residual_gaps).unwrap(),
-            now_millis(),
-        ],
-    )?;
-    Ok(())
-}
-
 fn settle_terminal_commands(
     transaction: &Transaction<'_>,
     agent_id: &str,
@@ -2147,8 +2076,8 @@ fn settle_terminal_commands(
         params![reason_code, agent_id],
     )?;
     transaction.execute(
-        "UPDATE pending_requests SET state='PENDING',response_decision=NULL,response_content=NULL
-         WHERE agent_id=?1 AND state='SENDING'",
+        "DELETE FROM pending_requests
+         WHERE agent_id=?1 AND state IN ('PENDING','SENDING')",
         [agent_id],
     )?;
     Ok(())
@@ -2584,17 +2513,84 @@ mod tests {
         );
         let decision = store.request_stop("agent").unwrap();
         assert_eq!(decision.phase, TaskPhase::Cancelling);
-        assert!(matches!(
-            store.store_task_result("agent", &result(TaskOutcome::Completed)),
-            Err(StoreError::Conflict(_))
-        ));
+        assert!(store.pending_requests("agent").unwrap().is_empty());
+        for outcome in [
+            TaskOutcome::Completed,
+            TaskOutcome::Failed,
+            TaskOutcome::TimedOut,
+            TaskOutcome::BudgetExhausted,
+            TaskOutcome::RuntimeLost,
+            TaskOutcome::ResultInvalid,
+        ] {
+            assert!(matches!(
+                store.store_task_result("agent", &result(outcome)),
+                Err(StoreError::Conflict(_))
+            ));
+        }
         store
             .store_task_result("agent", &result(TaskOutcome::Cancelled))
             .unwrap();
     }
 
     #[test]
-    fn restart_terminalizes_active_tasks_and_preserves_result() {
+    fn close_intent_coerces_non_cancel_terminal_transition() {
+        let (_directory, _path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("agent", "/repo", None))
+            .unwrap();
+        let owner_epoch = running(&store, "agent");
+        store.request_close("agent").unwrap();
+        assert_eq!(
+            store
+                .transition_terminal(
+                    "agent",
+                    owner_epoch,
+                    &TerminalUpdate {
+                        outcome: TaskOutcome::RuntimeLost,
+                        failure_code: Some("LATE_RUNTIME_LOST".into()),
+                        failure_message: None,
+                    },
+                )
+                .unwrap(),
+            TaskOutcome::Cancelled
+        );
+        let task = store.get_task("agent").unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+        assert!(task.closed_at.is_some());
+    }
+
+    #[test]
+    fn whole_result_budget_accepts_exact_boundary_and_rejects_one_byte_less() {
+        let sample = result(TaskOutcome::Completed);
+        let encoded = serde_json::to_vec(&sample).unwrap();
+        for (agent_id, limit, accepted) in [
+            ("exact", encoded.len() as u64, true),
+            ("over", encoded.len() as u64 - 1, false),
+        ] {
+            let (_directory, _path, store) = store();
+            let mut submitted = task(agent_id, "/repo", None);
+            submitted.budget = BudgetRequest::Limits(EffectiveBudget {
+                max_result_bytes: limit,
+                ..DEFAULT_BUDGET
+            });
+            store.enqueue_task_authoritative(&submitted).unwrap();
+            running(&store, agent_id);
+            let stored = store.store_task_result(agent_id, &sample);
+            assert_eq!(stored.is_ok(), accepted);
+            assert_eq!(store.task_result(agent_id).unwrap().is_some(), accepted);
+            assert_eq!(
+                store.get_task(agent_id).unwrap().unwrap().phase,
+                if accepted {
+                    TaskPhase::Terminal
+                } else {
+                    TaskPhase::Running
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn startup_recovery_inventory_is_read_only() {
         let (_directory, path, store) = store();
         store
             .enqueue_task_authoritative(&task("agent", "/repo", None))
@@ -2603,14 +2599,19 @@ mod tests {
         drop(store);
         let reopened = Store::open(&path).unwrap();
         assert_eq!(
-            reopened.reconcile_startup().unwrap(),
-            vec![("agent".into(), TaskOutcome::RuntimeLost)]
+            reopened
+                .startup_recovery_tasks()
+                .unwrap()
+                .into_iter()
+                .map(|task| task.agent_id)
+                .collect::<Vec<_>>(),
+            vec!["agent"]
         );
         assert_eq!(
-            reopened.get_task("agent").unwrap().unwrap().outcome,
-            Some(TaskOutcome::RuntimeLost)
+            reopened.get_task("agent").unwrap().unwrap().phase,
+            TaskPhase::Running
         );
-        assert!(reopened.task_result("agent").unwrap().is_some());
+        assert!(reopened.task_result("agent").unwrap().is_none());
     }
 
     #[test]

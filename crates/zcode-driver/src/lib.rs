@@ -731,6 +731,38 @@ pub fn observe_process_group(pgid: i32) -> io::Result<Vec<ProcessIdentity>> {
     Err(last_error.unwrap_or_else(|| io::Error::other("process-group observation failed")))
 }
 
+pub fn stop_and_reap_persisted_process_group(
+    identity: &ProcessIdentity,
+    timeout: Duration,
+) -> io::Result<()> {
+    validate_spawn_identity(identity.pid, identity)?;
+    let observed = match observe_process(identity.pid) {
+        Ok(observed) => observed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ensure_group_empty(identity.pgid)
+        }
+        Err(error) => return Err(error),
+    };
+    validate_same_identity(identity, &observed)?;
+    validate_owned_group(identity, &observe_process_group(identity.pgid)?)?;
+
+    signal_group(identity.pgid, TERM_SIGNAL)?;
+    if wait_for_persisted_group_death(identity.pgid, timeout)? {
+        return Ok(());
+    }
+
+    validate_live_group_after_term(identity, &observe_process_group(identity.pgid)?)?;
+    signal_group(identity.pgid, KILL_SIGNAL)?;
+    if wait_for_persisted_group_death(identity.pgid, timeout)? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "persisted process group survived SIGKILL",
+        ))
+    }
+}
+
 fn validate_spawn_identity(child_pid: u32, identity: &ProcessIdentity) -> io::Result<()> {
     if identity.pid != child_pid
         || identity.pid <= 1
@@ -844,6 +876,24 @@ fn wait_for_group_death(
         }
         if Instant::now() >= deadline {
             return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_persisted_group_death(pgid: i32, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match observe_process_group(pgid) {
+            Ok(members) if members.is_empty() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -1724,6 +1774,24 @@ mod tests {
 
         driver.identity = actual;
         driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn persisted_identity_reaper_rejects_reuse_and_reaps_the_owned_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "trap '' TERM; exec tail -f /dev/null"]);
+        let driver = Driver::spawn(command).unwrap();
+        let identity = driver.identity();
+        let mut reused = identity.clone();
+        reused.start_token.push_str(":reused");
+
+        let error =
+            stop_and_reap_persisted_process_group(&reused, Duration::from_millis(50)).unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(observe_process(identity.pid).unwrap(), identity);
+
+        stop_and_reap_persisted_process_group(&identity, Duration::from_millis(100)).unwrap();
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
     }
 
     #[test]

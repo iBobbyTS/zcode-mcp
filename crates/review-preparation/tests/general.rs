@@ -793,6 +793,8 @@ fn implementation_context_covered_by_write_manifest_can_finalize() {
         "pub fn value() -> u8 { 22 }\n",
     )
     .unwrap();
+    assert!(prepared.launcher().is_err());
+    assert!(prepared.final_tree_launcher().is_ok());
 
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
 
@@ -979,6 +981,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     assert_eq!(prepared.context[0].size_bytes, b"fixture\n".len() as u64);
     fs::write(&prepared.prompt_path, "mutated prepared prompt").unwrap();
     assert!(prepared.launcher().is_err());
+    assert!(prepared.final_tree_launcher().is_err());
     let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
     assert_eq!(
         completion.reason_code.as_deref(),
@@ -994,6 +997,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
         .unwrap();
     fs::write(&prepared.attachments[0].prepared_path, "replacement").unwrap();
     assert!(prepared.launcher().is_err());
+    assert!(prepared.final_tree_launcher().is_err());
     assert_eq!(
         GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed)
             .reason_code
@@ -1012,6 +1016,7 @@ fn context_uses_detached_base_and_prepared_bytes_are_reverified() {
     )
     .unwrap();
     assert!(prepared.launcher().is_err());
+    assert!(prepared.final_tree_launcher().is_err());
     assert_eq!(
         GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed)
             .reason_code

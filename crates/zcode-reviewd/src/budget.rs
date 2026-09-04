@@ -129,6 +129,10 @@ impl RuntimeBudget {
         self.deadline.checked_duration_since(Instant::now())
     }
 
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     #[cfg(test)]
     fn counts(&self) -> (u64, usize) {
         let state = self.state.lock().unwrap();

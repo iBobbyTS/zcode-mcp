@@ -283,6 +283,15 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
 }
 
 fn submit_general_fixture(fixture: &Fixture, name: &str, group_id: &str) -> (PathBuf, String) {
+    submit_general_fixture_with_budget(fixture, name, group_id, None)
+}
+
+fn submit_general_fixture_with_budget(
+    fixture: &Fixture,
+    name: &str,
+    group_id: &str,
+    budget: Option<BudgetLimits>,
+) -> (PathBuf, String) {
     let repository = fixture._directory.path().join(format!("repository-{name}"));
     std::fs::create_dir_all(repository.join("src")).unwrap();
     std::fs::write(repository.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
@@ -313,7 +322,7 @@ fn submit_general_fixture(fixture: &Fixture, name: &str, group_id: &str) -> (Pat
                     write_manifest: Vec::new(),
                     scratch_root: ".agent-work/scratch/general".into(),
                     artifact_root: PathBuf::from(".agent-work/artifacts").join(&requested_agent_id),
-                    budget: None,
+                    budget,
                     validation_commands: Default::default(),
                     retain_partial: false,
                     idempotency_key: format!("s05-{name}-key"),
@@ -435,6 +444,117 @@ fn task_poll_uses_revision_and_wakes_for_pending_and_terminal() {
             ..
         } if phase == "TERMINAL"
     ));
+}
+
+#[test]
+fn terminal_poll_settles_pending_requests_after_cancel_and_input_timeout() {
+    for timed_out in [false, true] {
+        let fixture = fixture();
+        let budget = timed_out.then(|| {
+            let mut budget = AccessMode::ReadOnly.default_budget();
+            budget.input_wait_timeout_ms = 40;
+            budget.absolute_wall_time_ms = 5_000;
+            budget
+        });
+        let (_, agent_id) = submit_general_fixture_with_budget(
+            &fixture,
+            if timed_out {
+                "pending-timeout"
+            } else {
+                "pending-cancel"
+            },
+            "feature-pending-terminal",
+            budget,
+        );
+        fixture.scheduler.start_ready().unwrap();
+        let runtime = fixture.factory.runtime(&agent_id);
+        runtime.emit(RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(
+            RequestEnvelope {
+                id: zcode_protocol::WireId::String("terminal-pending-wire".into()),
+                method: zcode_protocol::INTERACTION_REQUEST_PERMISSION.into(),
+                params: serde_json::json!({
+                    "requestId":"terminal-pending",
+                    "toolCallId":"read-terminal",
+                    "toolName":"Read",
+                    "input":{"path":"src/lib.rs"},
+                    "options":[{"id":"deny","kind":"deny","label":"Deny","response":{"decision":"deny"}}]
+                }),
+            },
+        ))));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request_id = loop {
+            if let Some(request) = fixture
+                .store
+                .pending_requests(&agent_id)
+                .unwrap()
+                .into_iter()
+                .next()
+            {
+                break request.request_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pending request was not published"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        if !timed_out {
+            fixture
+                .service
+                .dispatch(RpcMethod::TaskCancel {
+                    agent_id: agent_id.clone(),
+                })
+                .unwrap();
+        }
+        while fixture.store.task_result(&agent_id).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "terminal result was not persisted"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        match fixture
+            .service
+            .dispatch(RpcMethod::TaskPoll(TaskPollQuery {
+                agent_id: agent_id.clone(),
+                after_revision: 0,
+                timeout_ms: 1000,
+            }))
+            .unwrap()
+        {
+            RpcSuccess::TaskPoll {
+                task,
+                pending_requests,
+                result_available,
+                timed_out: poll_timed_out,
+                ..
+            } => {
+                assert_eq!(task.phase, "TERMINAL");
+                assert_eq!(
+                    task.outcome,
+                    Some(if timed_out {
+                        TaskOutcome::TimedOut
+                    } else {
+                        TaskOutcome::Cancelled
+                    })
+                );
+                assert!(pending_requests.is_empty());
+                assert!(result_available);
+                assert!(!poll_timed_out);
+            }
+            other => panic!("unexpected terminal poll: {other:?}"),
+        }
+        assert!(fixture
+            .service
+            .dispatch(RpcMethod::TaskRespond(RespondInput {
+                agent_id,
+                request_id,
+                decision: ResponseDecision::Deny,
+                content: None,
+            }))
+            .is_err());
+    }
 }
 
 #[test]
