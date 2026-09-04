@@ -5771,8 +5771,12 @@ impl Daemon {
             .map_err(|error| io::Error::other(error.to_string()))?;
         check_startup_shutdown(&shutdown_requested)?;
         let service = Arc::new(
-            rpc::RpcService::new(scheduler.clone(), scheduler.store())
-                .map_err(|_| io::Error::other("RPC service initialization failed"))?,
+            rpc::RpcService::new_with_service_generation(
+                scheduler.clone(),
+                scheduler.store(),
+                service_generation,
+            )
+            .map_err(|_| io::Error::other("RPC service initialization failed"))?,
         );
         let server = rpc::RpcServer::bind(socket, service, server_options)?;
         if let Err(error) = check_startup_shutdown(&shutdown_requested) {

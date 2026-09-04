@@ -566,16 +566,18 @@ pub enum RpcServiceConfigError {
 
 impl RpcService {
     pub fn new(scheduler: Scheduler, store: Arc<Store>) -> Result<Self, RpcServiceConfigError> {
+        let service_generation = opaque_generation()?;
+        Self::new_with_service_generation(scheduler, store, service_generation)
+    }
+
+    pub(crate) fn new_with_service_generation(
+        scheduler: Scheduler,
+        store: Arc<Store>,
+        service_generation: String,
+    ) -> Result<Self, RpcServiceConfigError> {
         if !Arc::ptr_eq(&scheduler.store(), &store) {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
-        // The daemon startup verifies this configured generation against the
-        // installed generic hook provenance. Direct in-process fixtures may
-        // omit the environment and retain an opaque local identity.
-        let service_generation = std::env::var("ZCODE_AGENT_SERVICE_GENERATION")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or(opaque_generation()?);
         Ok(Self {
             scheduler,
             store,
