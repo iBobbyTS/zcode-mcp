@@ -5,7 +5,7 @@
 Requirements are Rust 1.97 or compatible, Cargo, Git, and macOS or a compatible Unix host.
 
 ```text
-cargo build --release -p zcode-reviewd -p zcode-review-mcp
+cargo build --release -p zcode-agentd -p zcode-subagent-mcp
 ```
 
 ## Daemon
@@ -13,17 +13,17 @@ cargo build --release -p zcode-reviewd -p zcode-review-mcp
 Use private absolute database and socket paths outside the target repository:
 
 ```text
-export ZCODE_REVIEWD_DATABASE=/absolute/private/zcode-agent.sqlite3
-export ZCODE_REVIEWD_SOCKET=/absolute/private/zcode-agent.sock
+export ZCODE_AGENTD_STORE=/absolute/private/zcode-agent.sqlite3
+export ZCODE_AGENTD_SOCKET=/absolute/private/zcode-agent.sock
 export ZCODE_RUNTIME_PATH=/absolute/official/zcode-runtime
-./target/release/zcode-reviewd
+./target/release/zcode-agentd
 ```
 
 The daemon and Store are the sole durable lifecycle owner. The runtime owner keeps child process, stdio, session, turn, stop, and reap authority. `--database`, `--socket`, `--runtime`, and `--command-catalog` are equivalent CLI options.
 
 ## Codex MCP
 
-Merge values from `config/codex-zcode-subagent-mcp-v2.toml` into Codex configuration only when explicitly requested. The binary has one startup-static catalog:
+Merge values from `config/codex-zcode-subagent-mcp.toml` into Codex configuration only when explicitly requested. The binary has one startup-static catalog:
 
 ```text
 zcode_system_status

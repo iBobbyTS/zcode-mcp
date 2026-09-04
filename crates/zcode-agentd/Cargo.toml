@@ -1,0 +1,22 @@
+[package]
+name = "zcode-agentd"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+zcode-driver = { path = "../zcode-driver" }
+zcode-agent-store = { path = "../zcode-agent-store" }
+zcode-agent-preparation = { path = "../zcode-agent-preparation" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zcode-protocol = { path = "../zcode-protocol" }
+signal-hook = "0.3"
+libc = "0.2"
+sha2 = "0.10"
+socket2 = "0.6"
+tempfile = "3"
+
+[dev-dependencies]
+jsonschema = { version = "0.51", default-features = false }
+rusqlite = "0.32"

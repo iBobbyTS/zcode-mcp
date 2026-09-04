@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "zcode-subagent-v2": {
-      "command": "zcode-review-mcp",
-      "env_vars": ["ZCODE_REVIEWD_SOCKET"]
-    }
-  }
-}

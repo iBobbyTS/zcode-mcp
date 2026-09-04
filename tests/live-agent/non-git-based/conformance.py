@@ -32,7 +32,7 @@ class StdioMCPTransport:
     def __init__(self, binary: Path, socket: Path, timeout_s: float = 10.0):
         self.timeout_s = timeout_s
         env = dict(os.environ)
-        env["ZCODE_REVIEWD_SOCKET"] = str(socket)
+        env["ZCODE_AGENTD_SOCKET"] = str(socket)
         self.process = subprocess.Popen(
             [str(binary)],
             env=env,

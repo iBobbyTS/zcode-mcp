@@ -172,12 +172,12 @@ def main() -> int:
         database = root / "store.sqlite3"
         env = dict(os.environ)
         env.update({
-            "ZCODE_REVIEWD_SOCKET": str(socket),
-            "ZCODE_REVIEWD_DATABASE": str(database),
+            "ZCODE_AGENTD_SOCKET": str(socket),
+            "ZCODE_AGENTD_STORE": str(database),
             "ZCODE_RUNTIME_PATH": str(runtime_binary),
         })
         if args.command_catalog is not None:
-            env["ZCODE_REVIEWD_COMMAND_CATALOG"] = str(args.command_catalog.resolve())
+            env["ZCODE_AGENTD_COMMAND_CATALOG"] = str(args.command_catalog.resolve())
         daemon = subprocess.Popen(
             [str(daemon_binary)], env=env, stdout=daemon_log,
             stderr=subprocess.STDOUT,

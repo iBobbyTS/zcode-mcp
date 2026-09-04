@@ -1,0 +1,34 @@
+# Merge this table into ~/.codex/config.toml and replace the absolute paths.
+[mcp_servers.zcode_subagent]
+command = "/absolute/path/to/zcode-mcp/target/release/zcode-subagent-mcp"
+enabled = true
+required = true
+startup_timeout_sec = 10
+tool_timeout_sec = 10
+enabled_tools = [
+  "zcode_agent_cancel",
+  "zcode_agent_close",
+  "zcode_agent_list",
+  "zcode_agent_poll",
+  "zcode_agent_respond",
+  "zcode_agent_result",
+  "zcode_agent_send",
+  "zcode_agent_spawn",
+  "zcode_system_status",
+]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.zcode_subagent.env]
+ZCODE_AGENTD_SOCKET = "/absolute/private/zcode-agentd.sock"
+
+[mcp_servers.zcode_subagent.tools.zcode_system_status]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent.tools.zcode_agent_list]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent.tools.zcode_agent_poll]
+approval_mode = "auto"
+
+[mcp_servers.zcode_subagent.tools.zcode_agent_result]
+approval_mode = "auto"

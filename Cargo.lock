@@ -1000,7 +1000,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "review-preparation"
+name = "zcode-agent-preparation"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
@@ -1012,7 +1012,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "review-store"
+name = "zcode-agent-store"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
@@ -1670,12 +1670,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "zcode-review-mcp"
+name = "zcode-subagent-mcp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "review-preparation",
- "review-store",
+ "zcode-agent-preparation",
+ "zcode-agent-store",
  "rmcp",
  "rmcp-macros",
  "schemars",
@@ -1686,17 +1686,17 @@ dependencies = [
  "tokio",
  "zcode-driver",
  "zcode-protocol",
- "zcode-reviewd",
+ "zcode-agentd",
 ]
 
 [[package]]
-name = "zcode-reviewd"
+name = "zcode-agentd"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
  "libc",
- "review-preparation",
- "review-store",
+ "zcode-agent-preparation",
+ "zcode-agent-store",
  "rusqlite",
  "serde",
  "serde_json",
