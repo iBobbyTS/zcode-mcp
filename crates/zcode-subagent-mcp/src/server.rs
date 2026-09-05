@@ -16,8 +16,7 @@ use std::{
     time::Duration,
 };
 use zcode_agent_preparation::{
-    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, PermissionMode,
-    GENERAL_TASK_SCHEMA,
+    AttachmentInput, BudgetLimits, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA,
 };
 use zcode_agent_store::{EffectiveBudget, TaskOutcome};
 use zcode_agentd::rpc::{
@@ -33,6 +32,26 @@ use crate::{
     protocol_error, public_error, public_transport_error, PublicDecision, PublicPendingRequest,
     PublicResponseDisposition,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPermissionMode {
+    Build,
+    Edit,
+    Plan,
+    Yolo,
+}
+
+impl From<PublicPermissionMode> for PermissionMode {
+    fn from(value: PublicPermissionMode) -> Self {
+        match value {
+            PublicPermissionMode::Build => Self::Build,
+            PublicPermissionMode::Edit => Self::Edit,
+            PublicPermissionMode::Plan => Self::Plan,
+            PublicPermissionMode::Yolo => Self::Yolo,
+        }
+    }
+}
 
 pub const PUBLIC_TOOLS: [&str; 9] = [
     "zcode_agent_cancel",
@@ -73,22 +92,6 @@ fn validate_text(value: &str, field: &str, max: usize) -> Result<(), String> {
 
 fn validate_path(value: &str, field: &str) -> Result<(), String> {
     validate_text(value, field, MAX_PATH_BYTES)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicAccessMode {
-    ReadOnly,
-    WorkspaceWrite,
-}
-
-impl From<PublicAccessMode> for AccessMode {
-    fn from(value: PublicAccessMode) -> Self {
-        match value {
-            PublicAccessMode::ReadOnly => Self::ReadOnly,
-            PublicAccessMode::WorkspaceWrite => Self::WorkspaceWrite,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -199,8 +202,6 @@ impl From<ComponentStateView> for PublicComponentState {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicAgentCapabilities {
-    pub access_modes: Vec<String>,
-    pub access_mode_defaults: BTreeMap<String, PublicBudget>,
     pub hard_budget_caps: PublicBudget,
     pub max_rpc_frame_bytes: usize,
     pub max_wait_ms: u64,
@@ -210,34 +211,13 @@ pub struct PublicAgentCapabilities {
 }
 
 impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
-    fn from(mut value: AgentCapabilitiesView) -> Self {
-        let access_mode_defaults = [
-            ("read_only", "read_only"),
-            ("workspace_write", "workspace_write"),
-        ]
-        .into_iter()
-        .filter_map(|(public_name, access_mode)| {
-            value
-                .access_mode_defaults
-                .remove(access_mode)
-                .map(|budget| (public_name.into(), budget.into()))
-        })
-        .collect();
-        let maturity = [
-            ("read_only", "read_only"),
-            ("workspace_write", "workspace_write"),
-        ]
-        .into_iter()
-        .filter_map(|(public_name, access_mode)| {
-            value
-                .maturity
-                .remove(access_mode)
-                .map(|maturity| (public_name.into(), maturity.into()))
-        })
-        .collect();
+    fn from(value: AgentCapabilitiesView) -> Self {
+        let maturity = value
+            .maturity
+            .into_iter()
+            .map(|(name, maturity)| (name, maturity.into()))
+            .collect();
         Self {
-            access_modes: vec!["read_only".into(), "workspace_write".into()],
-            access_mode_defaults,
             hard_budget_caps: value.hard_budget_caps.into(),
             max_rpc_frame_bytes: value.max_rpc_frame_bytes,
             max_wait_ms: value.max_wait_ms,
@@ -287,8 +267,7 @@ pub struct PublicAttachmentInput {
 #[schemars(deny_unknown_fields)]
 pub struct AgentSpawnInput {
     pub repository: String,
-    pub base_ref: String,
-    pub access_mode: PublicAccessMode,
+    pub permission_mode: PublicPermissionMode,
     pub prompt: String,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub group_id: Option<String>,
@@ -336,7 +315,6 @@ pub struct AgentInput {
 #[schemars(deny_unknown_fields)]
 pub struct PublicTask {
     pub agent_id: String,
-    pub access_mode: String,
     pub phase: String,
     pub outcome: Option<PublicOutcome>,
     pub effective_budget: PublicBudget,
@@ -350,7 +328,6 @@ impl From<TaskView> for PublicTask {
     fn from(value: TaskView) -> Self {
         Self {
             agent_id: value.agent_id,
-            access_mode: value.access_mode,
             phase: value.phase,
             outcome: value.outcome.map(Into::into),
             effective_budget: value.effective_budget.into(),
@@ -470,8 +447,6 @@ pub struct AgentListInput {
     pub phase: Option<PublicTaskPhase>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub outcome: Option<PublicOutcomeFilter>,
-    #[serde(default, deserialize_with = "optional_non_null")]
-    pub access_mode: Option<PublicAccessMode>,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub cursor: Option<String>,
     #[schemars(range(min = 1, max = 100))]
@@ -846,7 +821,6 @@ fn attachment(value: &PublicAttachmentInput) -> Result<AttachmentInput, String> 
 fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, String> {
     for (field, value, max) in [
         ("repository", input.repository.as_str(), MAX_PATH_BYTES),
-        ("base_ref", input.base_ref.as_str(), MAX_ID_BYTES),
         ("prompt", input.prompt.as_str(), MAX_PROMPT_BYTES),
         (
             "idempotency_key",
@@ -870,9 +844,9 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: agent_id.clone(),
         repository,
-        base_ref: input.base_ref.clone(),
-        access_mode: input.access_mode.into(),
-        permission_mode: PermissionMode::Build,
+        base_ref: String::new(),
+        access_mode: PermissionMode::from(input.permission_mode).access_mode(),
+        permission_mode: input.permission_mode.into(),
         prompt: input.prompt.clone(),
         repo_context: input.repo_context.iter().map(PathBuf::from).collect(),
         attachments: input
@@ -883,13 +857,11 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
         write_manifest: input.write_manifest.iter().map(PathBuf::from).collect(),
         scratch_root: PathBuf::from(".agent-work/scratch/general"),
         artifact_root: PathBuf::from(".agent-work/artifacts").join(agent_id),
-        budget: Some(
-            input
-                .budget
-                .clone()
-                .map(Into::into)
-                .unwrap_or_else(|| AccessMode::from(input.access_mode).default_budget()),
-        ),
+        budget: Some(input.budget.clone().map(Into::into).unwrap_or_else(|| {
+            PermissionMode::from(input.permission_mode)
+                .access_mode()
+                .default_budget()
+        })),
         validation_commands: BTreeMap::new(),
         retain_partial: input.retain_partial,
         idempotency_key: input.idempotency_key.clone(),
@@ -1087,7 +1059,6 @@ impl SubagentMcp {
             group_id: input.group_id,
             phase: input.phase.map(Into::into),
             outcome: input.outcome.map(Into::into),
-            access_mode: input.access_mode.map(Into::into),
             cursor: input.cursor,
             limit: input.limit,
         }))? {
@@ -1425,8 +1396,7 @@ mod generic_tests {
     fn generic_spawn_rejects_duplicate_command_ids() {
         let mut input = serde_json::from_value::<AgentSpawnInput>(serde_json::json!({
             "repository": "/tmp/repository",
-            "base_ref": "a".repeat(40),
-            "access_mode": "workspace_write",
+            "permission_mode": "build",
             "prompt": "run checks",
             "group_id": "feature",
             "idempotency_key": "key",
@@ -1474,7 +1444,7 @@ mod generic_tests {
                     agent_id: "facade-result".into(),
                     repository: repository.clone(),
                     base_ref,
-                    access_mode: AccessMode::WorkspaceWrite,
+                    access_mode: PermissionMode::Build.access_mode(),
                     permission_mode: PermissionMode::Build,
                     prompt: "produce a patch".into(),
                     repo_context: vec!["src/lib.rs".into()],

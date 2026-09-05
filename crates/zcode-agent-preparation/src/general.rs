@@ -20,6 +20,8 @@ const MAX_CONTEXT_HINTS: usize = 128;
 const MAX_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ATTACHMENTS_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_DIRECT_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_DIRECT_SNAPSHOT_BYTES: u64 = 1_073_741_824;
 static GENERAL_PREPARATION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +219,9 @@ pub struct PreparedGeneralTask {
     /// Such a workspace is never owned or removed by task cleanup.
     #[serde(default)]
     pub direct_workspace: bool,
+    /// Filesystem-only integrity proof for a direct read-only workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_read_only_snapshot_sha256: Option<String>,
     pub worktree: PreparedWorktree,
     pub scratch_root: PathBuf,
     pub artifact_root: PathBuf,
@@ -648,6 +653,18 @@ impl GeneralTaskPreparer {
                 attachments,
                 write_manifest,
                 direct_workspace,
+                direct_read_only_snapshot_sha256: if direct_workspace
+                    && effective_access_mode == AccessMode::ReadOnly
+                {
+                    Some(direct_workspace_snapshot(&repository).map_err(|reason| {
+                        PreparationError::InvalidPath {
+                            path: repository.clone(),
+                            reason,
+                        }
+                    })?)
+                } else {
+                    None
+                },
                 worktree: worktree.clone(),
                 scratch_root,
                 artifact_root,
@@ -1085,6 +1102,15 @@ impl GeneralFinalizer {
         prepared
             .validate_digest()
             .map_err(|_| "PREPARED_TASK_INVALID".to_owned())?;
+        if prepared.direct_workspace && prepared.access_mode == AccessMode::ReadOnly {
+            let expected = prepared
+                .direct_read_only_snapshot_sha256
+                .as_deref()
+                .ok_or_else(|| "READ_ONLY_SNAPSHOT_MISSING".to_owned())?;
+            if direct_workspace_snapshot(&prepared.repository)? != expected {
+                return Err("READ_ONLY_MODIFIED_TRACKED_STATE".into());
+            }
+        }
         prepared
             .validate_finalization_content()
             .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
@@ -1163,6 +1189,71 @@ fn validate_direct_workspace_identity(prepared: &PreparedGeneralTask) -> Result<
         return Err("WORKSPACE_IDENTITY_INVALID".into());
     }
     Ok(())
+}
+
+fn direct_workspace_snapshot(root: &Path) -> Result<String, String> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        hasher: &mut Sha256,
+        entries: &mut usize,
+        bytes: &mut u64,
+    ) -> Result<(), String> {
+        let mut children = fs::read_dir(directory)
+            .map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?;
+            if relative.components().next().is_some_and(|component| {
+                matches!(component, Component::Normal(name) if name == ".git" || name == ".agent-work")
+            }) {
+                continue;
+            }
+            *entries += 1;
+            if *entries > MAX_DIRECT_SNAPSHOT_ENTRIES {
+                return Err("READ_ONLY_SNAPSHOT_LIMIT_EXCEEDED".into());
+            }
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?;
+            hasher.update(relative.as_os_str().as_encoded_bytes());
+            hasher.update([0]);
+            if metadata.file_type().is_symlink() {
+                hasher.update(b"symlink\0");
+                let target =
+                    fs::read_link(&path).map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?;
+                hasher.update(target.as_os_str().as_encoded_bytes());
+            } else if metadata.is_dir() {
+                hasher.update(b"directory\0");
+                visit(root, &path, hasher, entries, bytes)?;
+            } else if metadata.is_file() {
+                hasher.update(b"file\0");
+                *bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| "READ_ONLY_SNAPSHOT_LIMIT_EXCEEDED".to_owned())?;
+                if *bytes > MAX_DIRECT_SNAPSHOT_BYTES {
+                    return Err("READ_ONLY_SNAPSHOT_LIMIT_EXCEEDED".into());
+                }
+                let content =
+                    fs::read(&path).map_err(|_| "READ_ONLY_SNAPSHOT_FAILED".to_owned())?;
+                hasher.update(&content);
+            } else {
+                return Err("READ_ONLY_SNAPSHOT_UNSUPPORTED_ENTRY".into());
+            }
+            hasher.update([0xff]);
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    let mut entries = 0;
+    let mut bytes = 0;
+    visit(root, root, &mut hasher, &mut entries, &mut bytes)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn cleanup_failed_artifact_outputs(prepared: &PreparedGeneralTask) {

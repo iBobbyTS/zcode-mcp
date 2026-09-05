@@ -1034,19 +1034,7 @@ fn system_status_is_bounded_layered_and_generation_is_restart_scoped() {
     assert_eq!(first.capabilities.max_rpc_frame_bytes, MAX_FRAME_BYTES);
     assert_eq!(first.capabilities.max_wait_ms, MAX_WAIT.as_millis() as u64);
     assert!(!first.capabilities.named_checks);
-    assert_eq!(
-        first.capabilities.maturity,
-        BTreeMap::from([
-            (
-                "workspace_write".into(),
-                CapabilityMaturityView::ExperimentalUnverifiedRuntime
-            ),
-            (
-                "read_only".into(),
-                CapabilityMaturityView::ExperimentalUnverifiedRuntime
-            ),
-        ])
-    );
+    assert!(first.capabilities.maturity.is_empty());
 
     let replacement =
         RpcService::new(fixture.scheduler.clone(), Arc::clone(&fixture.store)).unwrap();
@@ -1149,7 +1137,6 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
             group_id: Some("feature-a".into()),
             phase: None,
             outcome: None,
-            access_mode: None,
             cursor: None,
             limit: 10,
         }))
@@ -1169,7 +1156,6 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
             group_id: Some("feature-a".into()),
             phase: Some(TaskPhaseFilter::Queued),
             outcome: None,
-            access_mode: Some(AccessMode::ReadOnly),
             cursor: None,
             limit: 2,
         }))
@@ -1188,7 +1174,6 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
             group_id: Some("feature-a".into()),
             phase: Some(TaskPhaseFilter::Queued),
             outcome: None,
-            access_mode: Some(AccessMode::ReadOnly),
             cursor: Some(cursor),
             limit: 2,
         }))
@@ -1218,7 +1203,6 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
                 group_id: Some("feature-a".into()),
                 phase: None,
                 outcome: None,
-                access_mode: None,
                 cursor: Some("not-a-cursor".into()),
                 limit: 2,
             }))
@@ -1234,7 +1218,6 @@ fn s05_scoped_task_list_and_typed_pending_are_daemon_authoritative() {
                 group_id: None,
                 phase: None,
                 outcome: None,
-                access_mode: None,
                 cursor: None,
                 limit: 10,
             }))
@@ -1491,7 +1474,6 @@ fn transport_reports_malformed_oversized_version_method_validation_and_not_found
                         group_id: Some("feature".into()),
                         phase: None,
                         outcome: None,
-                        access_mode: None,
                         cursor: None,
                         limit: 0,
                     })
@@ -1557,7 +1539,6 @@ fn forced_persistence_failure_is_typed_without_server_disconnect() {
                     group_id: Some("feature".into()),
                     phase: None,
                     outcome: None,
-                    access_mode: None,
                     cursor: None,
                     limit: 1,
                 }),

@@ -420,6 +420,44 @@ fn direct_submission_supports_non_git_workspace_without_git_identity() {
 }
 
 #[test]
+fn direct_plan_rejects_workspace_mutation_without_git() {
+    let workspace = tempfile::tempdir().unwrap();
+    let file = workspace.path().join("README.md");
+    fs::write(&file, "original\n").unwrap();
+    let manifest = GeneralTaskManifest {
+        schema: GENERAL_TASK_SCHEMA.into(),
+        agent_id: "ignored".into(),
+        repository: fs::canonicalize(workspace.path()).unwrap(),
+        base_ref: String::new(),
+        access_mode: AccessMode::ReadOnly,
+        permission_mode: zcode_agent_preparation::PermissionMode::Plan,
+        prompt: "inspect only".into(),
+        repo_context: vec!["README.md".into()],
+        attachments: Vec::new(),
+        write_manifest: Vec::new(),
+        scratch_root: ".agent-work/scratch/ignored".into(),
+        artifact_root: ".agent-work/artifacts/ignored".into(),
+        budget: None,
+        validation_commands: Default::default(),
+        retain_partial: false,
+        idempotency_key: "direct-plan-mutation".into(),
+    };
+    let prepared = GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest)
+        .unwrap();
+    assert!(prepared.direct_read_only_snapshot_sha256.is_some());
+    fs::write(file, "mutated\n").unwrap();
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Completed);
+    assert_eq!(completion.outcome, CompletionOutcome::ResultInvalid);
+    assert_eq!(
+        completion.reason_code.as_deref(),
+        Some("READ_ONLY_MODIFIED_TRACKED_STATE")
+    );
+}
+
+#[test]
 fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
     let f = Fixture::new();
     let mut manifest = f.manifest(AccessMode::ReadOnly);

@@ -123,7 +123,11 @@ pub(crate) fn public_error(error: RpcError) -> String {
             "subagent daemon could not complete the operation",
         ),
     };
-    format!("{code}: {message}")
+    if let Some(agent_id) = error.active_agent_id {
+        format!("{code}: {message} (active_agent_id={agent_id})")
+    } else {
+        format!("{code}: {message}")
+    }
 }
 
 pub(crate) fn public_transport_error(error: std::io::Error) -> String {

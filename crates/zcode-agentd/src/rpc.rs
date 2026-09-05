@@ -97,8 +97,6 @@ pub struct TaskListQuery {
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
     #[serde(default)]
-    pub access_mode: Option<AccessMode>,
-    #[serde(default)]
     pub cursor: Option<String>,
     pub limit: usize,
 }
@@ -319,8 +317,6 @@ pub struct SystemStatusView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapabilitiesView {
-    pub access_modes: Vec<String>,
-    pub access_mode_defaults: BTreeMap<String, BudgetLimits>,
     pub hard_budget_caps: BudgetLimits,
     pub max_rpc_frame_bytes: usize,
     pub max_wait_ms: u64,
@@ -331,7 +327,6 @@ pub struct AgentCapabilitiesView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub agent_id: String,
-    pub access_mode: String,
     pub phase: String,
     pub outcome: Option<TaskOutcome>,
     pub effective_budget: EffectiveBudget,
@@ -461,13 +456,19 @@ pub enum RpcErrorCode {
 pub struct RpcError {
     pub code: RpcErrorCode,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_agent_id: Option<String>,
 }
 
 impl RpcError {
     pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
         let mut message = message.into();
         message.truncate(512);
-        Self { code, message }
+        Self {
+            code,
+            message,
+            active_agent_id: None,
+        }
     }
 }
 
@@ -716,7 +717,6 @@ impl RpcService {
                         RpcError::new(RpcErrorCode::Validation, "repository scope is invalid")
                     })?
                     .map(|repository| repository.to_string_lossy().into_owned());
-                let access_mode = query.access_mode.map(access_mode_name);
                 let page = self
                     .store
                     .list_task_page(
@@ -727,7 +727,7 @@ impl RpcService {
                         TaskPageFilter {
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
-                            access_mode,
+                            access_mode: None,
                         },
                         query.cursor.as_deref().map(parse_task_cursor).transpose()?,
                         query.limit,
@@ -1022,25 +1022,8 @@ fn opaque_generation() -> Result<String, RpcServiceConfigError> {
 }
 
 fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
-    let mut access_mode_defaults = BTreeMap::new();
-    access_mode_defaults.insert(
-        "workspace_write".into(),
-        AccessMode::WorkspaceWrite.default_budget(),
-    );
-    access_mode_defaults.insert("read_only".into(), AccessMode::ReadOnly.default_budget());
-    let maturity = BTreeMap::from([
-        (
-            "read_only".into(),
-            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
-        ),
-        (
-            "workspace_write".into(),
-            CapabilityMaturityView::ExperimentalUnverifiedRuntime,
-        ),
-    ]);
+    let maturity = BTreeMap::new();
     AgentCapabilitiesView {
-        access_modes: access_mode_defaults.keys().cloned().collect(),
-        access_mode_defaults,
         hard_budget_caps: BudgetLimits {
             absolute_wall_time_ms: 86_400_000,
             runtime_activity_idle_timeout_ms: 86_400_000,
@@ -1057,13 +1040,6 @@ fn agent_capabilities(named_checks: bool) -> AgentCapabilitiesView {
         max_wait_ms: MAX_WAIT.as_millis() as u64,
         named_checks,
         maturity,
-    }
-}
-
-fn access_mode_name(access_mode: AccessMode) -> &'static str {
-    match access_mode {
-        AccessMode::ReadOnly => "read_only",
-        AccessMode::WorkspaceWrite => "workspace_write",
     }
 }
 
@@ -1149,7 +1125,6 @@ fn verified_artifact_chunk(
 fn task_view(task: TaskRecord) -> TaskView {
     TaskView {
         agent_id: task.agent_id,
-        access_mode: task.access_mode,
         phase: match task.phase {
             TaskPhase::Queued => "QUEUED",
             TaskPhase::Preparing => "PREPARING",
@@ -1469,7 +1444,12 @@ fn map_store(error: StoreError) -> RpcError {
             RpcError::new(RpcErrorCode::Persistence, "durable store operation failed")
         }
         StoreError::Conflict(message) if message.starts_with("WORKSPACE_BUSY") => {
-            RpcError::new(RpcErrorCode::Conflict, message)
+            let active_agent_id = message
+                .strip_prefix("WORKSPACE_BUSY active_agent_id=")
+                .map(str::to_owned);
+            let mut error = RpcError::new(RpcErrorCode::Conflict, "WORKSPACE_BUSY");
+            error.active_agent_id = active_agent_id;
+            error
         }
         StoreError::Conflict(_) => RpcError::new(RpcErrorCode::Conflict, "durable state conflict"),
         StoreError::InvalidState(_) => RpcError::new(
