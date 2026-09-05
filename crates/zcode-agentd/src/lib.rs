@@ -1780,13 +1780,6 @@ fn task_route(task: &TaskRecord) -> Result<TaskRoute, String> {
         Some(zcode_agent_preparation::GENERAL_TASK_SCHEMA) => {
             let prepared: PreparedGeneralTask = serde_json::from_value(value.clone())
                 .map_err(|_| "stored general preparation is invalid")?;
-            let expected_access_mode = match prepared.access_mode {
-                AccessMode::ReadOnly => "read_only",
-                AccessMode::WorkspaceWrite => "workspace_write",
-            };
-            if task.access_mode != expected_access_mode {
-                return Err("stored task access mode does not match its preparation".into());
-            }
             prepared
                 .validate_digest()
                 .map_err(|_| "stored general preparation digest is invalid")?;
@@ -3703,11 +3696,6 @@ impl Scheduler {
             idempotency_key: prepared.idempotency_key.clone(),
             repository: prepared.repository.to_string_lossy().into_owned(),
             group_id: group_id.map(str::to_owned),
-            access_mode: match prepared.access_mode {
-                AccessMode::ReadOnly => "read_only",
-                AccessMode::WorkspaceWrite => "workspace_write",
-            }
-            .into(),
             workspace_path: prepared.worktree.path.to_string_lossy().into_owned(),
             runtime_hash: None,
             prepared_launch_json: prepared_json,

@@ -727,7 +727,6 @@ impl RpcService {
                         TaskPageFilter {
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
-                            access_mode: None,
                         },
                         query.cursor.as_deref().map(parse_task_cursor).transpose()?,
                         query.limit,
@@ -871,13 +870,7 @@ impl RpcService {
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
         let prepared = serde_json::from_str::<PreparedGeneralTask>(&task.prepared_launch_json)
             .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let prepared_access_mode = match prepared.access_mode {
-            AccessMode::ReadOnly => "read_only",
-            AccessMode::WorkspaceWrite => "workspace_write",
-        };
-        if prepared.repository.to_string_lossy() != task.repository
-            || prepared_access_mode != task.access_mode
-        {
+        if prepared.repository.to_string_lossy() != task.repository {
             return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
         }
         Ok(task)

@@ -8,7 +8,7 @@ use std::{
 };
 
 const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -19,7 +19,6 @@ CREATE TABLE tasks (
     semantic_fingerprint TEXT NOT NULL,
     repository TEXT NOT NULL,
     group_id TEXT,
-    access_mode TEXT NOT NULL,
     phase TEXT NOT NULL,
     outcome TEXT,
     workspace_path TEXT NOT NULL,
@@ -288,6 +287,7 @@ pub struct NewTask {
     pub idempotency_key: String,
     pub repository: String,
     pub group_id: Option<String>,
+    #[deprecated(note = "not persisted; permission is owned by prepared launch")]
     pub access_mode: String,
     pub workspace_path: String,
     pub runtime_hash: Option<String>,
@@ -304,6 +304,7 @@ pub struct TaskRecord {
     pub idempotency_key: String,
     pub repository: String,
     pub group_id: Option<String>,
+    #[deprecated(note = "not persisted; permission is owned by prepared launch")]
     pub access_mode: String,
     pub phase: TaskPhase,
     pub outcome: Option<TaskOutcome>,
@@ -383,10 +384,11 @@ pub struct TaskQueryScope<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskPageFilter<'a> {
+pub struct TaskPageFilter {
     pub phase: Option<TaskPhase>,
     pub outcome: Option<TaskOutcome>,
-    pub access_mode: Option<&'a str>,
+    #[deprecated(note = "ignored; store no longer filters by access mode")]
+    pub access_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -650,17 +652,16 @@ impl Store {
         let created_at = now_millis();
         transaction.execute(
             "INSERT INTO tasks (
-                agent_id,idempotency_key,semantic_fingerprint,repository,group_id,access_mode,
+                agent_id,idempotency_key,semantic_fingerprint,repository,group_id,
                 phase,workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,
                 initial_prompt,effective_budget_json,retain_partial,created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,'QUEUED',?7,?8,?9,?10,?11,?12,?13,?14)",
+             ) VALUES (?1,?2,?3,?4,?5,'QUEUED',?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 task.agent_id,
                 task.idempotency_key,
                 semantic_fingerprint,
                 task.repository,
                 task.group_id,
-                task.access_mode,
                 task.workspace_path,
                 task.runtime_hash,
                 task.prepared_launch_json,
@@ -721,7 +722,7 @@ impl Store {
     pub fn list_task_page(
         &self,
         scope: TaskQueryScope<'_>,
-        filter: TaskPageFilter<'_>,
+        filter: TaskPageFilter,
         cursor: Option<u64>,
         limit: usize,
     ) -> StoreResult<TaskPage> {
@@ -738,9 +739,8 @@ impl Store {
                AND (?2 IS NULL OR group_id=?2)
                AND (?3 IS NULL OR phase=?3)
                AND (?4 IS NULL OR outcome=?4)
-               AND (?5 IS NULL OR access_mode=?5)
-               AND (?6 IS NULL OR rowid < ?6)
-             ORDER BY rowid DESC LIMIT ?7",
+               AND (?5 IS NULL OR rowid < ?5)
+             ORDER BY rowid DESC LIMIT ?6",
         )?;
         let rows = statement
             .query_map(
@@ -749,7 +749,6 @@ impl Store {
                     scope.group_id,
                     filter.phase.map(TaskPhase::as_str),
                     filter.outcome.map(TaskOutcome::as_str),
-                    filter.access_mode,
                     cursor.map(u64_to_i64).transpose()?,
                     usize_to_i64(limit.saturating_add(1))?,
                 ],
@@ -1686,7 +1685,6 @@ fn validate_task(task: &NewTask) -> StoreResult<()> {
         ("agent_id", task.agent_id.as_str()),
         ("idempotency_key", task.idempotency_key.as_str()),
         ("repository", task.repository.as_str()),
-        ("access_mode", task.access_mode.as_str()),
         ("workspace_path", task.workspace_path.as_str()),
         ("prepared_launch_json", task.prepared_launch_json.as_str()),
         (
@@ -1705,9 +1703,6 @@ fn validate_task(task: &NewTask) -> StoreResult<()> {
         .is_some_and(|value| value.trim().is_empty())
     {
         return Err(StoreError::InvalidState("group_id is invalid".into()));
-    }
-    if !matches!(task.access_mode.as_str(), "read_only" | "workspace_write") {
-        return Err(StoreError::InvalidState("access_mode is invalid".into()));
     }
     Ok(())
 }
@@ -1729,7 +1724,6 @@ fn task_fingerprint(task: &NewTask, budget: &EffectiveBudget) -> String {
         &task.idempotency_key,
         &task.repository,
         &task.group_id,
-        &task.access_mode,
         &task.workspace_path,
         &task.runtime_hash,
         &task.prepared_launch_json,
@@ -1869,10 +1863,10 @@ type TaskRow = (
     String,
     Option<String>,
     String,
+    String,
+    String,
+    String,
     Option<String>,
-    String,
-    String,
-    String,
     String,
     i64,
     Option<String>,
@@ -1897,7 +1891,7 @@ type TaskRow = (
 fn query_task(connection: &Connection, agent_id: &str) -> StoreResult<Option<TaskRecord>> {
     let row = connection
         .query_row(
-            "SELECT agent_id,idempotency_key,repository,group_id,access_mode,phase,outcome,
+            "SELECT agent_id,idempotency_key,repository,group_id,NULL,phase,outcome,
                     workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,
                     initial_prompt,effective_budget_json,retain_partial,owner_id,owner_epoch,
                     close_requested,stop_requested,failure_code,failure_message,runtime_agent_id,
@@ -1971,14 +1965,14 @@ fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
         idempotency_key: row.1,
         repository: row.2,
         group_id: row.3,
-        access_mode: row.4,
+        access_mode: String::new(),
         phase: TaskPhase::parse(&row.5)?,
         outcome: row.6.map(|value| TaskOutcome::parse(&value)).transpose()?,
         workspace_path: row.7,
-        runtime_hash: row.8,
+        runtime_hash: Some(row.8),
         prepared_launch_json: row.9,
         prepared_launch_sha256: row.10,
-        initial_prompt: row.11,
+        initial_prompt: row.11.expect("initial prompt column is non-null"),
         effective_budget: serde_json::from_str(&row.12)
             .map_err(|error| StoreError::InvalidState(error.to_string()))?,
         retain_partial: row.13 != 0,
