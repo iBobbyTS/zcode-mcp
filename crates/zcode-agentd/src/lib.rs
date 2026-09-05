@@ -24,10 +24,11 @@ use zcode_driver::{
 };
 use zcode_protocol::{
     event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
-    CreateSessionParams, LifecycleOrder, RuntimePreferences, SendParams, SessionCreateProjection,
-    SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
-    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
-    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE,
+    CreateSessionParams, LifecycleOrder, ResumeSessionParams, RuntimePreferences, SendParams,
+    SessionCreateProjection, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage,
+    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
+    SESSION_SUBSCRIBE,
 };
 
 mod budget;
@@ -1268,6 +1269,49 @@ impl RuntimeOwner {
         )
     }
 
+    pub fn resume_session_with_mcp(
+        &self,
+        task: &TaskRecord,
+        mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        let session_id = task.zcode_session_id.as_deref().ok_or_else(|| {
+            RuntimeCommandError::InvalidSession("task has no persisted session id".into())
+        })?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RuntimeCommandError::Timeout)?;
+        let workspace = WorkspaceRef {
+            workspace_key: &task.workspace_path,
+            workspace_path: &task.workspace_path,
+        };
+        let params = serde_json::to_value(ResumeSessionParams {
+            session_id,
+            workspace: Some(workspace),
+            mcp_servers,
+        })
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.driver
+            .request(SESSION_RESUME, params, remaining_runtime_time(deadline)?)?;
+        let subscribe_params = serde_json::to_value(SubscribeParams {
+            session_id,
+            delivery_kind: "desktop-continuous",
+            include_snapshot: true,
+        })
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        self.driver.request(
+            SESSION_SUBSCRIBE,
+            subscribe_params,
+            remaining_runtime_time(deadline)?,
+        )?;
+        *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+        Ok(SessionReady {
+            session_id: session_id.to_owned(),
+            initial_turn_id: None,
+            observed_model: None,
+        })
+    }
+
     fn bootstrap_prepared_session(
         &self,
         task: &TaskRecord,
@@ -1832,9 +1876,16 @@ fn validate_task_route(task: Option<&TaskRecord>, route: &TaskRoute) -> Result<(
 
 fn route_policy(
     route: &TaskRoute,
+    resumed: bool,
 ) -> zcode_agent_preparation::PreparationResult<Option<PolicyLauncher>> {
     match route {
-        TaskRoute::General(prepared, _) => prepared.launcher().map(Some),
+        TaskRoute::General(prepared, _) => {
+            if resumed {
+                prepared.resume_launcher().map(Some)
+            } else {
+                prepared.launcher().map(Some)
+            }
+        }
     }
 }
 
@@ -1856,6 +1907,14 @@ pub trait ManagedRuntime: Send + Sync + 'static {
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
         self.bootstrap_session(task, timeout)
+    }
+    fn resume_session_with_mcp(
+        &self,
+        _task: &TaskRecord,
+        _mcp_servers: &[StdioMcpServer],
+        _timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        Err(RuntimeCommandError::Unsupported)
     }
     fn send_turn(
         &self,
@@ -1941,6 +2000,15 @@ impl ManagedRuntime for RuntimeOwner {
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
         self.bootstrap_prepared_session(task, mcp_servers, timeout)
+    }
+
+    fn resume_session_with_mcp(
+        &self,
+        task: &TaskRecord,
+        mcp_servers: &[StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        self.resume_session_with_mcp(task, mcp_servers, timeout)
     }
 
     fn send_turn(
@@ -3884,7 +3952,8 @@ impl Scheduler {
                 hook();
             }
         }
-        let policy = match route_policy(&route) {
+        let resumed = claim.task.zcode_session_id.is_some();
+        let policy = match route_policy(&route, resumed) {
             Ok(policy) => policy.map(Arc::new),
             Err(error) => {
                 let message = error.to_string();
@@ -3995,11 +4064,11 @@ impl Scheduler {
                 }
                 None => (self.inner.config.bootstrap_timeout, false),
             };
-        let session = match runtime.bootstrap_session_with_mcp(
-            &claim.task,
-            &mcp_servers,
-            bootstrap_timeout,
-        ) {
+        let session = match if claim.task.zcode_session_id.is_some() {
+            runtime.resume_session_with_mcp(&claim.task, &mcp_servers, bootstrap_timeout)
+        } else {
+            runtime.bootstrap_session_with_mcp(&claim.task, &mcp_servers, bootstrap_timeout)
+        } {
             Ok(session) => session,
             Err(error) => {
                 let message = error.to_string();
@@ -4183,6 +4252,26 @@ impl Scheduler {
             )?;
             debug_assert!(state.is_terminal());
             return Ok(false);
+        }
+        if resumed {
+            let _guard = operation.lock().unwrap();
+            if let Err(error) = self.deliver_next_message(
+                &claim.task.agent_id,
+                &session.session_id,
+                &runtime,
+                &runtime_lifecycle,
+                self.control_deadline(),
+            ) {
+                self.record_failure(&claim.task.agent_id, error.to_string());
+                self.cleanup_registered_runtime(
+                    &claim.task.agent_id,
+                    claim.owner_epoch,
+                    &runtime,
+                    &sink,
+                    Some(("SESSION_SEND_FAILED", error.to_string())),
+                )?;
+                return Err(error);
+            }
         }
         self.spawn_monitor(MonitorContext {
             agent_id: claim.task.agent_id,
@@ -4433,6 +4522,7 @@ impl Scheduler {
         sink.runtime_lifecycle.terminalize();
         match route {
             TaskRoute::General(prepared, required_command_ids) => {
+                let resumed = !prepared.prompt_path.is_file();
                 let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
                     let outcome = match &terminal {
                         RuntimeTerminal::Completed(_) if natural_completion => {
@@ -4459,11 +4549,25 @@ impl Scheduler {
                 let mut completion = if natural_completed {
                     let terminal_text = sink.activity.take_terminal_text();
                     let mut completion = match &terminal_text {
+                        TerminalText::Visible(_) if resumed => GeneralFinalizer::finalize_resumed(
+                            prepared,
+                            CompletionOutcome::Completed,
+                        ),
                         TerminalText::Visible(_) => {
                             GeneralFinalizer::finalize_completed_tree(prepared)
                         }
                         TerminalText::Missing | TerminalText::Oversized => {
-                            GeneralFinalizer::finalize(prepared, CompletionOutcome::ResultInvalid)
+                            if resumed {
+                                GeneralFinalizer::finalize_resumed(
+                                    prepared,
+                                    CompletionOutcome::ResultInvalid,
+                                )
+                            } else {
+                                GeneralFinalizer::finalize(
+                                    prepared,
+                                    CompletionOutcome::ResultInvalid,
+                                )
+                            }
                         }
                     };
                     if matches!(terminal_text, TerminalText::Visible(_))
@@ -4530,7 +4634,11 @@ impl Scheduler {
                     }
                     GeneralFinalizer::finish_cleanup(prepared, completion)
                 } else if process_group_reaped {
-                    GeneralFinalizer::finalize(prepared, outcome)
+                    if resumed {
+                        GeneralFinalizer::finalize_resumed(prepared, outcome)
+                    } else {
+                        GeneralFinalizer::finalize(prepared, outcome)
+                    }
                 } else {
                     unreaped_general(outcome, &reason, &reason)
                 };
@@ -5110,6 +5218,50 @@ impl Scheduler {
                     MessageState::Queued | MessageState::Sending => MessageDisposition::Queued,
                 });
             }
+        }
+        if self
+            .inner
+            .store
+            .get_task(agent_id)?
+            .is_some_and(|task| task.phase == TaskPhase::Terminal)
+        {
+            let original = self
+                .inner
+                .store
+                .get_task(agent_id)?
+                .ok_or_else(|| StoreError::InvalidState("resume task disappeared".into()))?;
+            let original_result = self.inner.store.task_result(agent_id)?;
+            self.inner
+                .store
+                .requeue_task_for_resume_with_message(agent_id, message_id, content)?;
+            let started = match self.start_ready() {
+                Ok(started) => started,
+                Err(error) => {
+                    if self
+                        .inner
+                        .store
+                        .get_task(agent_id)?
+                        .is_some_and(|task| task.phase == TaskPhase::Terminal)
+                    {
+                        self.inner.store.restore_terminal_after_resume_failure(
+                            &original,
+                            original_result.as_ref().map(|stored| &stored.result),
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
+            if !started.iter().any(|started_id| started_id == agent_id) {
+                self.inner.store.restore_terminal_after_resume_failure(
+                    &original,
+                    original_result.as_ref().map(|stored| &stored.result),
+                )?;
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: agent_id.into(),
+                    message: "session resume was not started".into(),
+                });
+            }
+            return Ok(MessageDisposition::Queued);
         }
         let active = self.active_session(agent_id);
         let operation = active

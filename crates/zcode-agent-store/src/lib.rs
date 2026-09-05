@@ -1075,6 +1075,109 @@ impl Store {
         })
     }
 
+    pub fn requeue_task_for_resume_with_message(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (phase, session_id, workspace_path, owner_epoch): (
+            TaskPhase,
+            Option<String>,
+            String,
+            i64,
+        ) = transaction.query_row(
+            "SELECT phase,zcode_session_id,workspace_path,owner_epoch
+             FROM tasks WHERE agent_id=?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    TaskPhase::parse(&row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )?;
+        if phase != TaskPhase::Terminal {
+            return Err(StoreError::Conflict(format!(
+                "task {agent_id} is not terminal"
+            )));
+        }
+        if session_id.is_none() {
+            return Err(StoreError::InvalidState(
+                "task has no persisted session id to resume".into(),
+            ));
+        }
+        if let Some(active_agent_id) = transaction
+            .query_row(
+                "SELECT agent_id FROM tasks
+                 WHERE workspace_path=?1 AND agent_id!=?2
+                   AND phase IN ('QUEUED','PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
+                 ORDER BY created_at,rowid LIMIT 1",
+                params![workspace_path, agent_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Err(StoreError::Conflict(format!(
+                "WORKSPACE_BUSY active_agent_id={active_agent_id}"
+            )));
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM messages WHERE message_id=?1",
+                [message_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(StoreError::Conflict(format!(
+                "message {message_id} already exists"
+            )));
+        }
+        transaction.execute("DELETE FROM task_results WHERE agent_id=?1", [agent_id])?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET phase='QUEUED',outcome=NULL,owner_id=NULL,
+                 lease_expires_at=NULL,close_requested=0,stop_requested=0,
+                 failure_code=NULL,failure_message=NULL,closed_at=NULL,reaped_at=NULL,
+                 completed_at=NULL,last_event_seq=0,turn_state='IDLE',pid=NULL,
+                 process_group_id=NULL,process_uid=NULL,process_start_token=NULL,
+                 runtime_agent_id=NULL WHERE agent_id=?1 AND phase='TERMINAL'",
+            [agent_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {agent_id} changed before resume"
+            )));
+        }
+        insert_ledger(
+            &transaction,
+            agent_id,
+            i64_to_u64(owner_epoch)?,
+            Some(TaskPhase::Terminal),
+            TaskPhase::Queued,
+            None,
+            Some("RESUME_REQUESTED"),
+        )?;
+        transaction.execute(
+            "INSERT INTO messages(message_id,agent_id,mode,content,state,created_at)
+             VALUES (?1,?2,'queue',?3,'QUEUED',?4)",
+            params![message_id, agent_id, content, now_millis()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn reap_task(&self, agent_id: &str) -> StoreResult<TaskOutcome> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1091,6 +1194,77 @@ impl Store {
         )?;
         transaction.commit()?;
         outcome.ok_or_else(|| StoreError::InvalidState("terminal task has no outcome".into()))
+    }
+
+    pub fn restore_terminal_after_resume_failure(
+        &self,
+        original: &TaskRecord,
+        result: Option<&TaskResult>,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE tasks SET phase='TERMINAL',outcome=?1,owner_id=?2,lease_expires_at=NULL,
+                 close_requested=?3,stop_requested=?4,failure_code=?5,failure_message=?6,
+                 runtime_agent_id=?7,zcode_session_id=?8,turn_state=?9,pid=?10,
+                 process_group_id=?11,process_uid=?12,process_start_token=?13,
+                 closed_at=?14,reaped_at=?15,last_event_seq=?16
+             WHERE agent_id=?17",
+            params![
+                original.outcome.map(TaskOutcome::as_str),
+                original.owner_id,
+                original.close_requested,
+                original.stop_requested,
+                original.failure_code,
+                original.failure_message,
+                original.runtime_agent_id,
+                original.zcode_session_id,
+                original.turn_state.as_str(),
+                original.process_identity.as_ref().map(|v| v.pid),
+                original
+                    .process_identity
+                    .as_ref()
+                    .map(|v| v.process_group_id),
+                original.process_identity.as_ref().map(|v| v.uid),
+                original.process_identity.as_ref().map(|v| &v.start_token),
+                original.closed_at,
+                original.reaped_at,
+                u64_to_i64(original.last_event_seq)?,
+                original.agent_id,
+            ],
+        )?;
+        if let Some(result) = result {
+            transaction.execute(
+                "DELETE FROM task_results WHERE agent_id=?1",
+                [original.agent_id.as_str()],
+            )?;
+            let canonical = task_result_bytes(result)?;
+            let digest = task_result_digest(&canonical);
+            transaction.execute(
+                "INSERT INTO task_results(agent_id,outcome,final_text,partial,retained,base_commit,
+                     head_commit,changed_files_json,diff_stat,checks_json,result_sha256,
+                     residual_gaps_json,artifacts_json,completed_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    original.agent_id,
+                    result.outcome.as_str(),
+                    result.final_text,
+                    result.partial,
+                    retain_result(original.retain_partial, result),
+                    result.base_commit,
+                    result.head_commit,
+                    serde_json::to_string(&result.changed_files).unwrap(),
+                    result.diff_stat,
+                    serde_json::to_string(&result.checks).unwrap(),
+                    digest,
+                    serde_json::to_string(&result.residual_gaps).unwrap(),
+                    serde_json::to_string(&result.artifacts).unwrap(),
+                    now_millis(),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn startup_recovery_tasks(&self) -> StoreResult<Vec<TaskRecord>> {

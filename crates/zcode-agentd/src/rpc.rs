@@ -744,10 +744,10 @@ impl RpcService {
             RpcMethod::TaskMessage(input) => {
                 let task = self.require_task(&input.agent_id)?;
                 validate_id(&input.message_id, "message_id")?;
-                // The generic control plane only queues clarification.  A
-                // terminal task must be resumed by creating a new agent;
-                // interrupt-and-continue remains a legacy/private path and
-                // is intentionally not reachable through TaskMessage.
+                // The generic control plane only queues clarification. A
+                // terminal task may be resumed by the scheduler when the
+                // persisted ZCode session accepts a restore; other
+                // interrupt-and-continue paths remain private.
                 if input.mode != "queue" {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,

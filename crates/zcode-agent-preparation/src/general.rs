@@ -335,6 +335,27 @@ impl PreparedGeneralTask {
         self.validate_prepared_content()?;
         self.build_launcher(false)
     }
+
+    pub fn resume_launcher(&self) -> PreparationResult<PolicyLauncher> {
+        self.validate_digest()?;
+        if !self.direct_workspace {
+            return Err(PreparationError::Worktree(
+                "resumed session requires the canonical workspace".into(),
+            ));
+        }
+        fs::create_dir_all(&self.workspace.scratch_root)?;
+        fs::create_dir_all(&self.artifact_root)?;
+        PolicyLauncher::for_general(
+            self.workspace.path.clone(),
+            self.workspace.scratch_root.clone(),
+            self.artifact_root.join("result.json"),
+            Vec::new(),
+            self.validation_commands.clone(),
+            PolicyCapabilities::default(),
+            self.access_mode,
+            self.write_manifest.clone(),
+        )
+    }
     pub fn final_tree_launcher(&self) -> PreparationResult<PolicyLauncher> {
         self.validate_digest()?;
         self.validate_finalization_content()?;
@@ -1013,7 +1034,28 @@ impl GeneralFinalizer {
         prepared: &PreparedGeneralTask,
         requested: CompletionOutcome,
     ) -> GeneralCompletion {
-        Self::finish(prepared, requested, String::new(), Vec::new(), Vec::new())
+        Self::finish_with_resume(
+            prepared,
+            requested,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+    }
+
+    pub fn finalize_resumed(
+        prepared: &PreparedGeneralTask,
+        requested: CompletionOutcome,
+    ) -> GeneralCompletion {
+        Self::finish_with_resume(
+            prepared,
+            requested,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
     }
 
     pub fn finalize_completed_tree(prepared: &PreparedGeneralTask) -> GeneralCompletion {
@@ -1023,6 +1065,7 @@ impl GeneralFinalizer {
             String::new(),
             Vec::new(),
             Vec::new(),
+            false,
         )
     }
 
@@ -1033,14 +1076,16 @@ impl GeneralFinalizer {
         Self::cleanup(prepared, completion)
     }
 
-    fn finish(
+    fn finish_with_resume(
         prepared: &PreparedGeneralTask,
         requested: CompletionOutcome,
         summary: String,
         checks: Vec<String>,
         residual_gaps: Vec<String>,
+        resumed: bool,
     ) -> GeneralCompletion {
-        let completion = Self::prepare(prepared, requested, summary, checks, residual_gaps);
+        let completion =
+            Self::prepare(prepared, requested, summary, checks, residual_gaps, resumed);
         Self::cleanup(prepared, completion)
     }
 
@@ -1050,6 +1095,7 @@ impl GeneralFinalizer {
         summary: String,
         checks: Vec<String>,
         residual_gaps: Vec<String>,
+        resumed: bool,
     ) -> GeneralCompletion {
         match Self::try_finalize(
             prepared,
@@ -1057,6 +1103,7 @@ impl GeneralFinalizer {
             summary.clone(),
             checks.clone(),
             residual_gaps.clone(),
+            resumed,
         ) {
             Ok(completion) => completion,
             Err(code) => {
@@ -1106,11 +1153,15 @@ impl GeneralFinalizer {
         summary: String,
         checks: Vec<String>,
         residual_gaps: Vec<String>,
+        resumed: bool,
     ) -> Result<GeneralCompletion, String> {
         prepared
             .validate_digest()
             .map_err(|_| "PREPARED_TASK_INVALID".to_owned())?;
-        if prepared.direct_workspace && prepared.access_mode == AccessMode::ReadOnly {
+        if resumed && !prepared.direct_workspace {
+            return Err("RESUME_WORKSPACE_UNAVAILABLE".into());
+        }
+        if !resumed && prepared.direct_workspace && prepared.access_mode == AccessMode::ReadOnly {
             let expected = prepared
                 .direct_read_only_snapshot_sha256
                 .as_deref()
@@ -1119,9 +1170,11 @@ impl GeneralFinalizer {
                 return Err("READ_ONLY_MODIFIED_TRACKED_STATE".into());
             }
         }
-        prepared
-            .validate_finalization_content()
-            .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
+        if !resumed {
+            prepared
+                .validate_finalization_content()
+                .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
+        }
         // Direct submissions are filesystem-only. They never enter the
         // detached-worktree or Git commit path. They still publish a
         // read-only patch of the caller-owned workspace for result evidence.

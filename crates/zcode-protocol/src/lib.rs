@@ -4,6 +4,7 @@ use std::fmt;
 
 pub const WORKSPACE_READ_STATE: &str = "workspace/readState";
 pub const SESSION_CREATE: &str = "session/create";
+pub const SESSION_RESUME: &str = "session/resume";
 pub const SESSION_SUBSCRIBE: &str = "session/subscribe";
 pub const SESSION_SEND: &str = "session/send";
 pub const SESSION_STOP: &str = "session/stop";
@@ -326,6 +327,16 @@ pub struct WorkspaceParams<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionParams<'a> {
     pub workspace: WorkspaceRef<'a>,
+    #[serde(skip_serializing_if = "is_empty_mcp_servers")]
+    pub mcp_servers: &'a [StdioMcpServer],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionParams<'a> {
+    pub session_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef<'a>>,
     #[serde(skip_serializing_if = "is_empty_mcp_servers")]
     pub mcp_servers: &'a [StdioMcpServer],
 }

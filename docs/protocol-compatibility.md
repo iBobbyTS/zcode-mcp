@@ -62,6 +62,9 @@ Observed client request parameters are:
 - `session/create`: `workspace` with the same nested shape, plus the observed
   optional `mcpServers` variant whose entries contain exactly `name`, `command`,
   `args`, and `env`.
+- `session/resume`: `sessionId`, an optional `workspace` with the same nested
+  shape, and the same optional `mcpServers` variant. The daemon sends this
+  request before subscribing; the persisted session id is reused verbatim.
 - `session/subscribe`: exactly `sessionId`, `deliveryKind`, and
   `includeSnapshot`.
 - `session/send`: exactly `sessionId` and `content`.
@@ -69,6 +72,13 @@ Observed client request parameters are:
 
 The fake rejects unobserved extra keys, including `afterSeq`, `inputId`, and
 `queryId`.
+
+Closed-session message recovery is deliberately fail-closed. The daemon only
+queues the new message after `session/resume` succeeds, `session/subscribe`
+with `includeSnapshot: true` is accepted, and the synchronous `session/send`
+delivery succeeds. A rejection, malformed response, timeout, or send failure
+is returned as an error and leaves the prior terminal task/result queryable;
+no local flag is treated as proof that a runtime session is resumable.
 
 Production session bootstrap does not require this diagnostic. The pinned
 3.8.1 create-without-readState gate succeeded, including the three-false

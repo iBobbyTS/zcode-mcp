@@ -20,8 +20,8 @@ use std::{
 };
 use zcode_agent_preparation::AccessMode;
 use zcode_agent_store::{
-    ArtifactKind, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome, TaskRecord,
-    TaskResult,
+    ArtifactKind, MessageState, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome,
+    TaskRecord, TaskResult,
 };
 use zcode_driver::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use zcode_protocol::{EventEnvelope, RequestEnvelope, WireMessage};
@@ -33,6 +33,7 @@ struct FakeRuntime {
     stop_terminal: Mutex<Option<RuntimeTerminal>>,
     changed: Condvar,
     turn: Mutex<TurnSnapshot>,
+    resume_error: Mutex<Option<RuntimeCommandError>>,
 }
 
 impl FakeRuntime {
@@ -48,6 +49,7 @@ impl FakeRuntime {
                 active: false,
                 boundary: None,
             }),
+            resume_error: Mutex::new(None),
         }
     }
 
@@ -97,6 +99,10 @@ impl FakeRuntime {
 
     fn set_stop_terminal(&self, terminal: RuntimeTerminal) {
         *self.stop_terminal.lock().unwrap() = Some(terminal);
+    }
+
+    fn set_resume_error(&self, error: RuntimeCommandError) {
+        *self.resume_error.lock().unwrap() = Some(error);
     }
 }
 
@@ -156,6 +162,30 @@ impl ManagedRuntime for FakeRuntime {
         Ok(Some(format!("turn-{}", turn.generation)))
     }
 
+    fn resume_session_with_mcp(
+        &self,
+        job: &TaskRecord,
+        _mcp_servers: &[zcode_protocol::StdioMcpServer],
+        _timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        if let Some(error) = self.resume_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        *self.turn.lock().unwrap() = TurnSnapshot {
+            generation: 1,
+            active: false,
+            boundary: None,
+        };
+        Ok(SessionReady {
+            session_id: job
+                .zcode_session_id
+                .clone()
+                .expect("resume fixture must persist a session id"),
+            initial_turn_id: None,
+            observed_model: None,
+        })
+    }
+
     fn stop_turn(
         &self,
         _session_id: &str,
@@ -187,6 +217,7 @@ impl ManagedRuntime for FakeRuntime {
 struct FakeFactory {
     runtimes: Mutex<HashMap<String, Arc<FakeRuntime>>>,
     fail_for: Mutex<Vec<String>>,
+    fail_resume_for: Mutex<Vec<String>>,
 }
 
 impl FakeFactory {
@@ -218,6 +249,17 @@ impl RuntimeFactory for FakeFactory {
             return Err(io::Error::other("scripted runtime failure"));
         }
         let runtime = Arc::new(FakeRuntime::new(sink));
+        if self
+            .fail_resume_for
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|agent_id| agent_id == &job.agent_id)
+        {
+            runtime.set_resume_error(RuntimeCommandError::Remote(
+                serde_json::json!({"code": "SESSION_NOT_RESUMABLE"}),
+            ));
+        }
         runtime.emit(RuntimeEvent::Driver(Inbound::Malformed(
             "sensitive runtime text".into(),
         )));
@@ -654,6 +696,80 @@ fn cancel_and_close_return_the_reaped_generic_task_without_followup_rpc() {
     assert!(closed_task.close_requested);
     assert!(closed_task.closed);
     assert!(closed_task.reaped);
+}
+
+#[test]
+fn send_resumes_a_closed_session_and_rejects_when_runtime_cannot_resume() {
+    let fixture = fixture();
+    let (_, resumable) = submit_general_fixture(&fixture, "resume-send", "feature-resume");
+    fixture.scheduler.start_ready().unwrap();
+    let runtime = fixture.factory.runtime(&resumable);
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskClose {
+            agent_id: resumable.clone(),
+        })
+        .unwrap();
+    let resumed = fixture
+        .scheduler
+        .queue_message(
+            &resumable,
+            "resume-message",
+            "queue",
+            "continue after close",
+        )
+        .unwrap_or_else(|error| panic!("closed session resume failed: {error:?}"));
+    assert_eq!(resumed, MessageDisposition::Queued);
+    let resumed_runtime = fixture.factory.runtime(&resumable);
+    // Completing immediately after start must not be mistaken for a failed resume.
+    resumed_runtime.complete();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if fixture
+            .store
+            .message("resume-message")
+            .unwrap()
+            .is_some_and(|message| message.state == MessageState::Delivered)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resumed message was not delivered"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fixture.store.get_task(&resumable).unwrap().is_some());
+    let _ = runtime;
+
+    let (_, rejected) = submit_general_fixture(&fixture, "resume-rejected", "feature-resume");
+    fixture.scheduler.start_ready().unwrap();
+    fixture
+        .service
+        .dispatch(RpcMethod::TaskClose {
+            agent_id: rejected.clone(),
+        })
+        .unwrap();
+    fixture
+        .factory
+        .fail_resume_for
+        .lock()
+        .unwrap()
+        .push(rejected.clone());
+    let error = fixture
+        .service
+        .dispatch(RpcMethod::TaskMessage(MessageInput {
+            agent_id: rejected.clone(),
+            message_id: "resume-rejected-message".into(),
+            mode: "queue".into(),
+            content: "must fail closed".into(),
+        }))
+        .unwrap_err();
+    assert_eq!(error.code, RpcErrorCode::Unavailable);
+    let rejected_task = fixture.store.get_task(&rejected).unwrap().unwrap();
+    assert_eq!(rejected_task.phase, TaskPhase::Terminal);
+    assert!(rejected_task.close_requested);
+    assert!(fixture.store.task_result(&rejected).unwrap().is_some());
 }
 
 #[test]
