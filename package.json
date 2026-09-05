@@ -1,0 +1,25 @@
+{
+  "name": "zcode-as-subagent",
+  "version": "0.1.0",
+  "description": "Run ZCode as a local CLI and MCP subagent",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "zcode-as-subagent": "bin/zcode-as-subagent.mjs"
+  },
+  "files": [
+    "bin/",
+    "cli/",
+    "npm/",
+    "launchd/",
+    "scripts/install/",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/cli/*.test.mjs tests/platform/*.test.mjs",
+    "check": "node --check bin/zcode-as-subagent.mjs && node --check cli/*.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
