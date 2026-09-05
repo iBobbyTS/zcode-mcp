@@ -10,6 +10,13 @@ python tests/live-agent/non-git-based/run_matrix.py --help
 git diff --check
 ```
 
+For the macOS release payload, run `sh scripts/release/check-native-tarball.sh`
+and `sh scripts/release/test-installed-tarball.sh`. The latter installs the
+generated tarball into a fresh prefix and HOME, then checks the installed CLI,
+daemon path, and LaunchAgent plist. A daemon process also requires the existing
+plugin hook provenance and `ZCODE_AGENT_SERVICE_GENERATION`; missing or stale
+provenance must remain a fail-closed result.
+
 The pack must exclude `.DS_Store`, `__MACOSX`, `__pycache__`, `.agent-work`,
 raw sessions/reasoning, build output, and caches. Native daemon/runtime payload
 presence is checked separately; when unavailable, record `EVIDENCE_GAP` and do
