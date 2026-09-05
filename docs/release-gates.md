@@ -22,6 +22,12 @@ raw sessions/reasoning, build output, and caches. Native daemon/runtime payload
 presence is checked separately; when unavailable, record `EVIDENCE_GAP` and do
 not claim a real installation or model run.
 
+Live-agent goal status is judged by the executing agent or human evaluator from
+the stated task goal and collected evidence. Harness checks report facts such
+as ref preservation, resource cleanup, and artifact hash integrity; they must
+not turn one missing expected file or an inapplicable replay check into an
+automatic failure when the goal was otherwise achieved.
+
 The 50-call ledger is `.agent-work/audit/zcode-as-subagent-productization/TRACE.jsonl`.
 Each `real_model_call` records `event_id`, `scenario_id`, `phase`, requested
 and observed model, start/end timestamps, outcome, counted flag, and

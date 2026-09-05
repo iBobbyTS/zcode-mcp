@@ -838,6 +838,12 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
     validate_public_command_ids(&input.allowed_command_ids, "allowed_command_ids")?;
     validate_public_command_ids(&input.required_command_ids, "required_command_ids")?;
     let agent_id = "daemon-prepared".to_owned();
+    let write_manifest = match input.permission_mode {
+        PublicPermissionMode::Build | PublicPermissionMode::Edit | PublicPermissionMode::Yolo => {
+            vec![PathBuf::from(".")]
+        }
+        PublicPermissionMode::Plan => Vec::new(),
+    };
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: agent_id.clone(),
@@ -853,7 +859,7 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
             .map(attachment)
             .collect::<Result<Vec<_>, _>>()?,
         // Write manifests are daemon-owned policy, never caller-controlled.
-        write_manifest: Vec::new(),
+        write_manifest,
         scratch_root: PathBuf::from(".agent-work/scratch/general"),
         artifact_root: PathBuf::from(".agent-work/artifacts").join(agent_id),
         budget: Some(input.budget.clone().map(Into::into).unwrap_or_else(|| {
@@ -1418,6 +1424,31 @@ mod generic_tests {
         .unwrap();
         input.allowed_command_ids.push("unit".into());
         assert!(general_manifest(&input).is_err());
+    }
+
+    #[test]
+    fn public_write_modes_bind_the_canonical_workspace_write_scope() {
+        for mode in ["build", "edit", "yolo"] {
+            let input = serde_json::from_value::<AgentSpawnInput>(serde_json::json!({
+                "repository": "/tmp/repository",
+                "permission_mode": mode,
+                "prompt": "write a file",
+                "idempotency_key": mode
+            }))
+            .unwrap();
+            assert_eq!(
+                general_manifest(&input).unwrap().write_manifest,
+                [PathBuf::from(".")]
+            );
+        }
+        let input = serde_json::from_value::<AgentSpawnInput>(serde_json::json!({
+            "repository": "/tmp/repository",
+            "permission_mode": "plan",
+            "prompt": "inspect files",
+            "idempotency_key": "plan"
+        }))
+        .unwrap();
+        assert!(general_manifest(&input).unwrap().write_manifest.is_empty());
     }
 
     #[tokio::test]

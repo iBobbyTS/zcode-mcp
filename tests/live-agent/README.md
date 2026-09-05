@@ -24,3 +24,10 @@ Source scenarios are immutable inputs. Test code must use
 `non-git-based/fixture_workspace.py` to create a unique execution directory and
 materialize a scenario. Results, transcripts, logs, stores, temporary Git
 repositories, and imported historical evidence stay under `workspace/`.
+
+The runner records observable runtime facts and safety invariants; it does not
+replace the task executor's or human evaluator's judgment of whether a goal was
+achieved. A task that achieves its stated goal may be classified as success or
+success-with-gap when bounded evidence is incomplete. `FAILED` is reserved for
+an outcome that did not achieve the goal. Artifact hashes and repository
+identity remain integrity evidence, not a substitute for goal judgment.

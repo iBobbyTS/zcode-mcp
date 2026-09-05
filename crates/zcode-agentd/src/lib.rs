@@ -8274,7 +8274,15 @@ exit 7
             .residual_gaps
             .contains(&"RESULT_RESPONSE_FRAME_EXCEEDED".into()));
         if prepared.direct_workspace {
-            assert!(stored.result.artifacts.is_empty());
+            assert_eq!(stored.result.artifacts.len(), 1);
+            assert_eq!(stored.result.changed_files, ["src/lib.rs"]);
+            assert!(stored.result.base_commit.is_some());
+            assert!(stored.result.head_commit.is_none());
+            let patch_path = prepared.artifact_root.join("changes.patch");
+            let patch = std::fs::read(&patch_path).unwrap();
+            let patch_sha256 = format!("{:x}", Sha256::digest(&patch));
+            assert_eq!(stored.result.artifacts[0].sha256, patch_sha256);
+            assert!(String::from_utf8_lossy(&patch).contains("value() -> u8 { 2 }"));
             assert!(prepared.repository.exists());
             assert_general_workspace_cleaned(&prepared);
             return;
@@ -8390,7 +8398,17 @@ exit 7
             other => panic!("unexpected intermediate task result response: {other:?}"),
         };
         if prepared.direct_workspace {
-            assert!(intermediate_artifacts.is_empty());
+            assert_eq!(intermediate_artifacts.len(), 1);
+            let artifact = &intermediate_artifacts[0];
+            assert_eq!(artifact.kind, "changes_patch");
+            assert!(service
+                .dispatch(rpc::RpcMethod::TaskArtifact(rpc::TaskArtifactQuery {
+                    agent_id: agent_id.clone(),
+                    artifact_id: artifact.artifact_id.clone(),
+                    offset_bytes: 0,
+                    limit_bytes: rpc::MAX_ARTIFACT_CHUNK_BYTES,
+                }))
+                .is_ok());
             release.wait();
             finisher.join().unwrap();
             assert_general_workspace_cleaned(&prepared);

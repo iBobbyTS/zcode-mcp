@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-polls", type=int, default=360)
     parser.add_argument("--permission-decision", choices=["allow", "deny"], default="allow")
     parser.add_argument("--minimal-evidence", action="store_true")
+    parser.add_argument("--allow-workspace-changes", action="store_true")
     parser.add_argument("--forbid-result-text")
     return parser.parse_args()
 
@@ -60,6 +61,10 @@ def source_integrity_unchanged(before: dict[str, str], after: dict[str, str]) ->
     return all(
         before[field] == after[field] for field in ("head", "tracked_diff", "staged_diff")
     )
+
+
+def source_identity_unchanged(before: dict[str, str], after: dict[str, str]) -> bool:
+    return all(before[field] == after[field] for field in ("head", "staged_diff"))
 
 
 def evidence_identity(
@@ -265,7 +270,11 @@ def main() -> int:
                 })
             closed = transport.call("zcode_subagent_close", {"agent_id": agent_id})
             source_after = git_snapshot(args.repository.resolve())
-            source_unchanged = source_integrity_unchanged(source_before, source_after)
+            source_unchanged = (
+                source_identity_unchanged(source_before, source_after)
+                if args.allow_workspace_changes
+                else source_integrity_unchanged(source_before, source_after)
+            )
             output = {
                 "schema": EVIDENCE_SCHEMA,
                 "identity": identity,

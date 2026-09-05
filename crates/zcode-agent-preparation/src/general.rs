@@ -1123,17 +1123,19 @@ impl GeneralFinalizer {
             .validate_finalization_content()
             .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
         // Direct submissions are filesystem-only. They never enter the
-        // detached-worktree integrity or Git patch/commit path.
+        // detached-worktree or Git commit path. They still publish a
+        // read-only patch of the caller-owned workspace for result evidence.
         if prepared.direct_workspace {
             ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
             validate_direct_workspace_identity(prepared)?;
+            let changes_patch = finalize_direct_patch(prepared)?;
             return Ok(GeneralCompletion {
                 outcome: requested,
                 reason_code: None,
                 summary,
                 checks,
                 residual_gaps,
-                changes_patch: None,
+                changes_patch,
                 cleaned: false,
             });
         }
@@ -1208,6 +1210,94 @@ fn validate_direct_workspace_identity(prepared: &PreparedGeneralTask) -> Result<
         return Err("WORKSPACE_IDENTITY_INVALID".into());
     }
     Ok(())
+}
+
+fn finalize_direct_patch(prepared: &PreparedGeneralTask) -> Result<Option<ChangesPatch>, String> {
+    if !prepared.repository.join(".git").exists() {
+        return Ok(None);
+    }
+    let status = git_bytes(
+        &prepared.repository,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let paths = parse_status_paths(&status)?
+        .into_iter()
+        .filter(|path| !Path::new(path).starts_with(".agent-work"))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    for path in &paths {
+        let relative = confined_relative(Path::new(path)).map_err(|_| "CHANGED_PATH_INVALID")?;
+        reject_protected(&relative).map_err(|_| "PROTECTED_PATH_CHANGED")?;
+        if !prepared
+            .write_manifest
+            .iter()
+            .any(|root| root == Path::new(".") || relative.starts_with(root))
+        {
+            return Err("CHANGED_PATH_NOT_ALLOWLISTED".into());
+        }
+    }
+
+    let head = String::from_utf8(git_bytes(&prepared.repository, &["rev-parse", "HEAD"])?)
+        .map_err(|_| "GIT_HEAD_INVALID".to_owned())?
+        .trim()
+        .to_owned();
+    let mut patch = Vec::new();
+    for path in &paths {
+        let tracked = safe_git_output(
+            &prepared.repository,
+            &["ls-files", "--error-unmatch", "--", path],
+        )
+        .map_err(|_| "GIT_STATUS_CHECK_FAILED")?
+        .status
+        .success();
+        let output = if tracked {
+            safe_git_output(
+                &prepared.repository,
+                &[
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                    path,
+                ],
+            )
+            .map_err(|_| "GIT_DIFF_FAILED")?
+        } else {
+            safe_git_output(
+                &prepared.repository,
+                &["diff", "--no-index", "--binary", "/dev/null", path],
+            )
+            .map_err(|_| "GIT_DIFF_FAILED")?
+        };
+        if !output.status.success() && (!tracked && output.status.code() != Some(1)) {
+            return Err("GIT_DIFF_FAILED".into());
+        }
+        patch.extend_from_slice(&output.stdout);
+    }
+    if patch.is_empty() {
+        return Err("PATCH_EMPTY_FOR_CHANGED_WORKSPACE".into());
+    }
+    if patch.len() as u64 > prepared.effective_budget.max_artifact_bytes {
+        return Err("ARTIFACT_LIMIT_EXCEEDED".into());
+    }
+    let path = prepared.artifact_root.join("changes.patch");
+    atomic_write(&path, &patch).map_err(|_| "ARTIFACT_WRITE_FAILED")?;
+    let digest = hash(&patch);
+    verify_file(&path, &digest, Some(patch.len() as u64))
+        .map_err(|_| "AUTHORITATIVE_ARTIFACT_INVALID")?;
+    Ok(Some(ChangesPatch {
+        artifact_id: hash(format!("{}:{}", prepared.agent_id, digest).as_bytes()),
+        sha256: digest,
+        size_bytes: patch.len() as u64,
+        head_commit: None,
+        base_sha: head,
+        changed_paths: paths,
+        diff_stat: None,
+    }))
 }
 
 fn direct_workspace_snapshot(root: &Path) -> Result<String, String> {

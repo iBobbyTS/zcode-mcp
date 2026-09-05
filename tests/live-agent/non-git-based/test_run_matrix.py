@@ -7,6 +7,7 @@ from run_matrix import (
     EVIDENCE_SCHEMA,
     minimal_evidence,
     source_integrity_unchanged,
+    source_identity_unchanged,
     validate_evidence_identity,
 )
 
@@ -45,6 +46,12 @@ class SourceIntegrityTests(unittest.TestCase):
         self.assertFalse(
             source_integrity_unchanged(dirty, dict(dirty, tracked_diff="new change"))
         )
+
+    def test_workspace_write_allows_unstaged_changes_without_ref_mutation(self) -> None:
+        after = dict(self.clean, tracked_diff="expected workspace edit")
+        self.assertTrue(source_identity_unchanged(self.clean, after))
+        self.assertFalse(source_identity_unchanged(self.clean, dict(after, staged_diff="staged")))
+        self.assertFalse(source_identity_unchanged(self.clean, dict(after, head="b" * 40)))
 
 
 class EvidenceIdentityTests(unittest.TestCase):
