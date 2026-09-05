@@ -705,7 +705,7 @@ impl GeneralTaskPreparer {
         &self,
         manifest: &GeneralTaskManifest,
     ) -> PreparationResult<PreparedGeneralTask> {
-        self.prepare_submission_internal(manifest, None)
+        self.prepare_submission_internal_direct(manifest, None)
     }
 
     /// Prepare a public submission against the canonical repository workspace.
@@ -723,7 +723,7 @@ impl GeneralTaskPreparer {
         manifest: &GeneralTaskManifest,
         named_commands: &BTreeMap<String, GeneralNamedCommand>,
     ) -> PreparationResult<PreparedGeneralTask> {
-        self.prepare_submission_internal(manifest, Some(named_commands))
+        self.prepare_submission_internal_direct(manifest, Some(named_commands))
     }
 
     pub fn prepare_named_direct_submission(
