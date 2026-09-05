@@ -356,9 +356,19 @@ impl PreparedGeneralTask {
                 })
                 .map(|context| self.worktree.path.join(&context.repository_relative)),
         );
+        let workspace_path = if self.direct_workspace {
+            self.workspace.path.clone()
+        } else {
+            self.worktree.path.clone()
+        };
+        let scratch_root = if self.direct_workspace {
+            self.workspace.scratch_root.clone()
+        } else {
+            self.scratch_root.clone()
+        };
         PolicyLauncher::for_general(
-            self.worktree.path.clone(),
-            self.scratch_root.clone(),
+            workspace_path,
+            scratch_root,
             self.artifact_root.join("result.json"),
             inputs,
             self.validation_commands.clone(),
