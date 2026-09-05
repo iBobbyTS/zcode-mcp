@@ -41,7 +41,7 @@ def write_catalog(repository: Path) -> dict[str, object]:
                 "timeout_ms": 5000,
                 "max_output_bytes": 1024,
             },
-            "allowed_access_modes": ["workspace_write"],
+            "allowed_permission_modes": ["edit"],
             "readonly_safe": False,
         }],
     }
@@ -163,18 +163,18 @@ def main() -> int:
     root = create_execution_root(f"pretool-{args.scenario}-")
     if args.scenario == "write-allow":
         repository, catalog, head = make_write_fixture(root)
-        extra = ["--access-mode", "workspace_write", "--write-manifest", WRITE_FILE,
+        extra = ["--permission-mode", "edit",
                  "--command-catalog", str(catalog), "--required-command-id", WRITE_CHECK_ID,
                  "--permission-decision", "allow", "--prompt", write_prompt()]
     else:
         repository, head = make_read_fixture(root)
-        extra = ["--access-mode", "read_only", "--permission-decision", "deny",
+        extra = ["--permission-mode", "build", "--permission-decision", "deny",
                  "--forbid-result-text", READ_CONTENT, "--prompt", read_prompt()]
     command = [
         sys.executable, str(Path(__file__).with_name("run_matrix.py")),
         "--daemon", str(args.daemon.resolve()), "--facade", str(args.facade.resolve()),
         "--runtime", str(args.runtime.resolve()), "--repository", str(repository),
-        "--base-ref", head, "--group-id", f"s03-{args.scenario}",
+        "--group-id", f"s03-{args.scenario}",
         "--idempotency-key", f"s03-{args.scenario}-{uuid.uuid4()}",
         "--poll-timeout-ms", "5000", "--poll-interval-seconds", "15",
         "--max-polls", "60", "--minimal-evidence", *extra,

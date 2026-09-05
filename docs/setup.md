@@ -1,8 +1,8 @@
-# Setup
+# zcode-as-subagent setup
 
 ## Build
 
-Requirements are Rust 1.97 or compatible, Cargo, Git, and macOS or a compatible Unix host.
+Source builds require Rust 1.97 or compatible and Cargo. The distributed product requires Node.js 20 and macOS.
 
 ```text
 cargo build --release -p zcode-agentd -p zcode-subagent-mcp
@@ -15,7 +15,6 @@ Use private absolute database and socket paths outside the target repository:
 ```text
 export ZCODE_AGENTD_STORE=/absolute/private/zcode-agent.sqlite3
 export ZCODE_AGENTD_SOCKET=/absolute/private/zcode-agent.sock
-export ZCODE_RUNTIME_PATH=/absolute/official/zcode-runtime
 export ZCODE_AGENT_HOOK_PROVENANCE=/absolute/private/zcode-agent-hook-provenance.json
 export ZCODE_AGENT_SERVICE_GENERATION=<service_generation emitted by the hook installer>
 ./target/release/zcode-agentd
@@ -25,21 +24,22 @@ The daemon and Store are the sole durable lifecycle owner. The runtime owner kee
 Daemon startup verifies the installed Hook record, including its exact
 `service_generation`, before opening the Store or publishing the private
 socket. Missing, stale, tampered, or mismatched provenance fails closed.
+The npm product always uses `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`; it does not search PATH or expose a runtime override.
 
 ## Codex MCP
 
 Merge values from `config/codex-zcode-subagent-mcp.toml` into Codex configuration only when explicitly requested. The binary has one startup-static catalog:
 
 ```text
-zcode_system_status
-zcode_agent_spawn
-zcode_agent_poll
-zcode_agent_list
-zcode_agent_send
-zcode_agent_respond
-zcode_agent_cancel
-zcode_agent_result
-zcode_agent_close
+zcode_subagent_status
+zcode_subagent_spawn
+zcode_subagent_poll
+zcode_subagent_list
+zcode_subagent_send
+zcode_subagent_respond
+zcode_subagent_cancel
+zcode_subagent_result
+zcode_subagent_close
 ```
 
 Review is a normal read-only Agent invocation. Put review instructions in `prompt`; no review task type or continuation identity exists.
@@ -47,9 +47,8 @@ Review is a normal read-only Agent invocation. Put review instructions in `promp
 ```json
 {
   "repository": "/absolute/repository",
-  "base_ref": "0123456789abcdef0123456789abcdef01234567",
   "prompt": "Review base..HEAD and report concrete findings.",
-  "access_mode": "read_only",
+  "permission_mode": "build",
   "group_id": "feature",
   "idempotency_key": "fresh-agent-key",
   "allowed_command_ids": [],

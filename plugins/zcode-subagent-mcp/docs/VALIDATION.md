@@ -70,4 +70,4 @@ The package contains no third-party npm dependencies.
 
 ## Security boundary
 
-Passing this suite does not turn the hook into an operating-system sandbox. The supported deployment still requires a disposable agent worktree, daemon/MCP write confinement, bounded output and process cleanup, and daemon-owned named commands for tests/builds or other repository code execution. Unsupported or ambiguous Bash commands fail closed by default.
+Passing this suite does not turn the hook into an operating-system sandbox. The supported deployment still requires daemon/MCP write confinement, bounded output and process cleanup, and daemon-owned named commands for tests/builds or other workspace code execution. Unsupported or ambiguous Bash commands fail closed by default.

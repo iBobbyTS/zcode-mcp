@@ -2,15 +2,15 @@
 
 ## Generic lifecycle
 
-1. Call `zcode_agent_spawn` with `read_only` or `workspace_write`.
-2. Call `zcode_agent_poll` with the returned `agent_id`, `after_revision`, and bounded `timeout_ms`.
+1. Call `zcode_subagent_spawn` with a canonical workspace and one of `build|edit|plan|yolo` (`build` is the default).
+2. Call `zcode_subagent_poll` with the returned `agent_id`, `after_revision`, and bounded `timeout_ms`.
 3. Reuse `next_revision`; do not restart polling from zero.
-4. Answer only daemon-published typed requests through `zcode_agent_respond`.
-5. Queue clarification with `zcode_agent_send`. A terminal task cannot continue; create a new Agent.
-6. Read final text, verified checks, changed files, patch, and bounded artifact chunks through `zcode_agent_result`.
-7. Use `zcode_agent_cancel` for authoritative stop/kill/reap and `zcode_agent_close` for idempotent cleanup.
+4. Answer only daemon-published typed requests through `zcode_subagent_respond`.
+5. Queue clarification with `zcode_subagent_send`. A terminal task cannot continue; create a new Agent.
+6. Read final text, verified checks, changed files, patch, and bounded artifact chunks through `zcode_subagent_result`.
+7. Use `zcode_subagent_cancel` for authoritative stop/kill/reap and `zcode_subagent_close` for idempotent cleanup.
 
-`zcode_agent_list` requires repository, feature, or ownership scope. Filtering occurs in the Store before the limit.
+`zcode_subagent_list` requires repository, feature, or ownership scope. Filtering occurs in the Store before the limit.
 
 ## Activity
 

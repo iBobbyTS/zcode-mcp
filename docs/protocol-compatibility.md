@@ -21,7 +21,7 @@ project.
 
 Runtime protocol shapes and cleanup behavior are exercised through the Driver
 and daemon test suites. There is no separate production preflight executable;
-the generic `zcode_system_status` tool reports bounded daemon status without
+the generic `zcode_subagent_status` tool reports bounded daemon status without
 starting an additional ZCode runtime.
 
 ## Pinned 3.8.1 event and request shapes

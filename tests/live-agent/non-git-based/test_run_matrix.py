@@ -25,25 +25,25 @@ class SourceIntegrityTests(unittest.TestCase):
             with self.subTest(field=field):
                 before = dict(self.clean, **{field: "dirty"})
                 after = dict(before)
-                self.assertFalse(source_integrity_unchanged(before, after, "read_only"))
+                self.assertTrue(source_integrity_unchanged(before, after))
 
     def test_read_only_rejects_tracked_or_staged_diff_after_run(self) -> None:
         for field in ("tracked_diff", "staged_diff"):
             with self.subTest(field=field):
                 after = dict(self.clean, **{field: "dirty"})
-                self.assertFalse(source_integrity_unchanged(self.clean, after, "read_only"))
+                self.assertFalse(source_integrity_unchanged(self.clean, after))
 
     def test_read_only_accepts_clean_identity_with_untracked_diagnostics(self) -> None:
         after = dict(self.clean, status="?? .agent-work/artifacts/manifest.json")
 
-        self.assertTrue(source_integrity_unchanged(self.clean, after, "read_only"))
+        self.assertTrue(source_integrity_unchanged(self.clean, after))
 
     def test_workspace_write_preserves_before_after_change_semantics(self) -> None:
         dirty = dict(self.clean, tracked_diff="existing change")
 
-        self.assertTrue(source_integrity_unchanged(dirty, dict(dirty), "workspace_write"))
+        self.assertTrue(source_integrity_unchanged(dirty, dict(dirty)))
         self.assertFalse(
-            source_integrity_unchanged(dirty, dict(dirty, tracked_diff="new change"), "workspace_write")
+            source_integrity_unchanged(dirty, dict(dirty, tracked_diff="new change"))
         )
 
 

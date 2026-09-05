@@ -1,9 +1,13 @@
-# ZCode Subagent MCP hooks
+# zcode-as-subagent MCP hooks
 
 This plugin provides the local generic ZCode Subagent MCP facade and its
 fail-closed Bash and file policy hooks. The daemon remains the lifecycle and
 durable owner; the hooks only enforce tool permissions and write metadata-only
 audit records.
+
+Plugin install/check/uninstall is coordinated by the unified
+`zcode-as-subagent` CLI owner. Hook scripts do not manage installation state,
+invoke a second supervisor, provide old aliases, or migrate legacy data.
 
 ## Layout
 

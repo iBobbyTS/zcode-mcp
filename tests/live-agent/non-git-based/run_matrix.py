@@ -22,12 +22,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--facade", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--repository", type=Path, required=True)
-    parser.add_argument("--base-ref", required=True)
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--access-mode", choices=["read_only", "workspace_write"], default="read_only")
+    parser.add_argument("--permission-mode", choices=["build", "edit", "plan", "yolo"], default="build")
     parser.add_argument("--group-id", default="official-generic-agent")
     parser.add_argument("--idempotency-key", required=True)
-    parser.add_argument("--write-manifest", action="append", default=[])
     parser.add_argument("--allowed-command-id", action="append", default=[])
     parser.add_argument("--required-command-id", action="append", default=[])
     parser.add_argument("--command-catalog", type=Path)
@@ -58,18 +56,9 @@ def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def source_integrity_unchanged(
-    before: dict[str, str], after: dict[str, str], access_mode: str
-) -> bool:
-    identity_unchanged = all(
+def source_integrity_unchanged(before: dict[str, str], after: dict[str, str]) -> bool:
+    return all(
         before[field] == after[field] for field in ("head", "tracked_diff", "staged_diff")
-    )
-    if access_mode == "workspace_write":
-        return identity_unchanged
-    return identity_unchanged and all(
-        not snapshot[field]
-        for snapshot in (before, after)
-        for field in ("tracked_diff", "staged_diff")
     )
 
 
@@ -192,15 +181,13 @@ def main() -> int:
                 raise ConformanceError("daemon socket did not become ready")
             transport = StdioMCPTransport(facade_binary, socket)
             validate_catalog(transport)
-            status = transport.call("zcode_system_status", {})
-            spawn = transport.call("zcode_agent_spawn", {
+            status = transport.call("zcode_subagent_status", {})
+            spawn = transport.call("zcode_subagent_spawn", {
                 "repository": str(args.repository.resolve()),
-                "base_ref": args.base_ref,
                 "prompt": args.prompt,
-                "access_mode": args.access_mode,
+                "permission_mode": args.permission_mode,
                 "group_id": args.group_id,
                 "idempotency_key": args.idempotency_key,
-                "write_manifest": args.write_manifest,
                 "allowed_command_ids": args.allowed_command_id,
                 "required_command_ids": args.required_command_id,
             })
@@ -213,7 +200,7 @@ def main() -> int:
             for _ in range(args.max_polls):
                 started = time.monotonic()
                 poll_started_at.append(started)
-                poll = transport.call("zcode_agent_poll", {
+                poll = transport.call("zcode_subagent_poll", {
                     "agent_id": agent_id,
                     "after_revision": revision,
                     "timeout_ms": args.poll_timeout_ms,
@@ -230,7 +217,7 @@ def main() -> int:
                 for request in poll.get("pending_requests", []):
                     if not request.get("respondable") or request.get("state") != "pending":
                         continue
-                    response = transport.call("zcode_agent_respond", {
+                    response = transport.call("zcode_subagent_respond", {
                         "agent_id": agent_id,
                         "request_id": request["request_id"],
                         "decision": args.permission_decision,
@@ -247,7 +234,7 @@ def main() -> int:
                 time.sleep(max(0.0, args.poll_interval_seconds - elapsed))
             if not terminal:
                 raise ConformanceError("agent did not reach a terminal phase")
-            result = transport.call("zcode_agent_result", {"agent_id": agent_id})
+            result = transport.call("zcode_subagent_result", {"agent_id": agent_id})
             task = result["task"]
             final_text = result.get("result", {}).get("final_text", "")
             result_content_excluded = (
@@ -276,11 +263,9 @@ def main() -> int:
                         else None
                     ),
                 })
-            closed = transport.call("zcode_agent_close", {"agent_id": agent_id})
+            closed = transport.call("zcode_subagent_close", {"agent_id": agent_id})
             source_after = git_snapshot(args.repository.resolve())
-            source_unchanged = source_integrity_unchanged(
-                source_before, source_after, args.access_mode
-            )
+            source_unchanged = source_integrity_unchanged(source_before, source_after)
             output = {
                 "schema": EVIDENCE_SCHEMA,
                 "identity": identity,
@@ -302,10 +287,8 @@ def main() -> int:
                 "source_unchanged": source_unchanged,
                 "source_status_unchanged": source_before["status"] == source_after["status"],
             }
-            if args.access_mode == "read_only" and not source_unchanged:
-                raise ConformanceError(
-                    "read-only source integrity requires clean tracked and staged state before and after"
-                )
+            if not source_unchanged:
+                raise ConformanceError("the live run changed the caller's pre-existing Git identity")
             validate_evidence_identity(output, identity)
             evidence = minimal_evidence(output) if args.minimal_evidence else output
             evidence_path.write_text(
@@ -324,7 +307,7 @@ def main() -> int:
             if transport is not None:
                 if agent_id is not None:
                     try:
-                        transport.call("zcode_agent_close", {"agent_id": agent_id})
+                        transport.call("zcode_subagent_close", {"agent_id": agent_id})
                     except Exception:
                         pass
                 transport.close()

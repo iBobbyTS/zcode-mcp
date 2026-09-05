@@ -11,15 +11,15 @@ from pathlib import Path
 from typing import Any, Mapping
 
 REQUIRED_TOOLS = {
-    "zcode_system_status",
-    "zcode_agent_spawn",
-    "zcode_agent_poll",
-    "zcode_agent_list",
-    "zcode_agent_send",
-    "zcode_agent_respond",
-    "zcode_agent_cancel",
-    "zcode_agent_result",
-    "zcode_agent_close",
+    "zcode_subagent_status",
+    "zcode_subagent_spawn",
+    "zcode_subagent_poll",
+    "zcode_subagent_list",
+    "zcode_subagent_send",
+    "zcode_subagent_respond",
+    "zcode_subagent_cancel",
+    "zcode_subagent_result",
+    "zcode_subagent_close",
 }
 MAX_ARTIFACT_CHUNK_BYTES = 8192
 
@@ -121,7 +121,7 @@ def collect_artifact(
     data = bytearray()
     while len(data) < size:
         limit = min(MAX_ARTIFACT_CHUNK_BYTES, size - len(data))
-        result = transport.call("zcode_agent_result", {
+        result = transport.call("zcode_subagent_result", {
             "agent_id": agent_id,
             "artifact_id": artifact_id,
             "offset_bytes": len(data),
