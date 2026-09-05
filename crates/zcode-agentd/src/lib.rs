@@ -1812,7 +1812,7 @@ fn task_route(task: &TaskRecord) -> Result<TaskRoute, String> {
                 None => (Vec::new(), prepared.prepared_sha256.clone()),
             };
             if task.prepared_launch_sha256 != expected_digest
-                || task.workspace_path != prepared.worktree.path.to_string_lossy()
+                || task.workspace_path != prepared.workspace.path.to_string_lossy()
             {
                 return Err("stored task does not match its general preparation".into());
             }
