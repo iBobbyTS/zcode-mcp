@@ -3646,17 +3646,6 @@ impl Scheduler {
         allowed_command_ids: &[String],
         required_command_ids: &[String],
     ) -> Result<SubmittedTask, SchedulerError> {
-        // In-process legacy callers may still construct manifests with only
-        // access_mode; public JSON cannot set that field. Normalize that
-        // compatibility shape before applying the public permission policy.
-        let mut manifest_owned = manifest.clone();
-        if manifest_owned.permission_mode == zcode_agent_preparation::PermissionMode::Plan
-            && manifest_owned.access_mode == AccessMode::WorkspaceWrite
-            && !manifest_owned.write_manifest.is_empty()
-        {
-            manifest_owned.permission_mode = zcode_agent_preparation::PermissionMode::Build;
-        }
-        let manifest = &manifest_owned;
         if manifest
             .budget
             .as_ref()
@@ -5867,6 +5856,7 @@ mod tests {
         let (directory, _store, _factory, scheduler) = scheduler_fixture(1, 1);
         let mut manifest = general_manifest(directory.path(), "policy-env", None);
         manifest.access_mode = AccessMode::WorkspaceWrite;
+        manifest.permission_mode = zcode_agent_preparation::PermissionMode::Build;
         manifest.write_manifest = vec!["src".into()];
         let submitted = scheduler
             .enqueue_general(&manifest, Some("feature"))
@@ -7844,6 +7834,7 @@ exit 7
         let mut manifest = general_manifest(directory.path(), "required-final-tree", None);
         manifest.access_mode = AccessMode::WorkspaceWrite;
         manifest.repo_context = vec!["src/lib.rs".into()];
+        manifest.permission_mode = zcode_agent_preparation::PermissionMode::Build;
         manifest.write_manifest = vec!["src".into()];
         let repository = manifest.repository.clone();
         let catalog_path = write_general_command_catalog(
@@ -8269,6 +8260,7 @@ exit 7
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
         let mut manifest = general_manifest(directory.path(), "write-result-frame", None);
         manifest.access_mode = AccessMode::WorkspaceWrite;
+        manifest.permission_mode = zcode_agent_preparation::PermissionMode::Build;
         manifest.write_manifest = vec!["src".into()];
         let submitted = scheduler
             .enqueue_general(&manifest, Some("feature"))
@@ -8355,6 +8347,7 @@ exit 7
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
         let mut manifest = general_manifest(directory.path(), "result-before-reap", None);
         manifest.access_mode = AccessMode::WorkspaceWrite;
+        manifest.permission_mode = zcode_agent_preparation::PermissionMode::Build;
         manifest.write_manifest = vec!["src".into()];
         let submitted = scheduler
             .enqueue_general(&manifest, Some("feature"))
@@ -8921,6 +8914,7 @@ exit 7
         let (directory, store, factory, scheduler) = scheduler_fixture(1, 1);
         let mut implementation = general_manifest(directory.path(), "implementation-policy", None);
         implementation.access_mode = AccessMode::WorkspaceWrite;
+        implementation.permission_mode = zcode_agent_preparation::PermissionMode::Build;
         implementation.repo_context = vec!["src/lib.rs".into()];
         implementation.write_manifest = vec!["src".into()];
         let submitted = scheduler
@@ -9381,7 +9375,10 @@ exit 7
             .queue_message(&first_id, "late", "queue", "late")
             .is_err());
         factory.runtime(&second_id);
-        assert_eq!(store.get_task(&second_id).unwrap().unwrap().phase, TaskPhase::Running);
+        assert_eq!(
+            store.get_task(&second_id).unwrap().unwrap().phase,
+            TaskPhase::Running
+        );
         scheduler.close_task(&second_id).unwrap();
     }
 

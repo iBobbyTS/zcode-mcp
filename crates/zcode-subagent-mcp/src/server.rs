@@ -273,8 +273,6 @@ pub struct AgentSpawnInput {
     pub group_id: Option<String>,
     pub idempotency_key: String,
     #[serde(default)]
-    pub write_manifest: Vec<String>,
-    #[serde(default)]
     pub repo_context: Vec<String>,
     #[serde(default)]
     pub attachments: Vec<PublicAttachmentInput>,
@@ -854,7 +852,8 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
             .iter()
             .map(attachment)
             .collect::<Result<Vec<_>, _>>()?,
-        write_manifest: input.write_manifest.iter().map(PathBuf::from).collect(),
+        // Write manifests are daemon-owned policy, never caller-controlled.
+        write_manifest: Vec::new(),
         scratch_root: PathBuf::from(".agent-work/scratch/general"),
         artifact_root: PathBuf::from(".agent-work/artifacts").join(agent_id),
         budget: Some(input.budget.clone().map(Into::into).unwrap_or_else(|| {
@@ -1341,6 +1340,7 @@ mod generic_tests {
             .collect::<Vec<_>>();
         assert_eq!(names, PUBLIC_TOOLS);
         let encoded = serde_json::to_string(&tools).unwrap();
+        assert!(!encoded.contains("write_manifest"));
         for forbidden in [
             concat!("zcode_", "review_spawn"),
             concat!("zcode_", "review_continue"),
@@ -1374,6 +1374,18 @@ mod generic_tests {
     }
 
     #[test]
+    fn public_spawn_rejects_caller_write_manifest() {
+        let result = serde_json::from_value::<AgentSpawnInput>(serde_json::json!({
+            "repository": "/tmp/repository",
+            "permission_mode": "build",
+            "prompt": "run checks",
+            "idempotency_key": "key",
+            "write_manifest": ["src"]
+        }));
+        assert!(result.is_err(), "write_manifest must not be a public input");
+    }
+
+    #[test]
     fn public_budget_contains_only_runtime_and_absolute_limits() {
         let budget = PublicBudget {
             absolute_wall_time_ms: 1,
@@ -1400,7 +1412,6 @@ mod generic_tests {
             "prompt": "run checks",
             "group_id": "feature",
             "idempotency_key": "key",
-            "write_manifest": ["src/lib.rs"],
             "allowed_command_ids": ["unit"],
             "required_command_ids": ["lint"]
         }))

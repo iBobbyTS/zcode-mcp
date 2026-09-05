@@ -114,7 +114,7 @@ pub(crate) fn public_error(error: RpcError) -> String {
         }
         RpcErrorCode::UnknownMethod => ("protocol_error", "daemon method is unavailable"),
         RpcErrorCode::NotFound => ("not_found", "agent task was not found"),
-        RpcErrorCode::Conflict => ("conflict", "agent operation conflicts with durable state"),
+        RpcErrorCode::Conflict => ("conflict", "WORKSPACE_BUSY"),
         RpcErrorCode::Timeout => ("timeout", "daemon operation timed out"),
         RpcErrorCode::RuntimeLost => ("runtime_lost", "agent runtime was lost"),
         RpcErrorCode::ResultInvalid => ("result_invalid", "stored task result failed verification"),
@@ -144,4 +144,18 @@ pub(crate) fn public_transport_error(error: std::io::Error) -> String {
 
 pub(crate) fn protocol_error() -> String {
     "protocol_error: unexpected daemon response".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_busy_preserves_code_message_and_active_agent() {
+        let mut error = RpcError::new(RpcErrorCode::Conflict, "WORKSPACE_BUSY");
+        error.active_agent_id = Some("agent-42".into());
+        let rendered = public_error(error);
+        assert!(rendered.starts_with("conflict: WORKSPACE_BUSY"));
+        assert!(rendered.contains("active_agent_id=agent-42"));
+    }
 }
