@@ -1000,29 +1000,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "zcode-agent-preparation"
-version = "0.1.0"
-dependencies = [
- "jsonschema",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "zcode-agent-store"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
 name = "rmcp"
 version = "3.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1645,6 +1622,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcode-agent-preparation"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "zcode-agent-store"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "zcode-agentd"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "socket2",
+ "tempfile",
+ "zcode-agent-preparation",
+ "zcode-agent-store",
+ "zcode-driver",
+ "zcode-protocol",
+]
+
+[[package]]
 name = "zcode-driver"
 version = "0.1.0"
 dependencies = [
@@ -1674,8 +1693,6 @@ name = "zcode-subagent-mcp"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "zcode-agent-preparation",
- "zcode-agent-store",
  "rmcp",
  "rmcp-macros",
  "schemars",
@@ -1684,26 +1701,9 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
- "zcode-driver",
- "zcode-protocol",
- "zcode-agentd",
-]
-
-[[package]]
-name = "zcode-agentd"
-version = "0.1.0"
-dependencies = [
- "jsonschema",
- "libc",
  "zcode-agent-preparation",
  "zcode-agent-store",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook",
- "socket2",
- "tempfile",
+ "zcode-agentd",
  "zcode-driver",
  "zcode-protocol",
 ]
