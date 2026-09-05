@@ -734,26 +734,6 @@ impl GeneralTaskPreparer {
         self.prepare_submission_internal_direct(manifest, Some(named_commands))
     }
 
-    fn prepare_submission_internal(
-        &self,
-        manifest: &GeneralTaskManifest,
-        named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
-    ) -> PreparationResult<PreparedGeneralTask> {
-        let repository = canonical_general_repository(&manifest.repository)?;
-        let agent_id = format!(
-            "ztask-{}",
-            hash(&serde_json::to_vec(&(
-                repository.as_path(),
-                manifest.idempotency_key.as_str(),
-            ))?)
-        );
-        let mut canonical = manifest.clone();
-        canonical.repository = repository;
-        canonical.agent_id = agent_id.clone();
-        canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(agent_id);
-        self.prepare_internal(&canonical, named_commands, false)
-    }
-
     fn prepare_submission_internal_direct(
         &self,
         manifest: &GeneralTaskManifest,

@@ -15,8 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use zcode_agent_preparation::{
-    canonical_general_repository, AccessMode, BudgetLimits, GeneralTaskManifest,
-    PreparedGeneralTask,
+    canonical_general_repository, BudgetLimits, GeneralTaskManifest, PreparedGeneralTask,
 };
 use zcode_agent_store::{
     EffectiveBudget, PendingRequestState, Store, StoreError, StoredArtifact, StoredPendingRequest,
