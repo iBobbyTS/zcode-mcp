@@ -23,6 +23,11 @@ function copyTree(source, destination, records, root = source) {
 
 export function backupData(destination, paths = productPaths()) {
   const resolved = path.resolve(destination);
+  const source = path.resolve(paths.data);
+  const relativeToSource = path.relative(source, resolved);
+  if (relativeToSource === '' || (!relativeToSource.startsWith('..') && !path.isAbsolute(relativeToSource))) {
+    throw new CliError('BACKUP_DESTINATION_IN_DATA', 'backup destination must not be inside product data');
+  }
   if (fs.existsSync(resolved)) throw new CliError('BACKUP_EXISTS', 'backup destination already exists');
   fs.mkdirSync(resolved, { recursive: false, mode: 0o700 });
   const records = [];

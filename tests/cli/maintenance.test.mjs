@@ -31,6 +31,18 @@ test('restore detects corrupted backup before replacing data', () => {
   assert.equal(fs.readFileSync(path.join(paths.data, 'state'), 'utf8'), 'current');
 });
 
+test('backup rejects a destination inside product data before creating files', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-as-subagent-nested-backup-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.writeFileSync(path.join(paths.data, 'state'), 'original');
+  const destination = path.join(paths.data, 'backup');
+
+  assert.throws(() => backupData(destination, paths), (error) => error.code === 'BACKUP_DESTINATION_IN_DATA');
+  assert.equal(fs.existsSync(destination), false);
+  assert.equal(fs.readFileSync(path.join(paths.data, 'state'), 'utf8'), 'original');
+});
+
 test('uninstall retains data, while purge is an explicit separate operation', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-as-subagent-retain-'));
   const paths = productPaths(home);
