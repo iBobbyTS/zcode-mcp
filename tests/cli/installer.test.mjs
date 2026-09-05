@@ -35,3 +35,41 @@ test('plan uses no PATH lookup and points only at fixed bundle runtime', () => {
   assert.match(rendered, /\/Applications\/ZCode\.app\/Contents\/Resources\/glm\/zcode\.cjs/);
   assert.doesNotMatch(rendered, /which|\/usr\/bin\/env|ZCODE_RUNTIME_PATH/);
 });
+
+for (const failStep of ['write-product-config', 'install-launch-agent']) {
+  test(`init rolls back every artifact on injected ${failStep} failure`, () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), `zcode-as-subagent-rollback-${failStep}-`));
+    const paths = productPaths(home);
+    fs.mkdirSync(paths.data, { recursive: true });
+    fs.writeFileSync(path.join(paths.data, 'keep.txt'), 'keep-existing-data');
+    const originalCatalog = Buffer.from('{"provider":{"zai":{"models":{}}},"model":{"main":"old"}}\n');
+    const originalProvenance = Buffer.from('prior-provenance-bytes\n');
+    const originalState = Buffer.from('{"schema_version":1,"completed":["probe-runtime"]}\n');
+    const originalConfig = Buffer.from('prior-config-bytes\n');
+    const originalLaunchAgent = Buffer.from('prior-launch-agent-bytes\n');
+    fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+    fs.writeFileSync(paths.zcodeConfig, originalCatalog);
+    fs.writeFileSync(paths.provenance, originalProvenance);
+    fs.writeFileSync(paths.state, originalState);
+    fs.writeFileSync(paths.config, originalConfig);
+    fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+    fs.writeFileSync(paths.launchAgent, originalLaunchAgent);
+
+    assert.throws(() => runInit({
+      paths,
+      skipRuntimeProbe: true,
+      skipNativeProbe: true,
+      _failStep: failStep,
+    }), new RegExp(`injected failure at ${failStep}`));
+
+    for (const [file, expected] of [
+      [paths.zcodeConfig, originalCatalog],
+      [paths.provenance, originalProvenance],
+      [paths.state, originalState],
+      [paths.config, originalConfig],
+      [paths.launchAgent, originalLaunchAgent],
+    ]) assert.deepEqual(fs.readFileSync(file), expected, file);
+    assert.equal(fs.readFileSync(path.join(paths.data, 'keep.txt'), 'utf8'), 'keep-existing-data');
+    assert.equal(fs.existsSync(paths.logs), false, 'new logs directory must be removed');
+  });
+}

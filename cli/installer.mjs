@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from './constants.mjs';
 import { CliError } from './errors.mjs';
-import { atomicWrite, jsonBytes, readOptional, restoreOptional } from './fs-atomic.mjs';
+import { atomicWrite, jsonBytes, readOptional, restoreOptional, sha256 } from './fs-atomic.mjs';
 import { patchCatalog } from './catalog.mjs';
 import { productPaths } from './paths.mjs';
 
@@ -35,6 +35,23 @@ function loadState(file) {
   try { return JSON.parse(bytes); } catch { throw new CliError('INVALID_INSTALL_STATE', 'install state is invalid JSON'); }
 }
 
+function snapshotFile(file) {
+  const bytes = readOptional(file);
+  return { bytes, sha256: bytes === null ? null : sha256(bytes) };
+}
+
+function restoreSnapshotFile(file, snapshot) {
+  if (snapshot.bytes !== null && sha256(snapshot.bytes) !== snapshot.sha256) {
+    throw new Error(`snapshot hash mismatch for ${file}`);
+  }
+  restoreOptional(file, snapshot.bytes);
+  const restored = readOptional(file);
+  if ((snapshot.bytes === null && restored !== null)
+    || (snapshot.bytes !== null && (!restored || sha256(restored) !== snapshot.sha256))) {
+    throw new Error(`rollback verification failed for ${file}`);
+  }
+}
+
 export function runInit(options = {}) {
   const paths = options.paths || productPaths();
   const plan = installPlan(paths, options);
@@ -45,12 +62,27 @@ export function runInit(options = {}) {
   if (!fs.existsSync(nativeBinary('zcode-agentd')) && !options.skipNativeProbe) {
     throw new CliError('NATIVE_BINARY_NOT_FOUND', 'npm package does not contain the macOS daemon binary');
   }
-  const prior = { config: readOptional(paths.config), launchAgent: readOptional(paths.launchAgent) };
+  const prior = {
+    files: {
+      zcodeConfig: snapshotFile(paths.zcodeConfig),
+      provenance: snapshotFile(paths.provenance),
+      state: snapshotFile(paths.state),
+      config: snapshotFile(paths.config),
+      launchAgent: snapshotFile(paths.launchAgent),
+    },
+    directories: {
+      data: fs.existsSync(paths.data),
+      logs: fs.existsSync(paths.logs),
+    },
+  };
   const state = options.resume ? loadState(paths.state) : { schema_version: 1, completed: [] };
   const completed = new Set(state.completed || []);
   const mark = (id) => {
     completed.add(id);
     atomicWrite(paths.state, jsonBytes({ schema_version: 1, completed: [...completed] }));
+  };
+  const failAt = (id) => {
+    if (options._failStep === id) throw new Error(`injected failure at ${id}`);
   };
   try {
     if (!completed.has('probe-runtime')) mark('probe-runtime');
@@ -65,15 +97,31 @@ export function runInit(options = {}) {
     }
     if (!completed.has('write-product-config')) {
       atomicWrite(paths.config, jsonBytes({ schema_version: 1, runtime: ZCODE_RUNTIME, database: paths.database, socket: paths.socket }));
+      failAt('write-product-config');
       mark('write-product-config');
     }
     if (!completed.has('install-launch-agent')) {
       atomicWrite(paths.launchAgent, plist(paths), 0o600);
+      failAt('install-launch-agent');
       mark('install-launch-agent');
     }
   } catch (error) {
-    restoreOptional(paths.config, prior.config);
-    restoreOptional(paths.launchAgent, prior.launchAgent);
+    const rollbackErrors = [];
+    for (const [name, file] of Object.entries({
+      zcodeConfig: paths.zcodeConfig,
+      provenance: paths.provenance,
+      state: paths.state,
+      config: paths.config,
+      launchAgent: paths.launchAgent,
+    })) {
+      try { restoreSnapshotFile(file, prior.files[name]); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    for (const [name, directory] of Object.entries({ data: paths.data, logs: paths.logs })) {
+      if (!prior.directories[name] && fs.existsSync(directory)) {
+        try { fs.rmSync(directory, { recursive: true, force: true }); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+      }
+    }
+    if (rollbackErrors.length > 0) error.rollbackErrors = rollbackErrors;
     throw error;
   }
   return { installed: true, resumed: Boolean(options.resume), completed: [...completed], runtime: ZCODE_RUNTIME };
