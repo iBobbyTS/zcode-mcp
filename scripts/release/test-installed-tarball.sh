@@ -13,8 +13,10 @@ HOME="$test_home" "$prefix/bin/zcode-as-subagent" init --dry-run > .agent-work/e
 HOME="$test_home" "$prefix/bin/zcode-as-subagent" init > .agent-work/evidence/npm-tarball/init.json
 
 daemon="$prefix/lib/node_modules/zcode-as-subagent/npm/native/darwin-arm64/zcode-agentd"
+facade="$prefix/lib/node_modules/zcode-as-subagent/npm/native/darwin-arm64/zcode-subagent-mcp"
 plist="$test_home/Library/LaunchAgents/com.zcode-as-subagent.daemon.plist"
 test -x "$daemon"
+test -x "$facade"
 test -f "$plist"
 grep -Fq "$daemon" "$plist"
 grep -Fq '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs' "$plist"

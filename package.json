@@ -5,7 +5,8 @@
   "type": "module",
   "license": "MIT",
   "bin": {
-    "zcode-as-subagent": "bin/zcode-as-subagent.mjs"
+    "zcode-as-subagent": "bin/zcode-as-subagent.mjs",
+    "zcode-as-subagent-mcp": "bin/zcode-as-subagent-mcp.mjs"
   },
   "files": [
     "bin/",

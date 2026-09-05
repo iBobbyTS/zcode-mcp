@@ -6,6 +6,7 @@ test -n "$package_file"
 
 tar -tzf "$package_file" > .agent-work/evidence/npm-tarball/contents.txt
 grep -qx 'package/npm/native/darwin-arm64/zcode-agentd' .agent-work/evidence/npm-tarball/contents.txt
+grep -qx 'package/npm/native/darwin-arm64/zcode-subagent-mcp' .agent-work/evidence/npm-tarball/contents.txt
 if grep -Eq '(^|/)(\.agent-work|workspace|target|node_modules|\.npm|.*\.sqlite3|.*\.log|.*credentials|.*runtime)' .agent-work/evidence/npm-tarball/contents.txt; then
   echo 'forbidden release material found' >&2
   exit 1
