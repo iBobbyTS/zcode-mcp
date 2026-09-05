@@ -350,7 +350,8 @@ pub use general::{
     validate_general_named_command, AccessMode, AttachmentInput, BudgetLimits, ChangesPatch,
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralNamedCommand,
     GeneralTaskManifest, GeneralTaskPreparer, PreparedAttachment, PreparedContext,
-    PreparedGeneralTask, PublicAttachment, GENERAL_CONTROL_SCHEMA, GENERAL_TASK_SCHEMA,
+    PreparedGeneralTask, PreparedWorkspace, PublicAttachment, GENERAL_CONTROL_SCHEMA,
+    GENERAL_TASK_SCHEMA,
 };
 
 pub use manifest::{ValidationCommand, MAX_VALIDATION_COMMAND_TIMEOUT_MS};

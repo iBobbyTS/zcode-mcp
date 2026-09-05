@@ -203,11 +203,25 @@ pub struct PreparedContext {
     pub size_bytes: u64,
 }
 
+/// Filesystem-only identity for the caller-owned workspace used by General
+/// tasks. It deliberately contains no Git reference, detached checkout, or
+/// cleanup ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedWorkspace {
+    pub path: PathBuf,
+    pub scratch_root: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedGeneralTask {
     pub schema: String,
     pub agent_id: String,
     pub repository: PathBuf,
+    /// Canonical caller-owned filesystem workspace. This is the authoritative
+    /// General execution identity; legacy worktree metadata is not consulted
+    /// on the product submission path.
+    pub workspace: PreparedWorkspace,
     pub base_sha: String,
     pub access_mode: AccessMode,
     pub prompt_path: PathBuf,
@@ -645,6 +659,10 @@ impl GeneralTaskPreparer {
                 schema: manifest.schema.clone(),
                 agent_id: manifest.agent_id.clone(),
                 repository: repository.clone(),
+                workspace: PreparedWorkspace {
+                    path: repository.clone(),
+                    scratch_root: task_root.clone(),
+                },
                 base_sha: base_sha.clone(),
                 access_mode: effective_access_mode,
                 prompt_path,
