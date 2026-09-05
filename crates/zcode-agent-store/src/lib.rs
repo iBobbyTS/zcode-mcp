@@ -287,8 +287,6 @@ pub struct NewTask {
     pub idempotency_key: String,
     pub repository: String,
     pub group_id: Option<String>,
-    #[deprecated(note = "not persisted; permission is owned by prepared launch")]
-    pub access_mode: String,
     pub workspace_path: String,
     pub runtime_hash: Option<String>,
     pub prepared_launch_json: String,
@@ -304,8 +302,6 @@ pub struct TaskRecord {
     pub idempotency_key: String,
     pub repository: String,
     pub group_id: Option<String>,
-    #[deprecated(note = "not persisted; permission is owned by prepared launch")]
-    pub access_mode: String,
     pub phase: TaskPhase,
     pub outcome: Option<TaskOutcome>,
     pub workspace_path: String,
@@ -387,8 +383,6 @@ pub struct TaskQueryScope<'a> {
 pub struct TaskPageFilter {
     pub phase: Option<TaskPhase>,
     pub outcome: Option<TaskOutcome>,
-    #[deprecated(note = "ignored; store no longer filters by access mode")]
-    pub access_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1859,7 +1853,6 @@ type TaskRow = (
     String,
     String,
     Option<String>,
-    Option<String>,
     String,
     Option<String>,
     String,
@@ -1891,7 +1884,7 @@ type TaskRow = (
 fn query_task(connection: &Connection, agent_id: &str) -> StoreResult<Option<TaskRecord>> {
     let row = connection
         .query_row(
-            "SELECT agent_id,idempotency_key,repository,group_id,NULL,phase,outcome,
+            "SELECT agent_id,idempotency_key,repository,group_id,phase,outcome,
                     workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,
                     initial_prompt,effective_budget_json,retain_partial,owner_id,owner_epoch,
                     close_requested,stop_requested,failure_code,failure_message,runtime_agent_id,
@@ -1931,7 +1924,6 @@ fn query_task(connection: &Connection, agent_id: &str) -> StoreResult<Option<Tas
                     row.get(27)?,
                     row.get(28)?,
                     row.get(29)?,
-                    row.get(30)?,
                 ))
             },
         )
@@ -1940,7 +1932,7 @@ fn query_task(connection: &Connection, agent_id: &str) -> StoreResult<Option<Tas
 }
 
 fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
-    let process_identity = match (row.23, row.24, row.25, row.26) {
+    let process_identity = match (row.22, row.23, row.24, row.25) {
         (Some(pid), Some(process_group_id), Some(uid), Some(start_token)) => {
             Some(StoredProcessIdentity {
                 pid: u32::try_from(pid)
@@ -1965,31 +1957,30 @@ fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
         idempotency_key: row.1,
         repository: row.2,
         group_id: row.3,
-        access_mode: String::new(),
-        phase: TaskPhase::parse(&row.5)?,
-        outcome: row.6.map(|value| TaskOutcome::parse(&value)).transpose()?,
-        workspace_path: row.7,
-        runtime_hash: row.8,
-        prepared_launch_json: row.9,
-        prepared_launch_sha256: row.10,
-        initial_prompt: row.11.expect("initial prompt column is non-null"),
-        effective_budget: serde_json::from_str(&row.12)
+        phase: TaskPhase::parse(&row.4)?,
+        outcome: row.5.map(|value| TaskOutcome::parse(&value)).transpose()?,
+        workspace_path: row.6,
+        runtime_hash: row.7,
+        prepared_launch_json: row.8,
+        prepared_launch_sha256: row.9,
+        initial_prompt: row.10.expect("initial prompt column is non-null"),
+        effective_budget: serde_json::from_str(&row.11)
             .map_err(|error| StoreError::InvalidState(error.to_string()))?,
-        retain_partial: row.13 != 0,
-        owner_id: row.14,
-        owner_epoch: i64_to_u64(row.15)?,
-        close_requested: row.16 != 0,
-        stop_requested: row.17 != 0,
-        failure_code: row.18,
-        failure_message: row.19,
-        runtime_agent_id: row.20,
-        zcode_session_id: row.21,
-        turn_state: TurnState::parse(&row.22)?,
+        retain_partial: row.12 != 0,
+        owner_id: row.13,
+        owner_epoch: i64_to_u64(row.14)?,
+        close_requested: row.15 != 0,
+        stop_requested: row.16 != 0,
+        failure_code: row.17,
+        failure_message: row.18,
+        runtime_agent_id: row.19,
+        zcode_session_id: row.20,
+        turn_state: TurnState::parse(&row.21)?,
         process_identity,
-        closed_at: row.27,
-        reaped_at: row.28,
-        created_at: row.29,
-        last_event_seq: i64_to_u64(row.30)?,
+        closed_at: row.26,
+        reaped_at: row.27,
+        created_at: row.28,
+        last_event_seq: i64_to_u64(row.29)?,
     })
 }
 
@@ -2326,7 +2317,6 @@ mod tests {
             idempotency_key: format!("key-{id}"),
             repository: repository.into(),
             group_id: group_id.map(str::to_owned),
-            access_mode: "read_only".into(),
             workspace_path: format!("/workspace/{id}"),
             runtime_hash: Some("runtime".into()),
             prepared_launch_json: "{}".into(),
@@ -2538,7 +2528,6 @@ mod tests {
                 TaskPageFilter {
                     phase: None,
                     outcome: None,
-                    access_mode: None,
                 },
                 None,
                 1,
