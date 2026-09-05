@@ -1122,12 +1122,23 @@ impl GeneralFinalizer {
         prepared
             .validate_finalization_content()
             .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
-        let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
+        // Direct submissions are filesystem-only. They never enter the
+        // detached-worktree integrity or Git patch/commit path.
         if prepared.direct_workspace {
+            ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
             validate_direct_workspace_identity(prepared)?;
-        } else {
-            prefinalization_integrity(prepared, &manager)?;
+            return Ok(GeneralCompletion {
+                outcome: requested,
+                reason_code: None,
+                summary,
+                checks,
+                residual_gaps,
+                changes_patch: None,
+                cleaned: false,
+            });
         }
+        let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
+        prefinalization_integrity(prepared, &manager)?;
         ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
         let mut changes_patch = None;
         match prepared.access_mode {
