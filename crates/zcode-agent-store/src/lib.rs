@@ -634,10 +634,10 @@ impl Store {
         {
             if let Some(active_agent_id) = transaction
                 .query_row(
-                    "SELECT agent_id FROM tasks WHERE repository=?1
+                    "SELECT agent_id FROM tasks WHERE workspace_path=?1 AND repository=?2
                  AND phase IN ('QUEUED','PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
                  ORDER BY created_at, rowid LIMIT 1",
-                    [&task.repository],
+                    params![task.workspace_path, task.repository],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -2468,7 +2468,14 @@ mod tests {
             workers.push(std::thread::spawn(move || {
                 let store = Store::open(path).unwrap();
                 barrier.wait();
-                store.enqueue_task_authoritative(&task(id, "/same-workspace", None))
+                // Canonical direct-workspace submissions use the repository itself as
+                // their workspace and explicitly opt into the direct launch path.  Both
+                // contenders therefore exercise the atomic workspace guard (including
+                // the QUEUED phase) rather than the generic per-agent path.
+                let mut submission = task(id, "/same-workspace", None);
+                submission.workspace_path = submission.repository.clone();
+                submission.prepared_launch_json = r#"{"direct_workspace":true}"#.into();
+                store.enqueue_task_authoritative(&submission)
             }));
         }
         barrier.wait();
