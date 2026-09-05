@@ -6,29 +6,29 @@ required = true
 startup_timeout_sec = 10
 tool_timeout_sec = 10
 enabled_tools = [
-  "zcode_agent_cancel",
-  "zcode_agent_close",
-  "zcode_agent_list",
-  "zcode_agent_poll",
-  "zcode_agent_respond",
-  "zcode_agent_result",
-  "zcode_agent_send",
-  "zcode_agent_spawn",
-  "zcode_system_status",
+  "zcode_subagent_cancel",
+  "zcode_subagent_close",
+  "zcode_subagent_list",
+  "zcode_subagent_poll",
+  "zcode_subagent_respond",
+  "zcode_subagent_result",
+  "zcode_subagent_send",
+  "zcode_subagent_spawn",
+  "zcode_subagent_system_status",
 ]
 default_tools_approval_mode = "prompt"
 
 [mcp_servers.zcode_subagent.env]
 ZCODE_AGENTD_SOCKET = "/absolute/private/zcode-agentd.sock"
 
-[mcp_servers.zcode_subagent.tools.zcode_system_status]
+[mcp_servers.zcode_subagent.tools.zcode_subagent_system_status]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent.tools.zcode_agent_list]
+[mcp_servers.zcode_subagent.tools.zcode_subagent_list]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent.tools.zcode_agent_poll]
+[mcp_servers.zcode_subagent.tools.zcode_subagent_poll]
 approval_mode = "auto"
 
-[mcp_servers.zcode_subagent.tools.zcode_agent_result]
+[mcp_servers.zcode_subagent.tools.zcode_subagent_result]
 approval_mode = "auto"
