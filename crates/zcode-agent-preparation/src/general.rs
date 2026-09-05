@@ -29,6 +29,38 @@ pub enum AccessMode {
     WorkspaceWrite,
 }
 
+impl Default for AccessMode {
+    fn default() -> Self {
+        Self::WorkspaceWrite
+    }
+}
+
+/// Public native permission modes exposed by the product facade.  The
+/// legacy AccessMode remains an internal policy detail for persisted records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Build,
+    Edit,
+    Plan,
+    Yolo,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        Self::Build
+    }
+}
+
+impl PermissionMode {
+    pub fn access_mode(self) -> AccessMode {
+        match self {
+            Self::Plan => AccessMode::ReadOnly,
+            Self::Build | Self::Edit | Self::Yolo => AccessMode::WorkspaceWrite,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetLimits {
@@ -104,8 +136,15 @@ pub struct GeneralTaskManifest {
     pub schema: String,
     pub agent_id: String,
     pub repository: PathBuf,
+    /// Internal compatibility fields are never accepted from public JSON.
+    /// Callers select the public `permission_mode`; repository HEAD is pinned
+    /// automatically when `base_ref` is empty.
+    #[serde(skip_serializing, default, deserialize_with = "reject_legacy_field")]
     pub base_ref: String,
+    #[serde(skip_serializing, default, deserialize_with = "reject_legacy_field")]
     pub access_mode: AccessMode,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     pub prompt: String,
     #[serde(default)]
     pub repo_context: Vec<PathBuf>,
@@ -174,6 +213,10 @@ pub struct PreparedGeneralTask {
     pub context: Vec<PreparedContext>,
     pub attachments: Vec<PreparedAttachment>,
     pub write_manifest: Vec<PathBuf>,
+    /// True when execution is bound to the caller's canonical workspace.
+    /// Such a workspace is never owned or removed by task cleanup.
+    #[serde(default)]
+    pub direct_workspace: bool,
     pub worktree: PreparedWorktree,
     pub scratch_root: PathBuf,
     pub artifact_root: PathBuf,
@@ -355,13 +398,14 @@ impl GeneralTaskPreparer {
         &self,
         manifest: &GeneralTaskManifest,
     ) -> PreparationResult<PreparedGeneralTask> {
-        self.prepare_internal(manifest, None)
+        self.prepare_internal(manifest, None, false)
     }
 
     fn prepare_internal(
         &self,
         manifest: &GeneralTaskManifest,
         named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
+        direct_workspace: bool,
     ) -> PreparationResult<PreparedGeneralTask> {
         let mut resolved_manifest;
         let manifest = if let Some(named_commands) = named_commands {
@@ -383,12 +427,29 @@ impl GeneralTaskPreparer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_manifest(manifest)?;
-        let repository = canonical_repository(&manifest.repository)?;
-        let base_sha = resolve_commit(&repository, &manifest.base_ref)?;
+        // `access_mode` is retained only as an internal persisted detail.
+        // Public permission_mode is the sole authority for execution policy.
+        let effective_access_mode = if direct_workspace {
+            manifest.permission_mode.access_mode()
+        } else {
+            manifest.access_mode
+        };
+        let repository = if direct_workspace {
+            canonical_general_repository(&manifest.repository)?
+        } else {
+            canonical_repository(&manifest.repository)?
+        };
+        let base_sha = if direct_workspace {
+            String::new()
+        } else if manifest.base_ref.trim().is_empty() {
+            resolve_commit(&repository, "HEAD")?
+        } else {
+            resolve_commit(&repository, &manifest.base_ref)?
+        };
         let effective_budget = manifest
             .budget
             .clone()
-            .unwrap_or_else(|| manifest.access_mode.default_budget());
+            .unwrap_or_else(|| effective_access_mode.default_budget());
         validate_budget(&effective_budget)?;
         let context_paths = manifest
             .repo_context
@@ -400,12 +461,12 @@ impl GeneralTaskPreparer {
             .iter()
             .map(|p| confined_relative(p))
             .collect::<PreparationResult<Vec<_>>>()?;
-        if manifest.access_mode == AccessMode::WorkspaceWrite && write_manifest.is_empty() {
+        if effective_access_mode == AccessMode::WorkspaceWrite && write_manifest.is_empty() {
             return Err(PreparationError::InvalidManifest(
                 "workspace_write requires write_manifest".into(),
             ));
         }
-        if manifest.access_mode != AccessMode::WorkspaceWrite && !write_manifest.is_empty() {
+        if effective_access_mode != AccessMode::WorkspaceWrite && !write_manifest.is_empty() {
             return Err(PreparationError::InvalidManifest(
                 "write_manifest is implementation-only".into(),
             ));
@@ -445,7 +506,18 @@ impl GeneralTaskPreparer {
                 .map_err(PreparationError::from);
             let manager = WorktreeManager::new(repository.clone(), task_root.clone())?;
             let reusable = existing.and_then(|existing| {
-                validate_reusable_prepared_owner(&existing, &repository, &base_sha, &manager)?;
+                if existing.direct_workspace != direct_workspace {
+                    return Err(PreparationError::IdempotencyConflict(
+                        "key already owns a different workspace binding".into(),
+                    ));
+                }
+                validate_reusable_prepared_owner(
+                    &existing,
+                    &repository,
+                    &base_sha,
+                    &manager,
+                    direct_workspace,
+                )?;
                 if existing.idempotency_key != manifest.idempotency_key {
                     return Err(PreparationError::IdempotencyConflict(
                         "key already owns a different immutable general task".into(),
@@ -458,7 +530,7 @@ impl GeneralTaskPreparer {
                     &existing.scratch_root,
                 )?;
                 let expected_control = control_contract_from_prepared_commands(
-                    manifest.access_mode,
+                    effective_access_mode,
                     hash(manifest.prompt.as_bytes()),
                     manifest.prompt.len() as u64,
                     normalized_paths(&context_paths),
@@ -503,7 +575,11 @@ impl GeneralTaskPreparer {
         }
         let manager = WorktreeManager::new(repository.clone(), task_root.clone())?;
         let expected_worktree_path = task_root.join("worktrees").join(&key);
-        let worktree = match manager.create(&base_sha, &key) {
+        let worktree = match if direct_workspace {
+            manager.bind_direct()
+        } else {
+            manager.create(&base_sha, &key)
+        } {
             Ok(worktree) => worktree,
             Err(error) => {
                 let cleanup =
@@ -521,7 +597,7 @@ impl GeneralTaskPreparer {
             let validation_commands =
                 prepare_general_commands(manifest, named_commands, &worktree.path, &scratch_root)?;
             let control_contract = control_contract_from_prepared_commands(
-                manifest.access_mode,
+                effective_access_mode,
                 hash(manifest.prompt.as_bytes()),
                 manifest.prompt.len() as u64,
                 normalized_paths(&context_paths),
@@ -565,12 +641,13 @@ impl GeneralTaskPreparer {
                 agent_id: manifest.agent_id.clone(),
                 repository: repository.clone(),
                 base_sha: base_sha.clone(),
-                access_mode: manifest.access_mode,
+                access_mode: effective_access_mode,
                 prompt_path,
                 prompt_sha256: hash(manifest.prompt.as_bytes()),
                 context,
                 attachments,
                 write_manifest,
+                direct_workspace,
                 worktree: worktree.clone(),
                 scratch_root,
                 artifact_root,
@@ -592,7 +669,11 @@ impl GeneralTaskPreparer {
         match built {
             Ok(prepared) => Ok(prepared),
             Err(error) => {
-                let cleanup = bounded_cleanup_worktree(&manager, &worktree, &task_root);
+                let cleanup = if direct_workspace {
+                    cleanup_task_root_path(&task_root)
+                } else {
+                    bounded_cleanup_worktree(&manager, &worktree, &task_root)
+                };
                 if let Err(cleanup) = cleanup {
                     return Err(PreparationError::Worktree(format!(
                         "general preparation failed ({error}); cleanup failed ({cleanup})"
@@ -610,12 +691,30 @@ impl GeneralTaskPreparer {
         self.prepare_submission_internal(manifest, None)
     }
 
+    /// Prepare a public submission against the canonical repository workspace.
+    /// This is the product path; the legacy `prepare_submission` API retains
+    /// detached-worktree behavior for compatibility with existing callers.
+    pub fn prepare_direct_submission(
+        &self,
+        manifest: &GeneralTaskManifest,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        self.prepare_submission_internal_direct(manifest, None)
+    }
+
     pub fn prepare_named_submission(
         &self,
         manifest: &GeneralTaskManifest,
         named_commands: &BTreeMap<String, GeneralNamedCommand>,
     ) -> PreparationResult<PreparedGeneralTask> {
         self.prepare_submission_internal(manifest, Some(named_commands))
+    }
+
+    pub fn prepare_named_direct_submission(
+        &self,
+        manifest: &GeneralTaskManifest,
+        named_commands: &BTreeMap<String, GeneralNamedCommand>,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        self.prepare_submission_internal_direct(manifest, Some(named_commands))
     }
 
     fn prepare_submission_internal(
@@ -635,7 +734,27 @@ impl GeneralTaskPreparer {
         canonical.repository = repository;
         canonical.agent_id = agent_id.clone();
         canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(agent_id);
-        self.prepare_internal(&canonical, named_commands)
+        self.prepare_internal(&canonical, named_commands, false)
+    }
+
+    fn prepare_submission_internal_direct(
+        &self,
+        manifest: &GeneralTaskManifest,
+        named_commands: Option<&BTreeMap<String, GeneralNamedCommand>>,
+    ) -> PreparationResult<PreparedGeneralTask> {
+        let repository = canonical_general_repository(&manifest.repository)?;
+        let agent_id = format!(
+            "ztask-{}",
+            hash(&serde_json::to_vec(&(
+                repository.as_path(),
+                manifest.idempotency_key.as_str()
+            ))?)
+        );
+        let mut canonical = manifest.clone();
+        canonical.repository = repository;
+        canonical.agent_id = agent_id.clone();
+        canonical.artifact_root = PathBuf::from(".agent-work/artifacts").join(agent_id);
+        self.prepare_internal(&canonical, named_commands, true)
     }
 }
 
@@ -970,28 +1089,35 @@ impl GeneralFinalizer {
             .validate_finalization_content()
             .map_err(|_| "PREPARED_CONTENT_INVALID".to_owned())?;
         let manager = manager(prepared).map_err(|_| "WORKTREE_IDENTITY_INVALID".to_owned())?;
-        prefinalization_integrity(prepared, &manager)?;
+        if prepared.direct_workspace {
+            validate_direct_workspace_identity(prepared)?;
+        } else {
+            prefinalization_integrity(prepared, &manager)?;
+        }
         ensure_directory_empty(&prepared.artifact_root, "ARTIFACT_ROOT_NOT_EMPTY")?;
         let mut changes_patch = None;
         match prepared.access_mode {
             AccessMode::ReadOnly => {
-                let d = manager
-                    .capture_integrity(&prepared.worktree)
-                    .map_err(|_| "WORKTREE_INTEGRITY_FAILED".to_owned())?;
-                if !d.worktree_clean {
-                    return Err("READ_ONLY_MODIFIED_TRACKED_STATE".into());
+                if !prepared.direct_workspace {
+                    let d = manager
+                        .capture_integrity(&prepared.worktree)
+                        .map_err(|_| "WORKTREE_INTEGRITY_FAILED".to_owned())?;
+                    if !d.worktree_clean {
+                        return Err("READ_ONLY_MODIFIED_TRACKED_STATE".into());
+                    }
                 }
             }
             AccessMode::WorkspaceWrite => {
-                let retain = requested == CompletionOutcome::Completed
-                    || (prepared.retain_partial
-                        && matches!(
-                            requested,
-                            CompletionOutcome::Failed
-                                | CompletionOutcome::Cancelled
-                                | CompletionOutcome::TimedOut
-                                | CompletionOutcome::BudgetExhausted
-                        ));
+                let retain = !prepared.direct_workspace
+                    && (requested == CompletionOutcome::Completed
+                        || (prepared.retain_partial
+                            && matches!(
+                                requested,
+                                CompletionOutcome::Failed
+                                    | CompletionOutcome::Cancelled
+                                    | CompletionOutcome::TimedOut
+                                    | CompletionOutcome::BudgetExhausted
+                            )));
                 if retain {
                     changes_patch = finalize_patch(prepared)?;
                 }
@@ -1003,11 +1129,13 @@ impl GeneralFinalizer {
                 cleanup_worktree.head_sha = head.clone();
             }
         }
-        let diagnostics = manager
-            .capture_integrity(&cleanup_worktree)
-            .map_err(|_| "WORKTREE_INTEGRITY_FAILED".to_owned())?;
-        if !diagnostics.source_integrity_preserved() {
-            return Err("SOURCE_INTEGRITY_FAILED".into());
+        if !prepared.direct_workspace {
+            let diagnostics = manager
+                .capture_integrity(&cleanup_worktree)
+                .map_err(|_| "WORKTREE_INTEGRITY_FAILED".to_owned())?;
+            if !diagnostics.source_integrity_preserved() {
+                return Err("SOURCE_INTEGRITY_FAILED".into());
+            }
         }
         Ok(GeneralCompletion {
             outcome: requested,
@@ -1019,6 +1147,22 @@ impl GeneralFinalizer {
             cleaned: false,
         })
     }
+}
+
+fn validate_direct_workspace_identity(prepared: &PreparedGeneralTask) -> Result<(), String> {
+    let repository = fs::canonicalize(&prepared.repository)
+        .map_err(|_| "WORKSPACE_IDENTITY_INVALID".to_owned())?;
+    let workspace = fs::canonicalize(&prepared.worktree.path)
+        .map_err(|_| "WORKSPACE_IDENTITY_INVALID".to_owned())?;
+    if repository != prepared.repository
+        || workspace != repository
+        || prepared.worktree.repository != repository
+        || !prepared.base_sha.is_empty()
+        || !prepared.worktree.head_sha.is_empty()
+    {
+        return Err("WORKSPACE_IDENTITY_INVALID".into());
+    }
+    Ok(())
 }
 
 fn cleanup_failed_artifact_outputs(prepared: &PreparedGeneralTask) {
@@ -1036,12 +1180,19 @@ fn prefinalization_integrity(
     let diagnostics = manager
         .capture_integrity(&prepared.worktree)
         .map_err(|_| "PREFINALIZATION_HEAD_INVALID".to_owned())?;
-    if !diagnostics.source_integrity_preserved()
-        || !diagnostics.detached_head_unchanged
-        || diagnostics.observed_head.as_deref() != Some(prepared.base_sha.as_str())
-        || prepared.worktree.head_sha != prepared.base_sha
-        || !diagnostics.staged_diff.is_empty()
-    {
+    let invalid = if prepared.direct_workspace {
+        !diagnostics.refs_unchanged
+            || diagnostics.observed_head.as_deref() != Some(prepared.base_sha.as_str())
+            || prepared.worktree.head_sha != prepared.base_sha
+            || !diagnostics.staged_diff.is_empty()
+    } else {
+        !diagnostics.source_integrity_preserved()
+            || !diagnostics.detached_head_unchanged
+            || diagnostics.observed_head.as_deref() != Some(prepared.base_sha.as_str())
+            || prepared.worktree.head_sha != prepared.base_sha
+            || !diagnostics.staged_diff.is_empty()
+    };
+    if invalid {
         return Err("PREFINALIZATION_HEAD_INVALID".into());
     }
     Ok(())
@@ -1350,6 +1501,15 @@ where
     BudgetLimits::deserialize(deserializer).map(Some)
 }
 
+fn reject_legacy_field<'de, D, T>(_deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "legacy public field is not supported",
+    ))
+}
+
 fn ensure_unique_paths(paths: &[PathBuf], name: &str) -> PreparationResult<()> {
     let mut seen = std::collections::HashSet::new();
     if paths.iter().any(|path| !seen.insert(path)) {
@@ -1394,17 +1554,24 @@ pub fn canonical_general_repository(path: &Path) -> PreparationResult<PathBuf> {
         });
     }
     let p = fs::canonicalize(path)?;
-    if !p.join(".git").exists() {
+    if !p.is_dir() {
         return Err(PreparationError::InvalidPath {
             path: p,
-            reason: "repository is not a Git worktree".into(),
+            reason: "workspace is not a directory".into(),
         });
     }
     Ok(p)
 }
 
 fn canonical_repository(path: &Path) -> PreparationResult<PathBuf> {
-    canonical_general_repository(path)
+    let repository = canonical_general_repository(path)?;
+    if !repository.join(".git").exists() {
+        return Err(PreparationError::InvalidPath {
+            path: repository,
+            reason: "repository is not a Git worktree".into(),
+        });
+    }
+    Ok(repository)
 }
 fn resolve_commit(repo: &Path, r: &str) -> PreparationResult<String> {
     if r.len() != 40 || !r.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1718,6 +1885,14 @@ fn manager(p: &PreparedGeneralTask) -> PreparationResult<WorktreeManager> {
     WorktreeManager::new(p.repository.clone(), root.into())
 }
 fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
+    if prepared.direct_workspace {
+        // The canonical repository is caller-owned. Never invoke worktree
+        // removal or registration cleanup for a direct binding.
+        let Some(task_root) = prepared.worktree.scratch_worktrees_root.parent() else {
+            return false;
+        };
+        return cleanup_direct_task_root_path(task_root).is_ok();
+    }
     let Ok(manager) = manager(prepared) else {
         return false;
     };
@@ -1771,6 +1946,27 @@ fn cleanup_after_failure(prepared: &PreparedGeneralTask) -> bool {
     cleanup_task_root_path(task_root).is_ok()
 }
 
+fn cleanup_direct_task_root_path(task_root: &Path) -> PreparationResult<()> {
+    if !task_root.exists() {
+        return Ok(());
+    }
+    let root = fs::canonicalize(task_root)?;
+    let scratch = root
+        .ancestors()
+        .find(|candidate| candidate.file_name().is_some_and(|name| name == "scratch"))
+        .ok_or_else(|| {
+            PreparationError::Worktree("direct task root has no scratch ancestor".into())
+        })?;
+    if root == scratch || !root.starts_with(scratch) {
+        return Err(PreparationError::PathEscape {
+            path: root.clone(),
+            root: scratch.to_path_buf(),
+        });
+    }
+    fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
 fn bounded_cleanup_worktree(
     manager: &WorktreeManager,
     worktree: &PreparedWorktree,
@@ -1815,12 +2011,25 @@ fn validate_reusable_prepared_owner(
     repository: &Path,
     base_sha: &str,
     manager: &WorktreeManager,
+    direct_workspace: bool,
 ) -> PreparationResult<()> {
     prepared.validate_digest()?;
     if prepared.repository != repository || prepared.base_sha != base_sha {
         return Err(PreparationError::IdempotencyConflict(
             "key already owns a different immutable general task".into(),
         ));
+    }
+    if direct_workspace {
+        if !prepared.direct_workspace
+            || prepared.worktree.path != repository
+            || fs::canonicalize(&prepared.worktree.path)? != repository
+        {
+            return Err(PreparationError::Worktree(
+                "prepared record is not bound to the canonical workspace".into(),
+            ));
+        }
+        prepared.validate_prepared_content()?;
+        return Ok(());
     }
     let diagnostics = manager.capture_integrity(&prepared.worktree)?;
     if diagnostics.has_policy_violation()
@@ -1944,7 +2153,52 @@ fn parse_status_paths(bytes: &[u8]) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::raw_diff_has_gitlink;
+    use super::{raw_diff_has_gitlink, GeneralTaskManifest, PermissionMode};
+
+    fn public_manifest_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": "zcode-general-task/v1",
+            "agent_id": "public-contract",
+            "repository": ".",
+            "prompt": "build it",
+            "scratch_root": ".agent-work/scratch/general",
+            "artifact_root": ".agent-work/artifacts/public-contract",
+            "idempotency_key": "public-contract"
+        })
+    }
+
+    #[test]
+    fn public_manifest_defaults_permission_to_build_and_rejects_legacy_fields() {
+        let manifest: GeneralTaskManifest =
+            serde_json::from_value(public_manifest_json()).expect("public manifest parses");
+        assert_eq!(manifest.permission_mode, PermissionMode::Build);
+
+        for (field, value) in [
+            ("access_mode", serde_json::json!("read_only")),
+            ("base_ref", serde_json::json!("main")),
+            ("read_only", serde_json::json!(true)),
+            ("workspace_write", serde_json::json!(true)),
+        ] {
+            let mut json = public_manifest_json();
+            json[field] = value;
+            assert!(
+                serde_json::from_value::<GeneralTaskManifest>(json).is_err(),
+                "legacy field {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn public_manifest_accepts_only_closed_permission_mode_set() {
+        for mode in ["build", "edit", "plan", "yolo"] {
+            let mut json = public_manifest_json();
+            json["permission_mode"] = serde_json::json!(mode);
+            assert!(serde_json::from_value::<GeneralTaskManifest>(json).is_ok());
+        }
+        let mut json = public_manifest_json();
+        json["permission_mode"] = serde_json::json!("workspace_write");
+        assert!(serde_json::from_value::<GeneralTaskManifest>(json).is_err());
+    }
 
     #[test]
     fn raw_diff_parser_ignores_mode_digits_outside_exact_mode_fields() {

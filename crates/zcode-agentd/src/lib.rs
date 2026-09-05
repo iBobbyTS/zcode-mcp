@@ -2241,6 +2241,9 @@ impl GeneralCommandCatalog {
         access_mode: AccessMode,
         command_ids: &[String],
     ) -> Result<BTreeMap<String, GeneralNamedCommand>, SchedulerError> {
+        if command_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let repository = canonical_general_repository(repository)
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         let mut seen = HashSet::new();
@@ -2296,6 +2299,8 @@ fn general_initial_prompt(prepared: &PreparedGeneralTask) -> Result<String, Sche
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
+    /// Deprecated compatibility knob. Agent admission is intentionally not
+    /// process-wide limited; only the per-canonical-workspace guard applies.
     pub global_max_agents: usize,
     pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
@@ -2322,7 +2327,7 @@ impl MonotonicClock for ProcessMonotonicClock {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            global_max_agents: 2,
+            global_max_agents: usize::MAX,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(2),
@@ -3534,8 +3539,7 @@ impl Scheduler {
         factory: Arc<dyn RuntimeFactory>,
         config: SchedulerConfig,
     ) -> Result<Self, SchedulerError> {
-        if config.global_max_agents == 0
-            || config.per_workspace_max_agents == 0
+        if config.per_workspace_max_agents == 0
             || config.bootstrap_timeout.is_zero()
             || config.control_timeout.is_zero()
             || config.transport_idle_timeout.is_zero()
@@ -3642,6 +3646,17 @@ impl Scheduler {
         allowed_command_ids: &[String],
         required_command_ids: &[String],
     ) -> Result<SubmittedTask, SchedulerError> {
+        // In-process legacy callers may still construct manifests with only
+        // access_mode; public JSON cannot set that field. Normalize that
+        // compatibility shape before applying the public permission policy.
+        let mut manifest_owned = manifest.clone();
+        if manifest_owned.permission_mode == zcode_agent_preparation::PermissionMode::Plan
+            && manifest_owned.access_mode == AccessMode::WorkspaceWrite
+            && !manifest_owned.write_manifest.is_empty()
+        {
+            manifest_owned.permission_mode = zcode_agent_preparation::PermissionMode::Build;
+        }
+        let manifest = &manifest_owned;
         if manifest
             .budget
             .as_ref()
@@ -3669,11 +3684,13 @@ impl Scheduler {
         }
         let named_commands = self.inner.general_commands.resolve(
             &manifest.repository,
-            manifest.access_mode,
+            manifest.permission_mode.access_mode(),
             &command_ids,
         )?;
         let mut prepared = GeneralTaskPreparer::new(attachment_roots)
-            .and_then(|preparer| preparer.prepare_named_submission(manifest, &named_commands))
+            .and_then(|preparer| {
+                preparer.prepare_named_direct_submission(manifest, &named_commands)
+            })
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         let prepared_json = bind_general_daemon_contract(&mut prepared, required_command_ids)
             .map_err(SchedulerError::InvalidConfig)?;
@@ -3821,7 +3838,7 @@ impl Scheduler {
         loop {
             let claim = self.inner.store.claim_next(
                 &self.inner.owner_id,
-                self.inner.config.global_max_agents,
+                usize::MAX,
                 self.inner.config.per_workspace_max_agents,
             )?;
             let Some(claim) = claim else {
@@ -7635,6 +7652,7 @@ exit 7
             repository: std::fs::canonicalize(repository).unwrap(),
             base_ref: String::from_utf8(head.stdout).unwrap().trim().into(),
             access_mode: AccessMode::ReadOnly,
+            permission_mode: zcode_agent_preparation::PermissionMode::Plan,
             prompt: "Produce a bounded analysis result.".into(),
             repo_context: vec!["README.md".into()],
             attachments: Vec::new(),
@@ -8276,6 +8294,12 @@ exit 7
             .result
             .residual_gaps
             .contains(&"RESULT_RESPONSE_FRAME_EXCEEDED".into()));
+        if prepared.direct_workspace {
+            assert!(stored.result.artifacts.is_empty());
+            assert!(prepared.repository.exists());
+            assert_general_workspace_cleaned(&prepared);
+            return;
+        }
         assert_eq!(stored.result.artifacts.len(), 1);
         assert_eq!(stored.result.changed_files, ["src/lib.rs"]);
 
@@ -8385,9 +8409,16 @@ exit 7
             } => (task, result, artifacts),
             other => panic!("unexpected intermediate task result response: {other:?}"),
         };
+        if prepared.direct_workspace {
+            assert!(intermediate_artifacts.is_empty());
+            release.wait();
+            finisher.join().unwrap();
+            assert_general_workspace_cleaned(&prepared);
+            return;
+        }
         let intermediate_artifact_id = intermediate_artifacts
             .first()
-            .expect("workspace-write result must publish a patch artifact")
+            .expect("legacy workspace-write result must publish a patch artifact")
             .artifact_id
             .clone();
         let intermediate_chunk = match service
@@ -8665,7 +8696,12 @@ exit 7
     }
 
     fn assert_general_workspace_cleaned(prepared: &PreparedGeneralTask) {
-        assert!(!prepared.worktree.path.exists());
+        if prepared.direct_workspace {
+            assert!(prepared.worktree.path.exists());
+            assert!(prepared.repository.exists());
+        } else {
+            assert!(!prepared.worktree.path.exists());
+        }
         let job_root = prepared
             .worktree
             .scratch_worktrees_root
@@ -8678,8 +8714,10 @@ exit 7
             .output()
             .unwrap();
         assert!(listed.status.success());
-        assert!(!String::from_utf8_lossy(&listed.stdout)
-            .contains(prepared.worktree.path.to_string_lossy().as_ref()));
+        if !prepared.direct_workspace {
+            assert!(!String::from_utf8_lossy(&listed.stdout)
+                .contains(prepared.worktree.path.to_string_lossy().as_ref()));
+        }
     }
 
     #[test]

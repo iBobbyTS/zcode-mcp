@@ -663,6 +663,7 @@ impl RpcService {
                 status: self.system_status(),
             }),
             RpcMethod::SubmitGeneral { input } => {
+                let manifest = input.manifest;
                 if let Some(group_id) = input.group_id.as_deref() {
                     validate_text(group_id, "group_id", 256)?;
                 }
@@ -671,7 +672,7 @@ impl RpcService {
                 let submitted = self
                     .scheduler
                     .enqueue_general_with_commands(
-                        &input.manifest,
+                        &manifest,
                         input.group_id.as_deref(),
                         &input.allowed_command_ids,
                         &input.required_command_ids,
@@ -1466,6 +1467,9 @@ fn map_store(error: StoreError) -> RpcError {
         }
         StoreError::Sqlite(_) => {
             RpcError::new(RpcErrorCode::Persistence, "durable store operation failed")
+        }
+        StoreError::Conflict(message) if message.starts_with("WORKSPACE_BUSY") => {
+            RpcError::new(RpcErrorCode::Conflict, message)
         }
         StoreError::Conflict(_) => RpcError::new(RpcErrorCode::Conflict, "durable state conflict"),
         StoreError::InvalidState(_) => RpcError::new(

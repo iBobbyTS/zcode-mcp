@@ -294,6 +294,11 @@ impl Fixture {
             repository: self.repository.clone(),
             base_ref: self.head.clone(),
             access_mode,
+            permission_mode: if access_mode == AccessMode::ReadOnly {
+                zcode_agent_preparation::PermissionMode::Plan
+            } else {
+                zcode_agent_preparation::PermissionMode::Build
+            },
             prompt: "Inspect and produce the bounded result.".into(),
             repo_context: vec!["README.md".into()],
             attachments: vec![AttachmentInput {
@@ -348,6 +353,70 @@ fn preparation_snapshots_immutable_context_and_uses_access_mode_defaults() {
         b"owner context\n"
     );
     prepared.validate_digest().unwrap();
+}
+
+#[test]
+fn direct_submission_binds_canonical_workspace_and_cleanup_preserves_source() {
+    let f = Fixture::new();
+    let manifest = f.manifest(AccessMode::ReadOnly);
+    let prepared = f.preparer().prepare_direct_submission(&manifest).unwrap();
+    assert!(prepared.direct_workspace);
+    assert_eq!(prepared.worktree.path, f.repository);
+    let worktrees = prepared.worktree.scratch_worktrees_root.clone();
+    assert!(
+        !worktrees.join(&prepared.idempotency_key).exists(),
+        "direct preparation must not create a scratch worktree"
+    );
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Cancelled);
+    assert!(completion.cleaned);
+    assert!(f.repository.exists());
+    assert!(f.repository.join("README.md").exists());
+}
+
+#[test]
+fn direct_submission_supports_non_git_workspace_without_git_identity() {
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("README.md"), "plain workspace\n").unwrap();
+    let manifest = GeneralTaskManifest {
+        schema: GENERAL_TASK_SCHEMA.into(),
+        agent_id: "ignored".into(),
+        repository: fs::canonicalize(workspace.path()).unwrap(),
+        base_ref: "not-a-git-ref".into(),
+        access_mode: AccessMode::WorkspaceWrite,
+        permission_mode: zcode_agent_preparation::PermissionMode::Plan,
+        prompt: "inspect this directory".into(),
+        repo_context: vec!["README.md".into()],
+        attachments: Vec::new(),
+        write_manifest: Vec::new(),
+        scratch_root: ".agent-work/scratch/ignored".into(),
+        artifact_root: ".agent-work/artifacts/ignored".into(),
+        budget: None,
+        validation_commands: Default::default(),
+        retain_partial: false,
+        idempotency_key: "plain-directory".into(),
+    };
+    let prepared = GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest)
+        .unwrap();
+    assert_eq!(prepared.access_mode, AccessMode::ReadOnly);
+    assert!(prepared.base_sha.is_empty());
+    assert!(prepared.worktree.head_sha.is_empty());
+    assert!(!prepared.repository.join(".git").exists());
+
+    let completion = GeneralFinalizer::finalize(&prepared, CompletionOutcome::Cancelled);
+    assert_eq!(
+        completion.outcome,
+        CompletionOutcome::Cancelled,
+        "{:?}",
+        completion.reason_code
+    );
+    assert!(completion.cleaned);
+    assert!(workspace.path().exists());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("README.md")).unwrap(),
+        "plain workspace\n"
+    );
 }
 
 #[test]

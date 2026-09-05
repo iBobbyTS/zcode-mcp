@@ -3,6 +3,7 @@ mod manifest;
 mod policy;
 mod worktree;
 
+pub use general::PermissionMode;
 pub use policy::AGENT_BASH_COMMAND_FAMILIES;
 
 use serde::{Deserialize, Serialize};

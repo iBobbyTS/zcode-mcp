@@ -171,6 +171,7 @@ fn daemon_auto_claims_is_single_instance_reconnects_and_handles_sigterm() {
         repository,
         base_ref: head,
         access_mode: AccessMode::ReadOnly,
+        permission_mode: zcode_agent_preparation::PermissionMode::Plan,
         prompt: "permission input".into(),
         repo_context: vec!["src/lib.rs".into()],
         attachments: Vec::new(),

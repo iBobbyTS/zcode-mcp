@@ -622,6 +622,31 @@ impl Store {
                 task.agent_id
             )));
         }
+        if task.workspace_path == task.repository
+            && serde_json::from_str::<serde_json::Value>(&task.prepared_launch_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("direct_workspace")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                == Some(true)
+        {
+            if let Some(active_agent_id) = transaction
+                .query_row(
+                    "SELECT agent_id FROM tasks WHERE repository=?1
+                 AND phase IN ('QUEUED','PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
+                 ORDER BY created_at, rowid LIMIT 1",
+                    [&task.repository],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Err(StoreError::Conflict(format!(
+                    "WORKSPACE_BUSY active_agent_id={active_agent_id}"
+                )));
+            }
+        }
         let created_at = now_millis();
         transaction.execute(
             "INSERT INTO tasks (
@@ -754,26 +779,22 @@ impl Store {
         global_limit: usize,
         per_workspace_limit: usize,
     ) -> StoreResult<Option<TaskClaim>> {
-        if global_limit == 0 || per_workspace_limit == 0 {
+        // The product contract deliberately has no process-wide agent cap.
+        // Keep the parameter for source compatibility with older daemon
+        // callers, but do not use it as an admission gate.  Concurrency is
+        // scoped to the canonical repository/workspace below.
+        let _ = global_limit;
+        if per_workspace_limit == 0 {
             return Ok(None);
         }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')",
-            [],
-            |row| row.get(0),
-        )?;
-        if active >= usize_to_i64(global_limit)? {
-            transaction.commit()?;
-            return Ok(None);
-        }
         let candidate = transaction
             .query_row(
                 "SELECT agent_id FROM tasks queued
                  WHERE phase='QUEUED' AND close_requested=0
                    AND (SELECT COUNT(*) FROM tasks active
-                        WHERE active.workspace_path=queued.workspace_path
+                        WHERE active.repository=queued.repository
                           AND active.phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')) < ?1
                  ORDER BY queued.created_at,queued.rowid LIMIT 1",
                 [usize_to_i64(per_workspace_limit)?],
@@ -2435,17 +2456,78 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_same_workspace_submission_has_one_atomic_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent.sqlite3");
+        Store::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for id in ["first", "second"] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let store = Store::open(path).unwrap();
+                barrier.wait();
+                store.enqueue_task_authoritative(&task(id, "/same-workspace", None))
+            }));
+        }
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(StoreError::Conflict(message))
+                        if message.starts_with("WORKSPACE_BUSY active_agent_id=")
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn list_filters_repository_and_group_before_limit() {
         let (_directory, _path, store) = store();
         for (id, repository, group) in [
             ("noise", "/other", Some("target")),
             ("one", "/repo", Some("target")),
-            ("two", "/repo", Some("target")),
         ] {
             store
                 .enqueue_task_authoritative(&task(id, repository, group))
                 .unwrap();
         }
+        let owner_epoch = running(&store, "noise");
+        store
+            .transition_terminal(
+                "noise",
+                owner_epoch,
+                &TerminalUpdate {
+                    outcome: TaskOutcome::Completed,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            )
+            .unwrap();
+        let owner_epoch = running(&store, "one");
+        store
+            .transition_terminal(
+                "one",
+                owner_epoch,
+                &TerminalUpdate {
+                    outcome: TaskOutcome::Completed,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            )
+            .unwrap();
+        store
+            .enqueue_task_authoritative(&task("two", "/repo", Some("target")))
+            .unwrap();
         let page = store
             .list_task_page(
                 TaskQueryScope {

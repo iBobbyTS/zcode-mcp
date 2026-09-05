@@ -157,6 +157,28 @@ impl WorktreeManager {
         })
     }
 
+    /// Bind a prepared task directly to the canonical repository. This path
+    /// intentionally performs no `git worktree add`; cleanup is a no-op for
+    /// the source workspace and only scratch metadata is owned by the task.
+    pub fn bind_direct(&self) -> PreparationResult<PreparedWorktree> {
+        let worktrees_root = create_and_canonicalize(&self.scratch_root.join("worktrees"))?;
+        let diagnostic_root = create_and_canonicalize(&self.scratch_root.join("diagnostics"))?;
+        let path = self.repository.clone();
+        Ok(PreparedWorktree {
+            repository: self.repository.clone(),
+            path,
+            scratch_worktrees_root: worktrees_root,
+            diagnostic_root,
+            head_sha: String::new(),
+            source_refs_before: String::new(),
+            source_refs_before_sha256: String::new(),
+            source_refs_before_truncated: false,
+            source_status_before: String::new(),
+            source_status_before_sha256: String::new(),
+            source_status_before_truncated: false,
+        })
+    }
+
     pub fn capture_integrity(
         &self,
         worktree: &PreparedWorktree,
@@ -455,11 +477,14 @@ impl WorktreeManager {
             || worktree.scratch_worktrees_root != root
             || worktree.diagnostic_root != diagnostic_root
             || path != worktree.path
-            || path.parent() != Some(root.as_path())
+            || (path != self.repository && path.parent() != Some(root.as_path()))
         {
             return Err(PreparationError::Worktree(
                 "prepared worktree is not bound to this manager".into(),
             ));
+        }
+        if path == self.repository {
+            return Ok(());
         }
         let registered = registered_worktree(&self.repository, &path)?.ok_or_else(|| {
             PreparationError::Worktree(
