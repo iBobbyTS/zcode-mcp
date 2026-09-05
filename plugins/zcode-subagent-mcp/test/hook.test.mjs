@@ -46,6 +46,14 @@ test('hook denies shell composition', () => {
   assert.equal('updatedInput' in output.hookSpecificOutput, false);
 });
 
+test('all native permission modes preserve fail-closed denies', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-hook-mode-'));
+  for (const mode of ['build', 'edit', 'plan', 'yolo']) {
+    const output = runHook('find . -delete', root, { ZCODE_PERMISSION_MODE: mode });
+    assert.equal(output.hookSpecificOutput.permissionDecision, 'deny', mode);
+  }
+});
+
 test('hook supports ask for unsupported commands when explicitly configured', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-hook-'));
   fs.writeFileSync(path.join(root, 'README.md'), 'x');
@@ -101,8 +109,7 @@ test('default PostToolUse audit writes bounded metadata without raw output', () 
   assert.equal(record.tool_use_id, 'tool-audit');
   assert.equal(record.status_code, 0);
   assert.equal(record.duration_ms, 17);
-  assert.match(record.canonical_argv.at(-2), /\/cat$/u);
-  assert.equal(record.canonical_argv.at(-1), 'README.md');
+  assert.match(record.canonical_argv_sha256, /^[a-f0-9]{64}$/u);
   assert.match(record.stdout_sha256, /^[a-f0-9]{64}$/u);
   assert.equal(raw.includes('sensitive output'), false);
 });

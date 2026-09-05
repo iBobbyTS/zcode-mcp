@@ -22,11 +22,12 @@ try {
   const toolInput = input?.tool_input ?? input?.input ?? {};
   const command = String(toolInput?.command ?? '');
   const cwd = String(input?.cwd ?? '');
+  const permissionMode = process.env.ZCODE_PERMISSION_MODE || process.env.ZCODE_AGENT_PERMISSION_MODE || 'build';
   const evaluation = evaluateCommand({
     command,
     cwd,
     root: process.env.ZCODE_AGENT_BASH_ROOT || undefined,
-    unknownDecision: process.env.ZCODE_AGENT_BASH_UNKNOWN_DECISION || 'deny',
+    unknownDecision: permissionMode === 'yolo' ? 'deny' : (process.env.ZCODE_AGENT_BASH_UNKNOWN_DECISION || 'deny'),
   });
   const response = input?.tool_response ?? input?.toolResponse ?? {};
   const stdout = boundedText(response?.stdout ?? response?.output ?? '');
@@ -40,7 +41,9 @@ try {
     hook_event_name: input?.hook_event_name ?? input?.hookEventName ?? null,
     cwd_sha256: crypto.createHash('sha256').update(cwd).digest('hex'),
     command_sha256: crypto.createHash('sha256').update(command).digest('hex'),
-    canonical_argv: evaluation.decision === 'allow' ? evaluation.argv : null,
+    canonical_argv_sha256: evaluation.decision === 'allow'
+      ? crypto.createHash('sha256').update(JSON.stringify(evaluation.argv)).digest('hex')
+      : null,
     policy_decision: evaluation.decision,
     policy_code: evaluation.code,
     policy_version: metadata.version,
@@ -53,6 +56,7 @@ try {
     stdout_bytes_observed: Buffer.byteLength(stdout),
     stderr_bytes_observed: Buffer.byteLength(stderr),
     failed: Boolean(input?.error) || input?.hook_event_name === 'PostToolUseFailure' || input?.hookEventName === 'PostToolUseFailure',
+    permission_mode: ['build', 'edit', 'plan', 'yolo'].includes(permissionMode) ? permissionMode : 'build',
   };
 
   const dataRoot = process.env.ZCODE_PLUGIN_DATA;

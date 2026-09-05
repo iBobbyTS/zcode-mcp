@@ -54,10 +54,10 @@ fn stdio_catalog_is_exactly_the_generic_nine_tools() {
     let schema = serde_json::to_string(tools).unwrap();
     for forbidden in [
         concat!("zcode_", "review_"),
-        "zcode_system_ensure_ready",
-        "zcode_agent_get",
-        "zcode_agent_events",
-        "zcode_agent_wait",
+        concat!("zcode_subagent_", "system_ensure_ready"),
+        concat!("zcode_subagent_", "get"),
+        concat!("zcode_subagent_", "events"),
+        concat!("zcode_subagent_", "wait"),
         concat!("review", "_id"),
         concat!("report_", "markdown"),
         concat!("check_", "report"),

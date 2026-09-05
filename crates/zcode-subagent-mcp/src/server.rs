@@ -54,15 +54,15 @@ impl From<PublicPermissionMode> for PermissionMode {
 }
 
 pub const PUBLIC_TOOLS: [&str; 9] = [
-    "zcode_agent_cancel",
-    "zcode_agent_close",
-    "zcode_agent_list",
-    "zcode_agent_poll",
-    "zcode_agent_respond",
-    "zcode_agent_result",
-    "zcode_agent_send",
-    "zcode_agent_spawn",
-    "zcode_system_status",
+    "zcode_subagent_cancel",
+    "zcode_subagent_close",
+    "zcode_subagent_list",
+    "zcode_subagent_poll",
+    "zcode_subagent_respond",
+    "zcode_subagent_result",
+    "zcode_subagent_send",
+    "zcode_subagent_spawn",
+    "zcode_subagent_status",
 ];
 
 const MAX_ID_BYTES: usize = 512;
@@ -928,7 +928,7 @@ impl ServerHandler for SubagentMcp {
 #[tool_router(router = tool_router)]
 impl SubagentMcp {
     #[tool(
-        name = "zcode_system_status",
+        name = "zcode_subagent_status",
         description = "Read bounded daemon and runtime readiness status",
         annotations(
             read_only_hint = true,
@@ -948,7 +948,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_spawn",
+        name = "zcode_subagent_spawn",
         description = "Submit a durable bounded general subagent task",
         annotations(
             read_only_hint = false,
@@ -990,7 +990,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_poll",
+        name = "zcode_subagent_poll",
         description = "Long-poll a task revision with typed pending requests and passive runtime activity",
         annotations(
             read_only_hint = true,
@@ -1034,7 +1034,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_list",
+        name = "zcode_subagent_list",
         description = "List tasks within an explicit daemon-enforced scope",
         annotations(
             read_only_hint = true,
@@ -1070,7 +1070,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_send",
+        name = "zcode_subagent_send",
         description = "Queue an idempotent bounded message for a running task",
         annotations(
             read_only_hint = false,
@@ -1111,7 +1111,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_respond",
+        name = "zcode_subagent_respond",
         description = "Respond idempotently to a typed pending permission request",
         annotations(
             read_only_hint = false,
@@ -1145,7 +1145,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_cancel",
+        name = "zcode_subagent_cancel",
         description = "Cancel a task without removing durable history",
         annotations(
             read_only_hint = false,
@@ -1167,7 +1167,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_result",
+        name = "zcode_subagent_result",
         description = "Read verified task results and an optional bounded artifact chunk",
         annotations(
             read_only_hint = true,
@@ -1258,7 +1258,7 @@ impl SubagentMcp {
     }
 
     #[tool(
-        name = "zcode_agent_close",
+        name = "zcode_subagent_close",
         description = "Close a task and reap runtime resources while preserving durable history",
         annotations(
             read_only_hint = false,
@@ -1344,10 +1344,10 @@ mod generic_tests {
         for forbidden in [
             concat!("zcode_", "review_spawn"),
             concat!("zcode_", "review_continue"),
-            "zcode_system_ensure_ready",
-            "zcode_agent_get",
-            "zcode_agent_events",
-            "zcode_agent_wait",
+            concat!("zcode_", "system_ensure_ready"),
+            concat!("zcode_", "agent_get"),
+            concat!("zcode_", "agent_events"),
+            concat!("zcode_", "agent_wait"),
             concat!("review", "_id"),
             concat!("review", "_evidence"),
             concat!("report_", "markdown"),

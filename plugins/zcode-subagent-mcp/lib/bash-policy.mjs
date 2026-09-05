@@ -1322,11 +1322,18 @@ export function evaluateHookInput(input, env = process.env) {
   if (tool !== 'Bash') {
     return hardDeny('unexpected_tool', `hook only evaluates Bash, received ${String(tool)}`, { hookEventName, toolInput });
   }
+  // Permission mode is a public four-value selector. It may influence the
+  // caller's prompting policy, but it can never weaken this fail-closed hook:
+  // especially `yolo` must not turn a deny into an allow.
+  const permissionMode = env.ZCODE_PERMISSION_MODE || env.ZCODE_AGENT_PERMISSION_MODE || 'build';
+  if (!['build', 'edit', 'plan', 'yolo'].includes(permissionMode)) {
+    return hardDeny('invalid_permission_mode', 'permission mode must be build, edit, plan, or yolo', { hookEventName, toolInput });
+  }
   const evaluated = evaluateCommand({
     command,
     cwd,
     root: env.ZCODE_AGENT_BASH_ROOT || undefined,
-    unknownDecision: env.ZCODE_AGENT_BASH_UNKNOWN_DECISION || 'deny',
+    unknownDecision: permissionMode === 'yolo' ? 'deny' : (env.ZCODE_AGENT_BASH_UNKNOWN_DECISION || 'deny'),
     trustedBinDirs: env.ZCODE_AGENT_BASH_TRUSTED_BIN_DIRS
       ? env.ZCODE_AGENT_BASH_TRUSTED_BIN_DIRS.split(path.delimiter).filter(Boolean)
       : undefined,
