@@ -1430,9 +1430,10 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
 
 fn map_store(error: StoreError) -> RpcError {
     match error {
-        StoreError::LegacySchemaUnsupported => {
-            RpcError::new(RpcErrorCode::Persistence, "LEGACY_SCHEMA_UNSUPPORTED")
-        }
+        StoreError::LegacySchemaUnsupported => RpcError::new(
+            RpcErrorCode::Persistence,
+            "STORE_SCHEMA_VERSION_UNSUPPORTED",
+        ),
         StoreError::Sqlite(_) => {
             RpcError::new(RpcErrorCode::Persistence, "durable store operation failed")
         }

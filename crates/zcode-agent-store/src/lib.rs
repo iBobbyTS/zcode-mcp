@@ -146,7 +146,7 @@ pub enum StoreError {
 impl StoreError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::LegacySchemaUnsupported => "LEGACY_SCHEMA_UNSUPPORTED",
+            Self::LegacySchemaUnsupported => "STORE_SCHEMA_VERSION_UNSUPPORTED",
             Self::Sqlite(_) => "PERSISTENCE_ERROR",
             Self::InvalidState(_) => "INVALID_STATE",
             Self::Conflict(_) => "CONFLICT",
@@ -159,7 +159,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::Sqlite(error) => write!(formatter, "SQLite store error: {error}"),
             Self::LegacySchemaUnsupported => formatter.write_str(
-                "LEGACY_SCHEMA_UNSUPPORTED: existing Store must be backed up and recreated",
+                "STORE_SCHEMA_VERSION_UNSUPPORTED: existing Store must be backed up and recreated",
             ),
             Self::InvalidState(message) => write!(formatter, "invalid store state: {message}"),
             Self::Conflict(message) => write!(formatter, "store conflict: {message}"),
@@ -2417,7 +2417,7 @@ mod tests {
             Ok(_) => panic!("legacy schema unexpectedly opened"),
             Err(error) => error,
         };
-        assert_eq!(error.code(), "LEGACY_SCHEMA_UNSUPPORTED");
+        assert_eq!(error.code(), "STORE_SCHEMA_VERSION_UNSUPPORTED");
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(!path.with_extension("sqlite3-wal").exists());
         assert!(!path.with_extension("sqlite3-shm").exists());

@@ -536,7 +536,7 @@ fn daemon_control_header_is_deterministic_identity_bound_and_prompt_separate() {
 }
 
 #[test]
-fn named_command_identity_uses_pinned_base_canonical_cwd() {
+fn named_command_identity_uses_direct_canonical_workspace_cwd() {
     let f = Fixture::new();
     fs::create_dir_all(f.repository.join("pinned")).unwrap();
     fs::create_dir_all(f.repository.join("current")).unwrap();
@@ -573,9 +573,9 @@ fn named_command_identity_uses_pinned_base_canonical_cwd() {
         .unwrap();
     assert_eq!(
         prepared.validation_commands["unit"].cwd,
-        fs::canonicalize(prepared.worktree.path.join("pinned")).unwrap()
+        fs::canonicalize(f.repository.join("current")).unwrap()
     );
-    assert_ne!(
+    assert_eq!(
         prepared.validation_commands["unit"].cwd,
         fs::canonicalize(f.repository.join("command-cwd")).unwrap()
     );

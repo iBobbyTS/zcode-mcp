@@ -18,6 +18,7 @@ use std::{
         Arc, Condvar, Mutex,
     },
 };
+use zcode_agent_preparation::AccessMode;
 use zcode_agent_store::{
     ArtifactKind, NewArtifact, PendingRequestState, ResultArtifact, TaskOutcome, TaskRecord,
     TaskResult,
