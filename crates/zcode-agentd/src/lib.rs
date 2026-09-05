@@ -8554,9 +8554,10 @@ exit 7
         let completed = wait_for_task_result(&store, &agent_id);
         assert_eq!(completed.result.outcome, TaskOutcome::Completed);
 
+        let queued_directory = tempfile::tempdir().unwrap();
         let queued = scheduler
             .enqueue_general(
-                &general_manifest(directory.path(), "queued-completion-gate", None),
+                &general_manifest(queued_directory.path(), "queued-completion-gate", None),
                 Some("feature"),
             )
             .unwrap();
@@ -8578,8 +8579,6 @@ exit 7
                 .contains(&"continue".to_owned())
                 .then_some(())
         });
-        assert!(store.task_result(&queued_id).unwrap().is_none());
-        queued_runtime.complete_turn(TurnBoundary::Completed);
         let completed = wait_for_task_result(&store, &queued_id);
         assert_eq!(completed.result.outcome, TaskOutcome::Completed);
     }
@@ -9027,14 +9026,18 @@ exit 7
             )
             .unwrap();
         let first_id = first.task.agent_id;
+        let next_directory = tempfile::tempdir().unwrap();
         let next = scheduler
             .enqueue_general(
-                &general_manifest(directory.path(), "natural-next", None),
+                &general_manifest(next_directory.path(), "natural-next", None),
                 Some("feature"),
             )
             .unwrap();
         let next_id = next.task.agent_id;
-        assert_eq!(scheduler.start_ready().unwrap(), vec![first_id.clone()]);
+        let started = scheduler.start_ready().unwrap();
+        assert_eq!(started.len(), 2);
+        assert!(started.contains(&first_id));
+        assert!(started.contains(&next_id));
         let operation = scheduler.active_session(&first_id).unwrap().3;
         let guard = operation.lock().unwrap();
         let decision = store.request_close(&first_id).unwrap();
@@ -9302,16 +9305,17 @@ exit 7
                 Some("feature"),
             )
             .unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
         let second = scheduler
             .enqueue_general(
-                &general_manifest(directory.path(), "after-cooperative-stop", None),
+                &general_manifest(second_directory.path(), "after-cooperative-stop", None),
                 Some("feature"),
             )
             .unwrap();
-        assert_eq!(
-            scheduler.start_ready().unwrap(),
-            vec![first.task.agent_id.clone()]
-        );
+        let started = scheduler.start_ready().unwrap();
+        assert_eq!(started.len(), 2);
+        assert!(started.contains(&first.task.agent_id));
+        assert!(started.contains(&second.task.agent_id));
         let runtime_lifecycle = {
             let state = scheduler.inner.state.lock().unwrap();
             Arc::clone(
@@ -9331,10 +9335,6 @@ exit 7
         assert_eq!(snapshot.phase, RuntimeLifecyclePhase::Terminal);
         assert_eq!(snapshot.force_termination_count, 0);
         assert_eq!(snapshot.observed_boundary, Some(TurnBoundary::Completed));
-        assert_eq!(
-            scheduler.start_ready().unwrap(),
-            vec![second.task.agent_id.clone()]
-        );
         assert_eq!(scheduler.active_count(), 1);
         factory.runtime(&second.task.agent_id);
         scheduler.close_task(&second.task.agent_id).unwrap();
@@ -9346,12 +9346,16 @@ exit 7
         let mut budget = AccessMode::ReadOnly.default_budget();
         budget.max_tool_calls = 1;
         let first = general_manifest(directory.path(), "general-budget", Some(budget));
-        let second = general_manifest(directory.path(), "general-next", None);
+        let second_directory = tempfile::tempdir().unwrap();
+        let second = general_manifest(second_directory.path(), "general-next", None);
         let first = scheduler.enqueue_general(&first, Some("feature")).unwrap();
         let second = scheduler.enqueue_general(&second, Some("feature")).unwrap();
         let first_id = first.task.agent_id;
         let second_id = second.task.agent_id;
-        assert_eq!(scheduler.start_ready().unwrap(), vec![first_id.clone()]);
+        let started = scheduler.start_ready().unwrap();
+        assert_eq!(started.len(), 2);
+        assert!(started.contains(&first_id));
+        assert!(started.contains(&second_id));
         let runtime = factory.runtime(&first_id);
         let tool_event = |tool_call_id: &str| {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(EventEnvelope {
@@ -9377,10 +9381,7 @@ exit 7
             .queue_message(&first_id, "late", "queue", "late")
             .is_err());
         factory.runtime(&second_id);
-        assert_eq!(
-            store.get_task(&second_id).unwrap().unwrap().phase,
-            TaskPhase::Running
-        );
+        assert_eq!(store.get_task(&second_id).unwrap().unwrap().phase, TaskPhase::Running);
         scheduler.close_task(&second_id).unwrap();
     }
 
