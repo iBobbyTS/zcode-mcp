@@ -16,7 +16,8 @@ use std::{
     time::Duration,
 };
 use zcode_agent_preparation::{
-    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, GENERAL_TASK_SCHEMA,
+    AccessMode, AttachmentInput, BudgetLimits, GeneralTaskManifest, PermissionMode,
+    GENERAL_TASK_SCHEMA,
 };
 use zcode_agent_store::{EffectiveBudget, TaskOutcome};
 use zcode_agentd::rpc::{
@@ -871,6 +872,7 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Stri
         repository,
         base_ref: input.base_ref.clone(),
         access_mode: input.access_mode.into(),
+        permission_mode: PermissionMode::Build,
         prompt: input.prompt.clone(),
         repo_context: input.repo_context.iter().map(PathBuf::from).collect(),
         attachments: input
@@ -1473,6 +1475,7 @@ mod generic_tests {
                     repository: repository.clone(),
                     base_ref,
                     access_mode: AccessMode::WorkspaceWrite,
+                    permission_mode: PermissionMode::Build,
                     prompt: "produce a patch".into(),
                     repo_context: vec!["src/lib.rs".into()],
                     attachments: Vec::new(),
