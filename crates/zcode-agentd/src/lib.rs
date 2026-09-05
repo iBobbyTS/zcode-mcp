@@ -3696,6 +3696,7 @@ impl Scheduler {
             idempotency_key: prepared.idempotency_key.clone(),
             repository: prepared.repository.to_string_lossy().into_owned(),
             group_id: group_id.map(str::to_owned),
+            access_mode: String::new(),
             workspace_path: prepared.worktree.path.to_string_lossy().into_owned(),
             runtime_hash: None,
             prepared_launch_json: prepared_json,

@@ -727,6 +727,7 @@ impl RpcService {
                         TaskPageFilter {
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
+                            access_mode: None,
                         },
                         query.cursor.as_deref().map(parse_task_cursor).transpose()?,
                         query.limit,
